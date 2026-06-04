@@ -103,6 +103,13 @@ class TestBuildReportCard:
         assert card["predictor"]["grade"] is None
         assert "shadow_book.json" in card["_provenance"]["artifacts"]["artifacts_missing"]
 
+    def test_v2_tiles_attached(self, s3):
+        # RC v2 MetricRecord tiles are nested under "tiles" (portfolio + predictor).
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert set(card["tiles"]) == {"portfolio_outcome", "predictor"}
+        for tile in card["tiles"].values():
+            assert "status" in tile and "components" in tile
+
 
 class TestWriteReportCard:
     def test_writes_to_evaluator_namespace(self, s3):
