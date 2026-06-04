@@ -32,11 +32,13 @@ from botocore.exceptions import ClientError
 from grading.artifacts import read_scorecard_inputs
 from grading.scorecard import compute_scorecard
 from grading.module_agg import overall_status
+from grading.tiles.agent import build_agent_tile
 from grading.tiles.backtester import build_backtester_tile
 from grading.tiles.executor import build_executor_tile
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 from grading.tiles.predictor import build_predictor_tile
 from grading.tiles.research import build_research_tile
+from grading.tiles.substrate import build_substrate_tile
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +72,16 @@ def build_report_card(
     #   - research (Tile 1): backtest/{date}/e2e_lift + score_calibration + macro_eval + portfolio_calibration
     #   - executor (Tile 3): backtest/{date}/trigger_scorecard + shadow_book + exit_timing + portfolio_excursion
     #   - backtester (Tile 4): grading.json coverage audit + parity + attribution FDR + freshness + rollbacks
+    #   - substrate (Tile 5): price-cache freshness (+ SF/data-quality producers N/A until wired)
+    #   - agent (Tile 6): agent-quality transparency shell (producers not yet persisted)
     tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
         "predictor": build_predictor_tile(bucket, s3_client=s3_client),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
         "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),
+        "substrate": build_substrate_tile(bucket, s3_client=s3_client),
+        "agent": build_agent_tile(bucket, s3_client=s3_client),
     }
     scorecard["tiles"] = tiles
     # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
