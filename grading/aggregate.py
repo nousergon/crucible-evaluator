@@ -31,6 +31,8 @@ from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
 from grading.scorecard import compute_scorecard
+from grading.module_agg import overall_status
+from grading.tiles.executor import build_executor_tile
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 from grading.tiles.predictor import build_predictor_tile
 from grading.tiles.research import build_research_tile
@@ -65,11 +67,21 @@ def build_report_card(
     #   - portfolio_outcome (Tile 0): trades/eod_pnl.csv
     #   - predictor (Tile 2): predictor metrics + weights manifest (LEAK-FREE IC)
     #   - research (Tile 1): backtest/{date}/e2e_lift + score_calibration + macro_eval + portfolio_calibration
-    scorecard["tiles"] = {
+    #   - executor (Tile 3): backtest/{date}/trigger_scorecard + shadow_book + exit_timing + portfolio_excursion
+    tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
         "predictor": build_predictor_tile(bucket, s3_client=s3_client),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client),
+        "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
     }
+    scorecard["tiles"] = tiles
+    # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
+    # any cascade module fails overall), per module_agg.overall_status. The
+    # Backtester / Substrate / Agent tiles join later; overall_status tolerates
+    # their absence. Distinct from the v1 scorecard["overall"] letter.
+    scorecard["tiles_overall_status"] = overall_status(
+        {name: t["status"] for name, t in tiles.items()}
+    )
 
     scorecard["_provenance"] = {
         "run_date": run_date,
