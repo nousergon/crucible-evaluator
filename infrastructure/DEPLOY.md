@@ -25,22 +25,25 @@ infra on its own.
   `real_graded` counts, and the written `report_card_key`.
 - **Env:** `EVALUATOR_BUCKET` (optional), `EVALUATOR_RUN_DATE` (optional pin).
 
-### Packaging + publish (fleet pattern)
+### Packaging + publish — container image (fleet pattern)
+
+The runtime deps (numpy / pandas via `alpha-engine-lib[quant-stats]`) need
+Amazon-Linux manylinux wheels, so — like the research/predictor Lambdas — this
+ships as a **container image** (`Dockerfile` → ECR), not a zip. `infrastructure/
+deploy.sh` does the whole cycle:
 
 ```
-rm -rf build && mkdir build
-pip install -r requirements.txt -t build/
-cp -r grading director build/
-( cd build && zip -qr ../evaluator.zip . )
-aws lambda update-function-code --function-name alpha-engine-evaluator \
-  --zip-file fileb://evaluator.zip --query LastUpdateStatus --output text
-aws lambda publish-version --function-name alpha-engine-evaluator \
-  --query Version --output text   # then point the `live` alias at it
+./infrastructure/iam/apply.sh          # one-time: create the execution role
+./infrastructure/deploy.sh             # build → ECR push → create/update Lambda
+                                       # → canary (write=false) → publish + live alias
 ```
 
-First-ever deploy creates the function + role once (operator), then the above is
-the steady-state update. A `deploy.sh` mirroring the predictor/research pattern
-lands once the function + role ARN exist.
+- **Image:** `Dockerfile` (`public.ecr.aws/lambda/python:3.12`, `git` for the
+  lib pip-install, `CMD ["grading.handler.handler"]`). The lib `@vX.Y.Z` pin in
+  the Dockerfile is authoritative — keep in lockstep with `requirements.txt`.
+- **Canary:** `deploy.sh` invokes with `{"write": false}` and only promotes the
+  `live` alias when the returned `status == "ok"`.
+- **Config:** timeout 300s, memory 1024 MB, env `EVALUATOR_BUCKET`.
 
 ## IAM (least-privilege)
 
