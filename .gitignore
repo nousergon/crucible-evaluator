@@ -50,3 +50,6 @@ run.log
 
 # Gitleaks
 .gitleaks.toml
+
+# Director — tuned system prompt is proprietary (operator copies prompt_example.py → prompt.py)
+director/prompt.py
