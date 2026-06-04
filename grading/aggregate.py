@@ -32,6 +32,7 @@ from botocore.exceptions import ClientError
 from grading.artifacts import read_scorecard_inputs
 from grading.scorecard import compute_scorecard
 from grading.module_agg import overall_status
+from grading.tiles.backtester import build_backtester_tile
 from grading.tiles.executor import build_executor_tile
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 from grading.tiles.predictor import build_predictor_tile
@@ -68,11 +69,13 @@ def build_report_card(
     #   - predictor (Tile 2): predictor metrics + weights manifest (LEAK-FREE IC)
     #   - research (Tile 1): backtest/{date}/e2e_lift + score_calibration + macro_eval + portfolio_calibration
     #   - executor (Tile 3): backtest/{date}/trigger_scorecard + shadow_book + exit_timing + portfolio_excursion
+    #   - backtester (Tile 4): grading.json coverage audit + parity + attribution FDR + freshness + rollbacks
     tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
         "predictor": build_predictor_tile(bucket, s3_client=s3_client),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
+        "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),
     }
     scorecard["tiles"] = tiles
     # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
