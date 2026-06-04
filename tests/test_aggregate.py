@@ -106,7 +106,10 @@ class TestBuildReportCard:
     def test_v2_tiles_attached(self, s3):
         # RC v2 MetricRecord tiles are nested under "tiles" (portfolio + predictor).
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        assert set(card["tiles"]) == {"portfolio_outcome", "predictor", "research", "executor", "backtester"}
+        assert set(card["tiles"]) == {
+            "portfolio_outcome", "predictor", "research", "executor",
+            "backtester", "substrate", "agent",
+        }
         for tile in card["tiles"].values():
             assert "status" in tile and "components" in tile
         # Unified v2 overall status rolls up the tiles.
