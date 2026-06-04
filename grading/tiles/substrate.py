@@ -20,10 +20,11 @@ Spec: ``system-report-card-revamp-260522.md`` Tile 5.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+import os
+from datetime import UTC, datetime, timedelta
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -32,6 +33,85 @@ logger = logging.getLogger(__name__)
 
 MODULE = "substrate"
 PRICE_CACHE_PREFIX = "predictor/price_cache/"
+
+# The 3 orchestration Step Functions whose rolling success rate IS the substrate
+# headline. ARNs are *discovered* at runtime (list_state_machines) rather than
+# hardcoded, so no AWS account id lives in this public repo.
+_SF_NAMES = (
+    "alpha-engine-saturday-pipeline",
+    "alpha-engine-weekday-pipeline",
+    "alpha-engine-eod-pipeline",
+)
+_SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
+_SF_WINDOW_DAYS = 28
+
+
+def _discover_sf_arns(sfn) -> list[str]:
+    """Resolve the 3 pipeline SF ARNs by name (no hardcoded account id).
+
+    Env override ``EVALUATOR_SF_ARNS`` (comma-separated) wins — lets the Lambda
+    skip the ListStateMachines call / IAM grant if the ARNs are configured.
+    """
+    env = os.environ.get("EVALUATOR_SF_ARNS")
+    if env:
+        return [a.strip() for a in env.split(",") if a.strip()]
+    arns: list[str] = []
+    paginator = sfn.get_paginator("list_state_machines")
+    for page in paginator.paginate():
+        for sm in page.get("stateMachines", []):
+            if sm.get("name") in _SF_NAMES:
+                arns.append(sm["stateMachineArn"])
+    return arns
+
+
+def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
+    """Rolling success rate across the 3 SFs over the trailing window.
+
+    Returns ``{rate, n_terminal, n_succeeded, per_sf}`` or ``None`` when no SF
+    ARNs are discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED;
+    RUNNING / NOT_RUN excluded from the denominator.
+    """
+    from alpha_engine_lib.pipeline_status import list_recent_pipeline_runs
+
+    arns = _discover_sf_arns(sfn)
+    if not arns:
+        return None
+    cutoff = as_of - timedelta(days=window_days)
+    n_terminal = n_succeeded = 0
+    per_sf: dict[str, str] = {}
+    for arn in arns:
+        runs = list_recent_pipeline_runs(arn, limit=50, client=sfn)
+        succ = term = 0
+        for r in runs:
+            start = getattr(r, "start_utc", None)
+            if start is not None and start < cutoff:
+                continue
+            # Count PRODUCTION runs only: EventBridge-triggered executions carry a
+            # pipeline_role (weekly/saturday/daily/eod/recovery); ad-hoc smoke /
+            # manual / legacy runs have no role and would misleadingly tank the
+            # rate (cry-wolf). Role-carrying ⇒ a tracked, intended run.
+            if getattr(r, "pipeline_role", None) is None:
+                continue
+            # RunStatus is a (str, Enum) — str() yields "RunStatus.SUCCEEDED",
+            # so read .value to get the bare AWS status vocabulary.
+            raw = getattr(r, "status", None)
+            status = getattr(raw, "value", raw)
+            if status in _SF_TERMINAL:
+                term += 1
+                if status == "SUCCEEDED":
+                    succ += 1
+        n_terminal += term
+        n_succeeded += succ
+        name = arn.rsplit(":", 1)[-1]
+        per_sf[name] = f"{succ}/{term}"
+    if n_terminal == 0:
+        return {"rate": None, "n_terminal": 0, "n_succeeded": 0, "per_sf": per_sf}
+    return {
+        "rate": n_succeeded / n_terminal,
+        "n_terminal": n_terminal,
+        "n_succeeded": n_succeeded,
+        "per_sf": per_sf,
+    }
 
 
 def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
@@ -50,7 +130,13 @@ def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
     return latest
 
 
-def build_substrate_tile(bucket: str, s3_client=None, *, as_of: datetime | None = None) -> dict:
+def build_substrate_tile(
+    bucket: str,
+    s3_client=None,
+    *,
+    as_of: datetime | None = None,
+    sfn_client=None,
+) -> dict:
     """Build the Substrate Reliability tile."""
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
@@ -75,11 +161,50 @@ def build_substrate_tile(bucket: str, s3_client=None, *, as_of: datetime | None 
             na_detail="price_cache_freshness: no objects under predictor/price_cache/ to date-stamp.",
         ))
 
-    # 2-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
+    # 2. sf_success_rate_4w (critical) — the substrate headline: rolling success
+    #    rate across the 3 orchestration SFs (Saturday/Weekday/EOD). Reads the SF
+    #    API via alpha_engine_lib.pipeline_status. Graceful N/A-NOT-RUN on an SF
+    #    access error (a secondary read must not fail the whole report card —
+    #    WARN-logged, not swallowed).
+    sf_src = "stepfunctions:alpha-engine-{saturday,weekday,eod}-pipeline"
+    try:
+        sfn = sfn_client or boto3.client(
+            "stepfunctions", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        sf = _sf_success_rate(sfn, as_of, _SF_WINDOW_DAYS)
+        if sf is None:
+            components.append(build_metric(
+                name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, input_present=False,
+                na_detail="sf_success_rate_4w: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
+            ))
+        elif sf["rate"] is None:
+            components.append(build_metric(
+                name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
+                na_detail=f"sf_success_rate_4w: no terminal SF executions in the last {_SF_WINDOW_DAYS}d.",
+            ))
+        else:
+            components.append(build_metric(
+                name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                value=sf["rate"], n_samples=sf["n_terminal"], n_floor=3, target=0.95, red_line=0.80,
+                source_path=sf_src,
+                reason=(f"sf_success_rate_4w = {sf['rate']:.0%} ({sf['n_succeeded']}/{sf['n_terminal']} "
+                        f"production-role terminal SF executions in {_SF_WINDOW_DAYS}d: {sf['per_sf']}) "
+                        f"vs target 95% / red-line 80%."),
+            ))
+    except (ClientError, BotoCoreError) as e:
+        code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
+        logger.warning("sf_success_rate_4w: SF API read failed (%s) — grading N/A", e)
+        components.append(build_metric(
+            name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+            n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
+            na_detail=f"sf_success_rate_4w: Step Functions read failed this cycle ({code}).",
+        ))
+
+    # 3-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
-        ("sf_success_rate_4w", "critical",
-         "sf_success_rate_4w: wire alpha_engine_lib.pipeline_status.list_recent_pipeline_runs over the 3 SF ARNs (Saturday/Weekday/EOD), rolling 4w success rate. HIGHEST-VALUE substrate follow-up."),
         ("data_quality_incidents", "critical",
          "data_quality_incidents: needs the data-quality substrate inventory (count of failing rows, last 4w) — not yet exposed to the evaluator."),
         ("schema_drift_incidents", "critical",
