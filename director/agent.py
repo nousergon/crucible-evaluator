@@ -40,9 +40,22 @@ def _load_system_prompt() -> str:
 
 
 def _default_llm():
-    """Construct the real structured-output Opus client (lazy import)."""
+    """Construct the real structured-output Opus client (lazy import).
+
+    The Anthropic key is fetched from SSM (``/alpha-engine/ANTHROPIC_API_KEY``)
+    via the lib's ``get_secret`` — the fleet's institutional secret path — so the
+    Director Lambda needs no ``ANTHROPIC_API_KEY`` env wiring (just the
+    ``ssm:GetParameter`` grant on the role). Passed as ``anthropic_api_key=``
+    (the ChatAnthropic kwarg, not ``api_key``). Both imports are lazy so tests +
+    the grading path never pull langchain or hit SSM.
+    """
+    from alpha_engine_lib.secrets import get_secret
     from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
-    base = ChatAnthropic(model=DIRECTOR_MODEL, temperature=0, max_tokens=8000)
+
+    api_key = get_secret("ANTHROPIC_API_KEY")
+    base = ChatAnthropic(
+        model=DIRECTOR_MODEL, temperature=0, max_tokens=8000, anthropic_api_key=api_key,
+    )
     return base.with_structured_output(DirectorWeeklyActionPlan)
 
 

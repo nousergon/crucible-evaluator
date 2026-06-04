@@ -14,7 +14,8 @@
             "trades/*",
             "config/*",
             "signals/*",
-            "evaluator/*"
+            "evaluator/*",
+            "director/*"
           ]
         }
       }
@@ -36,6 +37,18 @@
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/evaluator/*"
+    },
+    {
+      "Sid": "WriteDirectorPlan",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/director/*"
+    },
+    {
+      "Sid": "ReadAnthropicSecret",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParametersByPath"],
+      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/*"
     },
     {
       "Sid": "ReadStepFunctionExecutionHistory",
