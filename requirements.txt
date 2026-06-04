@@ -8,10 +8,10 @@ numpy~=1.26
 pandas~=2.2
 
 # Shared contracts: MetricRecord (alpha_engine_lib.metrics), statistical
-# intervals (alpha_engine_lib.quant.stats.intervals), agent schemas, secrets.
-# Pinned to v0.51.0 for scaffolding; bumps to v0.52.0 (MetricRecord) when the
-# grading layer (Phase C) consumes it.
-alpha-engine-lib[quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.51.0
+# intervals (alpha_engine_lib.quant.stats.intervals), quant stats (sharpe /
+# sortino / max_drawdown / PSR / DSR / CVaR / BH-FDR), agent schemas, secrets.
+# v0.52.0 — Phase C consumes MetricRecord + derive_* + the quant battery.
+alpha-engine-lib[quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.52.0
 
 # Dev / testing
 pytest~=8.2
