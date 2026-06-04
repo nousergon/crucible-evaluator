@@ -13,6 +13,11 @@ pandas~=2.2
 # v0.52.0 — Phase C consumes MetricRecord + derive_* + the quant battery.
 alpha-engine-lib[quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.52.0
 
+# Director (Layer C) — single structured Opus call. langchain-anthropic provides
+# ChatAnthropic + with_structured_output; only needed when DIRECTOR_ENABLED is on
+# (imported lazily, so the test suite + the grading path don't require it).
+langchain-anthropic~=0.3
+
 # Dev / testing
 pytest~=8.2
 pytest-cov~=4.1
