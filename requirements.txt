@@ -1,0 +1,20 @@
+# Config / storage
+boto3~=1.34
+pydantic~=2.7
+pyyaml~=6.0
+
+# Numerics for grading / report-card aggregation
+numpy~=1.26
+pandas~=2.2
+
+# Shared contracts: MetricRecord (alpha_engine_lib.metrics), statistical
+# intervals (alpha_engine_lib.quant.stats.intervals), agent schemas, secrets.
+# Pinned to v0.51.0 for scaffolding; bumps to v0.52.0 (MetricRecord) when the
+# grading layer (Phase C) consumes it.
+alpha-engine-lib[quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.51.0
+
+# Dev / testing
+pytest~=8.2
+pytest-cov~=4.1
+# moto: mocked S3 for artifact-read integration tests (added with the grading layer)
+moto~=5.0
