@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
@@ -183,15 +183,21 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             na_detail="fdr_surface_health: attribution.json absent/empty/not-ok this cycle.",
         ))
 
-    # 5. auto_apply_rollback_count (diagnostic) — config rollbacks (lower better).
+    # 5. auto_apply_rollback_count (diagnostic) — config rollbacks in the last
+    #    ~4 cycles (28d by LastModified), per the Tile-4 spec (C6-fu); all-time
+    #    over-counted long-resolved rollbacks.
     try:
+        cutoff = as_of - timedelta(days=28)
         resp = s3.list_objects_v2(Bucket=bucket, Prefix="config/rollback_audit/")
-        n_rb = sum(1 for o in resp.get("Contents", []) if not o["Key"].endswith("/"))
+        n_rb = sum(
+            1 for o in resp.get("Contents", [])
+            if not o["Key"].endswith("/") and o.get("LastModified") and o["LastModified"] >= cutoff
+        )
         components.append(build_metric(
             name="auto_apply_rollback_count", module=MODULE, metric_type="count", criticality="diagnostic",
             value=float(n_rb), n_samples=1, n_floor=1, target=0.0, red_line=2.0, higher_is_better=False,
             source_path=f"s3://{bucket}/config/rollback_audit/",
-            reason=f"auto_apply_rollback_count = {n_rb} rollback-audit objects (all-time) vs target 0 / red-line 2.",
+            reason=f"auto_apply_rollback_count = {n_rb} rollback-audit objects in the last 28d vs target 0 / red-line 2.",
         ))
     except ClientError:
         components.append(build_metric(

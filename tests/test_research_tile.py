@@ -12,19 +12,24 @@ BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-07"
 
 
-def _clf(precision, tp, fp):
-    return {"precision": precision, "tp": tp, "fp": fp, "n": tp + fp}
+def _clf(precision, tp, fp, fn=0, tn=0):
+    return {"precision": precision, "tp": tp, "fp": fp, "fn": fn, "tn": tn, "n": tp + fp + fn + tn}
 
 
+# Realistic classification blocks (with fn/tn) so the base-rate edge is
+# meaningful: edge = precision − base_rate, base_rate = (tp+fn)/n_pop.
 _E2E = {
     "status": "ok",
+    # precision 0.50, base 200/5000=0.04 → edge +0.46
     "scanner_lift": {"lift": -0.0016, "n_passing": 320,
-                     "classification": _clf(0.50, 60, 60)},
+                     "classification": _clf(0.50, 60, 60, fn=140, tn=4740)},
     "team_lift": [
-        {"team_id": "tech", "lift": 0.01, "classification": _clf(0.6, 18, 12)},
-        {"team_id": "health", "lift": 0.0, "classification": _clf(0.5, 10, 10)},
+        {"team_id": "tech", "lift": 0.01, "classification": _clf(0.6, 18, 12, fn=12, tn=58)},
+        {"team_id": "health", "lift": 0.0, "classification": _clf(0.5, 10, 10, fn=10, tn=70)},
     ],
-    "cio_lift": {"lift": -0.0067, "n_advance": 69, "classification": _clf(0.55, 38, 31)},
+    # precision 0.55, base 58/200=0.29 → edge +0.26
+    "cio_lift": {"lift": -0.0067, "n_advance": 69,
+                 "classification": _clf(0.55, 38, 31, fn=20, tn=111)},
     "cio_vs_ranking": {"lift": 0.0003},
 }
 
@@ -56,29 +61,33 @@ class TestMissingArtifacts:
 
 
 class TestPrecisionComponents:
-    def test_scanner_precision_with_wilson_ci(self, s3):
+    def test_scanner_edge_over_base_rate(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         scanner = _comp(tile, "scanner")
-        assert scanner["value"] == pytest.approx(0.50)
+        # edge = precision 0.50 − base_rate (200/5000=0.04) = +0.46
+        assert scanner["value"] == pytest.approx(0.50 - 0.04)
         assert scanner["ci_method"] == "wilson"
-        assert scanner["n_samples"] == 120  # tp+fp
+        assert scanner["n_samples"] == 120  # tp+fp (selected)
+        assert "base-rate" in scanner["status_reason"]
         assert "return-lift" in scanner["status_reason"]
 
-    def test_sector_teams_pooled_precision(self, s3):
+    def test_sector_teams_pooled_edge(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         teams = _comp(tile, "sector_teams_avg")
-        # pooled: tp=28, fp=22 → precision 0.56, N=50.
-        assert teams["value"] == pytest.approx(28 / 50)
+        # pooled tp=28 fp=22 fn=22 tn=128 → precision 28/50=0.56,
+        # base_rate (28+22)/200=0.25 → edge +0.31
+        assert teams["value"] == pytest.approx(28 / 50 - 50 / 200)
         assert teams["n_samples"] == 50
         assert teams["criticality"] == "critical"
 
-    def test_cio_precision(self, s3):
+    def test_cio_edge(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         cio = _comp(tile, "cio")
-        assert cio["value"] == pytest.approx(0.55)
+        # precision 0.55 − base_rate (58/200=0.29) = +0.26
+        assert cio["value"] == pytest.approx(0.55 - 0.29)
         assert "vs-ranking-lift" in cio["status_reason"]
 
 

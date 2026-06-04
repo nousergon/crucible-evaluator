@@ -48,14 +48,19 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
 
 
 def _precision_metric(
-    name, clf, *, criticality, source, target=0.45, red_line=0.35,
+    name, clf, *, criticality, source, target=0.05, red_line=-0.02,
     lift=None, lift_label=None, missing_detail=None,
 ) -> dict:
-    """A precision MetricRecord (Wilson CI) from an e2e classification block.
+    """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
-    precision = tp/(tp+fp); N = tp+fp (the count of *selected* names). When the
-    classification block is absent the component grades N/A-MISSING-INPUT with a
-    specific reason.
+    A selector's precision near the cross-sectional base rate means *no edge*
+    regardless of its absolute level (C4-fu). So we grade ``precision −
+    base_rate`` (pp lift over the population positive rate), with a Wilson CI on
+    precision shifted by the base rate. Falls back to raw precision (no edge
+    framing) only when the classification block lacks the fn/tn needed to
+    compute the base rate. N/A-MISSING-INPUT when the whole block is absent.
+
+    base_rate = (tp+fn)/(tp+fp+fn+tn); edge = precision − base_rate.
     """
     if not clf or clf.get("precision") is None:
         return build_metric(
@@ -63,20 +68,37 @@ def _precision_metric(
             n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
         )
-    tp = int(clf.get("tp", 0))
-    fp = int(clf.get("fp", 0))
+    tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
+    fn, tn = int(clf.get("fn", 0)), int(clf.get("tn", 0))
     n_sel = tp + fp
-    w = wilson_score_interval(tp, n_sel) if n_sel > 0 else {"status": "insufficient_data"}
+    n_pop = tp + fp + fn + tn
     precision = clf.get("precision")
+    w = wilson_score_interval(tp, n_sel) if n_sel > 0 else {"status": "insufficient_data"}
     lift_s = f"; {lift_label} {lift:+.2%}" if (lift is not None and lift_label) else ""
+
+    base_rate = (tp + fn) / n_pop if n_pop > 0 else None
+    if base_rate is None:
+        # No fn/tn → can't compute the base rate; grade raw precision (legacy).
+        return build_metric(
+            name=name, module=MODULE, metric_type="pct", criticality=criticality,
+            value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35,
+            ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
+            ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
+            reason=(f"{name} precision = {precision:.1%} (raw — base rate unavailable; "
+                    f"N={n_sel}){lift_s}." if w.get("status") == "ok" else None),
+        )
+
+    edge = precision - base_rate
+    ci_low = w["ci_low"] - base_rate if w.get("status") == "ok" else None
+    ci_high = w["ci_high"] - base_rate if w.get("status") == "ok" else None
     return build_metric(
         name=name, module=MODULE, metric_type="pct", criticality=criticality,
-        value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=target, red_line=red_line,
-        ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
+        value=edge, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=target, red_line=red_line,
+        ci_low=ci_low, ci_high=ci_high,
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
-        reason=(f"{name} precision = {precision:.1%} (Wilson CI "
-                f"[{w.get('ci_low', 0):.2f}, {w.get('ci_high', 0):.2f}], N={n_sel} selected) "
-                f"vs target {target:.0%} / red-line {red_line:.0%}{lift_s}.")
+        reason=(f"{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
+                f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
+                f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}.")
         if w.get("status") == "ok" else None,
     )
 
@@ -107,7 +129,10 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if isinstance(team_lift, list) and team_lift:
         tp = sum(int((t.get("classification") or {}).get("tp", 0)) for t in team_lift)
         fp = sum(int((t.get("classification") or {}).get("fp", 0)) for t in team_lift)
-        pooled = {"precision": (tp / (tp + fp)) if (tp + fp) else None, "tp": tp, "fp": fp}
+        fn = sum(int((t.get("classification") or {}).get("fn", 0)) for t in team_lift)
+        tn = sum(int((t.get("classification") or {}).get("tn", 0)) for t in team_lift)
+        pooled = {"precision": (tp / (tp + fp)) if (tp + fp) else None,
+                  "tp": tp, "fp": fp, "fn": fn, "tn": tn}
         components.append(_precision_metric(
             "sector_teams_avg", pooled, criticality="critical", source=e2e_src,
         ))
