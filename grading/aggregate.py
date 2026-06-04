@@ -33,6 +33,7 @@ from grading.artifacts import read_scorecard_inputs
 from grading.scorecard import compute_scorecard
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 from grading.tiles.predictor import build_predictor_tile
+from grading.tiles.research import build_research_tile
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +64,11 @@ def build_report_card(
     # also migrate to MetricRecords (later Phase C increments).
     #   - portfolio_outcome (Tile 0): trades/eod_pnl.csv
     #   - predictor (Tile 2): predictor metrics + weights manifest (LEAK-FREE IC)
+    #   - research (Tile 1): backtest/{date}/e2e_lift + score_calibration + macro_eval + portfolio_calibration
     scorecard["tiles"] = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
         "predictor": build_predictor_tile(bucket, s3_client=s3_client),
+        "research": build_research_tile(bucket, run_date, s3_client=s3_client),
     }
 
     scorecard["_provenance"] = {
