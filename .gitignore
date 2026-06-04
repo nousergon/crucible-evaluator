@@ -1,0 +1,52 @@
+# ── Proprietary source (prompts, scoring, orchestration) ──────────
+# The Director's prompt template is proprietary IP — gitignored, loaded at
+# runtime via the prompt_loader fallback (mirrors alpha-engine-research).
+config/prompts/
+director/prompts/
+# config.py is a loader only — proprietary values live in alpha-engine-config.
+config/*.yaml
+
+# Secrets
+.env
+
+# Stale-backup hygiene — local-only safety-net copies that may contain real
+# proprietary content (prompts, configs). Never commit. (Mirrors the fleet
+# pattern after the 2026-05-12 stale-bak near-miss in alpha-engine-research.)
+*.stale-*-bak
+*.stale-bak/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+.ipynb_checkpoints/
+*.ipynb
+
+# Lambda / Docker build staging
+lambda/package/
+*.zip
+vendor/
+
+# Local docs / scratch
+CLAUDE.md
+*-design-*.md
+*-design.md
+run.log
+
+# OS
+.DS_Store
+
+# Gitleaks
+.gitleaks.toml
