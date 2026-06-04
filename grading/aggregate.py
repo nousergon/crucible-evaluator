@@ -31,6 +31,7 @@ from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
 from grading.scorecard import compute_scorecard
+from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,15 @@ def build_report_card(
     """Read artifacts → grade → attach provenance. Pure of writes."""
     inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
     scorecard = compute_scorecard(**inputs)
+
+    # Tile 0 — Portfolio Outcome (RC v2 MetricRecord tile, outcome-leads). Read
+    # from trades/eod_pnl.csv independently of the backtest/{date}/ artifacts;
+    # all-N/A (loudly) when the export is absent. This is the first v2 tile to
+    # land alongside the v1 raw-dict scorecard; more tiles migrate in later
+    # Phase C increments, after which the overall status rolls up via
+    # module_agg.overall_status.
+    scorecard["portfolio_outcome"] = build_portfolio_outcome_tile(bucket, s3_client=s3_client)
+
     scorecard["_provenance"] = {
         "run_date": run_date,
         "grader_source": GRADER_SOURCE,
