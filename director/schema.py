@@ -65,6 +65,26 @@ class SelfGrade(BaseModel):
     notes: str = ""
 
 
+class RetroGrade(BaseModel):
+    """Phase-G realized-outcome retro: last week's plan judged against what
+    actually happened (the current Report Card), a week later.
+
+    Distinct from ``SelfGrade`` (the cheap same-call self-check, which cannot see
+    outcomes): the retro adds **calibration** — did the risks the prior plan
+    flagged actually materialize? — by grading the prior plan against the fresh
+    card. Reuses the LLM-as-judge rubric pattern (mirrors research
+    ``evals/judge.py`` ``RubricEvalLLMOutput``).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    prior_run_date: str = Field(description="run_date of the plan being graded.")
+    grounding: int = Field(ge=0, le=100, description="Did the prior plan's rationale cite real metrics?")
+    calibration: int = Field(ge=0, le=100, description="Did the risks the prior plan flagged actually materialize in this card?")
+    actionability: int = Field(ge=0, le=100, description="Were the prior plan's items concrete + owner-assignable?")
+    notes: str = Field(default="", description="One-paragraph justification, citing what moved vs what the plan expected.")
+
+
 class DirectorWeeklyActionPlan(BaseModel):
     """The weekly advisory plan — the single Opus call's structured output."""
 

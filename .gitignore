@@ -53,3 +53,5 @@ run.log
 
 # Director — tuned system prompt is proprietary (operator copies prompt_example.py → prompt.py)
 director/prompt.py
+# Director Phase-G retro rubric — tuned copy is proprietary (retro_prompt_example.py → retro_prompt.py)
+director/retro_prompt.py
