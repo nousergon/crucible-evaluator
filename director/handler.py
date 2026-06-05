@@ -52,6 +52,42 @@ def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
+def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
+    """Preflight probe: exercise the Director's bootstrap/import/IAM surface with
+    no Opus call and no S3 write.
+
+    What it validates (the Saturday-fatal-break classes):
+      - the ``langchain-anthropic`` lazy import + ``ChatAnthropic`` construction,
+      - the SSM ``ANTHROPIC_API_KEY`` fetch (the ``ReadAnthropicSecret`` IAM grant),
+      - the carry-over-ledger S3 read + (when a card is present) the digest build.
+
+    The card is normally ABSENT on a preflight (the dry ``ReportCard`` upstream did
+    not write one), so a missing card is expected here — we still construct the
+    client and read the ledger, then stop short of the digest. Anything that raises
+    (broken import, revoked key grant, unreadable ledger) propagates to the SF
+    state's non-fatal Catch as a caught preflight failure.
+    """
+    from director.agent import _default_llm, build_messages
+
+    _default_llm()  # raises on a missing langchain dep or a broken SSM key-fetch grant
+    ledger = load_ledger(bucket, s3_client=s3)  # validates ledger read IAM
+    digest_built = False
+    if card is not None:
+        build_messages(card, carryover=ledger)  # exercises the digest path
+        digest_built = True
+
+    summary = {
+        "status": "dry_run",
+        "run_date": run_date,
+        "card_present": card is not None,
+        "llm_constructed": True,
+        "digest_built": digest_built,
+        "ledger_size": len(ledger.get("items", [])),
+    }
+    logger.info("Director preflight probe ok: %s", summary)
+    return summary
+
+
 def handler(event: dict | None = None, context=None) -> dict:
     """Build + persist the weekly Director action plan (flag-gated)."""
     event = event or {}
@@ -61,9 +97,23 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
     run_date = _resolve_run_date(event)
+    dry_run = bool(event.get("dry_run", False))
     s3 = boto3.client("s3")
 
     card = _load_report_card(s3, bucket, run_date)
+
+    if dry_run:
+        # Friday-PM Preflight Pipeline (SF passes dry_run=$.research_dry). Exercise
+        # the Saturday-fatal-break surface — container boot, the langchain-anthropic
+        # lazy import, the SSM ANTHROPIC_API_KEY fetch (validates the
+        # ReadAnthropicSecret IAM grant), the S3 reads — but make NO paid Opus call
+        # and NO write (no action_plan, no carry-over-ledger mutation: that ledger
+        # is shared + non-date-scoped, so a preflight write would pollute the real
+        # Saturday run, ROADMAP L4504). Fail-loud (the SF state's Catch is non-fatal):
+        # a broken import / revoked key grant surfaces as a caught preflight failure
+        # ~18h before the real Saturday Director would hit it.
+        return _dry_run_probe(bucket, run_date, card, s3)
+
     if card is None:
         # The ReportCard state should have produced it; absence is a real gap
         # the SF Catch + freshness monitor surface. Fail loud.
