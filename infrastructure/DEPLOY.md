@@ -10,9 +10,17 @@ the fleet's image-share pattern (cf. the research eval-judge / rationale-
 clustering Lambdas). It runs as the **final Saturday-SF task, after `ReportCard`**,
 and is **flag-gated dormant** (`DIRECTOR_ENABLED` off) until an operator flips it.
 
-This doc is the **runbook**; provisioning the Lambda + IAM role + the SF state is
-a live-infra step (operator-run — not done from CI). Nothing here mutates live
-infra on its own.
+This doc is the **runbook**. One-time *provisioning* (the execution IAM role + the
+first Lambda/alias creation + the SF state) is an operator step. Ongoing
+*redeploys are automatic*: `.github/workflows/deploy.yml` runs `infrastructure/
+deploy.sh` on every push to `main` that touches the image (`grading/**`,
+`director/**`, `requirements*.txt`, `Dockerfile*`, `infrastructure/deploy.sh`, or
+the workflow), assuming the shared `github-actions-lambda-deploy` role via OIDC —
+consistent with the alpha-engine-research / -predictor Lambda repos. So a merged
+code change ships to both Lambdas (grading + director) without a manual step; the
+auto-deploy **preserves any operator-set `DIRECTOR_ENABLED`**. `workflow_dispatch`
+re-runs it manually (e.g. to ship an already-merged change). Manual fallback:
+`./infrastructure/deploy.sh` from the repo root.
 
 ## Lambda
 
