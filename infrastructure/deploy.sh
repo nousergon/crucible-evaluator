@@ -69,11 +69,12 @@ fi
 
 echo "=== Publish version + point live alias ==="
 VERSION=$(aws lambda publish-version --function-name "$FUNCTION" --region "$REGION" --query 'Version' --output text)
-if aws lambda get-alias --function-name "$FUNCTION" --name live --region "$REGION" &>/dev/null; then
-  aws lambda update-alias --function-name "$FUNCTION" --name live --function-version "$VERSION" --region "$REGION" --query 'AliasArn' --output text
-else
+# Promote :live — try update, fall back to create. Mirrors the predictor/research
+# deploy.sh idiom; needs only lambda:UpdateAlias + CreateAlias (NOT GetAlias, which
+# the shared github-actions-lambda-deploy role does not grant — a get-alias gate
+# here fails on AccessDenied once the alias exists and wrongly retries create).
+aws lambda update-alias --function-name "$FUNCTION" --name live --function-version "$VERSION" --region "$REGION" --query 'AliasArn' --output text 2>/dev/null || \
   aws lambda create-alias --function-name "$FUNCTION" --name live --function-version "$VERSION" --region "$REGION" --query 'AliasArn' --output text
-fi
 echo "=== Deployed $FUNCTION:live (version $VERSION) ==="
 
 # ── Director (Layer C) — shares THIS image with a CMD override ────────────────
@@ -122,9 +123,8 @@ fi
 
 echo "=== Publish Director version + point live alias ==="
 DVERSION=$(aws lambda publish-version --function-name "$DIRECTOR_FUNCTION" --region "$REGION" --query 'Version' --output text)
-if aws lambda get-alias --function-name "$DIRECTOR_FUNCTION" --name live --region "$REGION" &>/dev/null; then
-  aws lambda update-alias --function-name "$DIRECTOR_FUNCTION" --name live --function-version "$DVERSION" --region "$REGION" --query 'AliasArn' --output text
-else
+# Promote :live — try update, fall back to create (see the grading alias note above:
+# avoids needing lambda:GetAlias on the shared deploy role).
+aws lambda update-alias --function-name "$DIRECTOR_FUNCTION" --name live --function-version "$DVERSION" --region "$REGION" --query 'AliasArn' --output text 2>/dev/null || \
   aws lambda create-alias --function-name "$DIRECTOR_FUNCTION" --name live --function-version "$DVERSION" --region "$REGION" --query 'AliasArn' --output text
-fi
 echo "=== Deployed $DIRECTOR_FUNCTION:live (version $DVERSION, DORMANT — DIRECTOR_ENABLED off) ==="
