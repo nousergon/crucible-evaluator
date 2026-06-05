@@ -219,3 +219,80 @@ class TestHandler:
         from director import handler as H
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
         assert out["status"] == "disabled"
+
+
+def _retro() -> "object":
+    from director.schema import RetroGrade
+    return RetroGrade(prior_run_date="2026-05-23", grounding=80, calibration=55,
+                      actionability=70, notes="Flagged risks mostly held.")
+
+
+class TestRetro:
+    """Phase G — self-grading retro loop."""
+
+    def test_grade_prior_plan_injected_llm_stamps_prior_date(self):
+        from director.retro import grade_prior_plan
+        from director.schema import RetroGrade
+        g = RetroGrade(prior_run_date="", grounding=80, calibration=55, actionability=70)
+        out = grade_prior_plan({"run_date": "2026-05-23"}, _CARD, llm=_FakeLLM(g))
+        assert isinstance(out, RetroGrade)
+        assert out.prior_run_date == "2026-05-23"  # stamped from the plan
+        assert out.calibration == 55
+
+    def test_build_messages_has_prior_plan_and_current_card(self):
+        from director.retro import build_messages
+        msgs = build_messages(_plan().model_dump(), _CARD)
+        human = msgs[-1][1]
+        assert "PRIOR PLAN" in human and "CURRENT REPORT CARD" in human
+        assert "Revive momentum L1" in human  # the prior plan's action item
+
+    def test_handler_runs_retro_when_prior_plan_exists(self, s3, monkeypatch):
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        # current card + a PRIOR plan (older date) seeded.
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        s3.put_object(Bucket=BUCKET, Key="director/2026-05-23/action_plan.json",
+                      Body=_plan().model_dump_json().encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        import director.retro as R
+        monkeypatch.setattr(R, "grade_prior_plan", lambda prior, card, **kw: _retro())
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["retro"] == "ok"
+        assert out["retro_prior_run_date"] == "2026-05-23"
+        assert out["retro_calibration"] == 55
+        # retro.json + trend persisted.
+        retro = json.loads(s3.get_object(Bucket=BUCKET, Key=f"director/{RUN_DATE}/retro.json")["Body"].read())
+        assert retro["calibration"] == 55
+        trend = json.loads(s3.get_object(Bucket=BUCKET, Key="director/retro_trend.json")["Body"].read())
+        assert len(trend["grades"]) == 1 and trend["grades"][0]["prior_run_date"] == "2026-05-23"
+
+    def test_handler_skips_retro_on_first_cycle(self, s3, monkeypatch):
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())  # no prior plan seeded
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["retro"] == "skipped"
+
+    def test_handler_retro_failure_is_best_effort(self, s3, monkeypatch):
+        # A retro failure must NOT lose the plan (primary deliverable) — status
+        # stays ok, the plan is written, the retro records its error.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        s3.put_object(Bucket=BUCKET, Key="director/2026-05-23/action_plan.json",
+                      Body=_plan().model_dump_json().encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        import director.retro as R
+        def _boom(prior, card, **kw):
+            raise RuntimeError("judge overloaded")
+        monkeypatch.setattr(R, "grade_prior_plan", _boom)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"  # plan still shipped
+        assert out["retro"] == "error" and "judge overloaded" in out["retro_error"]
+        assert json.loads(s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read())

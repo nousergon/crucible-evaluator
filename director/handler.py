@@ -52,6 +52,93 @@ def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
+RETRO_TREND_KEY = "director/retro_trend.json"
+
+
+def _load_prior_plan(s3, bucket: str, run_date: str) -> dict | None:
+    """The most recent ``director/{date}/action_plan.json`` with date < run_date
+    — the plan the Phase-G retro grades against the current card. None on the
+    first cycle (no prior plan yet)."""
+    paginator = s3.get_paginator("list_objects_v2")
+    dates: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix="director/", Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []) or []:
+            seg = cp["Prefix"].split("/")[1]  # director/{seg}/
+            if len(seg) == 10 and seg[4] == "-" and seg < run_date:
+                dates.append(seg)
+    if not dates:
+        return None
+    prior = max(dates)
+    from botocore.exceptions import ClientError
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=f"director/{prior}/action_plan.json")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return None
+        raise
+    return json.loads(resp["Body"].read())
+
+
+def _persist_retro(s3, bucket: str, run_date: str, grade) -> str:
+    """Write the per-run retro + upsert the trend ledger (dashboard self-grade
+    trend). Returns the retro key."""
+    from botocore.exceptions import ClientError
+
+    retro_key = f"director/{run_date}/retro.json"
+    s3.put_object(
+        Bucket=bucket, Key=retro_key,
+        Body=grade.model_dump_json(indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    # Append/upsert the trend ledger by prior_run_date (idempotent on re-run).
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=RETRO_TREND_KEY)
+        trend = json.loads(resp["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            trend = {"grades": []}
+        else:
+            raise
+    row = {"retro_run_date": run_date, **grade.model_dump()}
+    grades = [g for g in trend.get("grades", []) if g.get("prior_run_date") != grade.prior_run_date]
+    grades.append(row)
+    grades.sort(key=lambda g: g.get("prior_run_date", ""))
+    trend = {"updated": run_date, "grades": grades}
+    s3.put_object(
+        Bucket=bucket, Key=RETRO_TREND_KEY,
+        Body=json.dumps(trend, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return retro_key
+
+
+def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict) -> dict:
+    """Phase-G retro — judge LAST week's plan against THIS week's card. Best-effort:
+    the plan (primary deliverable) is already persisted, so a retro failure must
+    not fail the Director run. Records the failure via WARN + a summary field
+    (no silent swallow — [[feedback_no_silent_fails]]: secondary observability
+    hung off a primary path that records the failure)."""
+    from director.retro import grade_prior_plan
+
+    prior = _load_prior_plan(s3, bucket, run_date)
+    if prior is None:
+        return {"retro": "skipped", "retro_reason": "no prior plan (first cycle)"}
+    try:
+        grade = grade_prior_plan(prior, card)
+        retro_key = _persist_retro(s3, bucket, run_date, grade)
+        return {
+            "retro": "ok",
+            "retro_key": retro_key,
+            "retro_prior_run_date": grade.prior_run_date,
+            "retro_grounding": grade.grounding,
+            "retro_calibration": grade.calibration,
+            "retro_actionability": grade.actionability,
+        }
+    except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
+        logger.warning("Director retro failed (plan already written, non-fatal): %s", e)
+        return {"retro": "error", "retro_error": str(e)}
+
+
 def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
     """Preflight probe: exercise the Director's bootstrap/import/IAM surface with
     no Opus call and no S3 write.
@@ -135,6 +222,12 @@ def handler(event: dict | None = None, context=None) -> dict:
     merged = merge_plan_into_ledger(ledger, plan, run_date)
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
+    # Phase G — self-grading retro loop. Judge LAST week's plan against THIS
+    # week's card (the realized-outcome feedback the in-call SelfGrade can't give).
+    # Best-effort: the plan above is the primary deliverable and is already
+    # persisted; a retro failure is recorded, never fatal.
+    retro_summary = _run_retro_best_effort(s3, bucket, run_date, card)
+
     summary = {
         "status": "ok",
         "run_date": run_date,
@@ -143,6 +236,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "action_plan_key": plan_key,
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
+        **retro_summary,
     }
     logger.info("Director plan written: %s", summary)
     return summary
