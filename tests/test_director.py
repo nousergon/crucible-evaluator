@@ -176,3 +176,46 @@ class TestHandler:
         from director import handler as H
         with pytest.raises(RuntimeError):
             H.handler({"date": RUN_DATE, "bucket": BUCKET})
+
+    def test_dry_run_probes_infra_without_invoke_or_write(self, s3, monkeypatch):
+        # Friday-PM preflight (ROADMAP L4504): dry_run constructs the LLM client
+        # (the langchain import + SSM key-fetch IAM check) and builds the digest,
+        # but makes NO Opus call and NO write — and must NOT mutate the shared
+        # carry-over ledger. Stub _default_llm so the test needs no key/langchain.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        import director.agent as A
+        constructed = {"n": 0}
+        monkeypatch.setattr(A, "_default_llm", lambda: constructed.__setitem__("n", constructed["n"] + 1))
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["status"] == "dry_run"
+        assert out["card_present"] is True
+        assert out["llm_constructed"] is True
+        assert out["digest_built"] is True
+        assert constructed["n"] == 1  # the client (key-fetch + import) WAS exercised
+        # no action plan written, no ledger created.
+        assert s3.list_objects_v2(Bucket=BUCKET, Prefix=f"director/{RUN_DATE}/").get("KeyCount", 0) == 0
+        assert s3.list_objects_v2(Bucket=BUCKET, Prefix="director/carryover_ledger.json").get("KeyCount", 0) == 0
+
+    def test_dry_run_tolerates_missing_card(self, s3, monkeypatch):
+        # On a real preflight the upstream dry ReportCard didn't write a card, so
+        # the Director's card read misses — dry_run must still exercise the client
+        # (the key/import infra check) and return cleanly, NOT raise like live mode.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        import director.agent as A
+        monkeypatch.setattr(A, "_default_llm", lambda: object())
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["status"] == "dry_run"
+        assert out["card_present"] is False
+        assert out["digest_built"] is False  # no card → digest skipped, but client still built
+        assert out["llm_constructed"] is True
+
+    def test_dry_run_respects_disabled_flag(self, s3, monkeypatch):
+        # Pre-flip (DIRECTOR_ENABLED off) the Director no-ops regardless of dry_run.
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["status"] == "disabled"

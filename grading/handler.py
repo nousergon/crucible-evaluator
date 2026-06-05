@@ -57,9 +57,18 @@ def handler(event: dict | None = None, context=None) -> dict:
     event = event or {}
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
     run_date = _resolve_run_date(event)
-    write = event.get("write", True)  # SF runs write the card; dry-run can disable
+    # dry_run = the Friday-PM Preflight Pipeline (SF passes dry_run=$.research_dry,
+    # the canonical shell-run-dry signal). It still exercises the full read+compute
+    # path — container boot, lib/numpy/pandas imports, S3-read IAM/transport across
+    # the backtest/predictor/trades artifacts, the tile compute — but does NOT
+    # persist the (degenerate, mostly-N/A) preflight card. Explicit `write` wins.
+    dry_run = bool(event.get("dry_run", False))
+    write = event.get("write", not dry_run)
 
-    logger.info("Building Report Card v2 for %s (bucket=%s, write=%s)", run_date, bucket, write)
+    logger.info(
+        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s)",
+        run_date, bucket, write, dry_run,
+    )
     card = build_report_card(bucket, run_date)
 
     tiles = card.get("tiles", {})
@@ -75,6 +84,7 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     summary = {
         "status": "ok",
+        "dry_run": dry_run,
         "run_date": run_date,
         "bucket": bucket,
         "tiles_overall_status": card.get("tiles_overall_status"),

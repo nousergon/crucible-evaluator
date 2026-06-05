@@ -77,3 +77,23 @@ class TestHandler:
         # portfolio outcome has eod data → some real-graded components.
         assert out["real_graded"]["portfolio_outcome"] > 0
         assert "agent" in out["real_graded"]
+
+    def test_dry_run_computes_but_does_not_persist(self, s3):
+        # Friday-PM preflight (ROADMAP L4504): dry_run exercises the full
+        # read+compute path but must NOT write the degenerate preflight card.
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["status"] == "ok"
+        assert out["dry_run"] is True
+        assert out["report_card_key"] is None
+        # compute still ran (tiles graded), proving it's a dry execution, not a skip.
+        assert out["real_graded"]["portfolio_outcome"] > 0
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_explicit_write_overrides_dry_run(self, s3):
+        # Operator escape hatch: an explicit write=True wins even under dry_run.
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True})
+        assert out["dry_run"] is True
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
