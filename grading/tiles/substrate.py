@@ -149,6 +149,7 @@ def build_substrate_tile(
         age_d = (as_of - latest).total_seconds() / 86400.0
         components.append(build_metric(
             name="price_cache_freshness", module=MODULE, metric_type="duration", criticality="critical",
+            estimator="freshness_age",
             value=age_d, n_samples=1, n_floor=1, target=7.0, red_line=14.0, higher_is_better=False,
             source_path=pc_src,
             reason=f"price_cache_freshness = {age_d:.1f}d since the price cache last refreshed vs target 7d / red-line 14d.",
@@ -156,6 +157,7 @@ def build_substrate_tile(
     else:
         components.append(build_metric(
             name="price_cache_freshness", module=MODULE, metric_type="duration", criticality="critical",
+            estimator="freshness_age",
             n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=pc_src,
             input_present=False,
             na_detail="price_cache_freshness: no objects under predictor/price_cache/ to date-stamp.",
@@ -175,18 +177,21 @@ def build_substrate_tile(
         if sf is None:
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
                 n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, input_present=False,
                 na_detail="sf_success_rate_4w: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
             ))
         elif sf["rate"] is None:
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
                 n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
                 na_detail=f"sf_success_rate_4w: no terminal SF executions in the last {_SF_WINDOW_DAYS}d.",
             ))
         else:
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
                 value=sf["rate"], n_samples=sf["n_terminal"], n_floor=3, target=0.95, red_line=0.80,
                 source_path=sf_src,
                 reason=(f"sf_success_rate_4w = {sf['rate']:.0%} ({sf['n_succeeded']}/{sf['n_terminal']} "
@@ -198,6 +203,7 @@ def build_substrate_tile(
         logger.warning("sf_success_rate_4w: SF API read failed (%s) — grading N/A", e)
         components.append(build_metric(
             name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="success_proportion_4w", measurement_horizon="trailing_4w",
             n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
             na_detail=f"sf_success_rate_4w: Step Functions read failed this cycle ({code}).",
         ))

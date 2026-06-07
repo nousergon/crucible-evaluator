@@ -1,6 +1,50 @@
 """Tests for grading/metric_record.py — the MetricRecord factory."""
 
-from grading.metric_record import build_metric
+import pytest
+
+from grading.metric_record import MetricContractError, build_metric
+
+
+class TestMetricReliabilityContract:
+    """L4562 / ARCHITECTURE §18 — a value-bearing critical metric must declare a
+    robust estimator; the proven-bad classes are rejected at construction so a
+    brittle metric never reaches the Director."""
+
+    def _mk(self, **kw):
+        base = dict(name="x", module="m", metric_type="ratio", n_floor=10, value=1.0,
+                    n_samples=50, target=0.5, red_line=0.0, source_path="s3://b/x",
+                    criticality="critical")
+        base.update(kw)
+        return build_metric(**base)
+
+    def test_value_bearing_critical_requires_estimator(self):
+        with pytest.raises(MetricContractError, match="must declare an estimator"):
+            self._mk()  # no estimator
+
+    def test_forbidden_estimators_rejected(self):
+        for bad in ("strict_binary", "sub_horizon_proxy", "unbounded_ratio_mean"):
+            with pytest.raises(MetricContractError, match="forbidden estimator"):
+                self._mk(estimator=bad)
+
+    def test_robust_estimator_accepted_and_defaults_high_reliability(self):
+        m = self._mk(estimator="spearman_calibration", measurement_horizon="21d")
+        assert m.estimator == "spearman_calibration"
+        assert m.measurement_horizon == "21d"
+        assert m.reliability == "high"  # auto-defaulted for a declared critical
+
+    def test_explicit_low_reliability_preserved(self):
+        m = self._mk(estimator="rank_ic", reliability="low")
+        assert m.reliability == "low"
+
+    def test_na_critical_is_exempt(self):
+        # value None (N/A-*) carries no graded signal → no estimator required.
+        m = self._mk(value=None, input_present=False, estimator=None)
+        assert str(m.status).startswith("N/A")
+
+    def test_supporting_metric_not_constrained(self):
+        # Only criticals drive Director prescriptions; supporting is unconstrained.
+        m = self._mk(criticality="supporting", estimator=None)
+        assert m.estimator is None
 
 
 class TestBuildMetricStatus:
@@ -8,7 +52,7 @@ class TestBuildMetricStatus:
         m = build_metric(
             name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
             value=1.4, n_samples=120, n_floor=60, target=1.0, red_line=0.0,
-            ci_low=0.8, ci_high=2.0, ci_method="bootstrap", criticality="critical",
+            ci_low=0.8, ci_high=2.0, ci_method="bootstrap", criticality="critical", estimator="test_robust",
             source_path="s3://b/trades/eod_pnl.csv",
         )
         assert m.status == "GREEN"
@@ -40,7 +84,7 @@ class TestBuildMetricStatus:
         m = build_metric(
             name="max_drawdown", module="portfolio_outcome", metric_type="ratio",
             value=-0.08, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
-            source_path="s3://b/x", criticality="critical",
+            source_path="s3://b/x", criticality="critical", estimator="test_robust",
         )
         assert m.status == "GREEN"
 
@@ -48,7 +92,7 @@ class TestBuildMetricStatus:
         m = build_metric(
             name="max_drawdown", module="portfolio_outcome", metric_type="ratio",
             value=-0.30, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
-            source_path="s3://b/x", criticality="critical",
+            source_path="s3://b/x", criticality="critical", estimator="test_robust",
         )
         assert m.status == "RED"
 

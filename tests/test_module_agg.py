@@ -15,7 +15,7 @@ def _crit(status, *, p=None):
     return build_metric(
         name=f"c_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0,
         n_samples=120, target=0.5, red_line=0.0, criticality="critical",
-        source_path=SRC, status=status, bh_fdr_adjusted_p=p, reason="x",
+        estimator="test_robust", source_path=SRC, status=status, bh_fdr_adjusted_p=p, reason="x",
     )
 
 

@@ -164,19 +164,20 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
 
     if series is None:
         # Whole tile N/A-MISSING-INPUT — one record per component, specific reason.
-        def miss(name, mt, crit, floor, tgt, rl):
+        def miss(name, mt, crit, floor, tgt, rl, est=None):
             return build_metric(
                 name=name, module=MODULE, metric_type=mt, criticality=crit, n_floor=floor,
                 target=tgt, red_line=rl, source_path=src, input_present=False,
+                estimator=est, measurement_horizon="since_inception",
                 na_detail=f"{name}: trades/eod_pnl.csv not present this cycle — no EOD reconciliation export to grade.",
             )
 
         components = [
-            miss("sharpe_ratio", "sharpe", "critical", 60, 1.0, 0.0),
-            miss("information_ratio", "ratio", "critical", 60, 0.5, 0.0),
-            miss("psr", "pct", "critical", 60, 0.95, 0.50),
-            miss("alpha_vs_spy", "log_return", "critical", 60, 0.0, -0.05),
-            miss("max_drawdown", "ratio", "critical", 2, -0.15, -0.25),
+            miss("sharpe_ratio", "sharpe", "critical", 60, 1.0, 0.0, "sharpe_with_bootstrap_ci"),
+            miss("information_ratio", "ratio", "critical", 60, 0.5, 0.0, "info_ratio_bootstrap_ci"),
+            miss("psr", "pct", "critical", 60, 0.95, 0.50, "probabilistic_sharpe"),
+            miss("alpha_vs_spy", "log_return", "critical", 60, 0.0, -0.05, "cumulative_log_alpha"),
+            miss("max_drawdown", "ratio", "critical", 2, -0.15, -0.25, "peak_to_trough_nav"),
             miss("sortino_ratio", "sharpe", "supporting", 60, 1.5, 0.5),
             miss("calmar_ratio", "ratio", "supporting", 90, 1.0, 0.0),
             miss("cvar_95_daily", "ratio", "supporting", 60, -0.01, -0.04),
@@ -194,6 +195,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     s_lo, s_hi, s_m = _ci(_ann_sharpe, port) if sharpe is not None else (None, None, None)
     components.append(build_metric(
         name="sharpe_ratio", module=MODULE, metric_type="sharpe", criticality="critical",
+        estimator="sharpe_with_bootstrap_ci", measurement_horizon="since_inception",
         value=sharpe, n_samples=n, n_floor=60, target=1.0, red_line=0.0,
         ci_low=s_lo, ci_high=s_hi, ci_method=s_m, source_path=src,
     ))
@@ -204,6 +206,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     i_lo, i_hi, i_m = _ci(_ann_ir, active) if ir is not None else (None, None, None)
     components.append(build_metric(
         name="information_ratio", module=MODULE, metric_type="ratio", criticality="critical",
+        estimator="info_ratio_bootstrap_ci", measurement_horizon="since_inception",
         value=ir, n_samples=n, n_floor=60, target=0.5, red_line=0.0,
         ci_low=i_lo, ci_high=i_hi, ci_method=i_m, source_path=src,
     ))
@@ -213,6 +216,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     psr_val = psr_res.get("psr") if psr_res.get("status") == "ok" else None
     components.append(build_metric(
         name="psr", module=MODULE, metric_type="pct", criticality="critical",
+        estimator="probabilistic_sharpe", measurement_horizon="since_inception",
         value=psr_val, n_samples=psr_res.get("n", n), n_floor=60, target=0.95, red_line=0.50,
         source_path=src,
     ))
@@ -225,6 +229,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     )
     components.append(build_metric(
         name="alpha_vs_spy", module=MODULE, metric_type="log_return", criticality="critical",
+        estimator="cumulative_log_alpha", measurement_horizon="since_inception",
         value=log_alpha, n_samples=n, n_floor=60, target=0.0, red_line=-0.05, source_path=src,
     ))
 
@@ -232,6 +237,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     mdd = max_drawdown(nav)
     components.append(build_metric(
         name="max_drawdown", module=MODULE, metric_type="ratio", criticality="critical",
+        estimator="peak_to_trough_nav", measurement_horizon="since_inception",
         value=mdd, n_samples=len(nav), n_floor=2, target=-0.15, red_line=-0.25, source_path=src,
     ))
 
@@ -326,6 +332,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
     # 13. Regime-weighted alpha (critical) — needs macro regime tags per date.
     components.append(build_metric(
         name="regime_weighted_alpha", module=MODULE, metric_type="log_return", criticality="critical",
+        estimator="regime_weighted_log_alpha", measurement_horizon="since_inception",
         n_floor=30, target=0.0, red_line=0.0, source_path=src, input_present=False,
         na_detail=("regime_weighted_alpha: requires per-date macro regime tags "
                    "(bull/bear/neutral/caution) to decompose; eod_pnl.csv carries only "

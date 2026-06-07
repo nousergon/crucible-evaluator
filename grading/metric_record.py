@@ -29,6 +29,32 @@ from alpha_engine_lib.metrics import (
 )
 
 
+class MetricContractError(ValueError):
+    """A critical MetricRecord violated the reliability/horizon contract.
+
+    Raised at construction (the chokepoint) so a brittle metric can never reach
+    the report card and the Director. See ROADMAP L4562 + ARCHITECTURE §18: the
+    Director acts on critical tiles, so every critical metric must DECLARE a
+    robust estimator + its measurement horizon, and must NOT use one of the
+    proven-bad estimator classes that produced the 2026-06-07 false-positive
+    trio (L4550 strict binary / L4551 sub-horizon proxy / L4554 unbounded-ratio
+    mean).
+    """
+
+
+# Estimator classes that are STRUCTURALLY unreliable for a metric an autonomous
+# agent acts on — naming any of these on a critical metric fails construction.
+#   - strict_binary           : all-or-nothing flag that flips on one noisy
+#                               bucket (L4550 composite monotonicity).
+#   - sub_horizon_proxy       : measured on a window shorter than the strategy
+#                               horizon (L4551 5d vs the 21d thesis).
+#   - unbounded_ratio_mean    : mean of an unbounded per-item ratio, exploded by
+#                               a few outliers (L4554 realized/MFE capture).
+_FORBIDDEN_ESTIMATORS: frozenset[str] = frozenset(
+    {"strict_binary", "sub_horizon_proxy", "unbounded_ratio_mean"}
+)
+
+
 def _fmt(v: float | None) -> str:
     """Compact human format for a metric value in a reason string."""
     if v is None:
@@ -107,6 +133,9 @@ def build_metric(
     reason: str | None = None,
     na_detail: str | None = None,
     last_updated_utc: datetime | None = None,
+    estimator: str | None = None,
+    measurement_horizon: str | None = None,
+    reliability: str | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
 
@@ -117,7 +146,36 @@ def build_metric(
 
     ``higher_is_better`` only affects the trend glyph; when omitted it's inferred
     from the target/red-line ordering (matches ``derive_status``).
+
+    ``estimator`` / ``measurement_horizon`` / ``reliability`` are the L4562
+    metric-reliability contract (ARCHITECTURE §18). A ``criticality="critical"``
+    metric MUST declare a non-empty ``estimator`` that is not one of the
+    proven-bad classes (``_FORBIDDEN_ESTIMATORS``) — enforced here at
+    construction so a brittle metric never reaches the Director. ``reliability``
+    defaults to ``"high"`` for a declared critical estimator; pass ``"low"``
+    explicitly for a metric with a known validity caveat (e.g. an in-sample-
+    prone IC) so the digest can flag it and the Director can hedge.
     """
+    # Contract applies to VALUE-BEARING criticals — the ones that can produce a
+    # GREEN/WATCH/RED the Director acts on. An N/A-* critical (value is None:
+    # not-impl / not-run / missing-input) carries no graded signal, so it is
+    # exempt (it cannot launder a brittle estimate into a confident P0).
+    if criticality == "critical" and value is not None:
+        if not estimator:
+            raise MetricContractError(
+                f"critical metric '{name}' (value-bearing) must declare an estimator "
+                f"(L4562 / ARCHITECTURE §18) — the Director acts on critical tiles."
+            )
+        if estimator in _FORBIDDEN_ESTIMATORS:
+            raise MetricContractError(
+                f"critical metric '{name}' uses forbidden estimator "
+                f"'{estimator}' — brittle estimator class (L4562). Use a robust "
+                f"construction (winsorized/median, continuous rank-corr + "
+                f"significance) measured at the strategy horizon."
+            )
+        if reliability is None:
+            reliability = "high"
+
     if status is None:
         status = derive_status(
             value=value,
@@ -173,4 +231,8 @@ def build_metric(
         bh_fdr_adjusted_p=bh_fdr_adjusted_p,
         last_updated_utc=last_updated_utc or datetime.now(UTC),
         derived_letter=derive_letter(status),
+        # L4562 reliability contract (MetricRecord allows extra fields).
+        estimator=estimator,
+        measurement_horizon=measurement_horizon,
+        reliability=reliability,
     )

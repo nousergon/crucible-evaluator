@@ -47,6 +47,13 @@ def _component_line(c: dict) -> str:
         parts.append(seg)
     if c.get("trend_decoration") and c["trend_decoration"] != "→":
         parts.append(f"trend {c['trend_decoration']}")
+    # L4562 / ARCHITECTURE §18 — surface metric reliability so the Director can
+    # hedge: a low-reliability metric (or one measured at a non-canonical
+    # horizon) must NOT drive a confident root-cause/de-risk prescription.
+    if c.get("measurement_horizon"):
+        parts.append(f"horizon {c['measurement_horizon']}")
+    if c.get("reliability") == "low":
+        parts.append("⚠ reliability LOW — verify metric validity before acting")
     reason = c.get("status_reason")
     line = " · ".join(parts)
     if reason:

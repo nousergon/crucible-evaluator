@@ -172,14 +172,18 @@ class TestCompositeScoring:
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert _comp(tile, "composite_scoring")["status"] == "WATCH"
 
-    def test_legacy_monotonic_fallback_green(self, s3):
-        # Pre-2026-06-07 artifact without spearman fields → legacy binary path.
+    def test_legacy_monotonic_fallback_neutralized_to_watch(self, s3):
+        # Pre-2026-06-07 artifact without spearman fields → legacy brittle binary.
+        # Per the L4562 contract it must NOT drive a confident GREEN/RED: it is
+        # neutralized to WATCH + reliability=low (the binary is context only).
         _put(s3, "e2e_lift.json", _E2E)
         _put(s3, "score_calibration.json", {"status": "ok", "monotonic": True, "beat_spy_pct": 0.56, "n": 200})
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         cs = _comp(tile, "composite_scoring")
-        assert cs["status"] == "GREEN"
-        assert "monotonic=True" in cs["status_reason"]
+        assert cs["status"] == "WATCH"
+        assert cs["reliability"] == "low"
+        assert cs["estimator"] == "legacy_monotonic_binary_deprecated"
+        assert "DEPRECATED" in cs["status_reason"]
 
     def test_absent_missing_input(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
