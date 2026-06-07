@@ -91,6 +91,52 @@ class TestPrecisionComponents:
         assert "vs-ranking-lift" in cio["status_reason"]
 
 
+class TestHorizonPreference:
+    """Selectors grade on the canonical 21d block when present (ROADMAP L4551),
+    falling back to legacy 5d for older artifacts."""
+
+    def _e2e_with_21d(self):
+        e = json.loads(json.dumps(_E2E))  # deep copy
+        # 21d precision DIFFERS from 5d so we can prove which one was graded.
+        e["scanner_lift"]["classification_21d"] = _clf(0.80, 96, 24, fn=104, tn=4776)
+        e["scanner_lift"]["lift_21d_log"] = {"lift": 0.012, "selected_avg": 0.03, "baseline_avg": 0.018}
+        e["cio_lift"]["classification_21d"] = _clf(0.75, 52, 17, fn=20, tn=111)
+        e["cio_lift"]["lift_21d_log"] = {"lift": 0.02}
+        for t in e["team_lift"]:
+            t["classification_21d"] = _clf(0.9, 27, 3, fn=3, tn=67)
+        return e
+
+    def test_scanner_grades_21d_when_present(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_21d())
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        scanner = _comp(tile, "scanner")
+        # 21d precision 0.80, base (96+104)/5000=0.04 → edge +0.76 (not the 5d +0.46)
+        assert scanner["value"] == pytest.approx(0.80 - 0.04)
+        assert scanner["n_samples"] == 120  # tp+fp of the 21d block
+        assert "[21d]" in scanner["status_reason"]
+        assert "21d-alpha-lift" in scanner["status_reason"]
+
+    def test_cio_grades_21d_when_present(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_21d())
+        cio = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "cio")
+        assert cio["value"] == pytest.approx(0.75 - (52 + 20) / 200)
+        assert "[21d]" in cio["status_reason"]
+
+    def test_teams_pool_21d_when_present(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_21d())
+        teams = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "sector_teams_avg")
+        assert "[21d]" in teams["status_reason"]
+        # pooled 21d precision 54/60 = 0.90
+        assert teams["n_samples"] == 60
+
+    def test_falls_back_to_5d_without_21d(self, s3):
+        # The unmodified _E2E (5d only) must still grade on 5d.
+        _put(s3, "e2e_lift.json", _E2E)
+        scanner = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "scanner")
+        assert "[5d]" in scanner["status_reason"]
+        assert scanner["value"] == pytest.approx(0.50 - 0.04)
+
+
 class TestCompositeScoring:
     def test_spearman_positive_green(self, s3):
         # Significant positive rank correlation → GREEN.
