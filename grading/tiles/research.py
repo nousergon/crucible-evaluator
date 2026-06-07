@@ -190,6 +190,43 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
     ))
 
+    # 3b. cio_selection_skill (critical, L4561) — does the CIO entrant gate ADVANCE
+    #     the names that realize higher 21d alpha than the ones it REJECTs? The
+    #     gate's whole job is selection; this measures it at the canonical horizon.
+    #     Dogfoods the L4562 reliability contract: a statistically-insignificant
+    #     gap (Mann-Whitney p >= 0.10) grades WATCH + reliability=low — we make the
+    #     gate's skill VISIBLE and accumulate to significance, we do NOT rewrite the
+    #     rubric on noise.
+    sel = cl.get("selection_skill_21d") or {}
+    gap = sel.get("selection_gap_21d")
+    if gap is not None:
+        gp = sel.get("selection_gap_p")
+        n_sel = (sel.get("n_advance") or 0) + (sel.get("n_reject") or 0)
+        cic = sel.get("conviction_ic_21d")
+        insignificant = gp is None or gp >= 0.10
+        ic_txt = f", conviction-IC {cic:+.3f}" if cic is not None else ""
+        p_txt = f", MW p={gp:.3f}" if gp is not None else ""
+        components.append(build_metric(
+            name="cio_selection_skill", module=MODULE, metric_type="log_return", criticality="critical",
+            estimator="advance_minus_reject_alpha_21d", measurement_horizon="21d",
+            reliability="low" if insignificant else "high",
+            value=gap, n_samples=n_sel, n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src,
+            status="WATCH" if insignificant else None,
+            reason=(f"cio_selection_skill: ADVANCE−REJECT 21d log-alpha gap = {gap:+.4f} "
+                    f"(ADVANCE {sel.get('advance_alpha_21d')} vs REJECT {sel.get('reject_alpha_21d')}, "
+                    f"N={n_sel}{p_txt}{ic_txt}). "
+                    + ("Not yet significant — WATCH, accumulating." if insignificant
+                       else ("anti-selecting (gate advances worse names)" if gap < 0 else "adds selection value"))),
+        ))
+    else:
+        components.append(build_metric(
+            name="cio_selection_skill", module=MODULE, metric_type="log_return", criticality="critical",
+            estimator="advance_minus_reject_alpha_21d", measurement_horizon="21d",
+            n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src, input_present=False,
+            na_detail="cio_selection_skill: no selection_skill_21d block in e2e_lift this cycle "
+                      "(needs cio_evaluations joined to closed-21d universe_returns).",
+        ))
+
     # 4. composite_scoring (critical) — does higher composite score → higher
     #    realized return? Graded on the ROBUST row-level Spearman rank
     #    correlation of score vs realized alpha (target +0.10, red-line 0.0), not
