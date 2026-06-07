@@ -53,8 +53,12 @@ def _default_llm():
     from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
     api_key = get_secret("ANTHROPIC_API_KEY")
+    # NB: no `temperature` — claude-opus-4-8 (the DIRECTOR_MODEL) removed the
+    # sampling params (`temperature`/`top_p`/`top_k`); passing any of them 400s
+    # ("`temperature` is deprecated for this model"). Determinism is steered via
+    # the prompt + structured output, not a temperature knob.
     base = ChatAnthropic(
-        model=DIRECTOR_MODEL, temperature=0, max_tokens=8000, anthropic_api_key=api_key,
+        model=DIRECTOR_MODEL, max_tokens=8000, anthropic_api_key=api_key,
     )
     return base.with_structured_output(DirectorWeeklyActionPlan)
 
