@@ -227,6 +227,43 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                       "(needs cio_evaluations joined to closed-21d universe_returns).",
         ))
 
+    # 3c. research_composite_ic (critical, L4561) — the fundamental harness question:
+    #     does the blended research score the system ACTS ON predict realized 21d
+    #     alpha at all? Graded on the final_score rank-IC from the layer-attribution
+    #     block. Under the L4562 contract: insignificant (p >= 0.10) → WATCH +
+    #     reliability=low. The per-layer ICs (combined/macro/conviction) ride in the
+    #     reason so the orchestration leak is visible (e.g. macro tilt degrading the
+    #     stock score), motivating the de-blending arc.
+    attr = cl.get("layer_attribution_21d") or {}
+    fic = attr.get("final_score_ic")
+    if fic is not None:
+        fp = attr.get("final_score_ic_p")
+        n_at = attr.get("n")
+        insig = fp is None or fp >= 0.10
+        layers = ", ".join(
+            f"{k}={attr.get(k + '_ic'):+.3f}" for k in ("combined_score", "macro_shift", "cio_conviction")
+            if attr.get(k + "_ic") is not None
+        )
+        components.append(build_metric(
+            name="research_composite_ic", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
+            reliability="low" if insig else "high",
+            value=fic, n_samples=n_at, n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src,
+            status="WATCH" if insig else None,
+            reason=(f"research_composite_ic: final_score→21d-alpha rank-IC = {fic:+.3f} "
+                    f"(p={fp if fp is None else round(fp,3)}, N={n_at}); per-layer [{layers}]. "
+                    + ("Not yet significant — WATCH, accumulating." if insig
+                       else ("no forward signal — composite does not predict 21d alpha" if fic <= 0
+                             else "composite carries forward signal"))),
+        ))
+    else:
+        components.append(build_metric(
+            name="research_composite_ic", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
+            n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False,
+            na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
+        ))
+
     # 4. composite_scoring (critical) — does higher composite score → higher
     #    realized return? Graded on the ROBUST row-level Spearman rank
     #    correlation of score vs realized alpha (target +0.10, red-line 0.0), not

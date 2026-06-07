@@ -129,6 +129,35 @@ class TestCioSelectionSkill:
         assert m["status"] == "N/A-MISSING-INPUT"
 
 
+class TestResearchCompositeIC:
+    """L4561 — does the blended research score predict 21d alpha? Graded under
+    the L4562 contract (insignificant → WATCH + reliability=low)."""
+
+    def _e2e_with_attr(self, fic, p):
+        e = json.loads(json.dumps(_E2E))
+        e["cio_lift"]["layer_attribution_21d"] = {
+            "n": 89, "final_score_ic": fic, "final_score_ic_p": p,
+            "combined_score_ic": -0.016, "macro_shift_ic": -0.044, "cio_conviction_ic": 0.013}
+        return e
+
+    def test_insignificant_ic_watch_low(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_attr(-0.045, 0.67))  # the live case
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
+        assert m["status"] == "WATCH"
+        assert m["reliability"] == "low"
+        assert "per-layer" in m["status_reason"]
+
+    def test_significant_positive_ic_green(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_attr(0.08, 0.01))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
+        assert m["status"] == "GREEN"
+
+    def test_absent_missing_input(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+
 class TestHorizonPreference:
     """Selectors grade on the canonical 21d block when present (ROADMAP L4551),
     falling back to legacy 5d for older artifacts."""
