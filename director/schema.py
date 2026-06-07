@@ -9,8 +9,8 @@ item must cite the MetricRecord names / artifacts it leaned on (``evidence``),
 so the plan is grounded rather than plausible-but-ungrounded.
 
 The plan PROPOSES; the operator DISPOSES. Nothing here writes live trading
-config — the only downstream write is the archived artifact + (later, Phase H,
-flag-gated) an approval-gated ROADMAP PR the operator merges.
+config — the downstream writes are the archived artifact + (Phase H,
+``director/roadmap_pr.py``) an approval-gated ROADMAP PR the operator merges.
 
 This is defined here in the evaluator for the Phase-E build/validate; it lifts
 to ``alpha_engine_lib.agent_schemas`` once a 2nd consumer (the dashboard / the
