@@ -112,13 +112,21 @@ else
 fi
 
 if ! $NO_CANARY; then
-  echo "=== Director dormant canary (flag off → expect status: disabled) ==="
+  # Flag-AGNOSTIC canary: invoke with dry_run=true so it's side-effect-free in
+  # BOTH flag states (the bug that broke the 2026-06-07 deploys: the old canary
+  # asserted `disabled`, but once an operator flips DIRECTOR_ENABLED=true the
+  # handler runs a REAL plan — status `ok` — and the assert failed AND the canary
+  # wrote a bogus action_plan + polluted the shared carry-over ledger).
+  #   - flag off  → handler short-circuits before dry_run → status: disabled
+  #   - flag on   → _dry_run_probe → status: dry_run (langchain import + SSM key
+  #                 fetch + ledger read validated; NO Opus call, NO S3 write)
+  echo "=== Director canary (dry_run — expect 'disabled' when flag off, 'dry_run' when on) ==="
   aws lambda invoke --function-name "$DIRECTOR_FUNCTION" \
-    --payload "$(echo '{"date": "2026-05-30"}' | base64)" \
+    --payload "$(echo '{"date": "2026-05-30", "dry_run": true}' | base64)" \
     --region "$REGION" /tmp/director-canary.json --query 'StatusCode' --output text
   DSTATUS=$(python3 -c "import json; print(json.load(open('/tmp/director-canary.json')).get('status'))")
   echo "  director canary status: $DSTATUS"
-  [[ "$DSTATUS" == "disabled" ]] || { echo "DIRECTOR CANARY UNEXPECTED (want 'disabled' while flag off) — not promoting"; cat /tmp/director-canary.json; exit 1; }
+  [[ "$DSTATUS" == "disabled" || "$DSTATUS" == "dry_run" ]] || { echo "DIRECTOR CANARY UNEXPECTED (want 'disabled' or 'dry_run') — not promoting"; cat /tmp/director-canary.json; exit 1; }
 fi
 
 echo "=== Publish Director version + point live alias ==="
@@ -127,4 +135,4 @@ DVERSION=$(aws lambda publish-version --function-name "$DIRECTOR_FUNCTION" --reg
 # avoids needing lambda:GetAlias on the shared deploy role).
 aws lambda update-alias --function-name "$DIRECTOR_FUNCTION" --name live --function-version "$DVERSION" --region "$REGION" --query 'AliasArn' --output text 2>/dev/null || \
   aws lambda create-alias --function-name "$DIRECTOR_FUNCTION" --name live --function-version "$DVERSION" --region "$REGION" --query 'AliasArn' --output text
-echo "=== Deployed $DIRECTOR_FUNCTION:live (version $DVERSION, DORMANT — DIRECTOR_ENABLED off) ==="
+echo "=== Deployed $DIRECTOR_FUNCTION:live (version $DVERSION; DIRECTOR_ENABLED preserved as set) ==="
