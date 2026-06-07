@@ -91,6 +91,44 @@ class TestPrecisionComponents:
         assert "vs-ranking-lift" in cio["status_reason"]
 
 
+class TestCioSelectionSkill:
+    """L4561 — the CIO selection-skill instrument, graded under the L4562
+    reliability contract (insignificant gap → WATCH + reliability=low)."""
+
+    def _e2e_with_sel(self, gap, p, **extra):
+        e = json.loads(json.dumps(_E2E))
+        e["cio_lift"]["selection_skill_21d"] = {
+            "selection_gap_21d": gap, "selection_gap_p": p,
+            "advance_alpha_21d": -0.05, "reject_alpha_21d": -0.05 - gap,
+            "n_advance": 48, "n_reject": 40, "conviction_ic_21d": 0.05, **extra}
+        return e
+
+    def test_insignificant_gap_watch_low_reliability(self, s3):
+        # The live case: negative gap but p=0.12 → WATCH, NOT a confident RED.
+        _put(s3, "e2e_lift.json", self._e2e_with_sel(-0.039, 0.123))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "cio_selection_skill")
+        assert m["status"] == "WATCH"
+        assert m["reliability"] == "low"
+        assert m["value"] == pytest.approx(-0.039)
+
+    def test_significant_negative_gap_red(self, s3):
+        # If the anti-selection were significant, it WOULD grade RED.
+        _put(s3, "e2e_lift.json", self._e2e_with_sel(-0.04, 0.01))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "cio_selection_skill")
+        assert m["status"] == "RED"
+        assert m["reliability"] == "high"
+
+    def test_significant_positive_gap_green(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_sel(0.03, 0.01))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "cio_selection_skill")
+        assert m["status"] == "GREEN"
+
+    def test_absent_missing_input(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)  # no selection_skill_21d block
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "cio_selection_skill")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+
 class TestHorizonPreference:
     """Selectors grade on the canonical 21d block when present (ROADMAP L4551),
     falling back to legacy 5d for older artifacts."""
