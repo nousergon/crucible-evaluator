@@ -65,15 +65,29 @@ class TestPopulated:
         assert rg["n_samples"] == 50
         assert rg["ci_method"] == "wilson"
 
-    def test_exit_rules_capture_ratio(self, s3):
+    def test_exit_rules_grades_winner_capture(self, s3):
+        # Robust winner-capture median is graded; legacy mean is ignored even
+        # when it is negative (the L4554 artifact).
+        _put(s3, "exit_timing.json", {
+            "status": "ok", "n_roundtrips": 40, "diagnosis": "exits_well_timed",
+            "summary": {"avg_capture_ratio": -0.27, "capture_winners_median": 0.75,
+                        "n_winners": 30, "win_rate": 0.75, "stop_efficiency_median": 0.6,
+                        "avg_realized_return": 0.02},
+        })
+        ex = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "exit_rules")
+        assert ex["value"] == pytest.approx(0.75)  # the robust winner-capture, NOT -0.27
+        assert ex["status"] == "GREEN"  # 0.75 > target 0.70
+        assert ex["n_samples"] == 30
+
+    def test_exit_rules_legacy_fallback(self, s3):
+        # Pre-2026-06-07 artifact without winner-capture → legacy mean graded.
         _put(s3, "exit_timing.json", {
             "status": "ok", "n_roundtrips": 40, "diagnosis": "exits_well_timed",
             "summary": {"avg_capture_ratio": 0.75, "avg_realized_return": 0.02},
         })
-        tile = build_executor_tile(BUCKET, RUN_DATE, s3_client=s3)
-        ex = _comp(tile, "exit_rules")
+        ex = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "exit_rules")
         assert ex["value"] == pytest.approx(0.75)
-        assert ex["status"] == "GREEN"  # 0.75 > target 0.70
+        assert ex["status"] == "GREEN"
 
     def test_excursion_mfe_mae(self, s3):
         _put(s3, "portfolio_excursion.json", {
@@ -87,7 +101,7 @@ class TestPopulated:
     def test_full_executor_green_when_all_strong(self, s3):
         _put(s3, "trigger_scorecard.json", {"status": "ok", "summary": {"win_rate_vs_spy": 0.62, "total_entries": 60}, "triggers": []})
         _put(s3, "shadow_book.json", {"status": "ok", "classification": {"precision": 0.65, "tp": 33, "fp": 17}})
-        _put(s3, "exit_timing.json", {"status": "ok", "n_roundtrips": 40, "summary": {"avg_capture_ratio": 0.78}})
+        _put(s3, "exit_timing.json", {"status": "ok", "n_roundtrips": 40, "summary": {"capture_winners_median": 0.78, "n_winners": 30}})
         _put(s3, "portfolio_excursion.json", {"status": "ok", "mean_mfe_mae_ratio": 1.7, "pct_high_quality": 0.55, "n": 40})
         tile = build_executor_tile(BUCKET, RUN_DATE, s3_client=s3)
         # 3 critical GREEN (triggers/guard/exits); reconciliation is critical N/A-NOT-IMPL → WATCH.
