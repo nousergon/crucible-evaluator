@@ -9,7 +9,7 @@ N), which is more institutional than grading the noisy point-estimate return
 *lift* that has no per-pick CI in the artifact. Lift is surfaced in the reason.
 
 Sources: ``backtest/{date}/e2e_lift.json`` (scanner / team / cio classification),
-``score_calibration.json`` (composite monotonicity), ``macro_eval.json`` (macro
+``score_calibration.json`` (composite score→alpha Spearman calibration), ``macro_eval.json`` (macro
 accuracy lift), ``portfolio_calibration.json`` (judge-vs-realized ECE). The last
 three persist only from a post-2026-06-04 Saturday run (B1a/#279) — until then
 they grade a precise N/A-MISSING-INPUT, never silently omitted.
@@ -152,23 +152,49 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     ))
 
     # 4. composite_scoring (critical) — does higher composite score → higher
-    #    realized return? Graded on the score_calibration monotonicity flag.
+    #    realized return? Graded on the ROBUST row-level Spearman rank
+    #    correlation of score vs realized alpha (target +0.10, red-line 0.0), not
+    #    the legacy binary bucket-monotonicity flag — that flag flipped RED on a
+    #    single noisy quantile bucket. A statistically flat calibration
+    #    (p >= 0.10) grades WATCH, not RED: no measurable signal is not the same
+    #    as inverted calibration. The composite formula itself is provably
+    #    monotonic in its inputs (ROADMAP L4550 — metric-quality fix, not a
+    #    scoring-formula bug; the negative-edge substance lives in L4551).
     sc_src = f"s3://{bucket}/{prefix}/score_calibration.json"
-    if score_cal and score_cal.get("status") == "ok" and "monotonic" in score_cal:
+    if score_cal and score_cal.get("status") == "ok" and score_cal.get("spearman_rho") is not None:
+        rho = float(score_cal["spearman_rho"])
+        pval = score_cal.get("spearman_p")
+        n_cal = score_cal.get("spearman_n") or score_cal.get("n")
+        assessment = score_cal.get("calibration_assessment")
+        beat = score_cal.get("beat_spy_pct")
+        # Flat (insignificant) calibration → WATCH override; otherwise let the
+        # lib derive GREEN/WATCH/RED from rho vs target/red-line.
+        flat = assessment == "flat" or (pval is not None and pval >= 0.10)
+        p_txt = f", p={pval:.3f}" if pval is not None else ""
+        beat_txt = f", beat_spy_pct={beat:.1%}" if beat is not None else ""
+        components.append(build_metric(
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
+            value=rho, n_samples=n_cal, n_floor=30, target=0.10, red_line=0.0, source_path=sc_src,
+            status="WATCH" if flat else None,
+            reason=(f"composite_scoring Spearman rho={rho:+.3f} (score→realized-alpha rank{p_txt}); "
+                    f"assessment={assessment}{beat_txt} over N={n_cal}."),
+        ))
+    elif score_cal and score_cal.get("status") == "ok" and "monotonic" in score_cal:
+        # Legacy fallback: pre-2026-06-07 artifacts without the Spearman fields.
         mono = bool(score_cal["monotonic"])
         beat = score_cal.get("beat_spy_pct")
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="pct", criticality="critical",
             value=1.0 if mono else 0.0, n_samples=score_cal.get("n"), n_floor=1, source_path=sc_src,
             status="GREEN" if mono else "RED",
-            reason=(f"composite_scoring monotonic={mono} (score→return rank); "
+            reason=(f"composite_scoring monotonic={mono} (legacy bucket flag; score→return rank); "
                     f"beat_spy_pct={beat:.1%} over N={score_cal.get('n')}." if beat is not None
-                    else f"composite_scoring monotonic={mono}."),
+                    else f"composite_scoring monotonic={mono} (legacy bucket flag)."),
         ))
     else:
         components.append(build_metric(
-            name="composite_scoring", module=MODULE, metric_type="pct", criticality="critical",
-            n_floor=1, source_path=sc_src, input_present=False,
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
+            n_floor=30, source_path=sc_src, input_present=False,
             na_detail="composite_scoring: score_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
 

@@ -92,19 +92,48 @@ class TestPrecisionComponents:
 
 
 class TestCompositeScoring:
-    def test_monotonic_green(self, s3):
+    def test_spearman_positive_green(self, s3):
+        # Significant positive rank correlation → GREEN.
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "score_calibration.json", {
+            "status": "ok", "monotonic": False, "spearman_rho": 0.28, "spearman_p": 0.001,
+            "spearman_n": 200, "calibration_assessment": "positive", "beat_spy_pct": 0.56,
+        })
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        cs = _comp(tile, "composite_scoring")
+        assert cs["status"] == "GREEN"
+        assert cs["value"] == pytest.approx(0.28)
+        assert "rho=+0.280" in cs["status_reason"]
+
+    def test_spearman_negative_red(self, s3):
+        # Significant negative rank correlation (rho <= red-line 0.0) → RED.
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "score_calibration.json", {
+            "status": "ok", "monotonic": True, "spearman_rho": -0.22, "spearman_p": 0.004,
+            "spearman_n": 200, "calibration_assessment": "negative", "beat_spy_pct": 0.42,
+        })
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert _comp(tile, "composite_scoring")["status"] == "RED"
+
+    def test_spearman_flat_watch_not_red(self, s3):
+        # Insignificant (flat) calibration must NOT grade RED — the core fix:
+        # a single noisy bucket no longer forces critical RED.
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "score_calibration.json", {
+            "status": "ok", "monotonic": False, "spearman_rho": -0.04, "spearman_p": 0.61,
+            "spearman_n": 200, "calibration_assessment": "flat", "beat_spy_pct": 0.50,
+        })
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert _comp(tile, "composite_scoring")["status"] == "WATCH"
+
+    def test_legacy_monotonic_fallback_green(self, s3):
+        # Pre-2026-06-07 artifact without spearman fields → legacy binary path.
         _put(s3, "e2e_lift.json", _E2E)
         _put(s3, "score_calibration.json", {"status": "ok", "monotonic": True, "beat_spy_pct": 0.56, "n": 200})
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         cs = _comp(tile, "composite_scoring")
         assert cs["status"] == "GREEN"
         assert "monotonic=True" in cs["status_reason"]
-
-    def test_non_monotonic_red(self, s3):
-        _put(s3, "e2e_lift.json", _E2E)
-        _put(s3, "score_calibration.json", {"status": "ok", "monotonic": False, "beat_spy_pct": 0.48, "n": 200})
-        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
-        assert _comp(tile, "composite_scoring")["status"] == "RED"
 
     def test_absent_missing_input(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
