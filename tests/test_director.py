@@ -175,6 +175,41 @@ class TestHandler:
         assert written["run_date"] == RUN_DATE
         assert out["ledger_size"] == 1
 
+    def test_roadmap_pr_skipped_when_no_token(self, s3, monkeypatch):
+        # Phase H: no PAT configured → the PR channel records a skip (no silent
+        # swallow) and the plan still writes. Non-fatal advisory path.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        monkeypatch.setattr(H, "_director_github_token", lambda: None)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["roadmap_pr"] == "skipped"
+        assert out["roadmap_pr_reason"] == "no token configured"
+
+    def test_roadmap_pr_opened_when_token_present(self, s3, monkeypatch):
+        # Phase H: with a PAT, the handler opens the approval-gated ROADMAP PR and
+        # threads the live ROADMAP digest into the plan build.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        seen = {}
+        monkeypatch.setattr(H, "build_action_plan",
+                            lambda card, **kw: seen.update(kw) or _plan())
+        monkeypatch.setattr(H, "_director_github_token", lambda: "tok")
+        monkeypatch.setattr(H, "_fetch_roadmap_digest_best_effort", lambda tok: "DIGEST")
+        monkeypatch.setattr(H, "open_roadmap_pr",
+                            lambda plan, run_date, token: {
+                                "status": "ok", "pr_url": "https://x/pull/7",
+                                "branch": f"director/roadmap-{run_date}", "n_filed": 1})
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["roadmap_pr"] == "ok"
+        assert out["roadmap_pr_url"] == "https://x/pull/7"
+        assert seen.get("roadmap_digest") == "DIGEST"  # digest threaded into the build
+
     def test_enabled_missing_card_raises(self, s3, monkeypatch):
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
         from director import handler as H

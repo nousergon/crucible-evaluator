@@ -113,6 +113,37 @@ The Director is the **second function on the same image**, deployed by the same
   Read at request time → no redeploy. The flip must set **both** vars (the
   `--environment` map is a full replace). Flip OFF by dropping `DIRECTOR_ENABLED`.
 
+## Phase H — approval-gated ROADMAP PR channel
+
+When the Director runs (above), it also renders its plan into house-style
+`ROADMAP.md` entries and opens **one approval-gated PR** against
+`cipher813/alpha-engine-config` (`director/roadmap.py` → `director/roadmap_pr.py`).
+**Brian's PR review IS the gate** — there is no soak flag; the Director never
+self-merges and writes no live trading config. Entries are idempotent by
+`ActionItem.id` (re-runs don't duplicate; nothing new → no PR), land under a
+`## Director Proposals` section, and continue the file's `L####` numbering. The
+live ROADMAP digest is also read back **into** the director call so it doesn't
+re-propose tracked work.
+
+- **Default ON.** `DIRECTOR_ROADMAP_PR_ENABLED` is a kill-switch only — unset =
+  enabled. Set it to a falsey string to disable the PR channel (the plan still
+  writes to S3 + console).
+- **One-time operator step — the PAT:** mint a **fine-grained PAT** scoped to
+  `alpha-engine-config` ONLY, permissions **Contents: Read and write** +
+  **Pull requests: Read and write** (NO admin/merge), and store it in SSM:
+
+  ```
+  aws ssm put-parameter --name /alpha-engine/DIRECTOR_GITHUB_TOKEN \
+    --type SecureString --value "<fine-grained-pat>" --overwrite > /dev/null
+  ```
+
+  The director Lambda role's existing `ssm:GetParameter` on
+  `parameter/alpha-engine/*` already covers it — **no IAM change**. Until the
+  param exists the channel records `roadmap_pr: skipped (no token configured)`
+  in the run summary (WARN-logged, non-fatal) — the plan still writes.
+- Mirrors the cyphering release-queue token pattern; the secret flows from SSM
+  via `alpha_engine_lib.secrets.get_secret` at request time.
+
 ## Local invoke
 
 ```

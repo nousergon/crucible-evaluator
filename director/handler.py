@@ -29,6 +29,8 @@ import boto3
 
 from director.agent import build_action_plan
 from director.carryover import load_ledger, merge_plan_into_ledger, write_ledger
+from director.roadmap_pr import DEFAULT_PATH, DEFAULT_REPO, TOKEN_SECRET_NAME, open_roadmap_pr
+from director.roadmap_pr import roadmap_digest as build_roadmap_digest
 from grading.handler import _resolve_run_date
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,87 @@ DEFAULT_BUCKET = "alpha-engine-research"
 
 def _enabled() -> bool:
     return os.environ.get("DIRECTOR_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _roadmap_pr_enabled() -> bool:
+    """Phase H ROADMAP-PR channel. **Default ON** — Brian's PR review IS the gate,
+    so there is no soak flag (decision 2026-06-07, supersedes the original
+    observe-soak gating). ``DIRECTOR_ROADMAP_PR_ENABLED`` remains as a kill-switch:
+    set it to a falsey string to disable."""
+    val = os.environ.get("DIRECTOR_ROADMAP_PR_ENABLED")
+    if val is None:
+        return True
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _director_github_token() -> str | None:
+    """Fine-grained PAT (alpha-engine-config contents+PR write, **no merge**) from
+    SSM ``/alpha-engine/DIRECTOR_GITHUB_TOKEN``. ``None`` if unconfigured — Phase H
+    then records a skip rather than failing (the plan + ledger are the primary
+    deliverables; the PR is secondary). Mirrors the cyphering release-queue token
+    pattern + the fleet's institutional ``get_secret`` path."""
+    try:
+        from alpha_engine_lib.secrets import get_secret
+        tok = (get_secret(TOKEN_SECRET_NAME) or "").strip()
+        return tok or None
+    except Exception as e:  # noqa: BLE001 — absence is a recorded skip, not fatal
+        logger.warning(
+            "Director: %s not readable from SSM (%s) — ROADMAP-PR channel will skip.",
+            TOKEN_SECRET_NAME, e,
+        )
+        return None
+
+
+def _fetch_roadmap_digest_best_effort(token: str) -> str | None:
+    """Phase H input half: read the live ROADMAP and condense to an open-items
+    digest so the director won't re-propose tracked work. Best-effort — a fetch
+    failure just means the LLM runs without the dedup context (the slug-skip at
+    PR-render time is the second line of defense)."""
+    import base64
+
+    from director.roadmap_pr import _gh_request
+    try:
+        s, obj = _gh_request(
+            "GET",
+            f"https://api.github.com/repos/{DEFAULT_REPO}/contents/{DEFAULT_PATH}?ref=main",
+            token,
+        )
+        if s != 200:
+            logger.warning("Director: ROADMAP digest fetch -> %s; proceeding without digest.", s)
+            return None
+        text = base64.b64decode(obj["content"]).decode("utf-8")
+        return build_roadmap_digest(text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Director: ROADMAP digest fetch failed (%s); proceeding without digest.", e)
+        return None
+
+
+def _open_roadmap_pr_best_effort(plan, run_date: str, token: str | None) -> dict:
+    """Phase H output half: open the approval-gated ROADMAP PR. Best-effort +
+    fail-loud — the plan is already persisted, so a missing token or a GitHub
+    error is WARN-logged AND recorded in the returned summary (no silent
+    swallow — [[feedback_no_silent_fails]]: a secondary write hung off a primary
+    path that records the failure). NEVER fatal: the advisory PR must not break
+    the run that produced the real trading artifacts."""
+    if not _roadmap_pr_enabled():
+        return {"roadmap_pr": "disabled"}
+    if not token:
+        logger.warning(
+            "Director: ROADMAP-PR enabled but no token — skipped (set SSM /alpha-engine/%s).",
+            TOKEN_SECRET_NAME,
+        )
+        return {"roadmap_pr": "skipped", "roadmap_pr_reason": "no token configured"}
+    try:
+        res = open_roadmap_pr(plan, run_date, token=token)
+        return {
+            "roadmap_pr": res.get("status", "ok"),
+            "roadmap_pr_url": res.get("pr_url"),
+            "roadmap_pr_branch": res.get("branch"),
+            "roadmap_pr_n_filed": res.get("n_filed"),
+        }
+    except Exception as e:  # noqa: BLE001 — advisory channel; plan already shipped
+        logger.warning("Director ROADMAP-PR failed (plan already written, non-fatal): %s", e)
+        return {"roadmap_pr": "error", "roadmap_pr_error": str(e)}
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
@@ -210,7 +293,15 @@ def handler(event: dict | None = None, context=None) -> dict:
         )
 
     ledger = load_ledger(bucket, s3_client=s3)
-    roadmap_digest = event.get("roadmap_digest")  # optional; Phase H wires the live ROADMAP read
+
+    # Phase H token — shared by the ROADMAP digest read (in) and the PR open (out).
+    gh_token = _director_github_token()
+
+    # Phase H input half: feed the live ROADMAP digest to the director so it
+    # doesn't re-propose tracked work. An explicit event-supplied digest wins.
+    roadmap_digest = event.get("roadmap_digest")
+    if roadmap_digest is None and gh_token and _roadmap_pr_enabled():
+        roadmap_digest = _fetch_roadmap_digest_best_effort(gh_token)
     plan = build_action_plan(card, run_date=run_date, carryover=ledger, roadmap_digest=roadmap_digest)
 
     plan_key = f"director/{run_date}/action_plan.json"
@@ -228,6 +319,10 @@ def handler(event: dict | None = None, context=None) -> dict:
     # persisted; a retro failure is recorded, never fatal.
     retro_summary = _run_retro_best_effort(s3, bucket, run_date, card)
 
+    # Phase H output half: open the approval-gated ROADMAP PR (Brian reviews +
+    # merges). Best-effort — the plan above is the primary deliverable.
+    roadmap_pr_summary = _open_roadmap_pr_best_effort(plan, run_date, gh_token)
+
     summary = {
         "status": "ok",
         "run_date": run_date,
@@ -237,6 +332,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
         **retro_summary,
+        **roadmap_pr_summary,
     }
     logger.info("Director plan written: %s", summary)
     return summary
