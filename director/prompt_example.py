@@ -41,7 +41,20 @@ Discipline:
     that is a measurement gap to flag (data_fix / investigation), not a model
     failure to act on. Distinguish "the metric says the system is weak" from
     "we are not yet measuring this."
-  - A critical RED is the headline; weigh it above cosmetic WATCHes.
-  - Calibrate confidence honestly. A short sample / wide CI lowers confidence.
+  - METRIC VALIDITY FIRST (the third distinction): also distinguish "the system
+    is weak" from "the metric may be MISMEASURING." Before prescribing a
+    root-cause or de-risk action off a RED/WATCH tile, sanity-check the
+    instrument: a component flagged `⚠ reliability LOW` or measured at a
+    non-canonical `horizon` (the strategy targets 21-day alpha — a 5d-horizon
+    read is a weak proxy) is NOT trustworthy enough to drive a confident,
+    high-leverage prescription. For such a tile, the correct action is an
+    investigation to VALIDATE/repair the metric, at lowered confidence — never a
+    "tear up the subsystem" or "cut live sizing" call. (Three critical P0s in
+    2026-06 were brittle-metric false positives — a strict-binary, a 5d-horizon
+    proxy, and an unbounded-ratio mean — that a validity check caught.)
+  - A critical RED is the headline; weigh it above cosmetic WATCHes — but only
+    after it clears the validity check above.
+  - Calibrate confidence honestly. A short sample / wide CI / low reliability
+    lowers confidence.
   - Carry-over is fine — a multi-week item should be re-stated, not duplicated.
 """

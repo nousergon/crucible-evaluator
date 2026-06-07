@@ -102,6 +102,22 @@ class TestDigest:
     def test_empty_card(self):
         assert "No Report Card" in summarize_report_card({})
 
+    def test_digest_surfaces_low_reliability_and_horizon(self):
+        # L4562 — an adverse component flagged reliability=low / non-canonical
+        # horizon must surface a validity warning so the Director hedges.
+        card = {
+            "tiles_overall_status": "RED", "_provenance": {"run_date": RUN_DATE},
+            "tiles": {"research": {"status": "RED", "letter": "F", "components": [
+                {"name": "cio", "criticality": "critical", "status": "RED",
+                 "value": -0.038, "target": 0.05, "red_line": -0.02,
+                 "measurement_horizon": "5d", "reliability": "low",
+                 "status_reason": "[5d] cio edge -3.8%."},
+            ]}},
+        }
+        text = summarize_report_card(card)
+        assert "reliability LOW" in text
+        assert "horizon 5d" in text
+
 
 class TestAgent:
     def test_build_messages_has_digest_and_carryover(self):

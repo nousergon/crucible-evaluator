@@ -74,6 +74,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             slip = summ.get("avg_slippage_vs_signal")
             components.append(build_metric(
                 name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
+                estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
                 value=wr, n_samples=n, n_floor=30, target=0.55, red_line=0.45,
                 ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
                 ci_method="wilson" if w.get("status") == "ok" else None, source_path=ts_src,
@@ -85,12 +86,14 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         else:
             components.append(build_metric(
                 name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
+                estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
                 n_floor=30, target=0.55, red_line=0.45, source_path=ts_src, input_present=False,
                 na_detail="entry_triggers: trigger_scorecard has no win-rate/entries this cycle.",
             ))
     else:
         components.append(build_metric(
             name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
             n_floor=30, target=0.55, red_line=0.45, source_path=ts_src, input_present=False,
             na_detail="entry_triggers: trigger_scorecard.json absent this cycle (OK-only persisted; lands on a Saturday run).",
         ))
@@ -104,6 +107,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         w = wilson_score_interval(tp, n_blk) if n_blk > 0 else {"status": "insufficient_data"}
         components.append(build_metric(
             name="risk_guard", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="wilson_precision",
             value=clf.get("precision"), n_samples=n_blk, n_floor=20, target=0.55, red_line=0.40,
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=sb_src,
@@ -114,6 +118,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     else:
         components.append(build_metric(
             name="risk_guard", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="wilson_precision",
             n_floor=20, target=0.55, red_line=0.40, source_path=sb_src, input_present=False,
             na_detail="risk_guard: shadow_book.json absent or has no classification this cycle (OK-only persisted).",
         ))
@@ -137,6 +142,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         n_cap = summ.get("n_winners") or exits.get("n_roundtrips")
         components.append(build_metric(
             name="exit_rules", module=MODULE, metric_type="ratio", criticality="critical",
+            estimator="winner_capture_median", measurement_horizon="per_hold",
             value=cap, n_samples=n_cap, n_floor=15, target=0.70, red_line=0.40,
             source_path=et_src, input_present=cap is not None,
             reason=(f"exit_rules {cap_label} = {cap:.2f} (N={n_cap} winners of "
@@ -148,6 +154,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     else:
         components.append(build_metric(
             name="exit_rules", module=MODULE, metric_type="ratio", criticality="critical",
+            estimator="winner_capture_median", measurement_horizon="per_hold",
             n_floor=20, target=0.70, red_line=0.40, source_path=et_src, input_present=False,
             na_detail="exit_rules: exit_timing.json absent this cycle (OK-only persisted; lands on a Saturday run).",
         ))
@@ -185,6 +192,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     # 7. reconciliation_integrity (critical) — EOD NAV parity audit, not yet produced.
     components.append(build_metric(
         name="reconciliation_integrity", module=MODULE, metric_type="pct", criticality="critical",
+        estimator="reconciliation_match_rate",
         n_floor=1, target=1.0, red_line=0.0, source_path=f"s3://{bucket}/trades/", implemented=False,
         na_detail="reconciliation_integrity: daemon-vs-IB NAV parity audit not yet produced/persisted for the report card.",
     ))

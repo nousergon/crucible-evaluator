@@ -102,6 +102,7 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
         cov, graded, total = _coverage(grading)
         components.append(build_metric(
             name="evaluator_coverage", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="coverage_proportion", measurement_horizon="trailing_4w",
             value=cov, n_samples=total, n_floor=1, target=0.95, red_line=0.80, source_path=g_src,
             reason=(f"evaluator_coverage = {cov:.0%} ({graded}/{total} leaf components graded, "
                     f"non-N/A) vs target 95% / red-line 80%." if cov is not None else None),
@@ -110,6 +111,7 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
     else:
         components.append(build_metric(
             name="evaluator_coverage", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="coverage_proportion", measurement_horizon="trailing_4w",
             n_floor=1, target=0.95, red_line=0.80, source_path=g_src, input_present=False,
             na_detail="evaluator_coverage: grading.json absent this cycle.",
         ))

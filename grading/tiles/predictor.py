@@ -59,6 +59,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     if latest is None and manifest is None:
         miss = build_metric(
             name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="rank_ic", measurement_horizon="21d",
             n_floor=10, target=0.05, red_line=0.0, source_path=manifest_src, input_present=False,
             na_detail="predictor metrics + weights manifest both absent this cycle.",
         )
@@ -90,6 +91,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
         )
     components.append(build_metric(
         name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
+        estimator="rank_ic", measurement_horizon="21d",
         value=cpcv_mean, n_samples=n_combos, n_floor=10, target=0.05, red_line=0.0,
         ci_low=ci_low, ci_high=ci_high, ci_method=ci_method, source_path=manifest_src,
         input_present=cpcv_ok, reason=meta_reason,
@@ -102,6 +104,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     n_folds = wf.get("n_folds")
     components.append(build_metric(
         name="momentum_l1_ic", module=MODULE, metric_type="ic", criticality="critical",
+        estimator="rank_ic_oos", measurement_horizon="21d",
         value=mom_ic, n_samples=n_folds, n_floor=8, target=0.03, red_line=0.0,
         source_path=manifest_src, input_present=mom_ic is not None,
     ))
@@ -131,6 +134,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
         )
     components.append(build_metric(
         name="ensemble_lift_over_best_l1", module=MODULE, metric_type="ic", criticality="critical",
+        estimator="ic_delta", measurement_horizon="21d",
         value=lift, n_samples=n_combos, n_floor=10, target=0.01, red_line=-0.01,
         source_path=manifest_src, input_present=lift is not None, reason=lift_reason,
         na_detail="ensemble_lift: needs both the leak-free meta IC and at least one L1 IC.",
@@ -141,6 +145,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     ece = cc.get("ece_after")
     components.append(build_metric(
         name="confidence_calibration_ece", module=MODULE, metric_type="calibration", criticality="critical",
+        estimator="expected_calibration_error",
         value=ece, n_samples=cc.get("n_samples"), n_floor=100, target=0.05, red_line=0.15,
         higher_is_better=False, source_path=latest_src, input_present=ece is not None,
     ))
@@ -151,6 +156,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
         passed = bool(odg["passed"])
         components.append(build_metric(
             name="output_distribution_gate", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="distribution_gate",
             value=1.0 if passed else 0.0, n_samples=1, n_floor=1, source_path=latest_src,
             status="GREEN" if passed else "RED",
             reason=f"output_distribution_gate {'PASS' if passed else 'FAIL'}: {odg.get('reason', '')}".strip(),
@@ -158,6 +164,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     else:
         components.append(build_metric(
             name="output_distribution_gate", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="distribution_gate",
             n_floor=1, source_path=latest_src, input_present=False,
             na_detail="output_distribution_gate: no gate result in latest.json this cycle.",
         ))
@@ -170,6 +177,7 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     ))
     components.append(build_metric(
         name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
+        estimator="coverage_proportion",
         value=None, n_floor=1, target=0.95, red_line=0.80, source_path=latest_src, input_present=False,
         na_detail=(f"inference_coverage: n_predictions_today={latest.get('n_predictions_today')} observed, "
                    "but the tradable-universe denominator (signals.json universe count) is not joined yet to compute %. Follow-up."),

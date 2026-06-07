@@ -84,6 +84,7 @@ def _precision_metric(
     if not clf or clf.get("precision") is None:
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
+            estimator="wilson_precision_edge", measurement_horizon=horizon,
             n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
         )
@@ -100,6 +101,7 @@ def _precision_metric(
         # No fn/tn → can't compute the base rate; grade raw precision (legacy).
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
+            estimator="wilson_precision_edge", measurement_horizon=horizon,
             value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35,
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
@@ -112,6 +114,7 @@ def _precision_metric(
     ci_high = w["ci_high"] - base_rate if w.get("status") == "ok" else None
     return build_metric(
         name=name, module=MODULE, metric_type="pct", criticality=criticality,
+        estimator="wilson_precision_edge", measurement_horizon=horizon,
         value=edge, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=target, red_line=red_line,
         ci_low=ci_low, ci_high=ci_high,
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
@@ -171,6 +174,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     else:
         components.append(build_metric(
             name="sector_teams_avg", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="wilson_precision_edge", measurement_horizon="21d",
             n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35, source_path=e2e_src,
             input_present=False, na_detail="sector_teams_avg: no team_lift list in e2e_lift this cycle.",
         ))
@@ -209,6 +213,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         beat_txt = f", beat_spy_pct={beat:.1%}" if beat is not None else ""
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
+            estimator="spearman_calibration", measurement_horizon="21d",
             value=rho, n_samples=n_cal, n_floor=30, target=0.10, red_line=0.0, source_path=sc_src,
             status="WATCH" if flat else None,
             reason=(f"composite_scoring Spearman rho={rho:+.3f} (score→realized-alpha rank{p_txt}); "
@@ -216,19 +221,27 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         ))
     elif score_cal and score_cal.get("status") == "ok" and "monotonic" in score_cal:
         # Legacy fallback: pre-2026-06-07 artifacts without the Spearman fields.
+        # The legacy `monotonic` flag IS the brittle strict-binary the L4562
+        # contract forbids — so we do NOT let it drive a confident GREEN/RED.
+        # It grades WATCH + reliability=low (a deprecated, neutralized path that
+        # only fires for stale artifacts), surfacing the binary as context only.
         mono = bool(score_cal["monotonic"])
         beat = score_cal.get("beat_spy_pct")
         components.append(build_metric(
-            name="composite_scoring", module=MODULE, metric_type="pct", criticality="critical",
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
+            estimator="legacy_monotonic_binary_deprecated", measurement_horizon="21d", reliability="low",
             value=1.0 if mono else 0.0, n_samples=score_cal.get("n"), n_floor=1, source_path=sc_src,
-            status="GREEN" if mono else "RED",
-            reason=(f"composite_scoring monotonic={mono} (legacy bucket flag; score→return rank); "
+            status="WATCH",
+            reason=(f"composite_scoring legacy monotonic={mono} — DEPRECATED brittle bucket binary, "
+                    f"neutralized to WATCH per L4562 (awaiting a Spearman-bearing score_calibration.json); "
                     f"beat_spy_pct={beat:.1%} over N={score_cal.get('n')}." if beat is not None
-                    else f"composite_scoring monotonic={mono} (legacy bucket flag)."),
+                    else f"composite_scoring legacy monotonic={mono} — DEPRECATED brittle bucket binary, "
+                         f"neutralized to WATCH per L4562."),
         ))
     else:
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
+            estimator="spearman_calibration", measurement_horizon="21d",
             n_floor=30, source_path=sc_src, input_present=False,
             na_detail="composite_scoring: score_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
