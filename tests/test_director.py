@@ -13,7 +13,11 @@ from director.report_card_digest import summarize_report_card
 from director.schema import ActionItem, DirectorWeeklyActionPlan
 
 BUCKET = "alpha-engine-research"
-RUN_DATE = "2026-05-30"
+# A TRADING day (Fri) so _resolve_run_date's trading-day normalization is a
+# no-op (was "2026-05-30", a Saturday → would normalize to Fri 05-29 and break
+# the seed/lookup match). Calendar→trading normalization is covered in
+# tests/test_handler.py::TestResolveRunDate.
+RUN_DATE = "2026-05-29"
 
 _CARD = {
     "tiles_overall_status": "RED",

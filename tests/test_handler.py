@@ -9,7 +9,11 @@ from moto import mock_aws
 from grading import handler as H
 
 BUCKET = "alpha-engine-research"
-RUN_DATE = "2026-06-07"
+# A TRADING day (Fri) — the handler normalizes any calendar date to the trading
+# day, so the TestHandler keys/assertions below use a trading-day constant to
+# make that normalization a no-op. (Was "2026-06-07", a Sunday — which silently
+# encoded the pre-fix bug of keying on the calendar day.)
+RUN_DATE = "2026-06-05"
 
 
 @pytest.fixture
@@ -31,16 +35,31 @@ def _seed_eod(s3):
 
 
 class TestResolveRunDate:
-    def test_explicit_date_wins(self):
+    def test_explicit_trading_date_passes_through(self):
+        # 2026-01-02 is a Friday (trading day) → normalization is a no-op.
         assert H._resolve_run_date({"date": "2026-01-02"}) == "2026-01-02"
+
+    def test_explicit_calendar_date_normalized_to_trading_day(self):
+        # The real bug (2026-06-07): the SF threads the CALENDAR run_date, but
+        # the backtester + evaluate.py write backtest/{trading_day}/. The grader
+        # must read the SAME trading day or it grades 0/18 (insufficient_data).
+        assert H._resolve_run_date({"date": "2026-06-07"}) == "2026-06-05"  # Sun → Fri
+        assert H._resolve_run_date({"date": "2026-06-06"}) == "2026-06-05"  # Sat → Fri
+
+    def test_env_override_normalized_to_trading_day(self, monkeypatch):
+        # Env escape hatch is also normalized — a weekend env value still keys
+        # on the trading day.
+        monkeypatch.setenv("EVALUATOR_RUN_DATE", "2026-06-07")
+        assert H._resolve_run_date({}) == "2026-06-05"
 
     def test_falls_back_to_trading_day(self, monkeypatch):
         monkeypatch.delenv("EVALUATOR_RUN_DATE", raising=False)
         rd = H._resolve_run_date({})
-        # now_dual().trading_day is an ISO date string.
+        # now_dual().trading_day is an ISO date string (already a trading day).
         assert isinstance(rd, str) and len(rd) == 10 and rd[4] == "-"
 
     def test_env_override(self, monkeypatch):
+        # 2025-12-31 is a Wednesday (trading day) → passes through unchanged.
         monkeypatch.setenv("EVALUATOR_RUN_DATE", "2025-12-31")
         assert H._resolve_run_date({}) == "2025-12-31"
 
