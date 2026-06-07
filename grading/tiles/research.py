@@ -47,9 +47,23 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
+def _pick_clf(block: dict) -> tuple[dict | None, str]:
+    """Prefer the canonical 21d classification; fall back to the legacy 5d.
+
+    Returns ``(classification_block, horizon_label)``. The research picks are
+    21-day theses, so selection skill is graded on ``beat_spy_21d`` precision
+    (ROADMAP L4551); pre-2026-06-07 artifacts without ``classification_21d``
+    grade on the legacy 5d block.
+    """
+    c21 = block.get("classification_21d")
+    if c21:
+        return c21, "21d"
+    return block.get("classification"), "5d"
+
+
 def _precision_metric(
     name, clf, *, criticality, source, target=0.05, red_line=-0.02,
-    lift=None, lift_label=None, missing_detail=None,
+    lift=None, lift_label=None, missing_detail=None, horizon="5d",
 ) -> dict:
     """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
@@ -60,8 +74,13 @@ def _precision_metric(
     framing) only when the classification block lacks the fn/tn needed to
     compute the base rate. N/A-MISSING-INPUT when the whole block is absent.
 
+    ``horizon`` ("21d"|"5d") is the realized-outcome window the precision was
+    measured over — woven into the reason so a 5d-fallback grade is never
+    mistaken for the canonical 21d read.
+
     base_rate = (tp+fn)/(tp+fp+fn+tn); edge = precision − base_rate.
     """
+    hz = f"[{horizon}] "
     if not clf or clf.get("precision") is None:
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
@@ -84,7 +103,7 @@ def _precision_metric(
             value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35,
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
-            reason=(f"{name} precision = {precision:.1%} (raw — base rate unavailable; "
+            reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
                     f"N={n_sel}){lift_s}." if w.get("status") == "ok" else None),
         )
 
@@ -96,7 +115,7 @@ def _precision_metric(
         value=edge, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=target, red_line=red_line,
         ci_low=ci_low, ci_high=ci_high,
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
-        reason=(f"{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
+        reason=(f"{hz}{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
                 f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}.")
         if w.get("status") == "ok" else None,
@@ -116,25 +135,38 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
 
     e2e = e2e or {}
 
+    # All three selectors are graded on the CANONICAL 21d horizon (beat_spy_21d
+    # precision) when the producer emits it — the picks are 21-day theses, and
+    # the legacy 5d window collapsed precision toward the base rate (ROADMAP
+    # L4551). Pre-2026-06-07 artifacts fall back to the 5d block via _pick_clf.
+
     # 1. scanner (supporting) — precision of quant-filter passers vs baseline.
     sl = e2e.get("scanner_lift") or {}
+    sl_clf, sl_hz = _pick_clf(sl)
+    sl_lift = ((sl.get("lift_21d_log") or {}).get("lift") if sl_hz == "21d"
+               else sl.get("lift"))
     components.append(_precision_metric(
-        "scanner", sl.get("classification"), criticality="supporting", source=e2e_src,
-        lift=sl.get("lift"), lift_label="return-lift",
+        "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
+        lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
         missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
     ))
 
     # 2. sector_teams_avg (critical) — pooled precision across the 6 sector teams.
     team_lift = e2e.get("team_lift")
     if isinstance(team_lift, list) and team_lift:
-        tp = sum(int((t.get("classification") or {}).get("tp", 0)) for t in team_lift)
-        fp = sum(int((t.get("classification") or {}).get("fp", 0)) for t in team_lift)
-        fn = sum(int((t.get("classification") or {}).get("fn", 0)) for t in team_lift)
-        tn = sum(int((t.get("classification") or {}).get("tn", 0)) for t in team_lift)
+        # Pool whichever horizon each team carries; 21d when present (the modern
+        # producer emits it for every team), else legacy 5d. A homogeneous slate
+        # is the norm, so derive the tile horizon from the pooled blocks chosen.
+        chosen = [_pick_clf(t) for t in team_lift]
+        team_hz = "21d" if any(hz == "21d" for _, hz in chosen) else "5d"
+        tp = sum(int((c or {}).get("tp", 0)) for c, _ in chosen)
+        fp = sum(int((c or {}).get("fp", 0)) for c, _ in chosen)
+        fn = sum(int((c or {}).get("fn", 0)) for c, _ in chosen)
+        tn = sum(int((c or {}).get("tn", 0)) for c, _ in chosen)
         pooled = {"precision": (tp / (tp + fp)) if (tp + fp) else None,
                   "tp": tp, "fp": fp, "fn": fn, "tn": tn}
         components.append(_precision_metric(
-            "sector_teams_avg", pooled, criticality="critical", source=e2e_src,
+            "sector_teams_avg", pooled, criticality="critical", source=e2e_src, horizon=team_hz,
         ))
     else:
         components.append(build_metric(
@@ -145,9 +177,12 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
 
     # 3. cio (critical) — entrant-gate precision (CIO-advanced names that won).
     cl = e2e.get("cio_lift") or {}
+    cl_clf, cl_hz = _pick_clf(cl)
+    cl_lift = ((cl.get("lift_21d_log") or {}).get("lift") if cl_hz == "21d"
+               else (e2e.get("cio_vs_ranking") or {}).get("lift"))
     components.append(_precision_metric(
-        "cio", cl.get("classification"), criticality="critical", source=e2e_src,
-        lift=(e2e.get("cio_vs_ranking") or {}).get("lift"), lift_label="vs-ranking-lift",
+        "cio", cl_clf, criticality="critical", source=e2e_src, horizon=cl_hz,
+        lift=cl_lift, lift_label="21d-alpha-lift" if cl_hz == "21d" else "vs-ranking-lift",
         missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
     ))
 

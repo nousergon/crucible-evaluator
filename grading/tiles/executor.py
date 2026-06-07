@@ -118,17 +118,31 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             na_detail="risk_guard: shadow_book.json absent or has no classification this cycle (OK-only persisted).",
         ))
 
-    # 3. exit_rules (critical) — capture ratio (realized / max-favorable).
+    # 3. exit_rules (critical) — WINNER capture ratio (realized / max-favorable
+    #    on trades that had a favorable move). Graded on the robust median over
+    #    winners, NOT the legacy all-trade avg_capture_ratio — that mean is an
+    #    unbounded ratio polluted by stopped-out losers (tiny MFE denominator)
+    #    and read RED even when exits captured their winners well (ROADMAP
+    #    L4554: it was a metric artifact, not an exit-timing defect — the real
+    #    lever is entry quality, L4560). Pre-2026-06-07 artifacts without the
+    #    winner-capture field fall back to the legacy mean.
     et_src = src("exit_timing.json")
     if exits and exits.get("status") == "ok":
         summ = exits.get("summary") or {}
-        cap = summ.get("avg_capture_ratio")
+        cap = summ.get("capture_winners_median")
+        cap_label = "winner-capture-median"
+        if cap is None:
+            cap = summ.get("avg_capture_ratio")  # legacy fallback
+            cap_label = "capture-ratio (legacy all-trade mean)"
+        n_cap = summ.get("n_winners") or exits.get("n_roundtrips")
         components.append(build_metric(
             name="exit_rules", module=MODULE, metric_type="ratio", criticality="critical",
-            value=cap, n_samples=exits.get("n_roundtrips"), n_floor=20, target=0.70, red_line=0.40,
+            value=cap, n_samples=n_cap, n_floor=15, target=0.70, red_line=0.40,
             source_path=et_src, input_present=cap is not None,
-            reason=(f"exit_rules capture-ratio = {cap:.2f} (N={exits.get('n_roundtrips')} roundtrips); "
-                    f"diagnosis={exits.get('diagnosis')}." if cap is not None else None),
+            reason=(f"exit_rules {cap_label} = {cap:.2f} (N={n_cap} winners of "
+                    f"{exits.get('n_roundtrips')} roundtrips, win_rate={summ.get('win_rate')}); "
+                    f"diagnosis={exits.get('diagnosis')}, stop_eff_median={summ.get('stop_efficiency_median')}."
+                    if cap is not None else None),
             na_detail="exit_rules: exit_timing has no capture ratio this cycle.",
         ))
     else:
