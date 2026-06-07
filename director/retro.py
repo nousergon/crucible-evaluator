@@ -44,8 +44,10 @@ def _default_llm():
     from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
     api_key = get_secret("ANTHROPIC_API_KEY")
+    # No `temperature` — claude-opus-4-8 removed the sampling params; passing one
+    # 400s ("`temperature` is deprecated for this model"). Mirrors agent._default_llm.
     base = ChatAnthropic(
-        model=DIRECTOR_MODEL, temperature=0, max_tokens=2000, anthropic_api_key=api_key,
+        model=DIRECTOR_MODEL, max_tokens=2000, anthropic_api_key=api_key,
     )
     return base.with_structured_output(RetroGrade)
 
