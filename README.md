@@ -5,7 +5,7 @@
 [![Part of Nous Ergon](https://img.shields.io/badge/Part_of-Nous_Ergon-1a73e8?style=flat-square)](https://nousergon.ai)
 [![Python](https://img.shields.io/badge/python-3.12+-blue?style=flat-square)](https://www.python.org/)
 [![Anthropic Claude](https://img.shields.io/badge/Anthropic_Claude-1a73e8?style=flat-square)](https://www.anthropic.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
 
 The system's **measurement & evaluation layer**: it grades every module's output into a comprehensive report card, and (the **Director**) reviews those grades each week to propose an advisory action plan for refining the system.
 
