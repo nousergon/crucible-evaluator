@@ -74,7 +74,7 @@ class TestHandler:
         # all 7 tiles present in the per-tile status map.
         assert set(out["tile_status"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
-            "backtester", "substrate", "agent",
+            "backtester", "substrate", "agent", "behavioral",
         }
         assert out["tiles_overall_status"] in ("GREEN", "WATCH", "RED", "N/A-NOT-RUN")
         # the written object round-trips.
