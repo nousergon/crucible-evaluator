@@ -29,8 +29,8 @@ import boto3
 
 from director.agent import build_action_plan
 from director.carryover import load_ledger, merge_plan_into_ledger, write_ledger
-from director.roadmap_pr import DEFAULT_PATH, DEFAULT_REPO, TOKEN_SECRET_NAME, open_roadmap_pr
-from director.roadmap_pr import roadmap_digest as build_roadmap_digest
+from director.issue_filer import DEFAULT_REPO, file_director_issues, open_issues_digest
+from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
 
 logger = logging.getLogger(__name__)
@@ -49,85 +49,82 @@ def _enabled() -> bool:
     return os.environ.get("DIRECTOR_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _roadmap_pr_enabled() -> bool:
-    """Phase H ROADMAP-PR channel. **Default ON** — Brian's PR review IS the gate,
-    so there is no soak flag (decision 2026-06-07, supersedes the original
-    observe-soak gating). ``DIRECTOR_ROADMAP_PR_ENABLED`` remains as a kill-switch:
-    set it to a falsey string to disable."""
-    val = os.environ.get("DIRECTOR_ROADMAP_PR_ENABLED")
-    if val is None:
-        return True
-    return val.strip().lower() in ("1", "true", "yes", "on")
+def _issue_filing_enabled() -> bool:
+    """Phase H issue-filing channel (repointed from the ROADMAP-PR channel,
+    config#978). **Default ON** — Director proposals land as ``priority-unset``
+    ``area:director-proposals`` issues that Brian triages; triage IS the gate,
+    so there is no soak flag. Kill-switch: ``DIRECTOR_ROADMAP_PR_ENABLED`` is
+    PRESERVED (its semantics carry over to the new channel — #978); the clearer
+    ``DIRECTOR_ISSUE_FILING_ENABLED`` is accepted as an alias. Either set to a
+    falsey string disables filing."""
+    for name in ("DIRECTOR_ISSUE_FILING_ENABLED", "DIRECTOR_ROADMAP_PR_ENABLED"):
+        val = os.environ.get(name)
+        if val is not None:
+            return val.strip().lower() in ("1", "true", "yes", "on")
+    return True
 
 
 def _director_github_token() -> str | None:
-    """Fine-grained PAT (alpha-engine-config contents+PR write, **no merge**) from
-    SSM ``/alpha-engine/DIRECTOR_GITHUB_TOKEN``. ``None`` if unconfigured — Phase H
-    then records a skip rather than failing (the plan + ledger are the primary
-    deliverables; the PR is secondary). Mirrors the cyphering release-queue token
-    pattern + the fleet's institutional ``get_secret`` path."""
+    """Fine-grained PAT for ``alpha-engine-config`` from SSM
+    ``/alpha-engine/DIRECTOR_GITHUB_TOKEN``. The repoint needs this token scoped
+    ``issues:write`` (the prior ``contents``/``pull_requests`` write scopes filed
+    ROADMAP PRs and are no longer used — config#978). ``None`` if unconfigured —
+    Phase H then records a skip rather than failing (the plan + ledger are the
+    primary deliverables; issue filing is secondary). Mirrors the cyphering
+    release-queue token pattern + the fleet's institutional ``get_secret`` path."""
     try:
         from alpha_engine_lib.secrets import get_secret
         tok = (get_secret(TOKEN_SECRET_NAME) or "").strip()
         return tok or None
     except Exception as e:  # noqa: BLE001 — absence is a recorded skip, not fatal
         logger.warning(
-            "Director: SSM %s not readable (%s) — ROADMAP-PR channel will skip.",
+            "Director: SSM %s not readable (%s) — issue-filing channel will skip.",
             _GH_PARAM_HINT, e,
         )
         return None
 
 
-def _fetch_roadmap_digest_best_effort(token: str) -> str | None:
-    """Phase H input half: read the live ROADMAP and condense to an open-items
-    digest so the director won't re-propose tracked work. Best-effort — a fetch
-    failure just means the LLM runs without the dedup context (the slug-skip at
-    PR-render time is the second line of defense)."""
-    import base64
-
-    from director.roadmap_pr import _gh_request
+def _fetch_backlog_digest_best_effort(token: str) -> str | None:
+    """Phase H input half: read the live OPEN issue backlog and condense to a
+    digest so the director won't re-propose tracked work. Repointed from the
+    ROADMAP digest now that the backlog lives in GitHub Issues (config#978).
+    Best-effort — a fetch failure just means the LLM runs without the dedup
+    context (the slug-skip at file time is the second line of defense)."""
     try:
-        s, obj = _gh_request(
-            "GET",
-            f"https://api.github.com/repos/{DEFAULT_REPO}/contents/{DEFAULT_PATH}?ref=main",
-            token,
-        )
-        if s != 200:
-            logger.warning("Director: ROADMAP digest fetch -> %s; proceeding without digest.", s)
-            return None
-        text = base64.b64decode(obj["content"]).decode("utf-8")
-        return build_roadmap_digest(text)
+        digest = open_issues_digest(DEFAULT_REPO, token)
+        return digest or None
     except Exception as e:  # noqa: BLE001
-        logger.warning("Director: ROADMAP digest fetch failed (%s); proceeding without digest.", e)
+        logger.warning("Director: backlog digest fetch failed (%s); proceeding without digest.", e)
         return None
 
 
-def _open_roadmap_pr_best_effort(plan, run_date: str, token: str | None) -> dict:
-    """Phase H output half: open the approval-gated ROADMAP PR. Best-effort +
-    fail-loud — the plan is already persisted, so a missing token or a GitHub
-    error is WARN-logged AND recorded in the returned summary (no silent
-    swallow — [[feedback_no_silent_fails]]: a secondary write hung off a primary
-    path that records the failure). NEVER fatal: the advisory PR must not break
-    the run that produced the real trading artifacts."""
-    if not _roadmap_pr_enabled():
-        return {"roadmap_pr": "disabled"}
+def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
+    """Phase H output half: file the weekly proposals as ``area:director-proposals``
+    GitHub issues (Brian triages). Best-effort + fail-loud — the plan is already
+    persisted, so a missing token or a GitHub error is WARN-logged AND recorded
+    in the returned summary (no silent swallow — [[feedback_no_silent_fails]]: a
+    secondary write hung off a primary path that records the failure). NEVER
+    fatal: the advisory channel must not break the run that produced the real
+    trading artifacts."""
+    if not _issue_filing_enabled():
+        return {"director_issues": "disabled"}
     if not token:
         logger.warning(
-            "Director: ROADMAP-PR enabled but no token — skipped (set SSM %s).",
+            "Director: issue filing enabled but no token — skipped (set SSM %s, "
+            "scoped issues:write).",
             _GH_PARAM_HINT,
         )
-        return {"roadmap_pr": "skipped", "roadmap_pr_reason": "no token configured"}
+        return {"director_issues": "skipped", "director_issues_reason": "no token configured"}
     try:
-        res = open_roadmap_pr(plan, run_date, token=token)
+        res = file_director_issues(plan, run_date, token=token)
         return {
-            "roadmap_pr": res.get("status", "ok"),
-            "roadmap_pr_url": res.get("pr_url"),
-            "roadmap_pr_branch": res.get("branch"),
-            "roadmap_pr_n_filed": res.get("n_filed"),
+            "director_issues": res.get("status", "ok"),
+            "director_issues_n_filed": res.get("n_filed"),
+            "director_issues_urls": [i.get("url") for i in res.get("issues", [])],
         }
     except Exception as e:  # noqa: BLE001 — advisory channel; plan already shipped
-        logger.warning("Director ROADMAP-PR failed (plan already written, non-fatal): %s", e)
-        return {"roadmap_pr": "error", "roadmap_pr_error": str(e)}
+        logger.warning("Director issue filing failed (plan already written, non-fatal): %s", e)
+        return {"director_issues": "error", "director_issues_error": str(e)}
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
@@ -301,15 +298,17 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     ledger = load_ledger(bucket, s3_client=s3)
 
-    # Phase H token — shared by the ROADMAP digest read (in) and the PR open (out).
+    # Phase H token — shared by the backlog digest read (in) and issue filing (out).
     gh_token = _director_github_token()
 
-    # Phase H input half: feed the live ROADMAP digest to the director so it
-    # doesn't re-propose tracked work. An explicit event-supplied digest wins.
-    roadmap_digest = event.get("roadmap_digest")
-    if roadmap_digest is None and gh_token and _roadmap_pr_enabled():
-        roadmap_digest = _fetch_roadmap_digest_best_effort(gh_token)
-    plan = build_action_plan(card, run_date=run_date, carryover=ledger, roadmap_digest=roadmap_digest)
+    # Phase H input half: feed the live open-issue backlog digest to the director
+    # so it doesn't re-propose tracked work. An explicit event-supplied digest
+    # wins. (kwarg name `roadmap_digest` retained on build_action_plan — the
+    # source is now issues, not ROADMAP; config#978.)
+    backlog_digest = event.get("roadmap_digest")
+    if backlog_digest is None and gh_token and _issue_filing_enabled():
+        backlog_digest = _fetch_backlog_digest_best_effort(gh_token)
+    plan = build_action_plan(card, run_date=run_date, carryover=ledger, roadmap_digest=backlog_digest)
 
     plan_key = f"director/{run_date}/action_plan.json"
     s3.put_object(
@@ -326,9 +325,9 @@ def handler(event: dict | None = None, context=None) -> dict:
     # persisted; a retro failure is recorded, never fatal.
     retro_summary = _run_retro_best_effort(s3, bucket, run_date, card)
 
-    # Phase H output half: open the approval-gated ROADMAP PR (Brian reviews +
-    # merges). Best-effort — the plan above is the primary deliverable.
-    roadmap_pr_summary = _open_roadmap_pr_best_effort(plan, run_date, gh_token)
+    # Phase H output half: file the weekly proposals as area:director-proposals
+    # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
+    issues_summary = _file_issues_best_effort(plan, run_date, gh_token)
 
     summary = {
         "status": "ok",
@@ -339,7 +338,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
         **retro_summary,
-        **roadmap_pr_summary,
+        **issues_summary,
     }
     logger.info("Director plan written: %s", summary)
     return summary

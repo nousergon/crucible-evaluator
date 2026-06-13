@@ -191,9 +191,9 @@ class TestHandler:
         assert written["run_date"] == RUN_DATE
         assert out["ledger_size"] == 1
 
-    def test_roadmap_pr_skipped_when_no_token(self, s3, monkeypatch):
-        # Phase H: no PAT configured → the PR channel records a skip (no silent
-        # swallow) and the plan still writes. Non-fatal advisory path.
+    def test_issue_filing_skipped_when_no_token(self, s3, monkeypatch):
+        # Phase H (repointed): no PAT configured → the issue channel records a
+        # skip (no silent swallow) and the plan still writes. Non-fatal advisory.
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
         s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
                       Body=json.dumps(_CARD).encode())
@@ -202,12 +202,12 @@ class TestHandler:
         monkeypatch.setattr(H, "_director_github_token", lambda: None)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
         assert out["status"] == "ok"
-        assert out["roadmap_pr"] == "skipped"
-        assert out["roadmap_pr_reason"] == "no token configured"
+        assert out["director_issues"] == "skipped"
+        assert out["director_issues_reason"] == "no token configured"
 
-    def test_roadmap_pr_opened_when_token_present(self, s3, monkeypatch):
-        # Phase H: with a PAT, the handler opens the approval-gated ROADMAP PR and
-        # threads the live ROADMAP digest into the plan build.
+    def test_issues_filed_when_token_present(self, s3, monkeypatch):
+        # Phase H (repointed): with a PAT, the handler files area:director-proposals
+        # issues and threads the live open-issue backlog digest into the plan build.
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
         s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
                       Body=json.dumps(_CARD).encode())
@@ -216,15 +216,28 @@ class TestHandler:
         monkeypatch.setattr(H, "build_action_plan",
                             lambda card, **kw: seen.update(kw) or _plan())
         monkeypatch.setattr(H, "_director_github_token", lambda: "tok")
-        monkeypatch.setattr(H, "_fetch_roadmap_digest_best_effort", lambda tok: "DIGEST")
-        monkeypatch.setattr(H, "open_roadmap_pr",
+        monkeypatch.setattr(H, "_fetch_backlog_digest_best_effort", lambda tok: "DIGEST")
+        monkeypatch.setattr(H, "file_director_issues",
                             lambda plan, run_date, token: {
-                                "status": "ok", "pr_url": "https://x/pull/7",
-                                "branch": f"director/roadmap-{run_date}", "n_filed": 1})
+                                "status": "ok", "n_filed": 1,
+                                "issues": [{"slug": "s", "number": 7,
+                                            "url": "https://x/issues/7"}]})
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
-        assert out["roadmap_pr"] == "ok"
-        assert out["roadmap_pr_url"] == "https://x/pull/7"
-        assert seen.get("roadmap_digest") == "DIGEST"  # digest threaded into the build
+        assert out["director_issues"] == "ok"
+        assert out["director_issues_urls"] == ["https://x/issues/7"]
+        assert seen.get("roadmap_digest") == "DIGEST"  # backlog digest threaded into the build
+
+    def test_issue_filing_disabled_kill_switch(self, s3, monkeypatch):
+        # Preserved kill-switch: DIRECTOR_ROADMAP_PR_ENABLED=false disables filing.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        monkeypatch.setenv("DIRECTOR_ROADMAP_PR_ENABLED", "false")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        monkeypatch.setattr(H, "_director_github_token", lambda: "tok")
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["director_issues"] == "disabled"
 
     def test_enabled_missing_card_raises(self, s3, monkeypatch):
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
