@@ -1,7 +1,18 @@
 """
-roadmap_pr.py — Phase H: render the weekly ``DirectorWeeklyActionPlan`` into
-house-style ROADMAP entries and open an **approval-gated PR** against
-``alpha-engine-config``.
+roadmap_pr.py — Phase H (RETIRED, dormant): render the weekly
+``DirectorWeeklyActionPlan`` into house-style ROADMAP entries and open an
+**approval-gated PR** against ``alpha-engine-config``.
+
+.. deprecated:: 2026-06-13 (config#978)
+   The backlog migrated from ``ROADMAP.md`` to GitHub Issues (L4610), so the
+   Director now files proposals as issues via ``director.issue_filer`` — the
+   handler no longer calls ``open_roadmap_pr``. This module is kept DORMANT for
+   one organic Saturday cycle as a rollback path; its generic helpers
+   (``_gh_request``, ``_SLUG_RE``, ``select_new_items``, ``existing_slugs``) are
+   still imported by ``issue_filer``. **Remove the ROADMAP-render path
+   (``open_roadmap_pr`` + ``upsert_into_roadmap`` + ``render_*``) and the
+   ``ROADMAP.md`` ``## Director Proposals`` stub once the issue channel is
+   verified on a live Saturday run (config#978 closes-when).**
 
 The Director PROPOSES; Brian DISPOSES — he reviews and merges the PR (his
 review IS the gate; there is no soak flag). **No merge call here, no write to
