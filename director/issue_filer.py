@@ -9,10 +9,12 @@ Director's weekly proposals belong in the issue tracker, not as markdown appends
 (config#978).
 
 The Director PROPOSES; Brian DISPOSES. One issue per ``ActionItem``, labeled
-``area:director-proposals`` + ``priority-unset`` — the Director's *suggested*
-priority rides in the body, and a human assigns the real ``P#`` at triage.
-Advisory only: no live trading config is touched, and the Director never closes,
-prioritizes, or re-orders its own issues.
+``area:director-proposals`` + the Director's **suggested ``P#``** (P0–P3) as the
+live priority label — so the proposal lands directly in the prioritized backlog
+views and is queryable by priority (``gh issue list --label P1``). Brian
+re-prioritizes / routes / closes at triage. Advisory only: no live trading config
+is touched, and the Director never closes, re-prioritizes, or re-orders its own
+issues.
 
 Design invariants (mirror the retired ``roadmap_pr`` channel):
   - **Idempotent by ``ActionItem.id``.** Each issue title carries an
@@ -47,7 +49,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REPO = "cipher813/alpha-engine-config"
 PROPOSAL_LABEL = "area:director-proposals"
-PRIORITY_UNSET_LABEL = "priority-unset"
 
 
 def existing_proposal_slugs(
@@ -83,17 +84,17 @@ def render_issue(item: ActionItem, run_date: str) -> tuple[str, str]:
     """``(title, body)`` for one action item.
 
     The title carries the ``id=<slug>`` marker for title-search idempotency; the
-    body carries the full backlog discipline + the Director's SUGGESTED priority
-    (the live label stays ``priority-unset`` until a human triages)."""
+    body restates the Director's assigned priority (also applied as the live
+    ``P#`` label) alongside the full backlog discipline."""
     title = f"[director] {item.title.rstrip().rstrip('.')} (id={item.id})"
     evidence = ", ".join(item.evidence) if item.evidence else "see report card"
     change = item.suggested_change_type.replace("_", " ")
     body = (
-        "_Auto-filed by the weekly Director (Layer C, Phase H) — advisory. "
-        "Brian triages: assign the real priority + route to an owner. The "
-        "Director never closes or prioritizes its own proposals, and writes no "
-        "live trading config._\n\n"
-        f"**Suggested priority:** {item.priority}  ·  **Owner:** {item.proposed_owner}  ·  "
+        "_Auto-filed by the weekly Director (Layer C, Phase H) — advisory. The "
+        f"``{item.priority}`` label is the Director's SUGGESTED priority; Brian "
+        "re-prioritizes / routes / closes at triage. The Director never closes or "
+        "re-prioritizes its own proposals, and writes no live trading config._\n\n"
+        f"**Director-assigned priority:** {item.priority}  ·  **Owner:** {item.proposed_owner}  ·  "
         f"**Horizon:** {item.horizon}  ·  **Confidence:** {item.confidence}/100  ·  "
         f"**Change type:** {change}\n\n"
         f"## Rationale\n{item.rationale.rstrip()}\n\n"
@@ -114,11 +115,17 @@ def file_director_issues(
     repo: str = DEFAULT_REPO,
     gh_request=_gh_request,
 ) -> dict:
-    """File each NEW action item as an issue, idempotent by slug.
+    """File each NEW action item as an issue, idempotent by slug, labeled
+    ``area:director-proposals`` + the item's suggested ``P#``.
 
     If nothing new remains, files nothing and returns ``{"status": "nochange"}``.
-    A per-issue POST failure raises (the handler's best-effort wrapper records
-    it). ``gh_request`` is injected for tests. Returns a compact summary
+    A ``401``/``403`` on the first POST is the EXPECTED pre-activation state (the
+    PAT is not yet scoped ``issues:write`` — gates go-live, config#978): it is
+    WARN-logged + recorded as ``{"status": "skipped_unscoped"}`` and filing stops,
+    rather than raising — so the channel can ship default-on and self-activate the
+    moment the token is re-scoped, with NO Lambda redeploy. Any OTHER non-201
+    (422/5xx) still raises (the handler's best-effort wrapper records it).
+    ``gh_request`` is injected for tests. Returns a compact summary
     (status / n_filed / issues / slugs)."""
     api = f"https://api.github.com/repos/{repo}"
     already = existing_proposal_slugs(repo, token, gh_request=gh_request)
@@ -135,8 +142,29 @@ def file_director_issues(
         title, body = render_issue(item, run_date)
         status, res = gh_request(
             "POST", f"{api}/issues", token,
-            {"title": title, "body": body, "labels": [PROPOSAL_LABEL, PRIORITY_UNSET_LABEL]},
+            {"title": title, "body": body, "labels": [PROPOSAL_LABEL, item.priority]},
         )
+        if status in (401, 403):
+            # (a) Failure mode: DIRECTOR_GITHUB_TOKEN PAT not yet scoped issues:write
+            # (re-scoped at the nousergon org migration, config#978). (c) Recorded
+            # surface: this WARN + the returned "skipped_unscoped" status, which the
+            # handler folds into its summary — NOT a silent swallow
+            # ([[feedback_no_silent_fails]]): a secondary advisory channel whose
+            # failure is surfaced, while the plan (primary deliverable) is already
+            # persisted. Self-activates on token re-scope, no redeploy.
+            logger.warning(
+                "issue_filer: HTTP %s on POST /issues for %r — DIRECTOR_GITHUB_TOKEN "
+                "lacks issues:write (config#978; re-scope at org migration). Skipping "
+                "filing; channel will self-activate once the PAT is re-scoped.",
+                status, item.id,
+            )
+            return {
+                "status": "skipped_unscoped",
+                "n_filed": len(filed),
+                "reason": f"PAT lacks issues:write (HTTP {status})",
+                "issues": filed,
+                "slugs": [f["slug"] for f in filed],
+            }
         if status != 201:
             raise RuntimeError(f"issue_filer: create issue for {item.id!r} -> {status}: {res}")
         filed.append({"slug": item.id, "number": res.get("number"), "url": res.get("html_url")})
