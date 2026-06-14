@@ -2,8 +2,9 @@
 
 Covers idempotency by ActionItem.id across existing area:director-proposals
 issues (open OR closed), the issue render (title id-marker + body discipline +
-priority-unset labeling), the file orchestrator against a mocked GitHub
-transport, and the open-issue backlog digest.
+suggested-P# labeling), the file orchestrator (incl. the skipped_unscoped
+pre-activation path) against a mocked GitHub transport, and the open-issue
+backlog digest.
 """
 
 from __future__ import annotations
@@ -92,8 +93,9 @@ def test_existing_slugs_skips_prs():
 def test_render_issue_title_carries_id_marker():
     title, body = IF.render_issue(_item("my-slug", priority="P2", owner="predictor"), "2026-06-13")
     assert title == "[director] Do the thing my-slug (id=my-slug)"
-    # suggested priority is in the BODY (label stays priority-unset)
-    assert "**Suggested priority:** P2" in body
+    # the Director's suggested priority is restated in the body (and applied as the
+    # live P# label by file_director_issues)
+    assert "**Director-assigned priority:** P2" in body
     assert "Owner:** predictor" in body
     assert "## Closes when" in body
     assert "id=my-slug" in body  # idempotency marker echoed in body
@@ -109,11 +111,41 @@ def test_file_issues_happy_path_labels_and_idempotency():
     assert res["status"] == "ok"
     assert res["n_filed"] == 1
     assert res["slugs"] == ["brand-new"]
-    # exactly one POST, with both labels and the id-bearing title
+    # exactly one POST, labeled with the proposal tag + the item's suggested P#
+    # (default _item priority=P1), and the id-bearing title
     assert len(gh.posted) == 1
     posted = gh.posted[0]
-    assert posted["labels"] == ["area:director-proposals", "priority-unset"]
+    assert posted["labels"] == ["area:director-proposals", "P1"]
     assert "id=brand-new" in posted["title"]
+
+
+def test_file_issues_applies_director_suggested_priority_label():
+    # the live priority label reflects each item's OWN suggested P#
+    gh = FakeGitHub()
+    plan = DirectorWeeklyActionPlan(
+        run_date="2026-06-13",
+        system_summary="x",
+        top_risks=["r"],
+        action_items=[_item("crit", priority="P0"), _item("low", priority="P3")],
+    )
+    IF.file_director_issues(plan, "2026-06-13", token="tok", gh_request=gh)
+    labels_by_title = {p["title"]: p["labels"] for p in gh.posted}
+    assert any("id=crit" in t and "P0" in lbls for t, lbls in labels_by_title.items())
+    assert any("id=low" in t and "P3" in lbls for t, lbls in labels_by_title.items())
+    assert all("priority-unset" not in lbls for lbls in labels_by_title.values())
+
+
+def test_file_issues_skipped_unscoped_on_403_not_raise():
+    # pre-activation: PAT lacks issues:write -> POST 403. Recorded skip, not raise,
+    # and no items recorded as filed (channel self-activates on token re-scope).
+    def gh(method, url, token, body=None):
+        if method == "GET":
+            return 200, []
+        return 403, {"message": "Resource not accessible by personal access token"}
+    res = IF.file_director_issues(_plan("x", "y"), "2026-06-13", token="tok", gh_request=gh)
+    assert res["status"] == "skipped_unscoped"
+    assert res["n_filed"] == 0
+    assert "issues:write" in res["reason"]
 
 
 def test_file_issues_nochange_when_all_filed():

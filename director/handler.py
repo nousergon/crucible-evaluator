@@ -8,9 +8,13 @@ Director reads that fresh card, weighs the week's issues, and emits an advisory
 carry-over ledger.
 
 **The switch:** gated behind ``DIRECTOR_ENABLED`` (env, default OFF), checked at
-request time so flipping it on/off needs no redeploy. OFF → no-op (returns
-``status: disabled``), so the Director SF state can be wired non-fatally now and
-activated after the foundation validates on a clean Saturday cycle.
+request time. OFF → no-op (returns ``status: disabled``), so the Director SF
+state can be wired non-fatally now and activated after the foundation validates
+on a clean Saturday cycle. NOTE: the Saturday SF invokes this Lambda's ``:live``
+alias, whose env is FROZEN at the published version — so flipping a gate env var
+needs the operator to update ``$LATEST`` env, publish a new version, AND move the
+``live`` alias (no CODE change, but it is a config redeploy — not a bare
+``update-function-configuration`` on ``$LATEST``).
 
 Fail-loud on a genuine error (the SF state's own Catch makes it non-fatal — an
 advisory failure must never break the run that produced the real trading
@@ -51,9 +55,10 @@ def _enabled() -> bool:
 
 def _issue_filing_enabled() -> bool:
     """Phase H issue-filing channel (repointed from the ROADMAP-PR channel,
-    config#978). **Default ON** — Director proposals land as ``priority-unset``
-    ``area:director-proposals`` issues that Brian triages; triage IS the gate,
-    so there is no soak flag. Kill-switch: ``DIRECTOR_ROADMAP_PR_ENABLED`` is
+    config#978). **Default ON** — Director proposals land as
+    ``area:director-proposals`` issues carrying the Director's suggested ``P#``
+    label, which Brian re-triages; triage IS the gate, so there is no soak flag.
+    Kill-switch: ``DIRECTOR_ROADMAP_PR_ENABLED`` is
     PRESERVED (its semantics carry over to the new channel — #978); the clearer
     ``DIRECTOR_ISSUE_FILING_ENABLED`` is accepted as an alias. Either set to a
     falsey string disables filing."""
