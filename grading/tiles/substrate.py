@@ -45,6 +45,13 @@ _SF_NAMES = (
 _SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
 _SF_WINDOW_DAYS = 28
 
+# SCHEDULED-cadence roles: an EventBridge-triggered run that is SUPPOSED to
+# complete on its own (the "unattended" target). Everything else role-carrying
+# (recovery / operator / operator-replay / backfill / shell-run) is an operator
+# intervention — it still completes the cycle, but its presence means the
+# scheduled run did NOT succeed unattended. (config#1059 / #970 / L4552d.)
+_SCHEDULED_ROLES = {"weekly", "saturday", "daily", "eod"}
+
 
 def _discover_sf_arns(sfn) -> list[str]:
     """Resolve the 3 pipeline SF ARNs by name (no hardcoded account id).
@@ -65,11 +72,38 @@ def _discover_sf_arns(sfn) -> list[str]:
 
 
 def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
-    """Rolling success rate across the 3 SFs over the trailing window.
+    """Cycle-level success across the 3 SFs over the trailing window.
 
-    Returns ``{rate, n_terminal, n_succeeded, per_sf}`` or ``None`` when no SF
-    ARNs are discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED;
-    RUNNING / NOT_RUN excluded from the denominator.
+    Returns two distinct, complementary metrics (config#1059 / #970 / L4552d) —
+    the OLD per-execution rate conflated operator-recovered cycles AND scheduled
+    failures into one false-RED "everything is broken" number:
+
+    - ``cycle_rate`` (distinct-cycle outcome): a TRADING CYCLE that ultimately
+      completed clean = success, REGARDLESS of how many recovery runs it took.
+      This is the honest "did the work get done?" axis — a Saturday that failed
+      its scheduled run but was recovered-to-green still produced the retrains/
+      backtests, so the downstream tiles are NOT measured on a starved system.
+    - ``unattended_rate`` (first-pass / no-operator): the SCHEDULED run
+      (pipeline_role ∈ scheduled-cadence) succeeded with NO recovery run in the
+      same cycle. This surfaces the genuine target — full automation — honestly
+      (e.g. ~0 for Saturday) instead of hiding it inside the conflated number.
+
+    **Cycle key (principled approximation + its limitation):** the lightweight
+    ``PipelineExecutionSummary`` carries ``pipeline_role`` + ``start_utc`` but
+    NOT the artifact ``trading_day``, so a cycle cannot be keyed on the true
+    trading day. We approximate one cycle = ``(sf_name, start_utc UTC-date)``:
+    all executions of a given SF that START on the same UTC calendar date are
+    treated as one cycle, with recovery reruns landing same-day as the scheduled
+    run. This holds for the live cadence (scheduled run + same-day recoveries);
+    it would mis-split only if a recovery slipped past UTC midnight (rare) — in
+    which case the cycle is counted as two, slightly UNDER-counting recovery
+    linkage (conservative: never inflates the unattended rate). When the SF
+    summary gains a ``trading_day`` field, re-key on it directly.
+
+    Returns ``{cycle_rate, n_cycles, n_cycles_clean, unattended_rate,
+    n_unattended, per_sf, per_sf_unattended}`` or ``None`` when no SF ARNs are
+    discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED; RUNNING /
+    NOT_RUN excluded.
     """
     from alpha_engine_lib.pipeline_status import list_recent_pipeline_runs
 
@@ -77,40 +111,70 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
     if not arns:
         return None
     cutoff = as_of - timedelta(days=window_days)
-    n_terminal = n_succeeded = 0
+    n_cycles = n_cycles_clean = 0
+    n_unattended_cycles = n_unattended_ok = 0
     per_sf: dict[str, str] = {}
+    per_sf_unattended: dict[str, str] = {}
     for arn in arns:
         runs = list_recent_pipeline_runs(arn, limit=50, client=sfn)
-        succ = term = 0
+        # Bucket this SF's terminal, role-carrying, in-window executions into
+        # cycles keyed on the UTC date of start_utc.
+        cycles: dict[object, list[tuple[str, str | None]]] = {}
         for r in runs:
             start = getattr(r, "start_utc", None)
-            if start is not None and start < cutoff:
+            if start is None or start < cutoff:
                 continue
-            # Count PRODUCTION runs only: EventBridge-triggered executions carry a
-            # pipeline_role (weekly/saturday/daily/eod/recovery); ad-hoc smoke /
-            # manual / legacy runs have no role and would misleadingly tank the
-            # rate (cry-wolf). Role-carrying ⇒ a tracked, intended run.
-            if getattr(r, "pipeline_role", None) is None:
+            # PRODUCTION runs only: EventBridge-triggered + operator-tracked
+            # executions carry a pipeline_role; ad-hoc smoke / legacy runs have
+            # no role and would misleadingly tank the rate (cry-wolf).
+            role = getattr(r, "pipeline_role", None)
+            if role is None:
                 continue
             # RunStatus is a (str, Enum) — str() yields "RunStatus.SUCCEEDED",
             # so read .value to get the bare AWS status vocabulary.
             raw = getattr(r, "status", None)
             status = getattr(raw, "value", raw)
-            if status in _SF_TERMINAL:
-                term += 1
-                if status == "SUCCEEDED":
-                    succ += 1
-        n_terminal += term
-        n_succeeded += succ
+            if status not in _SF_TERMINAL:
+                continue
+            cycles.setdefault(start.date(), []).append((status, role))
+
+        sf_cycles = sf_cycles_clean = 0
+        sf_unatt = sf_unatt_ok = 0
+        for _day, execs in cycles.items():
+            sf_cycles += 1
+            # Distinct-cycle outcome: clean iff ANY execution in the cycle (the
+            # scheduled run OR a recovery rerun) ultimately SUCCEEDED.
+            if any(st == "SUCCEEDED" for st, _role in execs):
+                sf_cycles_clean += 1
+            # Unattended first-pass: only cycles that HAD a scheduled run count
+            # toward the unattended denominator (an operator-only ad-hoc day is
+            # not an unattended-cadence opportunity). It succeeded unattended iff
+            # the scheduled run itself SUCCEEDED *and* no recovery role appears.
+            scheduled = [(st, role) for st, role in execs if role in _SCHEDULED_ROLES]
+            if scheduled:
+                sf_unatt += 1
+                had_recovery = any(role not in _SCHEDULED_ROLES for _st, role in execs)
+                scheduled_ok = any(st == "SUCCEEDED" for st, _role in scheduled)
+                if scheduled_ok and not had_recovery:
+                    sf_unatt_ok += 1
+
+        n_cycles += sf_cycles
+        n_cycles_clean += sf_cycles_clean
+        n_unattended_cycles += sf_unatt
+        n_unattended_ok += sf_unatt_ok
         name = arn.rsplit(":", 1)[-1]
-        per_sf[name] = f"{succ}/{term}"
-    if n_terminal == 0:
-        return {"rate": None, "n_terminal": 0, "n_succeeded": 0, "per_sf": per_sf}
+        per_sf[name] = f"{sf_cycles_clean}/{sf_cycles}"
+        per_sf_unattended[name] = f"{sf_unatt_ok}/{sf_unatt}"
+
     return {
-        "rate": n_succeeded / n_terminal,
-        "n_terminal": n_terminal,
-        "n_succeeded": n_succeeded,
+        "cycle_rate": (n_cycles_clean / n_cycles) if n_cycles else None,
+        "n_cycles": n_cycles,
+        "n_cycles_clean": n_cycles_clean,
+        "unattended_rate": (n_unattended_ok / n_unattended_cycles) if n_unattended_cycles else None,
+        "n_unattended": n_unattended_cycles,
+        "n_unattended_ok": n_unattended_ok,
         "per_sf": per_sf,
+        "per_sf_unattended": per_sf_unattended,
     }
 
 
@@ -163,50 +227,92 @@ def build_substrate_tile(
             na_detail="price_cache_freshness: no objects under predictor/price_cache/ to date-stamp.",
         ))
 
-    # 2. sf_success_rate_4w (critical) — the substrate headline: rolling success
-    #    rate across the 3 orchestration SFs (Saturday/Weekday/EOD). Reads the SF
-    #    API via alpha_engine_lib.pipeline_status. Graceful N/A-NOT-RUN on an SF
-    #    access error (a secondary read must not fail the whole report card —
-    #    WARN-logged, not swallowed).
+    # 2. sf_success_rate_4w (critical) + unattended_first_pass_rate (supporting) —
+    #    the substrate headline, re-keyed (config#1059 / #970 / L4552d). The OLD
+    #    per-EXECUTION rate counted operator-recovered cycles AND scheduled-run
+    #    failures as failures, producing a false P0 RED (0.4918) even on a week
+    #    where every cycle ultimately completed clean. We now grade two distinct
+    #    axes off the SF execution history (alpha_engine_lib.pipeline_status):
+    #      - sf_success_rate_4w   = DISTINCT-CYCLE outcome (clean = recovered or
+    #                               not). The honest "did the work get done?" axis.
+    #      - unattended_first_pass_rate = scheduled run succeeded w/ NO recovery.
+    #                               Surfaces the genuine full-automation target.
+    #    Graceful N/A on an SF access error (a secondary read must not fail the
+    #    whole report card — WARN-logged, not swallowed).
     sf_src = "stepfunctions:alpha-engine-{saturday,weekday,eod}-pipeline"
+
+    def _na_pair(*, ran=True, input_present=True, cycle_detail, unatt_detail):
+        components.append(build_metric(
+            name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
+            n_floor=3, target=0.95, red_line=0.80, source_path=sf_src,
+            ran=ran, input_present=input_present, na_detail=cycle_detail,
+        ))
+        components.append(build_metric(
+            name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
+            n_floor=3, target=0.95, red_line=0.50, source_path=sf_src,
+            ran=ran, input_present=input_present, na_detail=unatt_detail,
+        ))
+
     try:
         sfn = sfn_client or boto3.client(
             "stepfunctions", region_name=os.environ.get("AWS_REGION", "us-east-1")
         )
         sf = _sf_success_rate(sfn, as_of, _SF_WINDOW_DAYS)
         if sf is None:
-            components.append(build_metric(
-                name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
-                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
-                n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, input_present=False,
-                na_detail="sf_success_rate_4w: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
-            ))
-        elif sf["rate"] is None:
-            components.append(build_metric(
-                name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
-                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
-                n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
-                na_detail=f"sf_success_rate_4w: no terminal SF executions in the last {_SF_WINDOW_DAYS}d.",
-            ))
+            _na_pair(
+                input_present=False,
+                cycle_detail="sf_success_rate_4w: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
+                unatt_detail="unattended_first_pass_rate: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
+            )
+        elif sf["cycle_rate"] is None:
+            _na_pair(
+                ran=False,
+                cycle_detail=f"sf_success_rate_4w: no terminal production-role SF cycles in the last {_SF_WINDOW_DAYS}d.",
+                unatt_detail=f"unattended_first_pass_rate: no scheduled-cadence SF cycles in the last {_SF_WINDOW_DAYS}d.",
+            )
         else:
+            # Distinct-cycle outcome (critical headline).
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
-                estimator="success_proportion_4w", measurement_horizon="trailing_4w",
-                value=sf["rate"], n_samples=sf["n_terminal"], n_floor=3, target=0.95, red_line=0.80,
+                estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
+                value=sf["cycle_rate"], n_samples=sf["n_cycles"], n_floor=3, target=0.95, red_line=0.80,
                 source_path=sf_src,
-                reason=(f"sf_success_rate_4w = {sf['rate']:.0%} ({sf['n_succeeded']}/{sf['n_terminal']} "
-                        f"production-role terminal SF executions in {_SF_WINDOW_DAYS}d: {sf['per_sf']}) "
-                        f"vs target 95% / red-line 80%."),
+                reason=(f"sf_success_rate_4w = {sf['cycle_rate']:.0%} ({sf['n_cycles_clean']}/{sf['n_cycles']} "
+                        f"DISTINCT production-role cycles completed clean — recovery counts as clean — in "
+                        f"{_SF_WINDOW_DAYS}d: {sf['per_sf']}) vs target 95% / red-line 80%. "
+                        f"Re-keyed off per-execution (config#1059): a recovered cycle still produced its "
+                        f"artifacts, so downstream tiles are NOT measured on a starved system."),
             ))
+            # Unattended first-pass (supporting — the true automation target).
+            if sf["unattended_rate"] is None:
+                components.append(build_metric(
+                    name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
+                    estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
+                    n_floor=3, target=0.95, red_line=0.50, source_path=sf_src, ran=False,
+                    na_detail=f"unattended_first_pass_rate: no scheduled-cadence cycles in the last {_SF_WINDOW_DAYS}d.",
+                ))
+            else:
+                components.append(build_metric(
+                    name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
+                    estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
+                    value=sf["unattended_rate"], n_samples=sf["n_unattended"], n_floor=3,
+                    target=0.95, red_line=0.50, source_path=sf_src,
+                    reason=(f"unattended_first_pass_rate = {sf['unattended_rate']:.0%} ({sf['n_unattended_ok']}/"
+                            f"{sf['n_unattended']} scheduled cycles succeeded with NO operator recovery in "
+                            f"{_SF_WINDOW_DAYS}d: {sf['per_sf_unattended']}) vs target 95% / red-line 50%. "
+                            f"The genuine full-automation target (config#970/L4552d) — distinct from the "
+                            f"did-the-work-get-done cycle rate above."),
+                ))
     except (ClientError, BotoCoreError) as e:
         code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
         logger.warning("sf_success_rate_4w: SF API read failed (%s) — grading N/A", e)
-        components.append(build_metric(
-            name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
-            estimator="success_proportion_4w", measurement_horizon="trailing_4w",
-            n_floor=3, target=0.95, red_line=0.80, source_path=sf_src, ran=False,
-            na_detail=f"sf_success_rate_4w: Step Functions read failed this cycle ({code}).",
-        ))
+        _na_pair(
+            ran=False,
+            cycle_detail=f"sf_success_rate_4w: Step Functions read failed this cycle ({code}).",
+            unatt_detail=f"unattended_first_pass_rate: Step Functions read failed this cycle ({code}).",
+        )
 
     # 3-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.

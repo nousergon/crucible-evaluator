@@ -20,12 +20,22 @@ _CPCV_ICS = [0.32, 0.27, 0.05, 0.07, 0.18, 0.47, 0.27, 0.28, 0.13, 0.09, 0.19, -
 _MANIFEST = {
     "walk_forward": {
         "momentum_median_ic": -0.0015,   # dead
-        "volatility_median_ic": 0.322,   # strong
+        "volatility_median_ic": 0.322,   # strong — but MAGNITUDE IC (abs-return)
         "n_folds": 16,
     },
     "meta_model_oos_ic_cpcv": {
         "status": "ok", "n_combos": 12, "mean_ic": 0.18,
         "frac_positive": 0.917, "ics": _CPCV_ICS,
+    },
+    # config#1062: the directional standalone alpha-ICs (each L1 output's IC vs
+    # the SAME signed-alpha label the L2 targets). These are the apples-to-apples
+    # comparison set for ensemble lift — NOT the magnitude volatility_median_ic.
+    "meta_l1_standalone_alpha_ic": {
+        "expected_move": {"xsec_ic": 0.21, "n_dates": 400},
+        "research_calibrator_prob": {"xsec_ic": 0.17, "n_dates": 400},
+        "momentum_score": {"xsec_ic": -0.03, "n_dates": 400},
+        # raw context features carry an xsec_ic too but must NOT enter best_l1
+        "macro_spy_20d_return": {"xsec_ic": 0.40, "n_dates": 400},
     },
 }
 
@@ -93,13 +103,47 @@ class TestLeakFreeSourcing:
         vol = _comp(tile, "volatility_l1_ic")
         assert vol["status"] == "GREEN"
 
-    def test_ensemble_lift_negative_red(self, s3):
+    def test_ensemble_lift_vs_directional_l1_not_magnitude(self, s3):
+        # config#1062: lift compares meta CPCV (0.18) vs the BEST DIRECTIONAL
+        # standalone L1 alpha-IC (expected_move 0.21), NOT the magnitude
+        # volatility_median_ic (0.322) and NOT the raw macro context feature
+        # (macro_spy_20d_return 0.40). 0.18 − 0.21 = −0.03.
         _seed(s3)
         tile = build_predictor_tile(BUCKET, s3_client=s3)
         lift = _comp(tile, "ensemble_lift_over_best_l1")
-        # meta 0.18 − best L1 (vol 0.322) = −0.142 → stacking adds no value → RED.
-        assert lift["value"] < 0
-        assert lift["status"] == "RED"
+        assert lift["value"] == pytest.approx(0.18 - 0.21)
+        # best L1 is the directional expected_move, not the 0.322 magnitude IC
+        # nor the 0.40 macro context feature.
+        assert "expected_move" in lift["status_reason"]
+        assert lift["status"] == "RED"  # −0.03 below red-line −0.01
+
+    def test_ensemble_lift_na_when_standalone_absent(self, s3):
+        # config#1062: with no directional standalone alpha-IC in the manifest we
+        # must NOT fall back to the magnitude WF IC (the old false-RED bug) —
+        # honest N/A instead.
+        manifest = {k: v for k, v in _MANIFEST.items() if k != "meta_l1_standalone_alpha_ic"}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        lift = _comp(tile, "ensemble_lift_over_best_l1")
+        assert lift["value"] is None
+        assert lift["status"] == "N/A-MISSING-INPUT"
+        assert "magnitude" in lift["status_reason"].lower()
+
+    def test_ensemble_lift_na_when_standalone_not_run(self, s3):
+        # status not_run/error → treated as absent, no magnitude fallback.
+        manifest = {**_MANIFEST, "meta_l1_standalone_alpha_ic": {"status": "not_run"}}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        assert _comp(tile, "ensemble_lift_over_best_l1")["status"] == "N/A-MISSING-INPUT"
+
+    def test_volatility_magnitude_ic_still_reported(self, s3):
+        # The magnitude volatility IC is excluded from LIFT but MUST remain
+        # reported in its own component (a valid magnitude metric — config#1062).
+        _seed(s3)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        vol = _comp(tile, "volatility_l1_ic")
+        assert vol["value"] == pytest.approx(0.322)
+        assert vol["status"] == "GREEN"
 
     def test_research_calibrator_null_low_n(self, s3):
         _seed(s3)

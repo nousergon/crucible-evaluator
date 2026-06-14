@@ -34,6 +34,15 @@ MODULE = "predictor"
 LATEST_KEY = "predictor/metrics/latest.json"
 MANIFEST_KEY = "predictor/weights/meta/manifest.json"
 
+# The DIRECTIONAL L1 model outputs — the three columns in META_FEATURES that are
+# themselves OOS L1 predictions trained against the SAME signed alpha label the
+# L2 targets. These are the apples-to-apples comparison set for ensemble lift.
+# Excluded from this set: the walk-forward `volatility_median_ic`, because the
+# volatility L1 is trained/scored on abs(return) MAGNITUDE (not signed alpha) —
+# its standalone surface here is `expected_move`'s directional alpha-IC, which
+# IS directional and IS included. (config#1062 false-RED fix.)
+_DIRECTIONAL_L1_FEATURES = ("expected_move", "research_calibrator_prob", "momentum_score", "momentum")
+
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
     try:
@@ -122,22 +131,57 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
     ))
 
     # 5. ensemble_lift_over_best_l1 (critical) — does stacking beat the best L1?
-    l1_ics = [v for v in (mom_ic, vol_ic, rescal_ic) if v is not None]
+    #    config#1062: the OLD code compared the directional meta CPCV IC against
+    #    max(momentum_wf, volatility_wf, research_calibrator) — but
+    #    `volatility_median_ic` is a MAGNITUDE IC (the volatility L1 trains/scores
+    #    on abs(return), predictor meta_trainer.py:1521-1530), not signed alpha.
+    #    Subtracting a magnitude-IC from a directional-IC is meaningless and
+    #    produced a false −0.296 "destroys signal" RED. The apples-to-apples read
+    #    is the manifest's `meta_l1_standalone_alpha_ic` — each L1 output's IC vs
+    #    the SAME signed alpha label the L2 targets. We compare the meta CPCV IC
+    #    against the best DIRECTIONAL standalone L1 alpha-IC.
+    standalone = manifest.get("meta_l1_standalone_alpha_ic")
+    directional_l1_ics: dict[str, float] = {}
+    if isinstance(standalone, dict) and standalone.get("status") not in ("not_run", "error"):
+        for feat in _DIRECTIONAL_L1_FEATURES:
+            entry = standalone.get(feat)
+            if isinstance(entry, dict):
+                xic = entry.get("xsec_ic")
+                if isinstance(xic, (int, float)):
+                    directional_l1_ics[feat] = float(xic)
     lift = None
     lift_reason = None
-    if cpcv_mean is not None and l1_ics:
-        best_l1 = max(l1_ics)
+    lift_present = False
+    lift_na = None
+    if cpcv_mean is None:
+        lift_na = "ensemble_lift: needs the leak-free meta CPCV IC (absent this cycle)."
+    elif directional_l1_ics:
+        best_feat = max(directional_l1_ics, key=lambda k: directional_l1_ics[k])
+        best_l1 = directional_l1_ics[best_feat]
         lift = cpcv_mean - best_l1
+        lift_present = True
         lift_reason = (
-            f"ensemble_lift_over_best_l1 = {lift:+.3g} (leak-free meta {cpcv_mean:.3g} − best L1 "
-            f"{best_l1:.3g}) vs target 0.01 / red-line -0.01 — directional (CPCV meta vs WF-median L1)."
+            f"ensemble_lift_over_best_l1 = {lift:+.3g} (leak-free meta {cpcv_mean:.3g} − best "
+            f"DIRECTIONAL standalone L1 {best_feat}={best_l1:+.3g}) vs target 0.01 / red-line "
+            f"-0.01. Compares signed-alpha-IC vs signed-alpha-IC; the volatility L1's "
+            f"MAGNITUDE walk-forward IC ({vol_ic if vol_ic is not None else 'n/a'}) is "
+            f"deliberately EXCLUDED — it scores abs(return), not directional alpha (config#1062)."
+        )
+    else:
+        # Manifest lacks the standalone-alpha-IC field (older training run, or it
+        # errored/not-run). Do NOT fall back to the magnitude WF IC — that is the
+        # exact false-RED bug. Surface honest N/A instead.
+        lift_na = (
+            "ensemble_lift: directional `meta_l1_standalone_alpha_ic` absent/not-run in the "
+            "manifest this cycle. Refusing to fall back to the volatility MAGNITUDE walk-forward "
+            "IC (config#1062 false-RED). Re-runs once the standalone alpha-IC diagnostic is present."
         )
     components.append(build_metric(
         name="ensemble_lift_over_best_l1", module=MODULE, metric_type="ic", criticality="critical",
         estimator="ic_delta", measurement_horizon="21d",
         value=lift, n_samples=n_combos, n_floor=10, target=0.01, red_line=-0.01,
-        source_path=manifest_src, input_present=lift is not None, reason=lift_reason,
-        na_detail="ensemble_lift: needs both the leak-free meta IC and at least one L1 IC.",
+        source_path=manifest_src, input_present=lift_present, reason=lift_reason,
+        na_detail=lift_na or "ensemble_lift: needs the leak-free meta IC and a directional standalone L1 alpha-IC.",
     ))
 
     # 6. confidence_calibration_ece (critical) — lower is better.

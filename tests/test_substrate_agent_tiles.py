@@ -52,9 +52,10 @@ class TestSubstrate:
         assert sf["status"] == "N/A-MISSING-INPUT"
         assert "discoverable" in sf["status_reason"]
 
-    def test_tile_has_nine_components(self, s3):
+    def test_tile_has_ten_components(self, s3):
+        # 10 = the original 9 + the new unattended_first_pass_rate (config#1059).
         tile = build_substrate_tile(BUCKET, s3_client=s3)
-        assert tile["n_components"] == 9
+        assert tile["n_components"] == 10
         assert tile["module"] == "substrate"
 
     def test_tile_watch_when_only_freshness_real(self, s3):
@@ -69,12 +70,15 @@ _ARNS = "arn:aws:states:us-east-1:0:stateMachine:alpha-engine-saturday-pipeline"
 
 def _run(status, days_ago, now, role="weekly"):
     # Production runs carry a pipeline_role; role=None mimics an untracked
-    # smoke/manual run (excluded from the rate).
+    # smoke/manual run (excluded from the rate). `days_ago` also keys the cycle
+    # (one cycle = one SF + one start UTC-date), so distinct days = distinct
+    # cycles, same day = same cycle (e.g. scheduled run + same-day recovery).
     return SimpleNamespace(status=status, start_utc=now - timedelta(days=days_ago), pipeline_role=role)
 
 
 class TestSfSuccessRate:
-    def test_rate_green_when_all_succeed(self, s3, monkeypatch):
+    def test_cycle_rate_green_when_all_succeed(self, s3, monkeypatch):
+        # 4 distinct days, each a clean scheduled run → 4/4 distinct cycles clean.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
@@ -87,8 +91,13 @@ class TestSfSuccessRate:
         assert sf["value"] == pytest.approx(1.0)
         assert sf["n_samples"] == 4
         assert sf["status"] == "GREEN"
+        # unattended: all 4 scheduled cycles succeeded with no recovery → 1.0
+        unatt = _comp(tile, "unattended_first_pass_rate")
+        assert unatt["value"] == pytest.approx(1.0)
+        assert unatt["n_samples"] == 4
 
-    def test_rate_red_when_failures_dominate(self, s3, monkeypatch):
+    def test_cycle_rate_red_when_failures_dominate(self, s3, monkeypatch):
+        # 4 distinct cycles: 1 clean, 3 failed (no recovery) → cycle_rate 0.25.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
@@ -101,6 +110,58 @@ class TestSfSuccessRate:
         assert sf["value"] == pytest.approx(0.25)
         assert sf["status"] == "RED"
 
+    def test_recovered_cycle_counts_clean_but_not_unattended(self, s3, monkeypatch):
+        # THE config#1059 false-RED fix: each cycle's scheduled run FAILS then a
+        # same-day recovery SUCCEEDS. The OLD per-execution rate = 50% (a false
+        # P0 RED). New cycle_rate = 100% (every cycle ultimately completed clean)
+        # but unattended_first_pass_rate = 0% (each needed an operator). 3 cycles
+        # on distinct days so N clears the floor and a status is gradeable.
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        monkeypatch.setattr(
+            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            lambda arn, **kw: [
+                _run("FAILED", 1, now, role="weekly"), _run("SUCCEEDED", 1, now, role="recovery"),
+                _run("FAILED", 8, now, role="weekly"), _run("SUCCEEDED", 8, now, role="recovery"),
+                _run("FAILED", 15, now, role="weekly"), _run("SUCCEEDED", 15, now, role="recovery"),
+            ],
+        )
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        sf = _comp(tile, "sf_success_rate_4w")
+        assert sf["value"] == pytest.approx(1.0)  # 3/3 distinct cycles clean
+        assert sf["n_samples"] == 3
+        assert sf["status"] == "GREEN"  # no longer a false RED
+        unatt = _comp(tile, "unattended_first_pass_rate")
+        assert unatt["value"] == pytest.approx(0.0)  # every scheduled run needed recovery
+        assert unatt["n_samples"] == 3
+        assert unatt["status"] == "RED"  # 0% unattended — the genuine target, surfaced honestly
+
+    def test_scheduled_success_no_recovery_is_unattended(self, s3, monkeypatch):
+        # Scheduled run succeeds outright, no recovery → both metrics 1.0.
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        monkeypatch.setattr(
+            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly")],
+        )
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        assert _comp(tile, "sf_success_rate_4w")["value"] == pytest.approx(1.0)
+        assert _comp(tile, "unattended_first_pass_rate")["value"] == pytest.approx(1.0)
+
+    def test_operator_only_cycle_excluded_from_unattended(self, s3, monkeypatch):
+        # A cycle with ONLY an operator/recovery run (no scheduled run) counts
+        # toward cycle_rate but NOT the unattended denominator.
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        monkeypatch.setattr(
+            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="recovery")],
+        )
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        assert _comp(tile, "sf_success_rate_4w")["value"] == pytest.approx(1.0)
+        # no scheduled cycle → unattended is N/A-NOT-RUN, not a fabricated number
+        assert _comp(tile, "unattended_first_pass_rate")["status"] == "N/A-NOT-RUN"
+
     def test_window_excludes_old_and_running(self, s3, monkeypatch):
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
@@ -111,7 +172,8 @@ class TestSfSuccessRate:
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
-        assert sf["n_samples"] == 1  # only the recent SUCCEEDED is terminal+in-window
+        # day-1 cycle: SUCCEEDED + RUNNING(non-terminal, dropped) → 1 clean cycle.
+        assert sf["n_samples"] == 1
         assert sf["value"] == pytest.approx(1.0)
 
     def test_untracked_none_role_excluded(self, s3, monkeypatch):
@@ -121,14 +183,14 @@ class TestSfSuccessRate:
         monkeypatch.setattr(
             "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly"),
-                               _run("FAILED", 1, now, role=None),  # untracked smoke → excluded
-                               _run("FAILED", 2, now, role=None)],
+                               _run("FAILED", 2, now, role=None),  # untracked smoke → excluded
+                               _run("FAILED", 3, now, role=None)],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
-        assert sf["n_samples"] == 1  # only the role-carrying run counts
+        assert sf["n_samples"] == 1  # only the role-carrying cycle counts
         assert sf["value"] == pytest.approx(1.0)
-        assert "production-role" in sf["status_reason"]
+        assert "DISTINCT" in sf["status_reason"]
 
     def test_no_terminal_runs_not_run(self, s3, monkeypatch):
         now = datetime.now(UTC)
@@ -140,6 +202,7 @@ class TestSfSuccessRate:
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         assert sf["status"] == "N/A-NOT-RUN"
+        assert _comp(tile, "unattended_first_pass_rate")["status"] == "N/A-NOT-RUN"
 
 
 class TestAgent:
