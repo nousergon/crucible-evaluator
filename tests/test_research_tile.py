@@ -209,14 +209,42 @@ class TestCompositeScoring:
         # Significant positive rank correlation → GREEN.
         _put(s3, "e2e_lift.json", _E2E)
         _put(s3, "score_calibration.json", {
-            "status": "ok", "monotonic": False, "spearman_rho": 0.28, "spearman_p": 0.001,
-            "spearman_n": 200, "calibration_assessment": "positive", "beat_spy_pct": 0.56,
+            "status": "ok", "horizon": "10d", "monotonic": False, "spearman_rho": 0.28,
+            "spearman_p": 0.001, "spearman_n": 200, "calibration_assessment": "positive",
+            "beat_spy_pct": 0.56,
         })
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         cs = _comp(tile, "composite_scoring")
         assert cs["status"] == "GREEN"
         assert cs["value"] == pytest.approx(0.28)
         assert "rho=+0.280" in cs["status_reason"]
+
+    def test_horizon_reported_honestly_not_hardcoded_21d(self, s3):
+        # config#1063: the artifact is computed at 10d (score_performance has no
+        # 21d column) — the tile must report the TRUE horizon, NOT assert 21d,
+        # grade it SUPPORTING (sub-horizon proxy), and point at the canonical-21d
+        # research_composite_ic.
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "score_calibration.json", {
+            "status": "ok", "horizon": "10d", "monotonic": False, "spearman_rho": 0.12,
+            "spearman_p": 0.02, "spearman_n": 150, "calibration_assessment": "positive",
+        })
+        cs = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "composite_scoring")
+        assert cs["measurement_horizon"] == "10d"
+        assert cs["criticality"] == "supporting"
+        assert "[10d]" in cs["status_reason"]
+        assert "research_composite_ic" in cs["status_reason"]
+
+    def test_horizon_defaults_to_10d_when_artifact_omits_it(self, s3):
+        # Legacy artifacts without a horizon field default to the producer's
+        # actual default (10d) rather than a mislabeled 21d.
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "score_calibration.json", {
+            "status": "ok", "monotonic": False, "spearman_rho": 0.12, "spearman_p": 0.02,
+            "spearman_n": 150, "calibration_assessment": "positive",
+        })
+        cs = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "composite_scoring")
+        assert cs["measurement_horizon"] == "10d"
 
     def test_spearman_negative_red(self, s3):
         # Significant negative rank correlation (rho <= red-line 0.0) → RED.

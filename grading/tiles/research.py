@@ -264,7 +264,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
         ))
 
-    # 4. composite_scoring (critical) — does higher composite score → higher
+    # 4. composite_scoring (supporting) — does higher composite score → higher
     #    realized return? Graded on the ROBUST row-level Spearman rank
     #    correlation of score vs realized alpha (target +0.10, red-line 0.0), not
     #    the legacy binary bucket-monotonicity flag — that flag flipped RED on a
@@ -273,7 +273,22 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    as inverted calibration. The composite formula itself is provably
     #    monotonic in its inputs (ROADMAP L4550 — metric-quality fix, not a
     #    scoring-formula bug; the negative-edge substance lives in L4551).
+    #    SUPPORTING (config#1063): this is computed at the score_performance
+    #    horizon (10d — that table has no 21d column), BELOW the 21d strategy
+    #    horizon, so it is a leading diagnostic rather than a critical gate. The
+    #    canonical-21d composite signal is graded critically as
+    #    research_composite_ic (final_score rank-IC vs 21d alpha) above; keeping
+    #    BOTH critical would double-count the construct and let a sub-horizon
+    #    proxy drive a Director P0 (the L4551/L4562 sub-horizon-proxy concern).
     sc_src = f"s3://{bucket}/{prefix}/score_calibration.json"
+    # The score_calibration artifact is computed from the score_performance table,
+    # which carries only 5d/10d/30d outcomes (NO 21d column) — the producer's
+    # default horizon is 10d. Report the TRUE horizon from the artifact rather
+    # than asserting the canonical 21d (config#1063: the metric was *computed* at
+    # 10d but *framed* as 21d). The canonical-21d composite signal IS graded — as
+    # research_composite_ic (final_score rank-IC vs 21d alpha) above — so this is
+    # an honest shorter-horizon calibration diagnostic, not a mislabeled 21d gate.
+    cal_horizon = (score_cal or {}).get("horizon") or "10d"
     if score_cal and score_cal.get("status") == "ok" and score_cal.get("spearman_rho") is not None:
         rho = float(score_cal["spearman_rho"])
         pval = score_cal.get("spearman_p")
@@ -286,12 +301,13 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         p_txt = f", p={pval:.3f}" if pval is not None else ""
         beat_txt = f", beat_spy_pct={beat:.1%}" if beat is not None else ""
         components.append(build_metric(
-            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
-            estimator="spearman_calibration", measurement_horizon="21d",
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
+            estimator="spearman_calibration", measurement_horizon=cal_horizon,
             value=rho, n_samples=n_cal, n_floor=30, target=0.10, red_line=0.0, source_path=sc_src,
             status="WATCH" if flat else None,
-            reason=(f"composite_scoring Spearman rho={rho:+.3f} (score→realized-alpha rank{p_txt}); "
-                    f"assessment={assessment}{beat_txt} over N={n_cal}."),
+            reason=(f"composite_scoring [{cal_horizon}] Spearman rho={rho:+.3f} (score→realized-alpha rank{p_txt}); "
+                    f"assessment={assessment}{beat_txt} over N={n_cal}. "
+                    f"Canonical-21d composite signal graded separately as research_composite_ic."),
         ))
     elif score_cal and score_cal.get("status") == "ok" and "monotonic" in score_cal:
         # Legacy fallback: pre-2026-06-07 artifacts without the Spearman fields.
@@ -302,8 +318,8 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         mono = bool(score_cal["monotonic"])
         beat = score_cal.get("beat_spy_pct")
         components.append(build_metric(
-            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
-            estimator="legacy_monotonic_binary_deprecated", measurement_horizon="21d", reliability="low",
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
+            estimator="legacy_monotonic_binary_deprecated", measurement_horizon=cal_horizon, reliability="low",
             value=1.0 if mono else 0.0, n_samples=score_cal.get("n"), n_floor=1, source_path=sc_src,
             status="WATCH",
             reason=(f"composite_scoring legacy monotonic={mono} — DEPRECATED brittle bucket binary, "
@@ -314,8 +330,8 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         ))
     else:
         components.append(build_metric(
-            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="critical",
-            estimator="spearman_calibration", measurement_horizon="21d",
+            name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
+            estimator="spearman_calibration", measurement_horizon=cal_horizon,
             n_floor=30, source_path=sc_src, input_present=False,
             na_detail="composite_scoring: score_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
