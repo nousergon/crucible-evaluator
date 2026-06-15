@@ -185,6 +185,36 @@ class TestNAComponents:
         assert "29" in _comp(tile, "inference_coverage")["status_reason"]
 
 
+class TestInferenceCoverage:
+    """config#1075: graded from the producer-persisted universe denominator."""
+
+    def test_high_coverage_green(self, s3):
+        latest = {**_LATEST, "n_universe": 30, "n_universe_covered": 29}
+        _seed(s3, latest=latest)
+        ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
+        assert ic["value"] == pytest.approx(29 / 30)
+        assert ic["status"] == "GREEN"  # 96.7% > target 95%
+        assert "29/30" in ic["status_reason"]
+
+    def test_low_coverage_red(self, s3):
+        latest = {**_LATEST, "n_universe": 30, "n_universe_covered": 20}
+        _seed(s3, latest=latest)
+        ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
+        assert ic["value"] == pytest.approx(20 / 30)
+        assert ic["status"] == "RED"  # 66.7% < red-line 80%
+
+    def test_absent_denominator_is_missing_input(self, s3):
+        _seed(s3)  # _LATEST has no n_universe
+        ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
+        assert ic["status"] == "N/A-MISSING-INPUT"
+
+    def test_zero_universe_is_missing_input(self, s3):
+        latest = {**_LATEST, "n_universe": 0, "n_universe_covered": 0}
+        _seed(s3, latest=latest)
+        ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
+        assert ic["status"] == "N/A-MISSING-INPUT"  # no /0
+
+
 class TestSlimCacheFreshness:
     def test_wired_from_s3_lastmodified(self, s3):
         # config#859: slim_cache_freshness is now sourced from the slim-cache
