@@ -238,13 +238,32 @@ def build_predictor_tile(bucket: str, s3_client=None, *, as_of: datetime | None 
         n_floor=30, target=0.60, red_line=0.40, source_path=latest_src, input_present=False,
         na_detail="veto_gate_precision: needs the backtester shadow-book + realized-outcome join (backtest/{date}/veto_analysis.json); not sourced from predictor metrics. Cross-tile follow-up.",
     ))
-    components.append(build_metric(
-        name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
-        estimator="coverage_proportion",
-        value=None, n_floor=1, target=0.95, red_line=0.80, source_path=latest_src, input_present=False,
-        na_detail=(f"inference_coverage: n_predictions_today={latest.get('n_predictions_today')} observed, "
-                   "but the tradable-universe denominator (signals.json universe count) is not joined yet to compute %. Follow-up."),
-    ))
+    # inference_coverage (critical) — fraction of the intended tradable universe
+    # that got a prediction. The producer persists the denominator + covered
+    # count (config#1075); we grade covered/universe ∈ [0,1]. Honest N/A until
+    # the producer field lands (or when the universe is empty this cycle).
+    n_universe = latest.get("n_universe")
+    n_covered = latest.get("n_universe_covered")
+    n_preds_today = latest.get("n_predictions_today")
+    if isinstance(n_universe, int) and n_universe > 0 and isinstance(n_covered, int):
+        coverage = n_covered / n_universe
+        components.append(build_metric(
+            name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="coverage_proportion",
+            value=coverage, n_samples=n_universe, n_floor=1, target=0.95, red_line=0.80,
+            source_path=latest_src,
+            reason=(f"inference_coverage = {coverage:.1%} ({n_covered}/{n_universe} tradable-universe "
+                    f"tickers predicted) vs target 95% / red-line 80%."),
+        ))
+    else:
+        components.append(build_metric(
+            name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="coverage_proportion",
+            value=None, n_floor=1, target=0.95, red_line=0.80, source_path=latest_src, input_present=False,
+            na_detail=(f"inference_coverage: n_predictions_today={n_preds_today} observed, but the "
+                       "tradable-universe denominator (n_universe) is absent/zero in latest.json this "
+                       "cycle (predictor config#1075 producer field not present yet)."),
+        ))
     # slim_cache_freshness (supporting) — days since the 2y inference slim-cache
     # last refreshed (weekly cadence). Sourced directly from the slim-cache
     # objects' LastModified (config#859 — was an unwired N/A; mirrors the
