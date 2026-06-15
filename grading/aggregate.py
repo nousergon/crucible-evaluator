@@ -79,7 +79,7 @@ def build_report_card(
     #     tripwire (L4514/config#698 — all components supporting/diagnostic during soak)
     tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
-        "predictor": build_predictor_tile(bucket, s3_client=s3_client),
+        "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
         "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),

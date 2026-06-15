@@ -75,8 +75,15 @@ def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
     return latest
 
 
-def build_predictor_tile(bucket: str, s3_client=None, *, as_of: datetime | None = None) -> dict:
-    """Build the Predictor tile from the predictor's metrics + weights manifest."""
+def build_predictor_tile(
+    bucket: str, run_date: str | None = None, s3_client=None, *, as_of: datetime | None = None
+) -> dict:
+    """Build the Predictor tile from the predictor's metrics + weights manifest.
+
+    ``run_date`` (YYYY-MM-DD) enables the cross-tile veto_gate_precision read
+    from ``backtest/{run_date}/veto_analysis.json``; when omitted that one
+    component grades a transparent N/A.
+    """
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
     latest = _get_json(s3, bucket, LATEST_KEY)
@@ -232,12 +239,50 @@ def build_predictor_tile(bucket: str, s3_client=None, *, as_of: datetime | None 
             na_detail="output_distribution_gate: no gate result in latest.json this cycle.",
         ))
 
-    # 8-10. Cross-tile / unresolved inputs — precise N/A (not silent omission).
-    components.append(build_metric(
-        name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
-        n_floor=30, target=0.60, red_line=0.40, source_path=latest_src, input_present=False,
-        na_detail="veto_gate_precision: needs the backtester shadow-book + realized-outcome join (backtest/{date}/veto_analysis.json); not sourced from predictor metrics. Cross-tile follow-up.",
-    ))
+    # veto_gate_precision (supporting) — precision of the veto gate AT THE LIVE
+    # threshold: of the names the gate vetoed, the fraction that actually
+    # underperformed (did not beat SPY). Cross-tile read from the backtester's
+    # backtest/{run_date}/veto_analysis.json (config#859 — was an unwired N/A).
+    # 10d-horizon measurement (beat_spy_10d), hence supporting not critical.
+    veto_key = f"backtest/{run_date}/veto_analysis.json" if run_date else None
+    veto_src = f"s3://{bucket}/{veto_key}" if veto_key else latest_src
+    va = _get_json(s3, bucket, veto_key) if veto_key else None
+    va_match = None
+    if va:
+        cur = va.get("current_threshold")
+        entries = [e for e in (va.get("thresholds") or []) if e.get("precision") is not None]
+        if cur is not None and entries:
+            va_match = min(entries, key=lambda e: abs((e.get("confidence") or 0) - cur))
+    if va_match is not None:
+        ci = va_match.get("precision_ci_95")
+        ci_low = ci[0] if isinstance(ci, (list, tuple)) and len(ci) >= 2 else None
+        ci_high = ci[1] if isinstance(ci, (list, tuple)) and len(ci) >= 2 else None
+        prec = va_match["precision"]
+        n_v = va_match.get("n_vetoes")
+        conf = va_match.get("confidence") or 0.0
+        components.append(build_metric(
+            name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
+            estimator="wilson_precision", measurement_horizon="10d",
+            value=prec, n_samples=n_v, n_floor=30, target=0.60, red_line=0.40,
+            ci_low=ci_low, ci_high=ci_high, ci_method="wilson" if ci_low is not None else None,
+            source_path=veto_src,
+            reason=(f"veto_gate_precision [10d] = {prec:.1%} at the live veto threshold {conf:.2f} "
+                    f"({va_match.get('true_negatives')}/{n_v} vetoed names underperformed) "
+                    f"vs target 60% / red-line 40%."),
+        ))
+    else:
+        if run_date is None:
+            na = "veto_gate_precision: run_date not provided to the predictor tile; cross-tile veto_analysis.json read skipped."
+        elif va is None:
+            na = f"veto_gate_precision: {veto_key} absent this cycle."
+        else:
+            na = f"veto_gate_precision: veto_analysis.json has no usable precision at the live threshold (status={va.get('status')}) this cycle."
+        components.append(build_metric(
+            name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
+            estimator="wilson_precision", measurement_horizon="10d",
+            n_floor=30, target=0.60, red_line=0.40, source_path=veto_src, input_present=False,
+            na_detail=na,
+        ))
     # inference_coverage (critical) — fraction of the intended tradable universe
     # that got a prediction. The producer persists the denominator + covered
     # count (config#1075); we grade covered/universe ∈ [0,1]. Honest N/A until
