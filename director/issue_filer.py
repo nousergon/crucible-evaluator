@@ -47,7 +47,7 @@ from director.schema import ActionItem, DirectorWeeklyActionPlan
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REPO = "cipher813/alpha-engine-config"
+DEFAULT_REPO = "nousergon/alpha-engine-config"
 PROPOSAL_LABEL = "area:director-proposals"
 
 

@@ -56,7 +56,7 @@ from director.schema import ActionItem, DirectorWeeklyActionPlan
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REPO = "cipher813/alpha-engine-config"
+DEFAULT_REPO = "nousergon/alpha-engine-config"
 DEFAULT_PATH = "private-docs/ROADMAP.md"
 DEFAULT_BASE = "main"
 TOKEN_SECRET_NAME = "DIRECTOR_GITHUB_TOKEN"  # SSM /alpha-engine/DIRECTOR_GITHUB_TOKEN

@@ -61,7 +61,7 @@ class FakeGitHub:
             self.posted.append(body)
             self._next_number += 1
             return 201, {"number": self._next_number,
-                         "html_url": f"https://github.com/cipher813/alpha-engine-config/issues/{self._next_number}"}
+                         "html_url": f"https://github.com/nousergon/alpha-engine-config/issues/{self._next_number}"}
         raise AssertionError(f"unexpected call: {method} {url}")
 
 
