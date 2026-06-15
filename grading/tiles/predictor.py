@@ -19,6 +19,7 @@ Spec: ``system-report-card-revamp-260522.md`` Tile 2.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 MODULE = "predictor"
 LATEST_KEY = "predictor/metrics/latest.json"
 MANIFEST_KEY = "predictor/weights/meta/manifest.json"
+SLIM_CACHE_PREFIX = "predictor/price_cache_slim/"
 
 # The DIRECTIONAL L1 model outputs — the three columns in META_FEATURES that are
 # themselves OOS L1 predictions trained against the SAME signed alpha label the
@@ -57,9 +59,26 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
-def build_predictor_tile(bucket: str, s3_client=None) -> dict:
+def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
+    """Max LastModified across objects under ``prefix`` (None if empty)."""
+    latest = None
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                lm = obj["LastModified"]
+                if latest is None or lm > latest:
+                    latest = lm
+    except ClientError as e:
+        logger.error("S3 list failed for s3://%s/%s: %s", bucket, prefix, e)
+        raise
+    return latest
+
+
+def build_predictor_tile(bucket: str, s3_client=None, *, as_of: datetime | None = None) -> dict:
     """Build the Predictor tile from the predictor's metrics + weights manifest."""
     s3 = s3_client or boto3.client("s3")
+    as_of = as_of or datetime.now(UTC)
     latest = _get_json(s3, bucket, LATEST_KEY)
     manifest = _get_json(s3, bucket, MANIFEST_KEY)
     latest_src = f"s3://{bucket}/{LATEST_KEY}"
@@ -226,12 +245,29 @@ def build_predictor_tile(bucket: str, s3_client=None) -> dict:
         na_detail=(f"inference_coverage: n_predictions_today={latest.get('n_predictions_today')} observed, "
                    "but the tradable-universe denominator (signals.json universe count) is not joined yet to compute %. Follow-up."),
     ))
-    components.append(build_metric(
-        name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
-        n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=latest_src,
-        input_present=False,
-        na_detail="slim_cache_freshness: slim-cache S3 prefix not resolved (predictor/price_cache_slim/ empty); needs the live cache path to compute age. Follow-up.",
-    ))
+    # slim_cache_freshness (supporting) — days since the 2y inference slim-cache
+    # last refreshed (weekly cadence). Sourced directly from the slim-cache
+    # objects' LastModified (config#859 — was an unwired N/A; mirrors the
+    # substrate tile's price_cache_freshness).
+    slim_src = f"s3://{bucket}/{SLIM_CACHE_PREFIX}"
+    slim_mtime = _latest_mtime(s3, bucket, SLIM_CACHE_PREFIX)
+    if slim_mtime is not None:
+        slim_age_d = (as_of - slim_mtime).total_seconds() / 86400.0
+        components.append(build_metric(
+            name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
+            estimator="freshness_age",
+            value=slim_age_d, n_samples=1, n_floor=1, target=7.0, red_line=14.0,
+            higher_is_better=False, source_path=slim_src,
+            reason=f"slim_cache_freshness = {slim_age_d:.1f}d since the inference slim-cache last refreshed vs target 7d / red-line 14d.",
+        ))
+    else:
+        components.append(build_metric(
+            name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
+            estimator="freshness_age",
+            n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=slim_src,
+            input_present=False,
+            na_detail="slim_cache_freshness: no objects under predictor/price_cache_slim/ to date-stamp.",
+        ))
 
     # 11. feature_drift_ks (diagnostic) — not yet produced.
     components.append(build_metric(
