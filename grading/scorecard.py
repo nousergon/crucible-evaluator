@@ -14,7 +14,7 @@ weighted composite. Components with insufficient data receive a grade of None
 and are excluded from module-level averages.
 
 PROVENANCE — verbatim port of ``analysis/grading.py`` from
-``cipher813/alpha-engine-backtester`` @ commit f46e7e6 (2026-06-04). The
+``nousergon/crucible-backtester`` @ commit f46e7e6 (2026-06-04). The
 function is pure (no S3/disk reads, no backtester-internal imports), so the
 port is a straight copy: the evaluator owns grading natively (Option B of
 ``director-implementation-plan-260604.md`` §2.4) by instantiating this pure
