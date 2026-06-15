@@ -215,6 +215,70 @@ class TestInferenceCoverage:
         assert ic["status"] == "N/A-MISSING-INPUT"  # no /0
 
 
+_RUN_DATE = "2026-06-14"
+
+
+def _put_veto(s3, payload):
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{_RUN_DATE}/veto_analysis.json",
+        Body=json.dumps(payload).encode(),
+    )
+
+
+class TestVetoGatePrecision:
+    """config#859: precision of the veto gate at the LIVE threshold, read
+    cross-tile from backtest/{run_date}/veto_analysis.json."""
+
+    _OK = {
+        "status": "ok", "current_threshold": 0.65, "base_rate": 0.5,
+        "thresholds": [
+            {"confidence": 0.55, "n_vetoes": 40, "true_negatives": 20,
+             "precision": 0.50, "precision_ci_95": [0.35, 0.65]},
+            {"confidence": 0.65, "n_vetoes": 50, "true_negatives": 35,
+             "precision": 0.70, "precision_ci_95": [0.56, 0.81]},
+        ],
+    }
+
+    def test_grades_precision_at_live_threshold(self, s3):
+        _seed(s3)
+        _put_veto(s3, self._OK)
+        vg = _comp(build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3), "veto_gate_precision")
+        assert vg["value"] == pytest.approx(0.70)  # the 0.65 entry, not the 0.55 one
+        assert vg["status"] == "GREEN"  # 70% > target 60%
+        assert vg["ci_method"] == "wilson"
+        assert "0.65" in vg["status_reason"]
+
+    def test_low_precision_red(self, s3):
+        _seed(s3)
+        payload = {**self._OK, "thresholds": [
+            {"confidence": 0.65, "n_vetoes": 50, "true_negatives": 15,
+             "precision": 0.30, "precision_ci_95": [0.18, 0.44]},
+        ]}
+        _put_veto(s3, payload)
+        vg = _comp(build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3), "veto_gate_precision")
+        assert vg["status"] == "RED"  # 30% < red-line 40%
+
+    def test_absent_artifact_missing_input(self, s3):
+        _seed(s3)  # no veto_analysis.json
+        vg = _comp(build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3), "veto_gate_precision")
+        assert vg["status"] == "N/A-MISSING-INPUT"
+        assert "absent" in vg["status_reason"]
+
+    def test_no_run_date_missing_input(self, s3):
+        _seed(s3)
+        _put_veto(s3, self._OK)  # present, but run_date not passed
+        vg = _comp(build_predictor_tile(BUCKET, s3_client=s3), "veto_gate_precision")
+        assert vg["status"] == "N/A-MISSING-INPUT"
+        assert "run_date not provided" in vg["status_reason"]
+
+    def test_insufficient_status_no_precision_na(self, s3):
+        _seed(s3)
+        _put_veto(s3, {"status": "insufficient_data", "current_threshold": 0.65, "thresholds": []})
+        vg = _comp(build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3), "veto_gate_precision")
+        assert vg["status"] == "N/A-MISSING-INPUT"
+        assert "insufficient_data" in vg["status_reason"]
+
+
 class TestSlimCacheFreshness:
     def test_wired_from_s3_lastmodified(self, s3):
         # config#859: slim_cache_freshness is now sourced from the slim-cache
