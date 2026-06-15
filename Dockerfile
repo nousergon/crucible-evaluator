@@ -12,7 +12,7 @@ RUN microdnf install -y git && microdnf clean all
 # no 250MB unzip limit, so we install the full [quant-stats] extra
 # (numpy+pandas+scipy) verbatim.
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir "alpha-engine-lib[quant-stats] @ git+https://github.com/cipher813/alpha-engine-lib@v0.52.0" && \
+RUN pip install --no-cache-dir "alpha-engine-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.52.0" && \
     grep -vE "^#|^$|^pytest|^pytest-cov|^moto|^python-dotenv|^boto3|^botocore|^s3transfer|^alpha-engine-lib" requirements.txt > /tmp/req-lambda.txt && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt

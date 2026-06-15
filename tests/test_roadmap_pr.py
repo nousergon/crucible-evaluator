@@ -163,7 +163,7 @@ class FakeGitHub:
         if method == "GET" and "/pulls?" in url:
             return 200, list(self.existing_prs)
         if method == "POST" and url.endswith("/pulls"):
-            return 201, {"html_url": "https://github.com/cipher813/alpha-engine-config/pull/99"}
+            return 201, {"html_url": "https://github.com/nousergon/alpha-engine-config/pull/99"}
         raise AssertionError(f"unexpected call: {method} {url}")
 
     @property
@@ -202,13 +202,13 @@ def test_open_roadmap_pr_nochange_when_all_filed():
     assert res["n_filed"] == 0
     # Short-circuits after the first contents GET — no branch/commit/PR.
     assert gh.calls == [("GET",
-                         "https://api.github.com/repos/cipher813/alpha-engine-config/"
+                         "https://api.github.com/repos/nousergon/alpha-engine-config/"
                          "contents/private-docs/ROADMAP.md?ref=main")]
 
 
 def test_open_roadmap_pr_returns_existing_open_pr():
     gh = FakeGitHub()
-    gh.existing_prs = [{"html_url": "https://github.com/cipher813/alpha-engine-config/pull/42"}]
+    gh.existing_prs = [{"html_url": "https://github.com/nousergon/alpha-engine-config/pull/42"}]
     res = rp.open_roadmap_pr(_plan("brand-new"), "2026-06-05", token="tok", gh_request=gh)
     assert res["pr_url"].endswith("/pull/42")
     # Did NOT POST a second PR.
