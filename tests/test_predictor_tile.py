@@ -1,6 +1,7 @@
 """Tests for grading/tiles/predictor.py — Tile 2, leak-free IC sourcing."""
 
 import json
+from datetime import timedelta
 
 import boto3
 import pytest
@@ -9,6 +10,7 @@ from moto import mock_aws
 from grading.tiles.predictor import (
     LATEST_KEY,
     MANIFEST_KEY,
+    SLIM_CACHE_PREFIX,
     build_predictor_tile,
 )
 
@@ -181,6 +183,34 @@ class TestNAComponents:
         assert _comp(tile, "feature_drift_ks")["status"] == "N/A-NOT-IMPL"
         # coverage reason carries the observed prediction count for context.
         assert "29" in _comp(tile, "inference_coverage")["status_reason"]
+
+
+class TestSlimCacheFreshness:
+    def test_wired_from_s3_lastmodified(self, s3):
+        # config#859: slim_cache_freshness is now sourced from the slim-cache
+        # objects' LastModified instead of grading a permanent N/A.
+        _seed(s3)
+        s3.put_object(Bucket=BUCKET, Key=f"{SLIM_CACHE_PREFIX}AAPL.parquet", Body=b"x")
+        # Read back the moto-assigned mtime so the age assertion is deterministic.
+        mtime = s3.list_objects_v2(Bucket=BUCKET, Prefix=SLIM_CACHE_PREFIX)["Contents"][0]["LastModified"]
+        tile = build_predictor_tile(BUCKET, s3_client=s3, as_of=mtime + timedelta(days=3))
+        sc = _comp(tile, "slim_cache_freshness")
+        assert sc["value"] == pytest.approx(3.0, abs=0.01)
+        assert sc["status"] == "GREEN"  # 3d < target 7d
+        assert "slim_cache_freshness = 3.0d" in sc["status_reason"]
+
+    def test_stale_slim_cache_grades_red(self, s3):
+        _seed(s3)
+        s3.put_object(Bucket=BUCKET, Key=f"{SLIM_CACHE_PREFIX}AAPL.parquet", Body=b"x")
+        mtime = s3.list_objects_v2(Bucket=BUCKET, Prefix=SLIM_CACHE_PREFIX)["Contents"][0]["LastModified"]
+        tile = build_predictor_tile(BUCKET, s3_client=s3, as_of=mtime + timedelta(days=20))
+        assert _comp(tile, "slim_cache_freshness")["status"] == "RED"  # 20d > red-line 14d
+
+    def test_absent_slim_cache_is_missing_input(self, s3):
+        _seed(s3)  # no slim-cache objects
+        sc = _comp(build_predictor_tile(BUCKET, s3_client=s3), "slim_cache_freshness")
+        assert sc["status"] == "N/A-MISSING-INPUT"
+        assert "price_cache_slim" in sc["status_reason"]
 
 
 class TestTileStatus:
