@@ -27,3 +27,11 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
+
+  # Alert (Telegram) on genuine post-merge failure of this workflow on the
+  # default branch. Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [analyze]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit
