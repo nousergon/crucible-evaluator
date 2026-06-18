@@ -333,13 +333,36 @@ def build_predictor_tile(
             na_detail="slim_cache_freshness: no objects under predictor/price_cache_slim/ to date-stamp.",
         ))
 
-    # 11. feature_drift_ks (diagnostic) — not yet produced.
-    components.append(build_metric(
-        name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
-        n_floor=30, target=0.10, red_line=0.25, higher_is_better=False, source_path=latest_src,
-        implemented=False,
-        na_detail="feature_drift_ks: inference-vs-training feature KS not yet computed/persisted by the predictor.",
-    ))
+    # 11. feature_drift_ks (diagnostic) — inference-vs-training KS (config#859).
+    #     Headline = max_ks (worst-feature drift); lower is better.
+    #     target 0.10 / red-line 0.25. Block emitted by the predictor inference
+    #     stage once a training reference exists.
+    fdk = latest.get("feature_drift_ks")
+    if fdk and fdk.get("max_ks") is not None:
+        max_ks = float(fdk["max_ks"])
+        per_feat = fdk.get("per_feature") or {}
+        worst = next(iter(per_feat.items()), None)
+        components.append(build_metric(
+            name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
+            estimator="ks_2samp_max", value=max_ks, n_samples=int(fdk.get("n_samples") or 0),
+            n_floor=30, target=0.10, red_line=0.25, higher_is_better=False, source_path=latest_src,
+            reason=(
+                f"feature_drift_ks: worst-feature inference-vs-training KS = {max_ks:.3f} "
+                f"across {fdk.get('n_features')} cross-sectional features"
+                + (f" (worst: {worst[0]}={worst[1]:.3f})" if worst else "")
+                + f", mean {fdk.get('mean_ks')}, vs target 0.10 / red-line 0.25."
+            ),
+        ))
+    else:
+        components.append(build_metric(
+            name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
+            n_floor=30, target=0.10, red_line=0.25, higher_is_better=False, source_path=latest_src,
+            input_present=False,
+            na_detail=(
+                "feature_drift_ks: feature_drift_ks block absent in metrics/latest.json "
+                "(no training reference yet, or inference compute degraded — config#859)."
+            ),
+        ))
 
     return build_tile(MODULE, components)
 
