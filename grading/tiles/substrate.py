@@ -45,6 +45,35 @@ _SF_NAMES = (
 _SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
 _SF_WINDOW_DAYS = 28
 
+# data_quality_incidents — the data collector's per-run quality gate emits
+# ``AlphaEngine/Data/daily_append_quality_blocked_count`` (rows EXCLUDED from the
+# feature store on a quality failure — the load-bearing incident) +
+# ``_warned_count`` (flagged-but-kept) per run (alpha-engine-data
+# builders/daily_append.py). We grade the trailing-4w SUM of BLOCKED as the
+# incident count; warned rides in the reason. Thresholds calibrated off the
+# 2026-06 baseline (~95 blocked / 4w ≈ 0.5%/day of ~900 tickers → GREEN); they
+# are a REGRESSION detector (WATCH ≈ 2x, RED ≈ 5x baseline), re-tune once a
+# trend establishes. (config#1150 Batch B.)
+_DQ_NAMESPACE = "AlphaEngine/Data"
+_DQ_BLOCKED_METRIC = "daily_append_quality_blocked_count"
+_DQ_WARNED_METRIC = "daily_append_quality_warned_count"
+
+
+def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
+    """Trailing-``window_days`` SUM of a CloudWatch metric, or None if no data."""
+    resp = cw.get_metric_statistics(
+        Namespace=namespace,
+        MetricName=metric,
+        StartTime=as_of - timedelta(days=window_days),
+        EndTime=as_of,
+        Period=window_days * 86400,
+        Statistics=["Sum"],
+    )
+    points = resp.get("Datapoints") or []
+    if not points:
+        return None
+    return float(sum(p.get("Sum", 0.0) for p in points))
+
 # SCHEDULED-cadence roles: an EventBridge-triggered run that is SUPPOSED to
 # complete on its own (the "unattended" target). Everything else role-carrying
 # (recovery / operator / operator-replay / backfill / shell-run) is an operator
@@ -200,6 +229,7 @@ def build_substrate_tile(
     *,
     as_of: datetime | None = None,
     sfn_client=None,
+    cloudwatch_client=None,
 ) -> dict:
     """Build the Substrate Reliability tile."""
     s3 = s3_client or boto3.client("s3")
@@ -314,11 +344,52 @@ def build_substrate_tile(
             unatt_detail=f"unattended_first_pass_rate: Step Functions read failed this cycle ({code}).",
         )
 
-    # 3-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
+    # 3. data_quality_incidents (critical) — trailing-4w SUM of feature-store
+    #    rows BLOCKED by the data-quality gate, read from CloudWatch (mirrors the
+    #    SF-history read above — the substrate tile is the one tile that reaches
+    #    AWS APIs, not just S3). Graceful N/A on a CW access error / missing perm
+    #    (a secondary read must not fail the whole card — WARN-logged, not
+    #    swallowed). config#1150 Batch B.
+    dq_src = f"cloudwatch:{_DQ_NAMESPACE}/{_DQ_BLOCKED_METRIC}"
+    try:
+        cw = cloudwatch_client or boto3.client(
+            "cloudwatch", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        blocked = _cw_metric_sum(cw, _DQ_NAMESPACE, _DQ_BLOCKED_METRIC, as_of, _SF_WINDOW_DAYS)
+        warned = _cw_metric_sum(cw, _DQ_NAMESPACE, _DQ_WARNED_METRIC, as_of, _SF_WINDOW_DAYS)
+        if blocked is None:
+            components.append(build_metric(
+                name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                n_floor=1, target=200.0, red_line=500.0, higher_is_better=False, source_path=dq_src,
+                ran=False,
+                na_detail=f"data_quality_incidents: no {_DQ_BLOCKED_METRIC} datapoints in CloudWatch over {_SF_WINDOW_DAYS}d.",
+            ))
+        else:
+            warned_s = f"{warned:.0f}" if warned is not None else "n/a"
+            components.append(build_metric(
+                name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                value=blocked, n_samples=1, n_floor=1, target=200.0, red_line=500.0,
+                higher_is_better=False, source_path=dq_src,
+                reason=(f"data_quality_incidents = {blocked:.0f} feature-store rows BLOCKED by the "
+                        f"quality gate over {_SF_WINDOW_DAYS}d (warned: {warned_s}) vs target 200 / "
+                        f"red-line 500 — a regression detector calibrated off the 2026-06 baseline."),
+            ))
+    except (ClientError, BotoCoreError) as e:
+        code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
+        logger.warning("data_quality_incidents: CloudWatch read failed (%s) — grading N/A", e)
+        components.append(build_metric(
+            name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
+            estimator="incident_count_4w", measurement_horizon="trailing_4w",
+            n_floor=1, target=200.0, red_line=500.0, higher_is_better=False, source_path=dq_src,
+            input_present=False,
+            na_detail=f"data_quality_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
+        ))
+
+    # 4-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
-        ("data_quality_incidents", "critical",
-         "data_quality_incidents: needs the data-quality substrate inventory (count of failing rows, last 4w) — not yet exposed to the evaluator."),
         ("schema_drift_incidents", "critical",
          "schema_drift_incidents: needs the ArcticDB StreamDescriptorMismatch / schema-failure error log — not yet aggregated."),
         ("deploy_success_rate", "supporting",
