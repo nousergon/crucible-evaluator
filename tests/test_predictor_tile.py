@@ -78,6 +78,35 @@ class TestMissing:
         assert tile["status"] == "WATCH"
 
 
+class TestFeatureDriftKS:
+    def _fdk(self, max_ks):
+        return {"feature_drift_ks": {
+            "max_ks": max_ks, "mean_ks": round(max_ks * 0.7, 4), "n_features": 6,
+            "n_samples": 120, "per_feature": {"expected_move": max_ks},
+        }}
+
+    def test_low_drift_green(self, s3):
+        _seed(s3, latest=self._fdk(0.06))
+        c = _comp(build_predictor_tile(BUCKET, s3_client=s3), "feature_drift_ks")
+        assert c["value"] == 0.06
+        assert c["status"] == "GREEN"  # 0.06 <= target 0.10 (lower is better)
+
+    def test_high_drift_red(self, s3):
+        _seed(s3, latest=self._fdk(0.40))
+        c = _comp(build_predictor_tile(BUCKET, s3_client=s3), "feature_drift_ks")
+        assert c["status"] == "RED"  # 0.40 >= red-line 0.25
+
+    def test_mid_drift_watch(self, s3):
+        _seed(s3, latest=self._fdk(0.18))
+        c = _comp(build_predictor_tile(BUCKET, s3_client=s3), "feature_drift_ks")
+        assert c["status"] == "WATCH"
+
+    def test_absent_block_missing_input(self, s3):
+        _seed(s3, latest={"status": "ok"})
+        c = _comp(build_predictor_tile(BUCKET, s3_client=s3), "feature_drift_ks")
+        assert c["status"] == "N/A-MISSING-INPUT"
+
+
 class TestLeakFreeSourcing:
     def test_meta_ic_uses_cpcv_not_in_sample(self, s3):
         _seed(s3)
@@ -180,7 +209,9 @@ class TestNAComponents:
         assert _comp(tile, "veto_gate_precision")["status"] == "N/A-MISSING-INPUT"
         assert _comp(tile, "inference_coverage")["status"] == "N/A-MISSING-INPUT"
         assert _comp(tile, "slim_cache_freshness")["status"] == "N/A-MISSING-INPUT"
-        assert _comp(tile, "feature_drift_ks")["status"] == "N/A-NOT-IMPL"
+        # feature_drift_ks is now IMPLEMENTED (config#859) — absent block →
+        # MISSING-INPUT, not NOT-IMPL.
+        assert _comp(tile, "feature_drift_ks")["status"] == "N/A-MISSING-INPUT"
         # coverage reason carries the observed prediction count for context.
         assert "29" in _comp(tile, "inference_coverage")["status_reason"]
 
