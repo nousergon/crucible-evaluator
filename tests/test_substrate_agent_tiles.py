@@ -205,9 +205,20 @@ class TestSfSuccessRate:
         assert _comp(tile, "unattended_first_pass_rate")["status"] == "N/A-NOT-RUN"
 
 
+RUN_DATE = "2026-06-20"
+
+
+def _put_agent_quality(s3, body):
+    import json
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/agent_quality.json",
+        Body=json.dumps(body).encode(),
+    )
+
+
 class TestAgent:
-    def test_all_components_na(self, s3):
-        tile = build_agent_tile(BUCKET, s3_client=s3)
+    def test_all_components_na_when_no_producer(self, s3):
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert tile["module"] == "agent"
         statuses = {c["status"] for c in tile["components"]}
         assert statuses <= {"N/A-NOT-IMPL", "N/A-MISSING-INPUT"}
@@ -215,18 +226,64 @@ class TestAgent:
         assert tile["status"] == "WATCH"
         assert tile["numeric_grade"] is None
 
+    def test_producer_components_missing_input_name_producer(self, s3):
+        """Absent agent_quality.json → the 5 wired components are MISSING-INPUT
+        (not NOT-IMPL) and name the producer issue — the live contract anchor."""
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        for name in ("agent_validation_failure_rate", "cost_per_signal",
+                     "retry_storm_count", "agent_latency_p95", "judge_rubric_distribution"):
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT", name
+            assert "agent_quality.json" in c["status_reason"], name
+            assert "config#1149" in c["status_reason"], name
+
     def test_stance_source_missing_input(self, s3):
-        tile = build_agent_tile(BUCKET, s3_client=s3)
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         ss = _comp(tile, "stance_source_provenance")
         assert ss["status"] == "N/A-MISSING-INPUT"
         assert "stance_source" in ss["status_reason"]
 
     def test_judge_kappa_not_impl_names_producer(self, s3):
-        tile = build_agent_tile(BUCKET, s3_client=s3)
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         jk = _comp(tile, "judge_calibration_cohen_kappa")
         assert jk["status"] == "N/A-NOT-IMPL"
         assert "decision_artifacts" in jk["status_reason"]
 
     def test_seven_components(self, s3):
-        tile = build_agent_tile(BUCKET, s3_client=s3)
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert tile["n_components"] == 7
+
+    def test_wired_validation_failure_rate_grades(self, s3):
+        """A healthy producer artifact grades the critical component GREEN."""
+        _put_agent_quality(s3, {
+            "status": "ok",
+            "agent_validation_failure_rate": {"value": 0.01, "n": 320},
+            "cost_per_signal": {"value": 0.40, "n": 25},
+            "retry_storm_count": {"value": 0, "n": 48},
+            "agent_latency_p95": {"value": 8200.0, "n": 48},
+            "judge_rubric_distribution": {"value": 0.30, "n": 60},
+        })
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        vfr = _comp(tile, "agent_validation_failure_rate")
+        assert vfr["value"] == 0.01
+        assert vfr["n_samples"] == 320
+        assert vfr["status"] == "GREEN"  # 1% < 2% target, lower-is-better
+        assert _comp(tile, "retry_storm_count")["status"] == "GREEN"
+        assert _comp(tile, "agent_latency_p95")["value"] == 8200.0
+
+    def test_wired_validation_failure_rate_red(self, s3):
+        _put_agent_quality(s3, {
+            "status": "ok",
+            "agent_validation_failure_rate": {"value": 0.18, "n": 300},
+        })
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        vfr = _comp(tile, "agent_validation_failure_rate")
+        assert vfr["value"] == 0.18
+        assert vfr["status"] == "RED"  # 18% > 10% red-line
+        # the un-supplied blocks stay MISSING-INPUT, not crashing.
+        assert _comp(tile, "cost_per_signal")["status"] == "N/A-MISSING-INPUT"
+
+    def test_non_ok_status_degrades_to_missing_input(self, s3):
+        _put_agent_quality(s3, {"status": "error", "agent_validation_failure_rate": {"value": 0.5}})
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert _comp(tile, "agent_validation_failure_rate")["status"] == "N/A-MISSING-INPUT"

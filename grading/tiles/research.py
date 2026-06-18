@@ -404,14 +404,70 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             ),
         ))
 
-    # 7-9. Aspirational components not yet produced — transparent N/A-NOT-IMPL.
-    for name, crit in (("judge_rubric_pass_rate", "supporting"),
-                       ("pillar_emit_coverage", "supporting"),
-                       ("signal_volume_adequacy", "diagnostic")):
+    # 7-9. Agent-quality producer components (config Batch A #1149). These read
+    #      backtest/{date}/agent_quality.json — the same artifact the Agent tile
+    #      reads — but grade the research-output-quality axis (judge pass-rate,
+    #      pillar coverage, signal volume). Absent → precise N/A-MISSING-INPUT
+    #      naming the producer, self-activating on the first agent_quality.json.
+    aq_key = f"{prefix}/agent_quality.json"
+    aq_src = f"s3://{bucket}/{aq_key}"
+    aq = _get_json(s3, bucket, aq_key)
+
+    def _aq_block(key: str) -> dict | None:
+        if not aq or aq.get("status") != "ok":
+            return None
+        blk = aq.get(key)
+        return blk if isinstance(blk, dict) and blk.get("value") is not None else None
+
+    # 7. judge_rubric_pass_rate (supporting) — % of judge evals clearing the
+    #    rubric pass threshold (higher better).
+    blk = _aq_block("judge_rubric_pass_rate")
+    if blk is not None:
         components.append(build_metric(
-            name=name, module=MODULE, metric_type="pct", criticality=crit, n_floor=1,
-            source_path=f"s3://{bucket}/{prefix}/", implemented=False,
-            na_detail=f"{name}: producer-side analysis not yet implemented/persisted for the report card.",
+            name="judge_rubric_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            value=blk["value"], n_samples=blk.get("n"), n_floor=10, target=0.85, red_line=0.60,
+            source_path=aq_src,
+            reason=f"judge_rubric_pass_rate = {blk['value']:.1%} (N={blk.get('n')} evals) vs target 85% / red-line 60%.",
+        ))
+    else:
+        components.append(build_metric(
+            name="judge_rubric_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            n_floor=10, target=0.85, red_line=0.60, source_path=aq_src, input_present=False,
+            na_detail="judge_rubric_pass_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+        ))
+
+    # 8. pillar_emit_coverage (supporting) — % of universe entries carrying a
+    #    pillar_assessment (higher better).
+    blk = _aq_block("pillar_emit_coverage")
+    if blk is not None:
+        components.append(build_metric(
+            name="pillar_emit_coverage", module=MODULE, metric_type="pct", criticality="supporting",
+            value=blk["value"], n_samples=blk.get("n"), n_floor=10, target=0.90, red_line=0.50,
+            source_path=aq_src,
+            reason=f"pillar_emit_coverage = {blk['value']:.1%} (N={blk.get('n')} universe entries) vs target 90% / red-line 50%.",
+        ))
+    else:
+        components.append(build_metric(
+            name="pillar_emit_coverage", module=MODULE, metric_type="pct", criticality="supporting",
+            n_floor=10, target=0.90, red_line=0.50, source_path=aq_src, input_present=False,
+            na_detail="pillar_emit_coverage: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+        ))
+
+    # 9. signal_volume_adequacy (diagnostic) — count of finalized signals vs the
+    #    adequacy floor (higher better).
+    blk = _aq_block("signal_volume_adequacy")
+    if blk is not None:
+        components.append(build_metric(
+            name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
+            value=blk["value"], n_samples=blk.get("n"), n_floor=1, target=20.0, red_line=8.0,
+            source_path=aq_src,
+            reason=f"signal_volume_adequacy = {blk['value']:.0f} finalized signals vs target 20 / red-line 8.",
+        ))
+    else:
+        components.append(build_metric(
+            name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
+            n_floor=1, target=20.0, red_line=8.0, source_path=aq_src, input_present=False,
+            na_detail="signal_volume_adequacy: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     return build_tile(MODULE, components)
