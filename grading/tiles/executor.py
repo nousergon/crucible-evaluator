@@ -57,6 +57,9 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     shadow = _get_json(s3, bucket, f"{prefix}/shadow_book.json")
     exits = _get_json(s3, bucket, f"{prefix}/exit_timing.json")
     exc = _get_json(s3, bucket, f"{prefix}/portfolio_excursion.json")
+    # reconciliation_audit lives under trades/{date}/ (executor EOD producer),
+    # NOT backtest/{date}/ — it is daily broker-vs-ledger state, config#859.
+    recon = _get_json(s3, bucket, f"trades/{run_date}/reconciliation_audit.json")
     components = []
 
     def src(name):
@@ -189,13 +192,45 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         na_detail="action_entropy: decision-stream entropy not persisted this cycle.",
     ))
 
-    # 7. reconciliation_integrity (critical) — EOD NAV parity audit, not yet produced.
-    components.append(build_metric(
-        name="reconciliation_integrity", module=MODULE, metric_type="pct", criticality="critical",
-        estimator="reconciliation_match_rate",
-        n_floor=1, target=1.0, red_line=0.0, source_path=f"s3://{bucket}/trades/", implemented=False,
-        na_detail="reconciliation_integrity: daemon-vs-IB NAV parity audit not yet produced/persisted for the report card.",
-    ))
+    # 7. reconciliation_integrity (critical) — ledger-vs-IB position parity
+    #    (config#859). Headline = reconciliation_match_rate from the executor's
+    #    trades/{date}/reconciliation_audit.json producer (the system's own
+    #    trade ledger reconstructed vs IB's actual positions — an INDEPENDENT
+    #    source, not the IB-vs-IB NAV tautology). target 1.0 / red-line 0.90:
+    #    perfect parity is GREEN, any drift is at least WATCH, <90% is a RED
+    #    integrity breakdown.
+    recon_src = f"s3://{bucket}/trades/{run_date}/reconciliation_audit.json"
+    if recon and recon.get("reconciliation_match_rate") is not None:
+        mr = float(recon["reconciliation_match_rate"])
+        n_pos = int(recon.get("n_positions") or 0)
+        n_mis = int(recon.get("n_mismatched") or 0)
+        dd = recon.get("daily_delta") or {}
+        dd_txt = (
+            f"; daily-delta {dd['match_rate']:.0%}"
+            if dd.get("computed") and dd.get("match_rate") is not None else ""
+        )
+        components.append(build_metric(
+            name="reconciliation_integrity", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="reconciliation_match_rate", measurement_horizon="eod",
+            value=mr, n_samples=n_pos, n_floor=1, target=1.0, red_line=0.90,
+            source_path=recon_src,
+            reason=(
+                f"reconciliation_integrity: ledger-vs-IB position parity = {mr:.1%} "
+                f"({n_pos - n_mis}/{n_pos} positions match, {n_mis} mismatched), "
+                f"status={recon.get('status')}{dd_txt}."
+            ),
+        ))
+    else:
+        components.append(build_metric(
+            name="reconciliation_integrity", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="reconciliation_match_rate", measurement_horizon="eod",
+            n_floor=1, target=1.0, red_line=0.90, source_path=recon_src, input_present=False,
+            na_detail=(
+                "reconciliation_integrity: reconciliation_audit.json absent this "
+                "cycle (executor EOD producer, config#859) — runs after a daemon "
+                "shutdown / EOD reconcile."
+            ),
+        ))
 
     return build_tile(MODULE, components)
 

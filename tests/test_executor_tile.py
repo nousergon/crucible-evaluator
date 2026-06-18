@@ -24,6 +24,10 @@ def _put(s3, name, data):
     s3.put_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/{name}", Body=json.dumps(data).encode())
 
 
+def _put_trades(s3, name, data):
+    s3.put_object(Bucket=BUCKET, Key=f"trades/{RUN_DATE}/{name}", Body=json.dumps(data).encode())
+
+
 def _comp(tile, name):
     return next(c for c in tile["components"] if c["name"] == name)
 
@@ -35,9 +39,42 @@ class TestMissing:
         assert _comp(tile, "entry_triggers")["status"] == "N/A-MISSING-INPUT"
         # position_sizing is genuinely unwired → NOT-IMPL, not MISSING-INPUT.
         assert _comp(tile, "position_sizing")["status"] == "N/A-NOT-IMPL"
-        assert _comp(tile, "reconciliation_integrity")["status"] == "N/A-NOT-IMPL"
+        # reconciliation_integrity is now IMPLEMENTED (config#859) — absent
+        # artifact → MISSING-INPUT, not NOT-IMPL.
+        assert _comp(tile, "reconciliation_integrity")["status"] == "N/A-MISSING-INPUT"
         # Critical components N/A → WATCH (never false GREEN).
         assert tile["status"] == "WATCH"
+
+
+class TestReconciliationIntegrity:
+    def test_perfect_parity_green(self, s3):
+        _put_trades(s3, "reconciliation_audit.json", {
+            "reconciliation_match_rate": 1.0, "status": "OK",
+            "n_positions": 12, "n_mismatched": 0,
+            "daily_delta": {"computed": True, "match_rate": 1.0},
+        })
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "reconciliation_integrity")
+        assert c["value"] == 1.0
+        assert c["status"] == "GREEN"
+        assert "12/12 positions match" in c["status_reason"]
+
+    def test_drift_below_red_line_is_red(self, s3):
+        _put_trades(s3, "reconciliation_audit.json", {
+            "reconciliation_match_rate": 0.80, "status": "DRIFT",
+            "n_positions": 10, "n_mismatched": 2,
+            "daily_delta": {"computed": True, "match_rate": 0.9},
+        })
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "reconciliation_integrity")
+        assert c["value"] == 0.80
+        assert c["status"] == "RED"
+
+    def test_minor_drift_is_watch(self, s3):
+        _put_trades(s3, "reconciliation_audit.json", {
+            "reconciliation_match_rate": 0.95, "status": "DRIFT",
+            "n_positions": 20, "n_mismatched": 1, "daily_delta": {"computed": False},
+        })
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "reconciliation_integrity")
+        assert c["status"] == "WATCH"
 
 
 class TestPopulated:
@@ -103,10 +140,14 @@ class TestPopulated:
         _put(s3, "shadow_book.json", {"status": "ok", "classification": {"precision": 0.65, "tp": 33, "fp": 17}})
         _put(s3, "exit_timing.json", {"status": "ok", "n_roundtrips": 40, "summary": {"capture_winners_median": 0.78, "n_winners": 30}})
         _put(s3, "portfolio_excursion.json", {"status": "ok", "mean_mfe_mae_ratio": 1.7, "pct_high_quality": 0.55, "n": 40})
+        _put_trades(s3, "reconciliation_audit.json", {
+            "reconciliation_match_rate": 1.0, "status": "OK", "n_positions": 8, "n_mismatched": 0,
+            "daily_delta": {"computed": True, "match_rate": 1.0},
+        })
         tile = build_executor_tile(BUCKET, RUN_DATE, s3_client=s3)
-        # 3 critical GREEN (triggers/guard/exits); reconciliation is critical N/A-NOT-IMPL → WATCH.
+        # 4 critical GREEN (triggers/guard/exits/reconciliation) → tile GREEN.
         assert _comp(tile, "entry_triggers")["status"] == "GREEN"
         assert _comp(tile, "risk_guard")["status"] == "GREEN"
         assert _comp(tile, "exit_rules")["status"] == "GREEN"
-        # reconciliation_integrity (critical, N/A-NOT-IMPL) keeps the tile at WATCH.
-        assert tile["status"] == "WATCH"
+        assert _comp(tile, "reconciliation_integrity")["status"] == "GREEN"
+        assert tile["status"] == "GREEN"
