@@ -287,3 +287,59 @@ class TestAgent:
         _put_agent_quality(s3, {"status": "error", "agent_validation_failure_rate": {"value": 0.5}})
         tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert _comp(tile, "agent_validation_failure_rate")["status"] == "N/A-MISSING-INPUT"
+
+
+class _FakeCW:
+    """Stub CloudWatch client: maps metric name → trailing-window Sum (or None
+    for no datapoints), or raises a preset exception."""
+
+    def __init__(self, sums=None, raises=None):
+        self._sums = sums or {}
+        self._raises = raises
+
+    def get_metric_statistics(self, *, MetricName, **kw):
+        if self._raises is not None:
+            raise self._raises
+        s = self._sums.get(MetricName)
+        return {"Datapoints": [] if s is None else [{"Sum": s}]}
+
+
+class TestDataQualityIncidents:
+    def _tile(self, s3, cw):
+        return build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC), cloudwatch_client=cw)
+
+    def test_baseline_green(self, s3):
+        cw = _FakeCW({"daily_append_quality_blocked_count": 95.0,
+                      "daily_append_quality_warned_count": 34.0})
+        dq = _comp(self._tile(s3, cw), "data_quality_incidents")
+        assert dq["value"] == 95.0
+        assert dq["status"] == "GREEN"          # 95 < 200 target, lower-is-better
+        assert "warned: 34" in dq["status_reason"]
+
+    def test_regression_red(self, s3):
+        cw = _FakeCW({"daily_append_quality_blocked_count": 600.0})
+        dq = _comp(self._tile(s3, cw), "data_quality_incidents")
+        assert dq["value"] == 600.0
+        assert dq["status"] == "RED"            # > 500 red-line
+
+    def test_regression_watch(self, s3):
+        cw = _FakeCW({"daily_append_quality_blocked_count": 300.0})
+        dq = _comp(self._tile(s3, cw), "data_quality_incidents")
+        assert dq["status"] == "WATCH"          # between target and red-line
+
+    def test_no_datapoints_not_run(self, s3):
+        cw = _FakeCW({"daily_append_quality_blocked_count": None})
+        dq = _comp(self._tile(s3, cw), "data_quality_incidents")
+        assert dq["status"] == "N/A-NOT-RUN"
+
+    def test_cw_access_error_missing_input_names_perm(self, s3):
+        from botocore.exceptions import ClientError
+        err = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetMetricStatistics")
+        dq = _comp(self._tile(s3, _FakeCW(raises=err)), "data_quality_incidents")
+        assert dq["status"] == "N/A-MISSING-INPUT"
+        assert "cloudwatch:GetMetricStatistics" in dq["status_reason"]
+
+    def test_schema_drift_still_not_impl(self, s3):
+        dq = _comp(self._tile(s3, _FakeCW()), "schema_drift_incidents")
+        assert dq["status"] == "N/A-NOT-IMPL"
+        assert "StreamDescriptorMismatch" in dq["status_reason"]
