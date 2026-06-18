@@ -310,3 +310,39 @@ class TestAspirationalNA:
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         for name in ("judge_rubric_pass_rate", "pillar_emit_coverage", "signal_volume_adequacy"):
             assert _comp(tile, name)["status"] == "N/A-NOT-IMPL"
+
+
+class TestMomentumRegimeIC:
+    def _e2e(self, mri):
+        d = dict(_E2E)
+        d["momentum_regime_ic"] = mri
+        return d
+
+    def test_present_grades_on_low_breadth_ic(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e({
+            "status": "ok", "n_weeks": 8, "low_breadth_ic": -0.115,
+            "high_breadth_ic": 0.030, "breadth_ic_corr": 0.58, "horizon": "21d",
+        }))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
+        assert m["value"] == pytest.approx(-0.115)
+        # low_breadth_ic below the -0.05 red-line → RED (momentum actively hurts).
+        assert m["status"] == "RED"
+        assert "breadth" in (m.get("status_reason") or "").lower()
+
+    def test_present_neutral_low_breadth_not_red(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e({
+            "status": "ok", "n_weeks": 8, "low_breadth_ic": 0.01,
+            "high_breadth_ic": 0.04, "breadth_ic_corr": 0.3, "horizon": "21d",
+        }))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
+        assert m["status"] != "RED"
+
+    def test_missing_block_na_missing_input(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)  # no momentum_regime_ic key
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+    def test_insufficient_status_na(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e({"status": "insufficient_data", "n_weeks": 2}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
