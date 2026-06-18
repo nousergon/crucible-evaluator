@@ -304,12 +304,31 @@ class TestMacroAndCalibration:
         assert cal["status"] == "GREEN"  # 0.03 < target 0.05
 
 
-class TestAspirationalNA:
-    def test_not_impl_components(self, s3):
+class TestAgentQualityComponents:
+    """judge_rubric_pass_rate / pillar_emit_coverage / signal_volume_adequacy
+    read backtest/{date}/agent_quality.json (config Batch A #1149)."""
+
+    def test_missing_input_when_no_producer(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
         tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
         for name in ("judge_rubric_pass_rate", "pillar_emit_coverage", "signal_volume_adequacy"):
-            assert _comp(tile, name)["status"] == "N/A-NOT-IMPL"
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT", name
+            assert "agent_quality.json" in c["status_reason"], name
+
+    def test_wired_grades_from_agent_quality(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "agent_quality.json", {
+            "status": "ok",
+            "judge_rubric_pass_rate": {"value": 0.90, "n": 60},
+            "pillar_emit_coverage": {"value": 0.95, "n": 25},
+            "signal_volume_adequacy": {"value": 24, "n": 24},
+        })
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        prr = _comp(tile, "judge_rubric_pass_rate")
+        assert prr["value"] == 0.90 and prr["status"] == "GREEN"
+        assert _comp(tile, "pillar_emit_coverage")["value"] == 0.95
+        assert _comp(tile, "signal_volume_adequacy")["value"] == 24
 
 
 class TestMomentumRegimeIC:
