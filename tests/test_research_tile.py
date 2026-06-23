@@ -334,6 +334,50 @@ class TestMacroAndCalibration:
         assert cal["status"] == "GREEN"  # 0.03 < target 0.05
 
 
+class TestNeutralizationLiveEfficacy:
+    """neutralization_live_efficacy reads neutralized_composite_ic.live_forward —
+    the LIVE #1142 cutover's forward edge (config#1187)."""
+
+    def _e2e_with_lf(self, lf):
+        e = json.loads(json.dumps(_E2E))
+        e["neutralized_composite_ic"] = {"status": "ok", "cutover_date": "2026-06-22", "live_forward": lf}
+        return e
+
+    def test_missing_when_no_live_forward(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)  # no neutralized_composite_ic block
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "config#1187" in m["status_reason"]
+
+    def test_accumulating_watch_low(self, s3):
+        # 2 post-cutover weeks, positive but not significant → WATCH/low.
+        _put(s3, "e2e_lift.json", self._e2e_with_lf({
+            "n_weeks": 2, "raw_mean_weekly_ic": -0.08, "neutralized_mean_weekly_ic": -0.01,
+            "mean_weekly_delta": 0.07, "delta_t_p": None, "recovers_edge_live": True, "significant": False}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "WATCH"
+        assert m["reliability"] == "low"
+        assert m["n_samples"] == 2
+
+    def test_significant_positive_green(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_with_lf({
+            "n_weeks": 6, "raw_mean_weekly_ic": -0.09, "neutralized_mean_weekly_ic": 0.03,
+            "mean_weekly_delta": 0.12, "delta_t_p": 0.01, "recovers_edge_live": True, "significant": True}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "GREEN"
+        assert m["reliability"] == "high"
+        assert m["value"] == 0.12
+
+    def test_significant_negative_red_revert_signal(self, s3):
+        # Live neutralization significantly HURTS → RED (revert candidate).
+        _put(s3, "e2e_lift.json", self._e2e_with_lf({
+            "n_weeks": 6, "raw_mean_weekly_ic": 0.02, "neutralized_mean_weekly_ic": -0.06,
+            "mean_weekly_delta": -0.08, "delta_t_p": 0.02, "recovers_edge_live": False, "significant": True}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "RED"
+        assert "revert" in m["status_reason"].lower()
+
+
 class TestAgentQualityComponents:
     """judge_rubric_pass_rate / pillar_emit_coverage / signal_volume_adequacy
     read backtest/{date}/agent_quality.json (config Batch A #1149)."""
