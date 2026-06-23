@@ -30,6 +30,7 @@ from botocore.exceptions import ClientError
 
 from alpha_engine_lib.quant.stats.intervals import wilson_score_interval
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -53,17 +54,24 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """Build the Executor tile from the backtester executor diagnostics."""
     s3 = s3_client or boto3.client("s3")
     prefix = f"backtest/{run_date}"
-    trig = _get_json(s3, bucket, f"{prefix}/trigger_scorecard.json")
-    shadow = _get_json(s3, bucket, f"{prefix}/shadow_book.json")
-    exits = _get_json(s3, bucket, f"{prefix}/exit_timing.json")
-    exc = _get_json(s3, bucket, f"{prefix}/portfolio_excursion.json")
+    # Windowed resolution (config#1190): the freshest artifact within the trailing
+    # window, so a partial/retried/off-cycle run still grades.
+    trig, _, _, _trig_key = get_json_windowed(s3, bucket, "backtest/{date}/trigger_scorecard.json", run_date)
+    shadow, _, _, _shadow_key = get_json_windowed(s3, bucket, "backtest/{date}/shadow_book.json", run_date)
+    exits, _, _, _exits_key = get_json_windowed(s3, bucket, "backtest/{date}/exit_timing.json", run_date)
+    exc, _, _, _exc_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_excursion.json", run_date)
     # reconciliation_audit lives under trades/{date}/ (executor EOD producer),
     # NOT backtest/{date}/ — it is daily broker-vs-ledger state, config#859.
-    recon = _get_json(s3, bucket, f"trades/{run_date}/reconciliation_audit.json")
+    recon, _, _, _recon_key = get_json_windowed(s3, bucket, "trades/{date}/reconciliation_audit.json", run_date)
+    _resolved = {
+        "trigger_scorecard.json": _trig_key, "shadow_book.json": _shadow_key,
+        "exit_timing.json": _exits_key, "portfolio_excursion.json": _exc_key,
+    }
     components = []
 
     def src(name):
-        return f"s3://{bucket}/{prefix}/{name}"
+        k = _resolved.get(name)
+        return f"s3://{bucket}/{k}" if k else f"s3://{bucket}/{prefix}/{name}"
 
     # 1. entry_triggers (critical) — win-rate vs SPY across timed entries (Wilson).
     ts_src = src("trigger_scorecard.json")
@@ -199,7 +207,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    source, not the IB-vs-IB NAV tautology). target 1.0 / red-line 0.90:
     #    perfect parity is GREEN, any drift is at least WATCH, <90% is a RED
     #    integrity breakdown.
-    recon_src = f"s3://{bucket}/trades/{run_date}/reconciliation_audit.json"
+    recon_src = (f"s3://{bucket}/{_recon_key}" if _recon_key
+                 else f"s3://{bucket}/trades/{run_date}/reconciliation_audit.json")
     if recon and recon.get("reconciliation_match_rate") is not None:
         mr = float(recon["reconciliation_match_rate"])
         n_pos = int(recon.get("n_positions") or 0)

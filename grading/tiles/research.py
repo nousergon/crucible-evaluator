@@ -27,6 +27,7 @@ from botocore.exceptions import ClientError
 
 from alpha_engine_lib.quant.stats.intervals import wilson_score_interval
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -129,11 +130,13 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """Build the Research tile from the e2e + research diagnostic artifacts."""
     s3 = s3_client or boto3.client("s3")
     prefix = f"backtest/{run_date}"
-    e2e = _get_json(s3, bucket, f"{prefix}/e2e_lift.json")
-    score_cal = _get_json(s3, bucket, f"{prefix}/score_calibration.json")
-    macro = _get_json(s3, bucket, f"{prefix}/macro_eval.json")
-    pcal = _get_json(s3, bucket, f"{prefix}/portfolio_calibration.json")
-    e2e_src = f"s3://{bucket}/{prefix}/e2e_lift.json"
+    # Windowed resolution (config#1190): grade off the freshest artifact within the
+    # trailing window so a partial/retried/off-cycle Saturday run still grades.
+    e2e, _, _, _e2e_key = get_json_windowed(s3, bucket, "backtest/{date}/e2e_lift.json", run_date)
+    score_cal, _, _, _score_key = get_json_windowed(s3, bucket, "backtest/{date}/score_calibration.json", run_date)
+    macro, _, _, _macro_key = get_json_windowed(s3, bucket, "backtest/{date}/macro_eval.json", run_date)
+    pcal, _, _, _pcal_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_calibration.json", run_date)
+    e2e_src = f"s3://{bucket}/{_e2e_key}" if _e2e_key else f"s3://{bucket}/{prefix}/e2e_lift.json"
     components = []
 
     e2e = e2e or {}
@@ -311,7 +314,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    research_composite_ic (final_score rank-IC vs 21d alpha) above; keeping
     #    BOTH critical would double-count the construct and let a sub-horizon
     #    proxy drive a Director P0 (the L4551/L4562 sub-horizon-proxy concern).
-    sc_src = f"s3://{bucket}/{prefix}/score_calibration.json"
+    sc_src = f"s3://{bucket}/{_score_key}" if _score_key else f"s3://{bucket}/{prefix}/score_calibration.json"
     # The score_calibration artifact is computed from the score_performance table,
     # which carries only 5d/10d/30d outcomes (NO 21d column) — the producer's
     # default horizon is 10d. Report the TRUE horizon from the artifact rather
@@ -368,7 +371,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         ))
 
     # 5. macro_agent (supporting) — macro accuracy lift vs realized regime (pp).
-    mac_src = f"s3://{bucket}/{prefix}/macro_eval.json"
+    mac_src = f"s3://{bucket}/{_macro_key}" if _macro_key else f"s3://{bucket}/{prefix}/macro_eval.json"
     if macro and macro.get("status") == "ok" and macro.get("accuracy_lift") is not None:
         components.append(build_metric(
             name="macro_agent", module=MODULE, metric_type="lift", criticality="supporting",
@@ -384,7 +387,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         ))
 
     # 6. calibration_diagnostics (supporting) — judge-vs-realized ECE (lower better).
-    pc_src = f"s3://{bucket}/{prefix}/portfolio_calibration.json"
+    pc_src = f"s3://{bucket}/{_pcal_key}" if _pcal_key else f"s3://{bucket}/{prefix}/portfolio_calibration.json"
     if pcal and pcal.get("status") == "ok" and pcal.get("ece") is not None:
         components.append(build_metric(
             name="calibration_diagnostics", module=MODULE, metric_type="calibration", criticality="supporting",
@@ -495,9 +498,8 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #      reads — but grade the research-output-quality axis (judge pass-rate,
     #      pillar coverage, signal volume). Absent → precise N/A-MISSING-INPUT
     #      naming the producer, self-activating on the first agent_quality.json.
-    aq_key = f"{prefix}/agent_quality.json"
-    aq_src = f"s3://{bucket}/{aq_key}"
-    aq = _get_json(s3, bucket, aq_key)
+    aq, _, _, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
+    aq_src = f"s3://{bucket}/{_aq_key}" if _aq_key else f"s3://{bucket}/{prefix}/agent_quality.json"
 
     def _aq_block(key: str) -> dict | None:
         if not aq or aq.get("status") != "ok":
