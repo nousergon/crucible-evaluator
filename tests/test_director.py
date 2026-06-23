@@ -127,6 +127,22 @@ class TestAgent:
         assert "OVERALL: RED" in human
         assert "old-1" in human
 
+    def test_build_messages_includes_resolved_digest_section(self):
+        msgs = build_messages(
+            _CARD,
+            roadmap_digest="#10 [P1] open thing",
+            resolved_digest="#1168 (closed 2026-06-23) [director] Validate CIO skill (id=validate-cio-selection-skill-metric)",
+        )
+        human = msgs[1][1]
+        assert "Recently INVESTIGATED & RESOLVED" in human
+        assert "do NOT re-propose these under a new name" in human
+        assert "validate-cio-selection-skill-metric" in human
+        assert "open backlog — do NOT re-propose" in human  # both sections present
+
+    def test_build_messages_omits_resolved_section_when_absent(self):
+        msgs = build_messages(_CARD)
+        assert "Recently INVESTIGATED & RESOLVED" not in msgs[1][1]
+
     def test_build_action_plan_injected_llm(self):
         plan = build_action_plan(_CARD, llm=_FakeLLM(_plan()))
         assert plan.run_date == RUN_DATE

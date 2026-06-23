@@ -203,3 +203,51 @@ def open_issues_digest(
         if len(items) < 100:
             break
     return "\n".join(lines)[:max_chars]
+
+
+def recently_closed_proposals_digest(
+    repo: str, token: str, *, run_date: str, weeks: int = 8,
+    gh_request=_gh_request, max_chars: int = 6000, max_pages: int = 10,
+) -> str:
+    """Condense director-proposal issues CLOSED within ``weeks`` of ``run_date``
+    into a digest so the director won't re-litigate a just-resolved concern.
+
+    The open-backlog digest only shows OPEN issues, and the file-time slug-skip
+    only catches the EXACT slug — so a recently-investigated concern that's been
+    closed can return under a semantically-similar NEW slug, evading both. This
+    feeds those recently-closed proposals to the LLM as "already examined — do
+    not re-propose" (config#1164 follow-up). ``run_date`` is ``YYYY-MM-DD``; an
+    unparseable date or a fetch failure yields an empty digest (best-effort —
+    the caller treats absence as "no extra dedup context"). Pages are fetched
+    newest-closed-first and the loop stops once a page predates the cutoff."""
+    from datetime import date, timedelta
+
+    try:
+        y, m, d = (int(x) for x in run_date.split("-"))
+        cutoff = (date(y, m, d) - timedelta(weeks=weeks)).isoformat()
+    except Exception:  # noqa: BLE001 — bad run_date → no dedup context, not fatal
+        return ""
+    api = f"https://api.github.com/repos/{repo}"
+    lines: list[str] = []
+    for page in range(1, max_pages + 1):
+        # sort=updated&direction=desc: a closed issue is rarely touched after
+        # closing, so updated_at is a safe lower bound on closed_at for paging
+        # termination; we still filter PRECISELY on closed_at below.
+        url = (f"{api}/issues?state=closed&labels=area:director-proposals"
+               f"&sort=updated&direction=desc&per_page=100&page={page}")
+        status, items = gh_request("GET", url, token)
+        if status != 200 or not isinstance(items, list) or not items:
+            break
+        page_has_recent = False
+        for it in items:
+            if "pull_request" in it:
+                continue
+            closed_at = (it.get("closed_at") or "")[:10]
+            if closed_at and closed_at >= cutoff:
+                page_has_recent = True
+                lines.append(
+                    f"#{it.get('number')} (closed {closed_at}) {it.get('title', '')}"[:300])
+        # Once a full page has nothing within the window, older pages won't either.
+        if len(items) < 100 or not page_has_recent:
+            break
+    return "\n".join(lines)[:max_chars]

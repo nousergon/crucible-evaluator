@@ -75,7 +75,8 @@ def _carryover_context(carryover: dict | None) -> str:
     return "\n".join(lines)
 
 
-def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_digest: str | None = None) -> list:
+def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_digest: str | None = None,
+                   resolved_digest: str | None = None) -> list:
     """Assemble (system, human) messages for the Director call."""
     human = [
         summarize_report_card(report_card),
@@ -83,7 +84,16 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
         _carryover_context(carryover),
     ]
     if roadmap_digest:
-        human += ["", "Currently-tracked / in-flight work (ROADMAP digest — do NOT re-propose):", roadmap_digest]
+        human += ["", "Currently-tracked / in-flight work (open backlog — do NOT re-propose):", roadmap_digest]
+    if resolved_digest:
+        human += [
+            "",
+            "Recently INVESTIGATED & RESOLVED (director-proposals closed in the last ~8 weeks — "
+            "do NOT re-propose these under a new name. If a metric tied to one of these still reads "
+            "adverse, it is being MONITORED / accumulating to significance, NOT unexamined — note it "
+            "in the existing item's terms rather than opening a fresh investigation):",
+            resolved_digest,
+        ]
     human += [
         "",
         "Produce the DirectorWeeklyActionPlan now. Ground every action item's "
@@ -115,6 +125,7 @@ def build_action_plan(
     run_date: str | None = None,
     carryover: dict | None = None,
     roadmap_digest: str | None = None,
+    resolved_digest: str | None = None,
     llm=None,
 ) -> DirectorWeeklyActionPlan:
     """Run the Director: report card → DirectorWeeklyActionPlan.
@@ -124,7 +135,8 @@ def build_action_plan(
     overrides the plan's run_date (else taken from the card provenance).
     """
     llm = llm or _default_llm()
-    messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest)
+    messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
+                              resolved_digest=resolved_digest)
     plan = _invoke_with_retry(llm, messages)
     # Stamp the run_date from the card if the model didn't echo one.
     rd = run_date or (report_card.get("_provenance", {}) or {}).get("run_date")
