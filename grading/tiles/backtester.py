@@ -211,12 +211,44 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             na_detail="auto_apply_rollback_count: could not list config/rollback_audit/.",
         ))
 
+    # sample_size_adequacy (critical, config#1151 Batch C) — are the per-cycle
+    # finalized-signal counts feeding the accuracy/attribution grades ABOVE the
+    # floor each needs, or are those grades computed on too few samples to mean
+    # anything? Graded on the WEAKEST-LINK adequacy ratio (min n/floor across
+    # analyses) from the backtester producer. ratio>=1.0 → GREEN (well-powered),
+    # 0.5<=ratio<1.0 → WATCH (building), <0.5 → RED (grades are under-powered noise).
+    ss, _, _, _ss_key = get_json_windowed(s3, bucket, "backtest/{date}/sample_size.json", run_date)
+    ss_src = f"s3://{bucket}/{_ss_key}" if _ss_key else f"s3://{bucket}/{prefix}/sample_size.json"
+    if ss and ss.get("status") == "ok" and ss.get("adequacy_ratio") is not None:
+        ratio = ss["adequacy_ratio"]
+        weakest = ss.get("weakest_analysis")
+        per = ss.get("per_analysis") or {}
+        wk = per.get(weakest) or {}
+        breakdown = "; ".join(f"{k} {v.get('n')}/{v.get('floor')}" for k, v in per.items())
+        verdict = ("well-powered" if ratio >= 1.0
+                   else "building — grades under-powered, WATCH" if ratio >= 0.5
+                   else "severely under-powered — accuracy/attribution grades are noise")
+        components.append(build_metric(
+            name="sample_size_adequacy", module=MODULE, metric_type="ratio", criticality="critical",
+            estimator="weakest_link_finalized_signal_count_vs_floor", measurement_horizon="per_cycle",
+            value=ratio, n_samples=wk.get("n"), n_floor=1, target=1.0, red_line=0.5,
+            higher_is_better=True, source_path=ss_src,
+            reason=(f"sample_size_adequacy: weakest-link adequacy = {ratio:.2f} "
+                    f"({weakest}: n={wk.get('n')} vs floor {wk.get('floor')}; {breakdown}). {verdict}"),
+        ))
+    else:
+        components.append(build_metric(
+            name="sample_size_adequacy", module=MODULE, metric_type="ratio", criticality="critical",
+            n_floor=1, target=1.0, red_line=0.5, higher_is_better=True, source_path=ss_src,
+            input_present=False,
+            na_detail=(f"sample_size_adequacy: no ok sample_size.json in the trailing window ending {run_date} "
+                       f"(status={(ss or {}).get('status')!r}); needs the backtester producer (config#1151)."),
+        ))
+
     # 6-9. Need param-history diffing / sweep-fold data not cleanly persisted yet.
     for name, crit, detail in (
         ("optimizer_churn", "critical",
          "optimizer_churn: needs per-cycle param-delta history (config/*_history) diffed across cycles — not yet computed."),
-        ("sample_size_adequacy", "critical",
-         "sample_size_adequacy: needs per-analysis sample-count vs documented floors — not yet aggregated for the report card."),
         ("backtest_vs_live_parity", "critical",
          "backtest_vs_live_parity: needs the predictor synthetic-backtest IC vs live L2 IC drift series — not yet persisted."),
         ("walk_forward_stability", "supporting",
