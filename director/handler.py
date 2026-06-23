@@ -33,7 +33,12 @@ import boto3
 
 from director.agent import build_action_plan
 from director.carryover import load_ledger, merge_plan_into_ledger, write_ledger
-from director.issue_filer import DEFAULT_REPO, file_director_issues, open_issues_digest
+from director.issue_filer import (
+    DEFAULT_REPO,
+    file_director_issues,
+    open_issues_digest,
+    recently_closed_proposals_digest,
+)
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
 
@@ -100,6 +105,21 @@ def _fetch_backlog_digest_best_effort(token: str) -> str | None:
         return digest or None
     except Exception as e:  # noqa: BLE001
         logger.warning("Director: backlog digest fetch failed (%s); proceeding without digest.", e)
+        return None
+
+
+def _fetch_resolved_digest_best_effort(token: str, run_date: str) -> str | None:
+    """Phase H input half (companion to the open-backlog digest): the
+    director-proposals CLOSED in the last ~8 weeks, so the LLM won't re-litigate
+    a just-resolved concern under a fresh slug (config#1164 follow-up). The open
+    digest only carries OPEN issues and the file-time skip only catches the EXACT
+    slug — this closes the semantically-similar-new-slug gap. Best-effort: a
+    fetch failure or unparseable run_date just drops the extra dedup context."""
+    try:
+        digest = recently_closed_proposals_digest(DEFAULT_REPO, token, run_date=run_date)
+        return digest or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Director: resolved-proposals digest fetch failed (%s); proceeding without it.", e)
         return None
 
 
@@ -311,9 +331,12 @@ def handler(event: dict | None = None, context=None) -> dict:
     # wins. (kwarg name `roadmap_digest` retained on build_action_plan — the
     # source is now issues, not ROADMAP; config#978.)
     backlog_digest = event.get("roadmap_digest")
+    resolved_digest = None
     if backlog_digest is None and gh_token and _issue_filing_enabled():
         backlog_digest = _fetch_backlog_digest_best_effort(gh_token)
-    plan = build_action_plan(card, run_date=run_date, carryover=ledger, roadmap_digest=backlog_digest)
+        resolved_digest = _fetch_resolved_digest_best_effort(gh_token, run_date)
+    plan = build_action_plan(card, run_date=run_date, carryover=ledger,
+                             roadmap_digest=backlog_digest, resolved_digest=resolved_digest)
 
     plan_key = f"director/{run_date}/action_plan.json"
     s3.put_object(

@@ -43,11 +43,12 @@ class FakeGitHub:
     already-filed area:director-proposals issues (title/body carry id= markers).
     ``open_issues`` seeds the open-backlog digest source. POSTs are captured."""
 
-    def __init__(self, existing=None, open_issues=None):
+    def __init__(self, existing=None, open_issues=None, closed=None):
         self.calls: list[tuple[str, str]] = []
         self.posted: list[dict] = []
         self._existing = existing or []          # list of issue dicts (state=all, labeled)
         self._open = open_issues or []           # list of issue dicts (state=open)
+        self._closed = closed or []              # list of issue dicts (state=closed, labeled)
         self._next_number = 500
 
     def __call__(self, method, url, token, body=None):
@@ -55,6 +56,8 @@ class FakeGitHub:
         if method == "GET" and "labels=area:director-proposals" in url and "state=all" in url:
             # paginate: page 1 returns all, later pages empty
             return (200, list(self._existing)) if "page=1" in url else (200, [])
+        if method == "GET" and "state=closed" in url and "labels=area:director-proposals" in url:
+            return (200, list(self._closed)) if "page=1" in url else (200, [])
         if method == "GET" and "state=open" in url:
             return (200, list(self._open)) if "page=1" in url else (200, [])
         if method == "POST" and url.endswith("/issues"):
@@ -186,3 +189,32 @@ def test_open_issues_digest_titles_and_labels():
     digest = IF.open_issues_digest("r/x", "tok", gh_request=gh)
     assert "#10 [P1,area:predictor] Fix the thing" in digest
     assert "A PR" not in digest  # PRs skipped
+
+
+# ── recently_closed_proposals_digest ─────────────────────────────────────────
+
+
+def test_recently_closed_digest_includes_within_window_excludes_old():
+    # run_date 2026-06-20, 8-week window → cutoff 2026-04-25.
+    gh = FakeGitHub(closed=[
+        {"number": 1168, "title": "[director] Validate CIO skill (id=validate-cio-selection-skill-metric)",
+         "closed_at": "2026-06-23T00:00:00Z"},
+        {"number": 900, "title": "[director] Ancient resolved thing (id=old-slug)",
+         "closed_at": "2026-03-01T00:00:00Z"},   # older than cutoff → excluded
+    ])
+    digest = IF.recently_closed_proposals_digest("r/x", "tok", run_date="2026-06-20", gh_request=gh)
+    assert "#1168 (closed 2026-06-23)" in digest
+    assert "validate-cio-selection-skill-metric" in digest
+    assert "#900" not in digest          # outside the window
+    assert "old-slug" not in digest
+
+
+def test_recently_closed_digest_skips_prs_and_handles_bad_date():
+    gh = FakeGitHub(closed=[
+        {"number": 7, "title": "A PR (id=pr-slug)", "closed_at": "2026-06-23T00:00:00Z",
+         "pull_request": {"url": "..."}},
+    ])
+    digest = IF.recently_closed_proposals_digest("r/x", "tok", run_date="2026-06-20", gh_request=gh)
+    assert digest == ""               # only a PR present → nothing
+    # Unparseable run_date → empty digest, no raise (best-effort).
+    assert IF.recently_closed_proposals_digest("r/x", "tok", run_date="not-a-date", gh_request=gh) == ""
