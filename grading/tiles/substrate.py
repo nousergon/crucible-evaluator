@@ -58,6 +58,21 @@ _DQ_NAMESPACE = "AlphaEngine/Data"
 _DQ_BLOCKED_METRIC = "daily_append_quality_blocked_count"
 _DQ_WARNED_METRIC = "daily_append_quality_warned_count"
 
+# schema_drift_incidents — the data collector counts every ArcticDB
+# StreamDescriptorMismatch / DataError raised on a universe write path
+# (``update_batch`` / ``write_batch`` / ``_write_row_backfill_safe``) per run
+# and emits ``AlphaEngine/Data/daily_append_schema_drift_count`` (alpha-engine-data
+# builders/daily_append.py). UNLIKE data_quality_incidents (a routine row-level
+# gate with a ~95/4w steady-state baseline), a schema-drift incident is a HARD
+# data-integrity failure: the persisted ArcticDB descriptor no longer matches the
+# row being written, the daily_append run FAILS LOUD (counted then re-raised),
+# and downstream features are starved until an operator repairs the descriptor.
+# It is meant to be ZERO in steady state, so the thresholds are an absolute
+# incident count, NOT a regression band: target 0 (any incident is a real event
+# worth a WATCH) / red-line 3 (a cluster of ≥3 schema failures in 4w is a
+# systemic descriptor regression → RED). (config#1150 Batch B.)
+_SCHEMA_DRIFT_METRIC = "daily_append_schema_drift_count"
+
 
 def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
     """Trailing-``window_days`` SUM of a CloudWatch metric, or None if no data."""
@@ -387,11 +402,58 @@ def build_substrate_tile(
             na_detail=f"data_quality_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
         ))
 
+    # 3b. schema_drift_incidents (critical) — trailing-4w SUM of ArcticDB
+    #    StreamDescriptorMismatch / DataError write failures, counted-then-
+    #    re-raised by the data collector and emitted to CloudWatch (mirrors the
+    #    data_quality read above — the substrate tile is the one tile that reaches
+    #    AWS APIs). A schema-drift incident is a HARD data-integrity failure (the
+    #    daily_append run fails loud), so the band is an absolute incident count
+    #    (target 0 / red-line 3) rather than a regression detector. Graceful N/A
+    #    on a CW access error / missing perm — WARN-logged, not swallowed.
+    #    config#1150 Batch B.
+    sd_src = f"cloudwatch:{_DQ_NAMESPACE}/{_SCHEMA_DRIFT_METRIC}"
+    try:
+        cw = cloudwatch_client or boto3.client(
+            "cloudwatch", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        drift = _cw_metric_sum(cw, _DQ_NAMESPACE, _SCHEMA_DRIFT_METRIC, as_of, _SF_WINDOW_DAYS)
+        if drift is None:
+            components.append(build_metric(
+                name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+                ran=False,
+                na_detail=(f"schema_drift_incidents: no {_SCHEMA_DRIFT_METRIC} datapoints in CloudWatch "
+                           f"over {_SF_WINDOW_DAYS}d (the metric self-activates once a daily_append run "
+                           f"emits it — zero is emitted on every clean run, so N/A means the instrumented "
+                           f"producer has not yet deployed/run)."),
+            ))
+        else:
+            components.append(build_metric(
+                name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                value=drift, n_samples=1, n_floor=1, target=0.0, red_line=3.0,
+                higher_is_better=False, source_path=sd_src,
+                reason=(f"schema_drift_incidents = {drift:.0f} ArcticDB StreamDescriptorMismatch / "
+                        f"DataError write failures over {_SF_WINDOW_DAYS}d vs target 0 / red-line 3. "
+                        f"A schema-drift incident is a HARD data-integrity failure (the daily_append "
+                        f"write fails loud) — meant to be zero in steady state; any incident is a WATCH, "
+                        f"a cluster (≥3) is a systemic descriptor regression (RED)."),
+            ))
+    except (ClientError, BotoCoreError) as e:
+        code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
+        logger.warning("schema_drift_incidents: CloudWatch read failed (%s) — grading N/A", e)
+        components.append(build_metric(
+            name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+            estimator="incident_count_4w", measurement_horizon="trailing_4w",
+            n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+            input_present=False,
+            na_detail=f"schema_drift_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
+        ))
+
     # 4-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
-        ("schema_drift_incidents", "critical",
-         "schema_drift_incidents: needs the ArcticDB StreamDescriptorMismatch / schema-failure error log — not yet aggregated."),
         ("deploy_success_rate", "supporting",
          "deploy_success_rate: needs GitHub Actions run history across the 8 repos (GH API) — outside the evaluator's S3 reach today."),
         ("alert_noise_ratio", "supporting",
