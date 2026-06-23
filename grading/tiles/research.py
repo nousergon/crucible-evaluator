@@ -234,24 +234,55 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #     reliability=low. The per-layer ICs (combined/macro/conviction) ride in the
     #     reason so the orchestration leak is visible (e.g. macro tilt degrading the
     #     stock score), motivating the de-blending arc.
+    #
+    #     SIGNIFICANCE is read off the DATE-CLUSTERED (Grinold-Kahn) IC t-stat when
+    #     the producer emits it (config#1164): the pooled ``final_score_ic`` p counts
+    #     every CIO-evaluated name as an independent draw, but the signal lives at the
+    #     eval_date level — pooling ~K weeks of names as N≈K·25 manufactured a
+    #     "significant negative composite IC" flag (pooled p≈0.02) that DISSOLVES under
+    #     the honest weeks-as-N estimator (date-clustered p≈0.18). We grade on
+    #     ``final_score_date_ic`` / ``_date_ic_p`` with n_samples = n_eval_dates, and
+    #     fall back to the pooled IC only for pre-config#1164 e2e_lift artifacts.
     attr = cl.get("layer_attribution_21d") or {}
-    fic = attr.get("final_score_ic")
+    date_ic = attr.get("final_score_date_ic")
+    pooled_ic = attr.get("final_score_ic")
+    use_clustered = date_ic is not None
+    fic = date_ic if use_clustered else pooled_ic
     if fic is not None:
-        fp = attr.get("final_score_ic_p")
-        n_at = attr.get("n")
+        if use_clustered:
+            fp = attr.get("final_score_date_ic_p")
+            n_at = attr.get("n_eval_dates")
+            estimator = "date_clustered_rank_ic_vs_21d_alpha"
+            n_floor = 8  # weeks: ~8 cohorts for a stable IC t-stat
+        else:
+            fp = attr.get("final_score_ic_p")
+            n_at = attr.get("n")
+            estimator = "rank_ic_vs_21d_alpha"
+            n_floor = 60
         insig = fp is None or fp >= 0.10
+        # Per-layer ride-along: prefer each layer's date-clustered IC, else pooled.
         layers = ", ".join(
-            f"{k}={attr.get(k + '_ic'):+.3f}" for k in ("combined_score", "macro_shift", "cio_conviction")
-            if attr.get(k + "_ic") is not None
+            f"{k}={(attr.get(k + '_date_ic') if attr.get(k + '_date_ic') is not None else attr.get(k + '_ic')):+.3f}"
+            for k in ("combined_score", "macro_shift", "cio_conviction")
+            if (attr.get(k + "_date_ic") is not None or attr.get(k + "_ic") is not None)
         )
+        # Surface the pseudo-replication gap when the pooled p would have over-flagged.
+        pooled_p = attr.get("final_score_ic_p")
+        pseudo_note = ""
+        if (use_clustered and pooled_p is not None and pooled_p < 0.10
+                and (fp is None or fp >= 0.10)):
+            pseudo_note = (f" (pooled p={round(pooled_p, 3)} over N={attr.get('n')} names is "
+                           "pseudo-replication-inflated; weeks-as-N is the honest test)")
         components.append(build_metric(
             name="research_composite_ic", module=MODULE, metric_type="ic", criticality="critical",
-            estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
+            estimator=estimator, measurement_horizon="21d",
             reliability="low" if insig else "high",
-            value=fic, n_samples=n_at, n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src,
+            value=fic, n_samples=n_at, n_floor=n_floor, target=0.03, red_line=0.0, source_path=e2e_src,
             status="WATCH" if insig else None,
-            reason=(f"research_composite_ic: final_score→21d-alpha rank-IC = {fic:+.3f} "
-                    f"(p={fp if fp is None else round(fp,3)}, N={n_at}); per-layer [{layers}]. "
+            reason=(f"research_composite_ic: final_score→21d-alpha "
+                    f"{'date-clustered ' if use_clustered else ''}rank-IC = {fic:+.3f} "
+                    f"(p={fp if fp is None else round(fp,3)}, N={n_at}"
+                    f"{' weeks' if use_clustered else ' names'}); per-layer [{layers}].{pseudo_note} "
                     + ("Not yet significant — WATCH, accumulating." if insig
                        else ("no forward signal — composite does not predict 21d alpha" if fic <= 0
                              else "composite carries forward signal"))),
