@@ -339,10 +339,50 @@ class TestDataQualityIncidents:
         assert dq["status"] == "N/A-MISSING-INPUT"
         assert "cloudwatch:GetMetricStatistics" in dq["status_reason"]
 
-    def test_schema_drift_still_not_impl(self, s3):
-        dq = _comp(self._tile(s3, _FakeCW()), "schema_drift_incidents")
-        assert dq["status"] == "N/A-NOT-IMPL"
-        assert "StreamDescriptorMismatch" in dq["status_reason"]
+
+class TestSchemaDriftIncidents:
+    def _tile(self, s3, cw):
+        return build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC), cloudwatch_client=cw)
+
+    def test_zero_incidents_green(self, s3):
+        # A clean run emits 0 every day → trailing-4w Sum is 0 → GREEN.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 0.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 0.0
+        assert sd["status"] == "GREEN"          # 0 == target, lower-is-better
+
+    def test_single_incident_watch(self, s3):
+        # Even ONE schema-drift incident is a real data-integrity failure → WATCH.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 1.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 1.0
+        assert sd["status"] == "WATCH"          # between target 0 and red-line 3
+
+    def test_cluster_red(self, s3):
+        # A cluster (≥3) is a systemic descriptor regression → RED.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 4.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 4.0
+        assert sd["status"] == "RED"            # ≥ red-line 3
+
+    def test_grades_non_na_and_is_critical(self, s3):
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 0.0})),
+                   "schema_drift_incidents")
+        assert sd["criticality"] == "critical"
+        assert not sd["status"].startswith("N/A")   # genuinely graded, not N/A
+
+    def test_no_datapoints_not_run(self, s3):
+        # No emitted datapoints yet (producer not deployed) → N/A-NOT-RUN.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": None})),
+                   "schema_drift_incidents")
+        assert sd["status"] == "N/A-NOT-RUN"
+
+    def test_cw_access_error_missing_input_names_perm(self, s3):
+        from botocore.exceptions import ClientError
+        err = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetMetricStatistics")
+        sd = _comp(self._tile(s3, _FakeCW(raises=err)), "schema_drift_incidents")
+        assert sd["status"] == "N/A-MISSING-INPUT"
+        assert "cloudwatch:GetMetricStatistics" in sd["status_reason"]
 
 
 _WF_RUN_DATE = "2026-06-20"
