@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -57,6 +58,18 @@ _SF_WINDOW_DAYS = 28
 _DQ_NAMESPACE = "AlphaEngine/Data"
 _DQ_BLOCKED_METRIC = "daily_append_quality_blocked_count"
 _DQ_WARNED_METRIC = "daily_append_quality_warned_count"
+
+# watchdog_firings (supporting, config#1151 Batch C) — per-RUN count of backtester
+# phases that hit their hard timeout cap and were force-aborted by the phase
+# watchdog (crucible-backtester pipeline_common.phase() → substrate_ops.json).
+# A firing means a phase burned through its entire silent-compute budget — the
+# 2026-04-22 dry-run's 110-min silent stall that motivated the tripwire. Thresholds
+# (lower-is-better): 0 firings = GREEN (no phase capped out, healthy); target 0,
+# red-line 2 → exactly 1 = WATCH (a single trip can be a transient infra slowdown —
+# a slow EBS volume, a one-off GC pause), >=2 = RED (repeated caps = a phase
+# systematically exceeding its budget, real degradation needing a root-cause).
+_WATCHDOG_TARGET = 0.0
+_WATCHDOG_RED_LINE = 2.0
 
 
 def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
@@ -225,13 +238,20 @@ def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
 
 def build_substrate_tile(
     bucket: str,
+    run_date: str | None = None,
     s3_client=None,
     *,
     as_of: datetime | None = None,
     sfn_client=None,
     cloudwatch_client=None,
 ) -> dict:
-    """Build the Substrate Reliability tile."""
+    """Build the Substrate Reliability tile.
+
+    ``run_date`` (ISO ``YYYY-MM-DD``) anchors the windowed read of the
+    backtester's ``substrate_ops.json`` for ``watchdog_firings`` (config#1151).
+    When omitted, ``watchdog_firings`` grades ``N/A-MISSING-INPUT`` rather than
+    crashing — the other components are AWS-API sourced and don't need it.
+    """
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
     components = []
@@ -387,6 +407,53 @@ def build_substrate_tile(
             na_detail=f"data_quality_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
         ))
 
+    # watchdog_firings (supporting, config#1151 Batch C) — how many backtester
+    # phases hit their hard timeout cap this run and were force-aborted by the
+    # phase watchdog. Read (windowed, config#1190 — a partial/off-cycle producer
+    # run still grades) from backtest/{date}/substrate_ops.json, the per-run
+    # aggregate pipeline_common.phase() writes. Lower-is-better: 0 = GREEN.
+    wf_src = f"s3://{bucket}/backtest/{run_date}/substrate_ops.json" if run_date else f"s3://{bucket}/"
+    wf_doc = None
+    if run_date:
+        wf_doc, _wf_date, _wf_age, _wf_key = get_json_windowed(
+            s3, bucket, "backtest/{date}/substrate_ops.json", run_date
+        )
+        if _wf_key:
+            wf_src = f"s3://{bucket}/{_wf_key}"
+    wd = (wf_doc or {}).get("watchdog") if isinstance(wf_doc, dict) else None
+    if isinstance(wd, dict) and wd.get("firing_count") is not None:
+        firings = wd["firing_count"]
+        capped = wd.get("capped_phases_run")
+        fired_phases = [
+            r.get("phase") for r in (wd.get("per_phase") or []) if r.get("watchdog_fired")
+        ]
+        if firings == 0:
+            verdict = "no phase hit its hard cap (healthy)"
+        elif firings == 1:
+            verdict = "one phase capped out — a single trip can be a transient infra slowdown, WATCH"
+        else:
+            verdict = "multiple phases capped out — a phase is systematically exceeding its budget, RED"
+        detail = f" ({', '.join(p for p in fired_phases if p)})" if fired_phases else ""
+        components.append(build_metric(
+            name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
+            estimator="per_run_phase_timeout_count", measurement_horizon="per_run",
+            value=float(firings), n_samples=1, n_floor=1,
+            target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE, higher_is_better=False,
+            source_path=wf_src,
+            reason=(f"watchdog_firings = {firings} backtester phase(s) hit their hard "
+                    f"timeout cap{detail} of {capped} capped phase(s) run vs target 0 / "
+                    f"red-line 2 — {verdict}."),
+        ))
+    else:
+        components.append(build_metric(
+            name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
+            n_floor=1, target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE,
+            higher_is_better=False, source_path=wf_src, input_present=False,
+            na_detail=(f"watchdog_firings: no substrate_ops.json with a watchdog block in the "
+                       f"trailing window ending {run_date} — needs the backtester producer "
+                       f"(config#1151) to have run a capped phase."),
+        ))
+
     # 4-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
@@ -396,8 +463,6 @@ def build_substrate_tile(
          "deploy_success_rate: needs GitHub Actions run history across the 8 repos (GH API) — outside the evaluator's S3 reach today."),
         ("alert_noise_ratio", "supporting",
          "alert_noise_ratio: needs the alerts log + a manual actionable/total tag — not yet sourced."),
-        ("watchdog_firings", "supporting",
-         "watchdog_firings: needs the backtester PhaseTimeoutError / silent-phase-tripwire firing count — not yet aggregated."),
         ("changelog_coverage", "diagnostic",
          "changelog_coverage: needs an expected-event-source set to compute % writing to the changelog — not yet defined."),
         ("iam_drift", "diagnostic",
@@ -418,9 +483,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover
 
     parser = argparse.ArgumentParser(description="Build the Substrate Reliability tile.")
     parser.add_argument("--bucket", default="alpha-engine-research")
+    parser.add_argument("--run-date", default=None, help="ISO run date for windowed artifact reads (watchdog_firings).")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    print(json.dumps(build_substrate_tile(args.bucket), indent=2, default=str))
+    print(json.dumps(build_substrate_tile(args.bucket, args.run_date), indent=2, default=str))
     return 0
 
 

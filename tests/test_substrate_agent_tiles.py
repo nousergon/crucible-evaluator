@@ -343,3 +343,78 @@ class TestDataQualityIncidents:
         dq = _comp(self._tile(s3, _FakeCW()), "schema_drift_incidents")
         assert dq["status"] == "N/A-NOT-IMPL"
         assert "StreamDescriptorMismatch" in dq["status_reason"]
+
+
+_WF_RUN_DATE = "2026-06-20"
+
+
+def _put_substrate_ops(s3, *, firing_count, per_phase, date=_WF_RUN_DATE, capped=None):
+    import json
+    body = {
+        "schema_version": 1,
+        "date": date,
+        "watchdog": {
+            "firing_count": firing_count,
+            "capped_phases_run": capped if capped is not None else len(per_phase),
+            "per_phase": per_phase,
+        },
+    }
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{date}/substrate_ops.json",
+        Body=json.dumps(body).encode(), ContentType="application/json",
+    )
+
+
+class TestWatchdogFirings:
+    """watchdog_firings reads backtest/{date}/substrate_ops.json (config#1151).
+
+    Mirrors the wired-substrate-component template (data_quality_incidents):
+    a real graded read, lower-is-better, target 0 / red-line 2."""
+
+    def test_no_run_date_missing_input(self, s3):
+        # No run_date threaded → can't resolve the dated artifact → graceful N/A.
+        wf = _comp(build_substrate_tile(BUCKET, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "N/A-MISSING-INPUT"
+        assert wf["criticality"] == "supporting"
+
+    def test_missing_artifact_missing_input_names_producer(self, s3):
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "N/A-MISSING-INPUT"
+        assert "config#1151" in wf["status_reason"]
+
+    def test_zero_firings_green(self, s3):
+        _put_substrate_ops(s3, firing_count=0, per_phase=[
+            {"phase": "param_sweep", "watchdog_fired": False, "cap_s": 3600.0, "wall_time_s": 120.0},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "GREEN"
+        assert wf["value"] == 0.0
+        assert "healthy" in wf["status_reason"]
+
+    def test_one_firing_watch(self, s3):
+        _put_substrate_ops(s3, firing_count=1, capped=2, per_phase=[
+            {"phase": "simulate", "watchdog_fired": False, "cap_s": 1800.0, "wall_time_s": 200.0},
+            {"phase": "param_sweep", "watchdog_fired": True, "cap_s": 3600.0, "wall_time_s": 3600.1},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "WATCH"
+        assert wf["value"] == 1.0
+        assert "param_sweep" in wf["status_reason"]
+
+    def test_two_firings_red(self, s3):
+        _put_substrate_ops(s3, firing_count=2, per_phase=[
+            {"phase": "simulate", "watchdog_fired": True, "cap_s": 1800.0, "wall_time_s": 1800.2},
+            {"phase": "param_sweep", "watchdog_fired": True, "cap_s": 3600.0, "wall_time_s": 3600.1},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "RED"
+        assert wf["value"] == 2.0
+
+    def test_windowed_grades_off_earlier_date(self, s3):
+        # Producer ran 3 days before run_date (partial/off-cycle) → still grades.
+        _put_substrate_ops(s3, firing_count=0, date="2026-06-17", per_phase=[
+            {"phase": "param_sweep", "watchdog_fired": False, "cap_s": 3600.0, "wall_time_s": 90.0},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "GREEN"
+        assert "2026-06-17" in wf["source_path"]
