@@ -435,6 +435,61 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             ),
         ))
 
+    # neutralization_live_efficacy (critical, config#1187) — does the LIVE #1142
+    # score-neutralization (cut over 2026-06-22) actually recover forward edge?
+    # The live cutover rewrites only signals.json score, which no IC producer
+    # reads back, so research_composite_ic / composite_scoring / momentum_regime_ic
+    # all measure the RAW research.db score and are BLIND to the live fix. The
+    # backtester's neutralized_composite_ic.live_forward segment closes that: the
+    # post-cutover per-week (neutralized − raw) IC delta with a date-clustered
+    # Grinold-Kahn t-stat (config#1164) — and because the backtester reconstructs
+    # the neutralized score with the same residualizer the live path applies, that
+    # segment IS the live efficacy. WATCH while accumulating / underpowered; GREEN
+    # once it's significantly positive; RED only if the live fix is SIGNIFICANTLY
+    # HURTING (a revert signal), not merely noisy.
+    nci = e2e.get("neutralized_composite_ic") or {}
+    lf = nci.get("live_forward") if nci.get("status") == "ok" else None
+    if lf is not None and lf.get("n_weeks"):
+        delta = lf.get("mean_weekly_delta")
+        p = lf.get("delta_t_p")
+        nwk = lf.get("n_weeks")
+        sig = bool(lf.get("significant"))
+        if not sig:
+            status = "WATCH"
+        elif delta is not None and delta < 0:
+            status = "RED"      # live neutralization significantly degrades edge → revert
+        else:
+            status = None       # significantly positive → GREEN via thresholds
+        components.append(build_metric(
+            name="neutralization_live_efficacy", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="date_clustered_neutralized_minus_raw_ic_21d", measurement_horizon="21d",
+            reliability="high" if sig else "low",
+            value=delta, n_samples=nwk, n_floor=4, target=0.0, red_line=-0.02,
+            higher_is_better=True, source_path=e2e_src, status=status,
+            reason=(
+                f"neutralization_live_efficacy: post-cutover ({nci.get('cutover_date')}) "
+                f"weekly (neutralized−raw) 21d-alpha IC delta = "
+                f"{('%+.3f' % delta) if delta is not None else 'n/a'} "
+                f"(date-clustered p={p if p is None else round(p, 3)}, N={nwk} weeks; "
+                f"neu {lf.get('neutralized_mean_weekly_ic')} vs raw {lf.get('raw_mean_weekly_ic')}). "
+                + ("Live cutover SIGNIFICANTLY DEGRADES edge — revert candidate." if status == "RED"
+                   else "Live cutover recovers edge (significant)." if sig
+                   else "Accumulating post-cutover cohorts — WATCH, not yet significant.")
+            ),
+        ))
+    else:
+        components.append(build_metric(
+            name="neutralization_live_efficacy", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="date_clustered_neutralized_minus_raw_ic_21d", measurement_horizon="21d",
+            n_floor=4, target=0.0, red_line=-0.02, higher_is_better=True, source_path=e2e_src,
+            input_present=False,
+            na_detail=(
+                f"neutralization_live_efficacy: no live_forward block in "
+                f"neutralized_composite_ic this cycle (status={nci.get('status')!r}); needs the "
+                f"backtester producer (config#1187) + >=1 post-cutover weekly cohort with realized 21d alpha."
+            ),
+        ))
+
     # 7-9. Agent-quality producer components (config Batch A #1149). These read
     #      backtest/{date}/agent_quality.json — the same artifact the Agent tile
     #      reads — but grade the research-output-quality axis (judge pass-rate,
