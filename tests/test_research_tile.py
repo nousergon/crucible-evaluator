@@ -133,15 +133,23 @@ class TestResearchCompositeIC:
     """L4561 — does the blended research score predict 21d alpha? Graded under
     the L4562 contract (insignificant → WATCH + reliability=low)."""
 
-    def _e2e_with_attr(self, fic, p):
+    def _e2e_with_attr(self, fic, p, *, date_ic=None, date_p=None, n_dates=None):
         e = json.loads(json.dumps(_E2E))
-        e["cio_lift"]["layer_attribution_21d"] = {
+        attr = {
             "n": 89, "final_score_ic": fic, "final_score_ic_p": p,
             "combined_score_ic": -0.016, "macro_shift_ic": -0.044, "cio_conviction_ic": 0.013}
+        if date_ic is not None:
+            attr.update({
+                "n_eval_dates": n_dates, "final_score_date_ic": date_ic,
+                "final_score_date_ic_p": date_p,
+                "combined_score_date_ic": -0.024, "macro_shift_date_ic": -0.185,
+                "cio_conviction_date_ic": 0.067})
+        e["cio_lift"]["layer_attribution_21d"] = attr
         return e
 
     def test_insignificant_ic_watch_low(self, s3):
-        _put(s3, "e2e_lift.json", self._e2e_with_attr(-0.045, 0.67))  # the live case
+        # Pre-config#1164 artifact (no date-clustered fields) → pooled fallback.
+        _put(s3, "e2e_lift.json", self._e2e_with_attr(-0.045, 0.67))
         m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
         assert m["status"] == "WATCH"
         assert m["reliability"] == "low"
@@ -151,6 +159,28 @@ class TestResearchCompositeIC:
         _put(s3, "e2e_lift.json", self._e2e_with_attr(0.08, 0.01))
         m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
         assert m["status"] == "GREEN"
+
+    def test_date_clustered_dissolves_pseudo_replicated_flag(self, s3):
+        # config#1164 — the LIVE case: pooled p=0.02 (N=145 names) looks significant
+        # negative, but the date-clustered estimator (N=9 weeks) is p=0.18 → the
+        # honest read is WATCH/underpowered, NOT a high-reliability negative.
+        _put(s3, "e2e_lift.json",
+             self._e2e_with_attr(-0.193, 0.02, date_ic=-0.147, date_p=0.18, n_dates=9))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
+        assert m["status"] == "WATCH"
+        assert m["reliability"] == "low"
+        assert m["value"] == -0.147          # graded on the date-clustered IC
+        assert m["n_samples"] == 9            # effective N = weeks, not 145 names
+        assert m["estimator"] == "date_clustered_rank_ic_vs_21d_alpha"
+        assert "pseudo-replication" in m["status_reason"]
+
+    def test_date_clustered_significant_positive_green(self, s3):
+        _put(s3, "e2e_lift.json",
+             self._e2e_with_attr(0.05, 0.30, date_ic=0.09, date_p=0.02, n_dates=12))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "research_composite_ic")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 0.09
+        assert m["n_samples"] == 12
 
     def test_absent_missing_input(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
