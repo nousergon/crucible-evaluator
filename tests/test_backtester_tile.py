@@ -135,5 +135,51 @@ class TestRollbackAndNA:
 
     def test_not_impl_components(self, s3):
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
-        for name in ("optimizer_churn", "sample_size_adequacy", "backtest_vs_live_parity", "walk_forward_stability"):
+        # sample_size_adequacy is now WIRED (config#1151) — no longer a stub here.
+        for name in ("optimizer_churn", "backtest_vs_live_parity", "walk_forward_stability"):
             assert _comp(tile, name)["status"] == "N/A-NOT-IMPL"
+
+
+class TestSampleSizeAdequacy:
+    """sample_size_adequacy reads backtest/{date}/sample_size.json (config#1151)."""
+
+    def _put_ss(self, s3, ratio, weakest="signal_quality", per=None):
+        per = per or {"signal_quality": {"n": int(ratio * 60), "floor": 60, "adequacy_ratio": ratio}}
+        _put(s3, f"backtest/{RUN_DATE}/sample_size.json", {
+            "status": "ok", "adequacy_ratio": ratio, "adequate": ratio >= 1.0,
+            "weakest_analysis": weakest, "per_analysis": per})
+
+    def test_missing_input(self, s3):
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "config#1151" in m["status_reason"]
+        assert m["criticality"] == "critical"
+
+    def test_well_powered_green(self, s3):
+        self._put_ss(s3, 1.5)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 1.5
+        assert "well-powered" in m["status_reason"]
+
+    def test_building_watch(self, s3):
+        self._put_ss(s3, 0.7)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
+        assert m["status"] == "WATCH"
+
+    def test_severely_underpowered_red(self, s3):
+        self._put_ss(s3, 0.3, weakest="attribution",
+                     per={"attribution": {"n": 30, "floor": 100, "adequacy_ratio": 0.3}})
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
+        assert m["status"] == "RED"
+        assert "under-powered" in m["status_reason"]
+        assert m["n_samples"] == 30
+
+    def test_windowed_grades_off_earlier_date(self, s3):
+        # Producer ran 2 days before run_date (partial/off-cycle) → still grades.
+        _put(s3, "backtest/2026-06-05/sample_size.json", {
+            "status": "ok", "adequacy_ratio": 1.2, "adequate": True,
+            "weakest_analysis": "signal_quality",
+            "per_analysis": {"signal_quality": {"n": 72, "floor": 60, "adequacy_ratio": 1.2}}})
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
+        assert m["status"] == "GREEN" and m["value"] == 1.2
