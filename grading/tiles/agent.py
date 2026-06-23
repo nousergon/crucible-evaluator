@@ -40,6 +40,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -81,9 +82,9 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     artifact (NYSE trading day, resolved by the handler).
     """
     s3 = s3_client or boto3.client("s3")
-    aq_key = f"backtest/{run_date}/agent_quality.json"
-    aq_src = f"s3://{bucket}/{aq_key}"
-    aq = _get_json(s3, bucket, aq_key)
+    # Windowed resolution (config#1190): freshest within the trailing window.
+    aq, _, _, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
+    aq_src = f"s3://{bucket}/{_aq_key}" if _aq_key else f"s3://{bucket}/backtest/{run_date}/agent_quality.json"
     components = []
 
     # 1. agent_validation_failure_rate (critical) — % of agent .invoke()s that

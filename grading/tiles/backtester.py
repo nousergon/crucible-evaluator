@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -96,8 +97,9 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
         return f"s3://{bucket}/{prefix}/{name}"
 
     # 1. evaluator_coverage (critical) — the anti-"insufficient data" meta-metric.
-    grading = _get_json(s3, bucket, f"{prefix}/grading.json")
-    g_src = src("grading.json")
+    # Windowed resolution (config#1190): freshest within the trailing window.
+    grading, _, _, _grading_key = get_json_windowed(s3, bucket, "backtest/{date}/grading.json", run_date)
+    g_src = f"s3://{bucket}/{_grading_key}" if _grading_key else src("grading.json")
     if grading:
         cov, graded, total = _coverage(grading)
         components.append(build_metric(
@@ -139,8 +141,8 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             raise
 
     # 3. vectorized_vs_consolidated_parity (supporting) — sim-path agreement.
-    parity = _get_json(s3, bucket, f"{prefix}/parity_report.json")
-    p_src = src("parity_report.json")
+    parity, _, _, _parity_key = get_json_windowed(s3, bucket, "backtest/{date}/parity_report.json", run_date)
+    p_src = f"s3://{bucket}/{_parity_key}" if _parity_key else src("parity_report.json")
     ok_states = ("ok", "parity_ok", "clean", "match")
     if parity and (parity.get("data_state") in ok_states):
         diverged = bool(parity.get("trade_count_divergence")) or bool(parity.get("ticker_set_divergence"))
@@ -162,8 +164,8 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
         ))
 
     # 4. fdr_surface_health (supporting) — count of BH-FDR-significant correlations.
-    attr = _get_json(s3, bucket, f"{prefix}/attribution.json")
-    a_src = src("attribution.json")
+    attr, _, _, _attr_key = get_json_windowed(s3, bucket, "backtest/{date}/attribution.json", run_date)
+    a_src = f"s3://{bucket}/{_attr_key}" if _attr_key else src("attribution.json")
     if attr and attr.get("status") == "ok":
         corr = attr.get("correlations") or {}
         n_sig = sum(

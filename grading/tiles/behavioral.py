@@ -36,6 +36,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -80,9 +81,9 @@ def _latest_shadow_tripwire(s3, bucket: str, run_date: str) -> tuple[dict | None
 def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """Build the Behavioral tile from behavioral_anomaly.json + the tripwire."""
     s3 = s3_client or boto3.client("s3")
-    ba_key = f"backtest/{run_date}/behavioral_anomaly.json"
-    ba_src = f"s3://{bucket}/{ba_key}"
-    ba = _get_json(s3, bucket, ba_key)
+    # Windowed resolution (config#1190): freshest within the trailing window.
+    ba, _, _, _ba_key = get_json_windowed(s3, bucket, "backtest/{date}/behavioral_anomaly.json", run_date)
+    ba_src = f"s3://{bucket}/{_ba_key}" if _ba_key else f"s3://{bucket}/backtest/{run_date}/behavioral_anomaly.json"
     components = []
 
     def _sub(name: str) -> dict | None:

@@ -26,6 +26,7 @@ from botocore.exceptions import ClientError
 
 from alpha_engine_lib.quant.stats.intervals import bootstrap_ci
 
+from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -244,9 +245,12 @@ def build_predictor_tile(
     # underperformed (did not beat SPY). Cross-tile read from the backtester's
     # backtest/{run_date}/veto_analysis.json (config#859 — was an unwired N/A).
     # 10d-horizon measurement (beat_spy_10d), hence supporting not critical.
-    veto_key = f"backtest/{run_date}/veto_analysis.json" if run_date else None
-    veto_src = f"s3://{bucket}/{veto_key}" if veto_key else latest_src
-    va = _get_json(s3, bucket, veto_key) if veto_key else None
+    # Windowed resolution (config#1190): freshest within the trailing window.
+    va, _, _, _veto_key = (
+        get_json_windowed(s3, bucket, "backtest/{date}/veto_analysis.json", run_date)
+        if run_date else (None, None, None, None)
+    )
+    veto_src = f"s3://{bucket}/{_veto_key}" if _veto_key else latest_src
     va_match = None
     if va:
         cur = va.get("current_threshold")
@@ -274,7 +278,7 @@ def build_predictor_tile(
         if run_date is None:
             na = "veto_gate_precision: run_date not provided to the predictor tile; cross-tile veto_analysis.json read skipped."
         elif va is None:
-            na = f"veto_gate_precision: {veto_key} absent this cycle."
+            na = f"veto_gate_precision: veto_analysis.json absent in the trailing window ending {run_date}."
         else:
             na = f"veto_gate_precision: veto_analysis.json has no usable precision at the live threshold (status={va.get('status')}) this cycle."
         components.append(build_metric(
