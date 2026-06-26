@@ -24,8 +24,8 @@ import json
 import logging
 import os
 
-from nousergon_lib.dates import now_dual
-from nousergon_lib.logging import setup_logging
+from krepis.dates import now_dual
+from krepis.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
 
@@ -78,7 +78,7 @@ def _to_trading_day(date_str: str) -> str:
     import datetime as _dt
 
     try:
-        from nousergon_lib import trading_calendar as _tc
+        from krepis import trading_calendar as _tc
 
         d = _dt.date.fromisoformat(date_str[:10])
         td = d if _tc.is_trading_day(d) else _tc.previous_trading_day(d)

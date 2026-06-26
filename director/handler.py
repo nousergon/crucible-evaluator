@@ -41,7 +41,7 @@ from director.issue_filer import (
 )
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
-from nousergon_lib.logging import setup_logging
+from krepis.logging import setup_logging
 
 # Structured logging + flow-doctor (see grading/handler.py for the full
 # rationale). Importing grading.handler above already ran its setup_logging;
@@ -103,7 +103,7 @@ def _director_github_token() -> str | None:
     primary deliverables; issue filing is secondary). Mirrors the cyphering
     release-queue token pattern + the fleet's institutional ``get_secret`` path."""
     try:
-        from nousergon_lib.secrets import get_secret
+        from krepis.secrets import get_secret
         tok = (get_secret(TOKEN_SECRET_NAME) or "").strip()
         return tok or None
     except Exception as e:  # noqa: BLE001 — absence is a recorded skip, not fatal

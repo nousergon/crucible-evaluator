@@ -19,7 +19,7 @@ Authoritative: ``system-report-card-revamp-260522.md`` §"Aggregation methodolog
 
 from __future__ import annotations
 
-from nousergon_lib.metrics import MetricRecord, StatusLiteral
+from krepis.metrics import MetricRecord, StatusLiteral
 from nousergon_lib.quant.stats.multiple_testing import benjamini_hochberg
 
 # Modules whose RED cascades to an overall RED (RC v2 module→overall rule).
@@ -145,7 +145,7 @@ def numeric_grade(components: list[MetricRecord]) -> float | None:
 
 def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.05) -> dict:
     """Assemble a tile summary from its components."""
-    from nousergon_lib.metrics import derive_letter
+    from krepis.metrics import derive_letter
 
     status = module_status(components, alpha=alpha)
     return {
