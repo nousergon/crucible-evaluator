@@ -15,9 +15,12 @@ Gradable from S3 today:
   - fdr_surface_health : count of BH-FDR-significant correlations in attribution
   - auto_apply_rollback_count : objects under config/rollback_audit/
 
-optimizer_churn / sample_size_adequacy / backtest_vs_live_parity /
-walk_forward_stability need param-history diffing or sweep-fold data not cleanly
-persisted yet → transparent N/A-NOT-IMPL.
+sample_size_adequacy, optimizer_churn and walk_forward_stability are WIRED
+(config#1151 Batch C) — they grade from their backtester producer artifacts
+(backtest/{date}/{sample_size,optimizer_churn,walk_forward_stability}.json) and
+fall to a transparent N/A only when the artifact is absent. backtest_vs_live_parity
+still needs a synthetic-backtest-IC-vs-live-IC drift series not yet persisted →
+transparent N/A-NOT-IMPL.
 
 Spec: ``system-report-card-revamp-260522.md`` Tile 4.
 """
@@ -245,18 +248,71 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
                        f"(status={(ss or {}).get('status')!r}); needs the backtester producer (config#1151)."),
         ))
 
-    # 6-9. Need param-history diffing / sweep-fold data not cleanly persisted yet.
-    for name, crit, detail in (
-        ("optimizer_churn", "critical",
-         "optimizer_churn: needs per-cycle param-delta history (config/*_history) diffed across cycles — not yet computed."),
-        ("backtest_vs_live_parity", "critical",
-         "backtest_vs_live_parity: needs the predictor synthetic-backtest IC vs live L2 IC drift series — not yet persisted."),
-        ("walk_forward_stability", "supporting",
-         "walk_forward_stability: needs param-recommendation rank-corr across walk-forward folds — not yet persisted."),
-    ):
+    # optimizer_churn (critical, config#1151 Batch C) — how hard did the weight
+    # optimizer push against its single-change guardrail this cycle? The producer
+    # emits churn_ratio = max|Δweight| / guardrail_cap; <1.0 = within guardrails.
+    # Lower is better: target 0.8 (well inside the cap → GREEN), red-line 1.0
+    # (at/over the cap → the tuner is fighting its own guardrail → RED).
+    oc, _, _, _oc_key = get_json_windowed(s3, bucket, "backtest/{date}/optimizer_churn.json", run_date)
+    oc_src = f"s3://{bucket}/{_oc_key}" if _oc_key else f"s3://{bucket}/{prefix}/optimizer_churn.json"
+    if oc and oc.get("status") == "ok" and oc.get("churn_ratio") is not None:
+        cr = float(oc["churn_ratio"])
+        within = bool(oc.get("within_guardrails"))
         components.append(build_metric(
-            name=name, module=MODULE, metric_type="ratio", criticality=crit, n_floor=1,
-            source_path=f"s3://{bucket}/{prefix}/", implemented=False, na_detail=detail,
+            name="optimizer_churn", module=MODULE, metric_type="ratio", criticality="critical",
+            estimator="max_abs_weight_change_over_guardrail_cap", measurement_horizon="per_cycle",
+            value=cr, n_samples=oc.get("n_params_changed"), n_floor=1,
+            target=0.8, red_line=1.0, higher_is_better=False, source_path=oc_src,
+            reason=(f"optimizer_churn = {cr:.2f} (max |Δ|={oc.get('max_abs_change')} on "
+                    f"{oc.get('max_change_param')!r} vs cap {oc.get('guardrail_cap')}; "
+                    f"{oc.get('n_params_changed')} params moved) — "
+                    f"{'within guardrails' if within else 'AT/OVER the guardrail cap'} "
+                    f"vs target 0.8 / red-line 1.0."),
+        ))
+    else:
+        components.append(build_metric(
+            name="optimizer_churn", module=MODULE, metric_type="ratio", criticality="critical",
+            n_floor=1, target=0.8, red_line=1.0, higher_is_better=False, source_path=oc_src,
+            input_present=False,
+            na_detail=(f"optimizer_churn: no ok optimizer_churn.json in the trailing window ending {run_date} "
+                       f"(status={(oc or {}).get('status')!r}); the optimizer had no usable recommendation "
+                       f"this cycle (config#1151)."),
+        ))
+
+    # backtest_vs_live_parity — still genuinely unwired (no producer artifact).
+    components.append(build_metric(
+        name="backtest_vs_live_parity", module=MODULE, metric_type="ratio", criticality="critical",
+        n_floor=1, source_path=f"s3://{bucket}/{prefix}/", implemented=False,
+        na_detail="backtest_vs_live_parity: needs the predictor synthetic-backtest IC vs live L2 IC drift series — not yet persisted.",
+    ))
+
+    # walk_forward_stability (supporting, config#1151 Batch C) — do the weekly
+    # weight recommendations converge or oscillate? The producer emits
+    # stability_ratio = 1 - reversals/max_possible_reversals over the loaded
+    # weekly window; 1.0 = monotone/converging, 0.0 = fully oscillating. Higher
+    # is better: target 0.8 (stable → GREEN), red-line 0.5 (half the steps
+    # reverse → drifting → RED).
+    wf, _, _, _wf_key = get_json_windowed(s3, bucket, "backtest/{date}/walk_forward_stability.json", run_date)
+    wf_src = f"s3://{bucket}/{_wf_key}" if _wf_key else f"s3://{bucket}/{prefix}/walk_forward_stability.json"
+    if wf and wf.get("status") == "ok" and wf.get("stability_ratio") is not None:
+        sr = float(wf["stability_ratio"])
+        components.append(build_metric(
+            name="walk_forward_stability", module=MODULE, metric_type="ratio", criticality="supporting",
+            estimator="one_minus_reversal_fraction_over_weekly_window", measurement_horizon="multi_week",
+            value=sr, n_samples=wf.get("weeks_loaded"), n_floor=1,
+            target=0.8, red_line=0.5, higher_is_better=True, source_path=wf_src,
+            reason=(f"walk_forward_stability = {sr:.2f} ({wf.get('n_reversals')} reversals of "
+                    f"{wf.get('max_possible_reversals')} possible over {wf.get('weeks_loaded')} prior weeks; "
+                    f"stable={wf.get('stable')}) vs target 0.8 / red-line 0.5."),
+        ))
+    else:
+        components.append(build_metric(
+            name="walk_forward_stability", module=MODULE, metric_type="ratio", criticality="supporting",
+            n_floor=1, target=0.8, red_line=0.5, higher_is_better=True, source_path=wf_src,
+            input_present=False,
+            na_detail=(f"walk_forward_stability: no ok walk_forward_stability.json in the trailing window ending "
+                       f"{run_date} (status={(wf or {}).get('status')!r}); need >=2 prior weeks of weight history "
+                       f"to judge drift (config#1151)."),
         ))
 
     return build_tile(MODULE, components)

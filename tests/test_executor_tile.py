@@ -151,3 +151,42 @@ class TestPopulated:
         assert _comp(tile, "exit_rules")["status"] == "GREEN"
         assert _comp(tile, "reconciliation_integrity")["status"] == "GREEN"
         assert tile["status"] == "GREEN"
+
+
+class TestActionEntropy:
+    """action_entropy reads backtest/{date}/action_entropy.json (config#1151)."""
+
+    def _put_ae(self, s3, h_norm, n=40, alarm=False, most_common="hold", mcf=0.4):
+        _put(s3, "action_entropy.json", {
+            "status": "ok", "n": n, "entropy": h_norm * 1.585,
+            "entropy_normalized": h_norm, "distribution": {"buy": 0.3, "hold": mcf, "sell": 0.3},
+            "most_common": most_common, "most_common_fraction": mcf, "alarm": alarm})
+
+    def test_missing_input(self, s3):
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "action_entropy")
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "config#1151" in c["status_reason"]
+        assert c["criticality"] == "diagnostic"
+
+    def test_diverse_green(self, s3):
+        self._put_ae(s3, 0.8)
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "action_entropy")
+        assert c["status"] == "GREEN"
+        assert c["value"] == 0.8
+        assert c["n_samples"] == 40
+
+    def test_narrowing_watch(self, s3):
+        self._put_ae(s3, 0.5)
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "action_entropy")
+        assert c["status"] == "WATCH"
+
+    def test_collapsed_red(self, s3):
+        self._put_ae(s3, 0.1, alarm=True, most_common="hold", mcf=0.95)
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "action_entropy")
+        assert c["status"] == "RED"
+        assert "COLLAPSE ALARM" in c["status_reason"]
+
+    def test_no_decision_stream_na(self, s3):
+        _put(s3, "action_entropy.json", {"status": "no_decision_stream", "n": 0})
+        c = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "action_entropy")
+        assert c["status"] == "N/A-MISSING-INPUT"
