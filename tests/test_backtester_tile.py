@@ -135,9 +135,90 @@ class TestRollbackAndNA:
 
     def test_not_impl_components(self, s3):
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
-        # sample_size_adequacy is now WIRED (config#1151) — no longer a stub here.
-        for name in ("optimizer_churn", "backtest_vs_live_parity", "walk_forward_stability"):
-            assert _comp(tile, name)["status"] == "N/A-NOT-IMPL"
+        # sample_size_adequacy, optimizer_churn, walk_forward_stability are now
+        # WIRED (config#1151) — they read producer artifacts, so absent ⇒
+        # N/A-MISSING-INPUT, not N/A-NOT-IMPL. Only backtest_vs_live_parity is
+        # still a genuine stub.
+        assert _comp(tile, "backtest_vs_live_parity")["status"] == "N/A-NOT-IMPL"
+        for name in ("optimizer_churn", "walk_forward_stability"):
+            assert _comp(tile, name)["status"] == "N/A-MISSING-INPUT"
+
+
+class TestOptimizerChurn:
+    """optimizer_churn reads backtest/{date}/optimizer_churn.json (config#1151)."""
+
+    def _put(self, s3, churn_ratio, within):
+        _put(s3, f"backtest/{RUN_DATE}/optimizer_churn.json", {
+            "status": "ok", "churn_ratio": churn_ratio, "max_abs_change": 0.06,
+            "max_change_param": "momentum", "guardrail_cap": 0.10,
+            "within_guardrails": within, "n_params_changed": 3})
+
+    def test_missing_input(self, s3):
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "optimizer_churn")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "config#1151" in m["status_reason"]
+        assert m["criticality"] == "critical"
+
+    def test_within_guardrails_green(self, s3):
+        self._put(s3, 0.6, True)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "optimizer_churn")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 0.6
+        assert "within guardrails" in m["status_reason"]
+
+    def test_approaching_cap_watch(self, s3):
+        self._put(s3, 0.9, True)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "optimizer_churn")
+        assert m["status"] == "WATCH"
+
+    def test_over_cap_red(self, s3):
+        self._put(s3, 1.1, False)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "optimizer_churn")
+        assert m["status"] == "RED"
+        assert "AT/OVER" in m["status_reason"]
+
+    def test_insufficient_data_na(self, s3):
+        _put(s3, f"backtest/{RUN_DATE}/optimizer_churn.json",
+             {"status": "insufficient_data", "reason": "no usable recommendation"})
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "optimizer_churn")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+
+class TestWalkForwardStability:
+    """walk_forward_stability reads backtest/{date}/walk_forward_stability.json (config#1151)."""
+
+    def _put(self, s3, stability_ratio, n_reversals, weeks=4, stable=True):
+        _put(s3, f"backtest/{RUN_DATE}/walk_forward_stability.json", {
+            "status": "ok", "stability_ratio": stability_ratio, "n_reversals": n_reversals,
+            "max_possible_reversals": 10, "weeks_loaded": weeks, "stable": stable, "reversals": []})
+
+    def test_missing_input(self, s3):
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "walk_forward_stability")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert m["criticality"] == "supporting"
+
+    def test_stable_green(self, s3):
+        self._put(s3, 0.9, 1)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "walk_forward_stability")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 0.9
+        assert m["n_samples"] == 4
+
+    def test_drifting_watch(self, s3):
+        self._put(s3, 0.6, 4)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "walk_forward_stability")
+        assert m["status"] == "WATCH"
+
+    def test_oscillating_red(self, s3):
+        self._put(s3, 0.3, 7, stable=False)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "walk_forward_stability")
+        assert m["status"] == "RED"
+
+    def test_insufficient_history_na(self, s3):
+        _put(s3, f"backtest/{RUN_DATE}/walk_forward_stability.json",
+             {"status": "insufficient_data", "reason": "only 1 prior week", "weeks_loaded": 1})
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "walk_forward_stability")
+        assert m["status"] == "N/A-MISSING-INPUT"
 
 
 class TestSampleSizeAdequacy:

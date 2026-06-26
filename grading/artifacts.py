@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 # computed in the backtester but NOT yet persisted to S3, so they read as
 # missing and grade N/A until a backtester PR persists them):
 #   veto_value, predictor_sizing, scanner_opt, cio_opt
-# and the explicitly-deferred (RC v2 Ph2): sizing_ab, action_entropy.
+# and the explicitly-deferred (RC v2 Ph2): sizing_ab.
+# (action_entropy is now wired — config#1151 Batch C — and grades from its
+# backtest/{date}/action_entropy.json producer.)
 # The ArtifactReport surfaces exactly which were absent so the gap is loud and
 # drives the follow-up persistence work, rather than silently grading partial.
 ARTIFACT_MAP: dict[str, str] = {

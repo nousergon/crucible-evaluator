@@ -11,11 +11,13 @@ over S3:
 
 These are OK-only-persisted by the backtester and only land on a Saturday run,
 so they grade a precise N/A-MISSING-INPUT until present. position_sizing
-(sizing_ab) is B1c-deferred (genuinely unwired); action_entropy /
-reconciliation_integrity are not yet produced → transparent N/A. Portfolio
-construction / implementation-shortfall / trigger-hit-rate components from the
-Tile-3 spec are deferred to a later increment (kept out to avoid N/A noise; the
-Portfolio Outcome tile already covers P&L).
+(sizing_ab) is B1c-deferred (genuinely unwired). action_entropy
+(backtest/{date}/action_entropy.json, config#1151 Batch C) and
+reconciliation_integrity (config#859) are now WIRED — they grade from their
+producer artifacts and fall to a transparent N/A only when the artifact is
+absent. Portfolio construction / implementation-shortfall / trigger-hit-rate
+components from the Tile-3 spec are deferred to a later increment (kept out to
+avoid N/A noise; the Portfolio Outcome tile already covers P&L).
 
 Spec: ``system-report-card-revamp-260522.md`` Tile 3.
 """
@@ -63,9 +65,11 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     # reconciliation_audit lives under trades/{date}/ (executor EOD producer),
     # NOT backtest/{date}/ — it is daily broker-vs-ledger state, config#859.
     recon, _, _, _recon_key = get_json_windowed(s3, bucket, "trades/{date}/reconciliation_audit.json", run_date)
+    aent, _, _, _aent_key = get_json_windowed(s3, bucket, "backtest/{date}/action_entropy.json", run_date)
     _resolved = {
         "trigger_scorecard.json": _trig_key, "shadow_book.json": _shadow_key,
         "exit_timing.json": _exits_key, "portfolio_excursion.json": _exc_key,
+        "action_entropy.json": _aent_key,
     }
     components = []
 
@@ -193,12 +197,34 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         na_detail="position_sizing: sizing_ab analysis genuinely unwired (evaluate.py hardcodes None) — ROADMAP B1c.",
     ))
 
-    # 6. action_entropy (diagnostic) — not persisted.
-    components.append(build_metric(
-        name="action_entropy", module=MODULE, metric_type="ratio", criticality="diagnostic",
-        n_floor=20, target=0.7, red_line=0.3, source_path=src("action_entropy.json"), input_present=False,
-        na_detail="action_entropy: decision-stream entropy not persisted this cycle.",
-    ))
+    # 6. action_entropy (diagnostic, config#1151 Batch C) — is the decision
+    #    stream diverse, or has it collapsed onto one action? The backtester
+    #    producer emits entropy_normalized ∈ [0,1] (1 = uniform over the action
+    #    set, 0 = always the same call). Higher is better: target 0.7 (healthy
+    #    diversity → GREEN), red-line 0.3 (collapsed → RED). `alarm` from the
+    #    producer flags a collapse independent of the band.
+    ae_src = src("action_entropy.json")
+    if aent and aent.get("status") == "ok" and aent.get("entropy_normalized") is not None:
+        h_norm = float(aent["entropy_normalized"])
+        mc = aent.get("most_common")
+        mcf = aent.get("most_common_fraction")
+        components.append(build_metric(
+            name="action_entropy", module=MODULE, metric_type="ratio", criticality="diagnostic",
+            estimator="normalized_shannon_entropy_of_decision_stream", measurement_horizon="per_cycle",
+            value=h_norm, n_samples=aent.get("n"), n_floor=20, target=0.7, red_line=0.3,
+            higher_is_better=True, source_path=ae_src,
+            reason=(f"action_entropy normalized = {h_norm:.2f} (N={aent.get('n')} decisions"
+                    + (f"; most_common={mc!r} at {mcf:.1%}" if mc is not None and mcf is not None else "")
+                    + (", COLLAPSE ALARM" if aent.get("alarm") else "")
+                    + ") vs target 0.7 / red-line 0.3."),
+        ))
+    else:
+        components.append(build_metric(
+            name="action_entropy", module=MODULE, metric_type="ratio", criticality="diagnostic",
+            n_floor=20, target=0.7, red_line=0.3, source_path=ae_src, input_present=False,
+            na_detail=(f"action_entropy: no ok action_entropy.json in the trailing window ending {run_date} "
+                       f"(status={(aent or {}).get('status')!r}); no labelled decision stream this cycle (config#1151)."),
+        ))
 
     # 7. reconciliation_integrity (critical) — ledger-vs-IB position parity
     #    (config#859). Headline = reconciliation_match_rate from the executor's
