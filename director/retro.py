@@ -40,7 +40,7 @@ def _default_llm():
     Same SSM-key + langchain path as ``agent._default_llm`` — kept here so the
     retro can be exercised independently — but bound to ``RetroGrade``.
     """
-    from alpha_engine_lib.secrets import get_secret
+    from nousergon_lib.secrets import get_secret
     from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
     api_key = get_secret("ANTHROPIC_API_KEY")

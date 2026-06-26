@@ -13,7 +13,7 @@ config — the downstream writes are the archived artifact + (Phase H,
 ``director/roadmap_pr.py``) an approval-gated ROADMAP PR the operator merges.
 
 This is defined here in the evaluator for the Phase-E build/validate; it lifts
-to ``alpha_engine_lib.agent_schemas`` once a 2nd consumer (the dashboard / the
+to ``nousergon_lib.agent_schemas`` once a 2nd consumer (the dashboard / the
 ROADMAP-PR renderer) appears (the lift-on-2nd-consumer rule). Authoritative
 spec: ``director-implementation-plan-260604.md`` §4.3.
 """

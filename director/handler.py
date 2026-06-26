@@ -41,6 +41,26 @@ from director.issue_filer import (
 )
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
+from nousergon_lib.logging import setup_logging
+
+# Structured logging + flow-doctor (see grading/handler.py for the full
+# rationale). Importing grading.handler above already ran its setup_logging;
+# this call resets the root handler to the director service name. setup_logging
+# clears+re-adds the root handler so the last call wins (no double-attach), and
+# both handlers share the same flow-doctor.yaml (flow_name: evaluator-lambda).
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "evaluator-director",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +103,7 @@ def _director_github_token() -> str | None:
     primary deliverables; issue filing is secondary). Mirrors the cyphering
     release-queue token pattern + the fleet's institutional ``get_secret`` path."""
     try:
-        from alpha_engine_lib.secrets import get_secret
+        from nousergon_lib.secrets import get_secret
         tok = (get_secret(TOKEN_SECRET_NAME) or "").strip()
         return tok or None
     except Exception as e:  # noqa: BLE001 — absence is a recorded skip, not fatal

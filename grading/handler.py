@@ -24,9 +24,32 @@ import json
 import logging
 import os
 
-from alpha_engine_lib.dates import now_dual
+from nousergon_lib.dates import now_dual
+from nousergon_lib.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
+
+# Structured logging + flow-doctor. Passing a flow-doctor.yaml attaches a
+# FlowDoctorHandler at ERROR (off under pytest), so every log.error() routes
+# through flow-doctor's capture -> dedupe -> diagnose -> alert dispatch without
+# explicit plumbing. The yaml ships in the Lambda task root (Dockerfile COPY);
+# its ${VAR} secrets resolve from SSM at runtime via the role's existing
+# parameter/alpha-engine/* read. Mirrors research/lambda/handler.py. The
+# grading state is non-fatal (SF Catch) and fail-loud by design; flow-doctor
+# adds capture/diagnosis on top without changing that contract.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "evaluator-grading",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +78,7 @@ def _to_trading_day(date_str: str) -> str:
     import datetime as _dt
 
     try:
-        from alpha_engine_lib import trading_calendar as _tc
+        from nousergon_lib import trading_calendar as _tc
 
         d = _dt.date.fromisoformat(date_str[:10])
         td = d if _tc.is_trading_day(d) else _tc.previous_trading_day(d)

@@ -2,7 +2,7 @@
 metric_record.py — the evaluator-side factory for ``MetricRecord`` (RC v2).
 
 The Pydantic contract + the pure status/letter/trend derivation live in
-``alpha_engine_lib.metrics`` (the shared chokepoint so producer and consumers
+``nousergon_lib.metrics`` (the shared chokepoint so producer and consumers
 agree). This module is the evaluator's *construction* convenience: one
 ``build_metric`` call that fills the full record from the raw measured value —
 running the lib's ``derive_status`` / ``derive_letter`` /
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from alpha_engine_lib.metrics import (
+from nousergon_lib.metrics import (
     CriticalityLiteral,
     MetricRecord,
     MetricTypeLiteral,

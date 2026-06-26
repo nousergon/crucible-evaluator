@@ -37,7 +37,7 @@ Design invariants (mirror director-plan §4.3 + the README):
 
 Auth: a fine-grained PAT scoped to ``alpha-engine-config`` ONLY
 (contents:write + pull_requests:write, **no merge**), fetched from SSM via
-``alpha_engine_lib.secrets.get_secret`` — the fleet's institutional secret path,
+``nousergon_lib.secrets.get_secret`` — the fleet's institutional secret path,
 mirroring the cyphering release-queue token pattern. The director Lambda role's
 existing ``ssm:GetParameter`` on ``parameter/alpha-engine/*`` already covers the
 token param, so no IAM change is required.
