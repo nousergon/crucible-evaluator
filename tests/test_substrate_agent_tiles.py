@@ -82,7 +82,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("SUCCEEDED", 8, now),
                                _run("SUCCEEDED", 15, now), _run("SUCCEEDED", 22, now)],
         )
@@ -101,7 +101,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("FAILED", 2, now),
                                _run("FAILED", 3, now), _run("TIMED_OUT", 4, now)],
         )
@@ -119,7 +119,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [
                 _run("FAILED", 1, now, role="weekly"), _run("SUCCEEDED", 1, now, role="recovery"),
                 _run("FAILED", 8, now, role="weekly"), _run("SUCCEEDED", 8, now, role="recovery"),
@@ -141,7 +141,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly")],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
@@ -154,7 +154,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="recovery")],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
@@ -166,7 +166,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("RUNNING", 1, now),
                                _run("FAILED", 40, now)],  # RUNNING excluded; 40d old excluded
         )
@@ -181,7 +181,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly"),
                                _run("FAILED", 2, now, role=None),  # untracked smoke → excluded
                                _run("FAILED", 3, now, role=None)],
@@ -196,7 +196,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("RUNNING", 1, now)],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())

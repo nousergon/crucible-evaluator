@@ -11,7 +11,8 @@ pandas~=3.0
 # intervals (alpha_engine_lib.quant.stats.intervals), quant stats (sharpe /
 # sortino / max_drawdown / PSR / DSR / CVaR / BH-FDR), agent schemas, secrets.
 # v0.52.0 — Phase C consumes MetricRecord + derive_* + the quant battery.
-alpha-engine-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.52.0
+krepis[flow_doctor]>=0.2.0
+nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.67.0
 
 # Director (Layer C) — single structured Opus call. langchain-anthropic provides
 # ChatAnthropic + with_structured_output; only needed when DIRECTOR_ENABLED is on

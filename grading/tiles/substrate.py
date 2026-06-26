@@ -11,7 +11,7 @@ report card says "the substrate is mostly unmeasured" out loud rather than
 hiding it.
 
 ``sf_success_rate_4w`` is the headline substrate metric and the highest-value
-follow-up: wire ``alpha_engine_lib.pipeline_status.list_recent_pipeline_runs``
+follow-up: wire ``nousergon_lib.pipeline_status.list_recent_pipeline_runs``
 over the 3 Step Function ARNs (Saturday / Weekday / EOD).
 
 Spec: ``system-report-card-revamp-260522.md`` Tile 5.
@@ -162,7 +162,7 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
     discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED; RUNNING /
     NOT_RUN excluded.
     """
-    from alpha_engine_lib.pipeline_status import list_recent_pipeline_runs
+    from nousergon_lib.pipeline_status import list_recent_pipeline_runs
 
     arns = _discover_sf_arns(sfn)
     if not arns:
@@ -297,7 +297,7 @@ def build_substrate_tile(
     #    per-EXECUTION rate counted operator-recovered cycles AND scheduled-run
     #    failures as failures, producing a false P0 RED (0.4918) even on a week
     #    where every cycle ultimately completed clean. We now grade two distinct
-    #    axes off the SF execution history (alpha_engine_lib.pipeline_status):
+    #    axes off the SF execution history (nousergon_lib.pipeline_status):
     #      - sf_success_rate_4w   = DISTINCT-CYCLE outcome (clean = recovered or
     #                               not). The honest "did the work get done?" axis.
     #      - unattended_first_pass_rate = scheduled run succeeded w/ NO recovery.
