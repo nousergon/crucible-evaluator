@@ -367,6 +367,20 @@ def handler(event: dict | None = None, context=None) -> dict:
     merged = merge_plan_into_ledger(ledger, plan, run_date)
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
+    # Digest email — a thin summary that deep-links to the console Director page
+    # for the full proposed plan (mirrors the EOD / model-zoo / backtester
+    # patterns). Best-effort: the plan above is the primary deliverable and is
+    # already persisted; a send failure (or missing email SSM config) is logged
+    # and never fatal. Transport resolves EMAIL_SENDER/EMAIL_RECIPIENTS/
+    # GMAIL_APP_PASSWORD from SSM (the role's parameter/alpha-engine/* grant),
+    # so until those are set the lib logs "Email not configured" and skips.
+    email_sent = False
+    try:
+        from director.emailer import send_director_digest
+        email_sent = send_director_digest(plan, run_date)
+    except Exception:  # noqa: BLE001 — the email must never break the Director
+        logger.warning("Director: digest email failed (non-fatal)", exc_info=True)
+
     # Phase G — self-grading retro loop. Judge LAST week's plan against THIS
     # week's card (the realized-outcome feedback the in-call SelfGrade can't give).
     # Best-effort: the plan above is the primary deliverable and is already
@@ -385,6 +399,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "action_plan_key": plan_key,
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
+        "digest_email": "sent" if email_sent else "not_sent",
         **retro_summary,
         **issues_summary,
     }
