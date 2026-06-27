@@ -443,15 +443,30 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     # The live cutover rewrites only signals.json score, which no IC producer
     # reads back, so research_composite_ic / composite_scoring / momentum_regime_ic
     # all measure the RAW research.db score and are BLIND to the live fix. The
-    # backtester's neutralized_composite_ic.live_forward segment closes that: the
-    # post-cutover per-week (neutralized − raw) IC delta with a date-clustered
-    # Grinold-Kahn t-stat (config#1164) — and because the backtester reconstructs
-    # the neutralized score with the same residualizer the live path applies, that
-    # segment IS the live efficacy. WATCH while accumulating / underpowered; GREEN
-    # once it's significantly positive; RED only if the live fix is SIGNIFICANTLY
-    # HURTING (a revert signal), not merely noisy.
+    # backtester closes that with a post-cutover per-week (neutralized − raw) IC
+    # delta + a date-clustered Grinold-Kahn t-stat (config#1164). WATCH while
+    # accumulating / underpowered; GREEN once it's significantly positive; RED
+    # only if the live fix is SIGNIFICANTLY HURTING (a revert signal), not noisy.
+    #
+    # SOURCE PREFERENCE (config#1187 root-cause fix): the DIRECT producer
+    # `neutralization_live_forward_ic` joins the score the live system ACTUALLY
+    # ranked on — crucible-research now persists it as the DUAL field
+    # cio_evaluations.neutralized_final_score — to realized 21d alpha. That is the
+    # true live efficacy, so prefer it. Fall back to neutralized_composite_ic's
+    # live_forward segment (which RE-DERIVES the neutralized score with the same
+    # residualizer the live path applies) until the persisted source has a
+    # post-cutover cohort. The grading contract is identical for both.
+    nlf = e2e.get("neutralization_live_forward_ic") or {}
     nci = e2e.get("neutralized_composite_ic") or {}
-    lf = nci.get("live_forward") if nci.get("status") == "ok" else None
+    if nlf.get("status") == "ok" and (nlf.get("live_forward") or {}).get("n_weeks"):
+        lf = nlf.get("live_forward")
+        cutover_date = nlf.get("cutover_date")
+    elif nci.get("status") == "ok" and (nci.get("live_forward") or {}).get("n_weeks"):
+        lf = nci.get("live_forward")
+        cutover_date = nci.get("cutover_date")
+    else:
+        lf = None
+        cutover_date = nlf.get("cutover_date") or nci.get("cutover_date")
     if lf is not None and lf.get("n_weeks"):
         delta = lf.get("mean_weekly_delta")
         p = lf.get("delta_t_p")
@@ -470,7 +485,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             value=delta, n_samples=nwk, n_floor=4, target=0.0, red_line=-0.02,
             higher_is_better=True, source_path=e2e_src, status=status,
             reason=(
-                f"neutralization_live_efficacy: post-cutover ({nci.get('cutover_date')}) "
+                f"neutralization_live_efficacy: post-cutover ({cutover_date}) "
                 f"weekly (neutralized−raw) 21d-alpha IC delta = "
                 f"{('%+.3f' % delta) if delta is not None else 'n/a'} "
                 f"(date-clustered p={p if p is None else round(p, 3)}, N={nwk} weeks; "
@@ -487,8 +502,10 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=4, target=0.0, red_line=-0.02, higher_is_better=True, source_path=e2e_src,
             input_present=False,
             na_detail=(
-                f"neutralization_live_efficacy: no live_forward block in "
-                f"neutralized_composite_ic this cycle (status={nci.get('status')!r}); needs the "
+                f"neutralization_live_efficacy: no live_forward block from either the "
+                f"persisted-field producer neutralization_live_forward_ic "
+                f"(status={nlf.get('status')!r}) or the re-derived "
+                f"neutralized_composite_ic (status={nci.get('status')!r}) this cycle; needs the "
                 f"backtester producer (config#1187) + >=1 post-cutover weekly cohort with realized 21d alpha."
             ),
         ))
