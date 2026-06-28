@@ -21,11 +21,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from krepis.console import console_url
+
 log = logging.getLogger(__name__)
 
-DEFAULT_CONSOLE_BASE_URL = "https://console.nousergon.ai"
 # Cross-repo contract: equals the dashboard's pinned ``url_path`` for the
-# Director page (tests/test_director_page.py guards both sides).
+# Director page (tests/test_director_page.py guards both sides). Stays local;
+# only the base-URL builder is lifted.
 DIRECTOR_SLUG = "director"
 
 # P0 first when ordering the action-items table.
@@ -33,9 +35,12 @@ _PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
 
 def director_plan_url(run_date: str, console_base_url: str | None = None) -> str:
-    """Deep-link to the console Director page for ``run_date``."""
-    base = (console_base_url or DEFAULT_CONSOLE_BASE_URL).rstrip("/")
-    return f"{base}/{DIRECTOR_SLUG}?date={run_date}"
+    """Deep-link to the console Director page for ``run_date``.
+
+    Thin wrapper over the lifted :func:`krepis.console.console_url` chokepoint
+    (config#1300) — the base-URL literal now lives once in krepis.
+    """
+    return console_url(DIRECTOR_SLUG, date=run_date, base=console_base_url)
 
 
 def _as_dict(plan: Any) -> dict:
