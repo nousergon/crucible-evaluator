@@ -49,7 +49,7 @@ def _default_llm():
     (the ChatAnthropic kwarg, not ``api_key``). Both imports are lazy so tests +
     the grading path never pull langchain or hit SSM.
     """
-    from alpha_engine_lib.secrets import get_secret
+    from krepis.secrets import get_secret
     from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
     api_key = get_secret("ANTHROPIC_API_KEY")

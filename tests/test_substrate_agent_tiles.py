@@ -65,6 +65,64 @@ class TestSubstrate:
         assert tile["status"] == "WATCH"
 
 
+class TestDeploySuccessRate:
+    def _put(self, s3, doc):
+        import json
+
+        from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
+        s3.put_object(Bucket=BUCKET, Key=DEPLOY_SUCCESS_KEY,
+                      Body=json.dumps(doc).encode("utf-8"))
+
+    def test_graded_green_when_fresh_rollup_present(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator", "nousergon/crucible-predictor"],
+            "success_runs": 19, "total_runs": 20, "success_rate": 0.95,
+        })
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now)
+        ds = _comp(tile, "deploy_success_rate")
+        assert ds["value"] == 0.95
+        assert ds["status"] == "GREEN"
+        assert ds["n_samples"] == 20
+
+    def test_red_when_rate_below_red_line(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator"],
+            "success_runs": 6, "total_runs": 10, "success_rate": 0.6,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "RED"
+
+    def test_na_missing_input_when_no_rollup(self, s3):
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "producer" in ds["status_reason"]
+
+    def test_na_when_rollup_stale(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": (now - timedelta(days=30)).isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator"],
+            "success_runs": 19, "total_runs": 20, "success_rate": 0.95,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "stopped running" in ds["status_reason"]
+
+    def test_na_when_rollup_has_no_runs(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": [], "success_runs": 0, "total_runs": 0, "success_rate": None,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "nothing to grade" in ds["status_reason"]
+
+
 _ARNS = "arn:aws:states:us-east-1:0:stateMachine:alpha-engine-saturday-pipeline"
 
 
@@ -82,7 +140,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("SUCCEEDED", 8, now),
                                _run("SUCCEEDED", 15, now), _run("SUCCEEDED", 22, now)],
         )
@@ -101,7 +159,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("FAILED", 2, now),
                                _run("FAILED", 3, now), _run("TIMED_OUT", 4, now)],
         )
@@ -119,7 +177,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [
                 _run("FAILED", 1, now, role="weekly"), _run("SUCCEEDED", 1, now, role="recovery"),
                 _run("FAILED", 8, now, role="weekly"), _run("SUCCEEDED", 8, now, role="recovery"),
@@ -141,7 +199,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly")],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
@@ -154,7 +212,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="recovery")],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
@@ -166,7 +224,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("RUNNING", 1, now),
                                _run("FAILED", 40, now)],  # RUNNING excluded; 40d old excluded
         )
@@ -181,7 +239,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly"),
                                _run("FAILED", 2, now, role=None),  # untracked smoke → excluded
                                _run("FAILED", 3, now, role=None)],
@@ -196,7 +254,7 @@ class TestSfSuccessRate:
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
         monkeypatch.setattr(
-            "alpha_engine_lib.pipeline_status.list_recent_pipeline_runs",
+            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
             lambda arn, **kw: [_run("RUNNING", 1, now)],
         )
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
@@ -339,7 +397,122 @@ class TestDataQualityIncidents:
         assert dq["status"] == "N/A-MISSING-INPUT"
         assert "cloudwatch:GetMetricStatistics" in dq["status_reason"]
 
-    def test_schema_drift_still_not_impl(self, s3):
-        dq = _comp(self._tile(s3, _FakeCW()), "schema_drift_incidents")
-        assert dq["status"] == "N/A-NOT-IMPL"
-        assert "StreamDescriptorMismatch" in dq["status_reason"]
+
+class TestSchemaDriftIncidents:
+    def _tile(self, s3, cw):
+        return build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC), cloudwatch_client=cw)
+
+    def test_zero_incidents_green(self, s3):
+        # A clean run emits 0 every day → trailing-4w Sum is 0 → GREEN.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 0.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 0.0
+        assert sd["status"] == "GREEN"          # 0 == target, lower-is-better
+
+    def test_single_incident_watch(self, s3):
+        # Even ONE schema-drift incident is a real data-integrity failure → WATCH.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 1.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 1.0
+        assert sd["status"] == "WATCH"          # between target 0 and red-line 3
+
+    def test_cluster_red(self, s3):
+        # A cluster (≥3) is a systemic descriptor regression → RED.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 4.0})),
+                   "schema_drift_incidents")
+        assert sd["value"] == 4.0
+        assert sd["status"] == "RED"            # ≥ red-line 3
+
+    def test_grades_non_na_and_is_critical(self, s3):
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": 0.0})),
+                   "schema_drift_incidents")
+        assert sd["criticality"] == "critical"
+        assert not sd["status"].startswith("N/A")   # genuinely graded, not N/A
+
+    def test_no_datapoints_not_run(self, s3):
+        # No emitted datapoints yet (producer not deployed) → N/A-NOT-RUN.
+        sd = _comp(self._tile(s3, _FakeCW({"daily_append_schema_drift_count": None})),
+                   "schema_drift_incidents")
+        assert sd["status"] == "N/A-NOT-RUN"
+
+    def test_cw_access_error_missing_input_names_perm(self, s3):
+        from botocore.exceptions import ClientError
+        err = ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetMetricStatistics")
+        sd = _comp(self._tile(s3, _FakeCW(raises=err)), "schema_drift_incidents")
+        assert sd["status"] == "N/A-MISSING-INPUT"
+        assert "cloudwatch:GetMetricStatistics" in sd["status_reason"]
+
+
+_WF_RUN_DATE = "2026-06-20"
+
+
+def _put_substrate_ops(s3, *, firing_count, per_phase, date=_WF_RUN_DATE, capped=None):
+    import json
+    body = {
+        "schema_version": 1,
+        "date": date,
+        "watchdog": {
+            "firing_count": firing_count,
+            "capped_phases_run": capped if capped is not None else len(per_phase),
+            "per_phase": per_phase,
+        },
+    }
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{date}/substrate_ops.json",
+        Body=json.dumps(body).encode(), ContentType="application/json",
+    )
+
+
+class TestWatchdogFirings:
+    """watchdog_firings reads backtest/{date}/substrate_ops.json (config#1151).
+
+    Mirrors the wired-substrate-component template (data_quality_incidents):
+    a real graded read, lower-is-better, target 0 / red-line 2."""
+
+    def test_no_run_date_missing_input(self, s3):
+        # No run_date threaded → can't resolve the dated artifact → graceful N/A.
+        wf = _comp(build_substrate_tile(BUCKET, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "N/A-MISSING-INPUT"
+        assert wf["criticality"] == "supporting"
+
+    def test_missing_artifact_missing_input_names_producer(self, s3):
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "N/A-MISSING-INPUT"
+        assert "config#1151" in wf["status_reason"]
+
+    def test_zero_firings_green(self, s3):
+        _put_substrate_ops(s3, firing_count=0, per_phase=[
+            {"phase": "param_sweep", "watchdog_fired": False, "cap_s": 3600.0, "wall_time_s": 120.0},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "GREEN"
+        assert wf["value"] == 0.0
+        assert "healthy" in wf["status_reason"]
+
+    def test_one_firing_watch(self, s3):
+        _put_substrate_ops(s3, firing_count=1, capped=2, per_phase=[
+            {"phase": "simulate", "watchdog_fired": False, "cap_s": 1800.0, "wall_time_s": 200.0},
+            {"phase": "param_sweep", "watchdog_fired": True, "cap_s": 3600.0, "wall_time_s": 3600.1},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "WATCH"
+        assert wf["value"] == 1.0
+        assert "param_sweep" in wf["status_reason"]
+
+    def test_two_firings_red(self, s3):
+        _put_substrate_ops(s3, firing_count=2, per_phase=[
+            {"phase": "simulate", "watchdog_fired": True, "cap_s": 1800.0, "wall_time_s": 1800.2},
+            {"phase": "param_sweep", "watchdog_fired": True, "cap_s": 3600.0, "wall_time_s": 3600.1},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "RED"
+        assert wf["value"] == 2.0
+
+    def test_windowed_grades_off_earlier_date(self, s3):
+        # Producer ran 3 days before run_date (partial/off-cycle) → still grades.
+        _put_substrate_ops(s3, firing_count=0, date="2026-06-17", per_phase=[
+            {"phase": "param_sweep", "watchdog_fired": False, "cap_s": 3600.0, "wall_time_s": 90.0},
+        ])
+        wf = _comp(build_substrate_tile(BUCKET, _WF_RUN_DATE, s3_client=s3), "watchdog_firings")
+        assert wf["status"] == "GREEN"
+        assert "2026-06-17" in wf["source_path"]

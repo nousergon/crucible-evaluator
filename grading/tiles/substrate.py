@@ -11,7 +11,7 @@ report card says "the substrate is mostly unmeasured" out loud rather than
 hiding it.
 
 ``sf_success_rate_4w`` is the headline substrate metric and the highest-value
-follow-up: wire ``alpha_engine_lib.pipeline_status.list_recent_pipeline_runs``
+follow-up: wire ``nousergon_lib.pipeline_status.list_recent_pipeline_runs``
 over the 3 Step Function ARNs (Saturday / Weekday / EOD).
 
 Spec: ``system-report-card-revamp-260522.md`` Tile 5.
@@ -26,8 +26,10 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from grading.artifacts import _get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,41 @@ _SF_WINDOW_DAYS = 28
 _DQ_NAMESPACE = "AlphaEngine/Data"
 _DQ_BLOCKED_METRIC = "daily_append_quality_blocked_count"
 _DQ_WARNED_METRIC = "daily_append_quality_warned_count"
+
+# schema_drift_incidents — the data collector counts every ArcticDB
+# StreamDescriptorMismatch / DataError raised on a universe write path
+# (``update_batch`` / ``write_batch`` / ``_write_row_backfill_safe``) per run
+# and emits ``AlphaEngine/Data/daily_append_schema_drift_count`` (alpha-engine-data
+# builders/daily_append.py). UNLIKE data_quality_incidents (a routine row-level
+# gate with a ~95/4w steady-state baseline), a schema-drift incident is a HARD
+# data-integrity failure: the persisted ArcticDB descriptor no longer matches the
+# row being written, the daily_append run FAILS LOUD (counted then re-raised),
+# and downstream features are starved until an operator repairs the descriptor.
+# It is meant to be ZERO in steady state, so the thresholds are an absolute
+# incident count, NOT a regression band: target 0 (any incident is a real event
+# worth a WATCH) / red-line 3 (a cluster of ≥3 schema failures in 4w is a
+# systemic descriptor regression → RED). (config#1150 Batch B.)
+_SCHEMA_DRIFT_METRIC = "daily_append_schema_drift_count"
+
+# watchdog_firings (supporting, config#1151 Batch C) — per-RUN count of backtester
+# phases that hit their hard timeout cap and were force-aborted by the phase
+# watchdog (crucible-backtester pipeline_common.phase() → substrate_ops.json).
+# A firing means a phase burned through its entire silent-compute budget — the
+# 2026-04-22 dry-run's 110-min silent stall that motivated the tripwire. Thresholds
+# (lower-is-better): 0 firings = GREEN (no phase capped out, healthy); target 0,
+# red-line 2 → exactly 1 = WATCH (a single trip can be a transient infra slowdown —
+# a slow EBS volume, a one-off GC pause), >=2 = RED (repeated caps = a phase
+# systematically exceeding its budget, real degradation needing a root-cause).
+_WATCHDOG_TARGET = 0.0
+_WATCHDOG_RED_LINE = 2.0
+
+# deploy_success_rate (supporting, config#1153 Batch E) — CI/CD deploy-workflow
+# health across the code repos, produced weekly by the Director
+# (grading.producers.deploy_success) since the evaluator Lambda holds no GitHub
+# token. Bands: deploys should almost always ship clean → target 95% / red-line
+# 80%. A rollup older than the freshness window means the producer stopped
+# running → grade a transparent stale N/A rather than a false-confident number.
+_DEPLOY_SUCCESS_MAX_AGE_DAYS = 21
 
 
 def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
@@ -134,7 +171,7 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
     discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED; RUNNING /
     NOT_RUN excluded.
     """
-    from alpha_engine_lib.pipeline_status import list_recent_pipeline_runs
+    from nousergon_lib.pipeline_status import list_recent_pipeline_runs
 
     arns = _discover_sf_arns(sfn)
     if not arns:
@@ -225,13 +262,20 @@ def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
 
 def build_substrate_tile(
     bucket: str,
+    run_date: str | None = None,
     s3_client=None,
     *,
     as_of: datetime | None = None,
     sfn_client=None,
     cloudwatch_client=None,
 ) -> dict:
-    """Build the Substrate Reliability tile."""
+    """Build the Substrate Reliability tile.
+
+    ``run_date`` (ISO ``YYYY-MM-DD``) anchors the windowed read of the
+    backtester's ``substrate_ops.json`` for ``watchdog_firings`` (config#1151).
+    When omitted, ``watchdog_firings`` grades ``N/A-MISSING-INPUT`` rather than
+    crashing — the other components are AWS-API sourced and don't need it.
+    """
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
     components = []
@@ -262,7 +306,7 @@ def build_substrate_tile(
     #    per-EXECUTION rate counted operator-recovered cycles AND scheduled-run
     #    failures as failures, producing a false P0 RED (0.4918) even on a week
     #    where every cycle ultimately completed clean. We now grade two distinct
-    #    axes off the SF execution history (alpha_engine_lib.pipeline_status):
+    #    axes off the SF execution history (nousergon_lib.pipeline_status):
     #      - sf_success_rate_4w   = DISTINCT-CYCLE outcome (clean = recovered or
     #                               not). The honest "did the work get done?" axis.
     #      - unattended_first_pass_rate = scheduled run succeeded w/ NO recovery.
@@ -387,17 +431,155 @@ def build_substrate_tile(
             na_detail=f"data_quality_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
         ))
 
-    # 4-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
+    # 3b. schema_drift_incidents (critical) — trailing-4w SUM of ArcticDB
+    #    StreamDescriptorMismatch / DataError write failures, counted-then-
+    #    re-raised by the data collector and emitted to CloudWatch (mirrors the
+    #    data_quality read above — the substrate tile is the one tile that reaches
+    #    AWS APIs). A schema-drift incident is a HARD data-integrity failure (the
+    #    daily_append run fails loud), so the band is an absolute incident count
+    #    (target 0 / red-line 3) rather than a regression detector. Graceful N/A
+    #    on a CW access error / missing perm — WARN-logged, not swallowed.
+    #    config#1150 Batch B.
+    sd_src = f"cloudwatch:{_DQ_NAMESPACE}/{_SCHEMA_DRIFT_METRIC}"
+    try:
+        cw = cloudwatch_client or boto3.client(
+            "cloudwatch", region_name=os.environ.get("AWS_REGION", "us-east-1")
+        )
+        drift = _cw_metric_sum(cw, _DQ_NAMESPACE, _SCHEMA_DRIFT_METRIC, as_of, _SF_WINDOW_DAYS)
+        if drift is None:
+            components.append(build_metric(
+                name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+                ran=False,
+                na_detail=(f"schema_drift_incidents: no {_SCHEMA_DRIFT_METRIC} datapoints in CloudWatch "
+                           f"over {_SF_WINDOW_DAYS}d (the metric self-activates once a daily_append run "
+                           f"emits it — zero is emitted on every clean run, so N/A means the instrumented "
+                           f"producer has not yet deployed/run)."),
+            ))
+        else:
+            components.append(build_metric(
+                name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+                estimator="incident_count_4w", measurement_horizon="trailing_4w",
+                value=drift, n_samples=1, n_floor=1, target=0.0, red_line=3.0,
+                higher_is_better=False, source_path=sd_src,
+                reason=(f"schema_drift_incidents = {drift:.0f} ArcticDB StreamDescriptorMismatch / "
+                        f"DataError write failures over {_SF_WINDOW_DAYS}d vs target 0 / red-line 3. "
+                        f"A schema-drift incident is a HARD data-integrity failure (the daily_append "
+                        f"write fails loud) — meant to be zero in steady state; any incident is a WATCH, "
+                        f"a cluster (≥3) is a systemic descriptor regression (RED)."),
+            ))
+    except (ClientError, BotoCoreError) as e:
+        code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
+        logger.warning("schema_drift_incidents: CloudWatch read failed (%s) — grading N/A", e)
+        components.append(build_metric(
+            name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
+            estimator="incident_count_4w", measurement_horizon="trailing_4w",
+            n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+            input_present=False,
+            na_detail=f"schema_drift_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
+        ))
+
+    # watchdog_firings (supporting, config#1151 Batch C) — how many backtester
+    # phases hit their hard timeout cap this run and were force-aborted by the
+    # phase watchdog. Read (windowed, config#1190 — a partial/off-cycle producer
+    # run still grades) from backtest/{date}/substrate_ops.json, the per-run
+    # aggregate pipeline_common.phase() writes. Lower-is-better: 0 = GREEN.
+    wf_src = f"s3://{bucket}/backtest/{run_date}/substrate_ops.json" if run_date else f"s3://{bucket}/"
+    wf_doc = None
+    if run_date:
+        wf_doc, _wf_date, _wf_age, _wf_key = get_json_windowed(
+            s3, bucket, "backtest/{date}/substrate_ops.json", run_date
+        )
+        if _wf_key:
+            wf_src = f"s3://{bucket}/{_wf_key}"
+    wd = (wf_doc or {}).get("watchdog") if isinstance(wf_doc, dict) else None
+    if isinstance(wd, dict) and wd.get("firing_count") is not None:
+        firings = wd["firing_count"]
+        capped = wd.get("capped_phases_run")
+        fired_phases = [
+            r.get("phase") for r in (wd.get("per_phase") or []) if r.get("watchdog_fired")
+        ]
+        if firings == 0:
+            verdict = "no phase hit its hard cap (healthy)"
+        elif firings == 1:
+            verdict = "one phase capped out — a single trip can be a transient infra slowdown, WATCH"
+        else:
+            verdict = "multiple phases capped out — a phase is systematically exceeding its budget, RED"
+        detail = f" ({', '.join(p for p in fired_phases if p)})" if fired_phases else ""
+        components.append(build_metric(
+            name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
+            estimator="per_run_phase_timeout_count", measurement_horizon="per_run",
+            value=float(firings), n_samples=1, n_floor=1,
+            target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE, higher_is_better=False,
+            source_path=wf_src,
+            reason=(f"watchdog_firings = {firings} backtester phase(s) hit their hard "
+                    f"timeout cap{detail} of {capped} capped phase(s) run vs target 0 / "
+                    f"red-line 2 — {verdict}."),
+        ))
+    else:
+        components.append(build_metric(
+            name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
+            n_floor=1, target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE,
+            higher_is_better=False, source_path=wf_src, input_present=False,
+            na_detail=(f"watchdog_firings: no substrate_ops.json with a watchdog block in the "
+                       f"trailing window ending {run_date} — needs the backtester producer "
+                       f"(config#1151) to have run a capped phase."),
+        ))
+
+    # 4. deploy_success_rate (supporting) — wired to the Director's weekly GH-API
+    #    rollup (config#1153 Batch E). Graded when the producer has run + the
+    #    rollup is fresh; transparent N/A naming the producer otherwise.
+    ds_src = f"s3://{bucket}/{DEPLOY_SUCCESS_KEY}"
+    ds_doc = _get_json(s3, bucket, DEPLOY_SUCCESS_KEY)
+    ds_age_days = None
+    if isinstance(ds_doc, dict):
+        gen = ds_doc.get("generated_utc")
+        if gen:
+            try:
+                gen_dt = datetime.fromisoformat(gen)
+                if gen_dt.tzinfo is None:
+                    gen_dt = gen_dt.replace(tzinfo=UTC)
+                ds_age_days = (as_of - gen_dt).total_seconds() / 86400.0
+            except ValueError:
+                ds_age_days = None
+    ds_rate = ds_doc.get("success_rate") if isinstance(ds_doc, dict) else None
+    ds_total = (ds_doc.get("total_runs") or 0) if isinstance(ds_doc, dict) else 0
+    ds_stale = ds_age_days is not None and ds_age_days > _DEPLOY_SUCCESS_MAX_AGE_DAYS
+    if ds_rate is not None and ds_total and not ds_stale:
+        ds_succ = ds_doc.get("success_runs", round(float(ds_rate) * ds_total))
+        win = ds_doc.get("window_days", "?")
+        n_repos = len(ds_doc.get("repos_measured") or [])
+        components.append(build_metric(
+            name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            estimator="deploy_workflow_success_rate", measurement_horizon=f"trailing_{win}d",
+            value=float(ds_rate), n_samples=int(ds_total), n_floor=3,
+            target=0.95, red_line=0.80, source_path=ds_src,
+            reason=(f"deploy_success_rate = {float(ds_rate):.0%} ({ds_succ}/{ds_total} terminal "
+                    f"deploy-workflow runs across {n_repos} repo(s) succeeded in {win}d) "
+                    f"vs target 95% / red-line 80%."),
+        ))
+    else:
+        if ds_stale:
+            na = (f"deploy_success_rate: rollup at {DEPLOY_SUCCESS_KEY} is {ds_age_days:.0f}d old "
+                  f"(> {_DEPLOY_SUCCESS_MAX_AGE_DAYS}d) — the Director's weekly producer has stopped running.")
+        elif isinstance(ds_doc, dict) and not ds_total:
+            na = ("deploy_success_rate: rollup present but no terminal deploy-workflow runs in the "
+                  "window — nothing to grade.")
+        else:
+            na = ("deploy_success_rate: no _substrate/deploy_success.json yet — needs the Director's "
+                  "weekly GH-API producer (grading.producers.deploy_success) to have run.")
+        components.append(build_metric(
+            name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            n_floor=3, target=0.95, red_line=0.80, source_path=ds_src,
+            input_present=False, na_detail=na,
+        ))
+
+    # 5-7. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
-        ("schema_drift_incidents", "critical",
-         "schema_drift_incidents: needs the ArcticDB StreamDescriptorMismatch / schema-failure error log — not yet aggregated."),
-        ("deploy_success_rate", "supporting",
-         "deploy_success_rate: needs GitHub Actions run history across the 8 repos (GH API) — outside the evaluator's S3 reach today."),
         ("alert_noise_ratio", "supporting",
          "alert_noise_ratio: needs the alerts log + a manual actionable/total tag — not yet sourced."),
-        ("watchdog_firings", "supporting",
-         "watchdog_firings: needs the backtester PhaseTimeoutError / silent-phase-tripwire firing count — not yet aggregated."),
         ("changelog_coverage", "diagnostic",
          "changelog_coverage: needs an expected-event-source set to compute % writing to the changelog — not yet defined."),
         ("iam_drift", "diagnostic",
@@ -418,9 +600,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover
 
     parser = argparse.ArgumentParser(description="Build the Substrate Reliability tile.")
     parser.add_argument("--bucket", default="alpha-engine-research")
+    parser.add_argument("--run-date", default=None, help="ISO run date for windowed artifact reads (watchdog_firings).")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    print(json.dumps(build_substrate_tile(args.bucket), indent=2, default=str))
+    print(json.dumps(build_substrate_tile(args.bucket, args.run_date), indent=2, default=str))
     return 0
 
 

@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 import boto3
 from botocore.exceptions import ClientError
 
-from alpha_engine_lib.quant.stats.intervals import bootstrap_ci
+from nousergon_lib.quant.stats.intervals import bootstrap_ci
 
 from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric

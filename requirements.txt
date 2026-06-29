@@ -1,17 +1,19 @@
 # Config / storage
-boto3~=1.34
+boto3~=1.43
 pydantic~=2.7
 pyyaml~=6.0
 
 # Numerics for grading / report-card aggregation
-numpy~=1.26
+numpy~=2.4
 pandas~=3.0
 
 # Shared contracts: MetricRecord (alpha_engine_lib.metrics), statistical
 # intervals (alpha_engine_lib.quant.stats.intervals), quant stats (sharpe /
 # sortino / max_drawdown / PSR / DSR / CVaR / BH-FDR), agent schemas, secrets.
 # v0.52.0 — Phase C consumes MetricRecord + derive_* + the quant battery.
-alpha-engine-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.52.0
+# v0.4.0 — director/emailer.py consumes krepis.console.console_url (config#1300).
+krepis[flow_doctor]>=0.4.0
+nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.67.0
 
 # Director (Layer C) — single structured Opus call. langchain-anthropic provides
 # ChatAnthropic + with_structured_output; only needed when DIRECTOR_ENABLED is on
@@ -19,7 +21,7 @@ alpha-engine-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v
 langchain-anthropic~=0.3
 
 # Dev / testing
-pytest~=9.0
-pytest-cov~=4.1
+pytest~=9.1
+pytest-cov~=7.1
 # moto: mocked S3 for artifact-read integration tests (added with the grading layer)
-moto~=5.0
+moto~=5.2

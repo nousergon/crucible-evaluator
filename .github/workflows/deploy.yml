@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout evaluator repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # The image is built purely from this repo (no proprietary config/prompt
       # is staged from alpha-engine-config — the tuned director/prompt.py is
@@ -44,13 +44,13 @@ jobs:
       # prompt is ever wanted in production, mirror the predictor/research
       # CONFIG_REPO_DIR staging pattern here.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
           aws-region: us-east-1

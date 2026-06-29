@@ -41,6 +41,26 @@ from director.issue_filer import (
 )
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
+from krepis.logging import setup_logging
+
+# Structured logging + flow-doctor (see grading/handler.py for the full
+# rationale). Importing grading.handler above already ran its setup_logging;
+# this call resets the root handler to the director service name. setup_logging
+# clears+re-adds the root handler so the last call wins (no double-attach), and
+# both handlers share the same flow-doctor.yaml (flow_name: evaluator-lambda).
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "evaluator-director",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +103,7 @@ def _director_github_token() -> str | None:
     primary deliverables; issue filing is secondary). Mirrors the cyphering
     release-queue token pattern + the fleet's institutional ``get_secret`` path."""
     try:
-        from alpha_engine_lib.secrets import get_secret
+        from krepis.secrets import get_secret
         tok = (get_secret(TOKEN_SECRET_NAME) or "").strip()
         return tok or None
     except Exception as e:  # noqa: BLE001 — absence is a recorded skip, not fatal
@@ -251,6 +271,31 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict) -> dict:
         return {"retro": "error", "retro_error": str(e)}
 
 
+def _run_deploy_success_best_effort(s3, bucket: str, token: str | None) -> dict:
+    """Produce the substrate tile's deploy_success_rate rollup (config#1153 Batch E).
+
+    The evaluator's grading Lambda holds no GitHub token, so the deploy health of
+    the code repos is invisible to it; the Director (which already authenticates to
+    GitHub and writes the research bucket) doubles as the weekly GH-API→S3 producer.
+    Best-effort: the action plan is the primary deliverable and is already
+    persisted, so a producer failure is WARN-logged + recorded, never fatal
+    ([[feedback_no_silent_fails]])."""
+    if not token:
+        return {"deploy_success": "skipped", "deploy_success_reason": "no GH token"}
+    try:
+        from grading.producers.deploy_success import run as run_deploy_success
+        res = run_deploy_success(s3, bucket, token)
+        return {
+            "deploy_success": "ok",
+            "deploy_success_rate": res.get("success_rate"),
+            "deploy_success_n": res.get("total_runs"),
+            "deploy_success_repos": res.get("n_repos_measured"),
+        }
+    except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
+        logger.warning("Director deploy_success producer failed (plan already written, non-fatal): %s", e)
+        return {"deploy_success": "error", "deploy_success_error": str(e)}
+
+
 def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
     """Preflight probe: exercise the Director's bootstrap/import/IAM surface with
     no Opus call and no S3 write.
@@ -347,6 +392,20 @@ def handler(event: dict | None = None, context=None) -> dict:
     merged = merge_plan_into_ledger(ledger, plan, run_date)
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
+    # Digest email — a thin summary that deep-links to the console Director page
+    # for the full proposed plan (mirrors the EOD / model-zoo / backtester
+    # patterns). Best-effort: the plan above is the primary deliverable and is
+    # already persisted; a send failure (or missing email SSM config) is logged
+    # and never fatal. Transport resolves EMAIL_SENDER/EMAIL_RECIPIENTS/
+    # GMAIL_APP_PASSWORD from SSM (the role's parameter/alpha-engine/* grant),
+    # so until those are set the lib logs "Email not configured" and skips.
+    email_sent = False
+    try:
+        from director.emailer import send_director_digest
+        email_sent = send_director_digest(plan, run_date)
+    except Exception:  # noqa: BLE001 — the email must never break the Director
+        logger.warning("Director: digest email failed (non-fatal)", exc_info=True)
+
     # Phase G — self-grading retro loop. Judge LAST week's plan against THIS
     # week's card (the realized-outcome feedback the in-call SelfGrade can't give).
     # Best-effort: the plan above is the primary deliverable and is already
@@ -357,6 +416,12 @@ def handler(event: dict | None = None, context=None) -> dict:
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
     issues_summary = _file_issues_best_effort(plan, run_date, gh_token)
 
+    # Substrate producer: the deploy-health rollup the substrate tile reads
+    # (config#1153 Batch E). The Director is the one weekly component holding both
+    # a GH token and the research bucket, so it doubles as the GH-API→S3 producer
+    # for deploy_success_rate. Best-effort — never breaks the plan.
+    deploy_summary = _run_deploy_success_best_effort(s3, bucket, gh_token)
+
     summary = {
         "status": "ok",
         "run_date": run_date,
@@ -365,8 +430,10 @@ def handler(event: dict | None = None, context=None) -> dict:
         "action_plan_key": plan_key,
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
+        "digest_email": "sent" if email_sent else "not_sent",
         **retro_summary,
         **issues_summary,
+        **deploy_summary,
     }
     logger.info("Director plan written: %s", summary)
     return summary

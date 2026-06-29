@@ -24,48 +24,36 @@ import json
 import logging
 import os
 
-from alpha_engine_lib.dates import now_dual
+from krepis.dates import now_dual, resolve_trading_day
+from krepis.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
+
+# Structured logging + flow-doctor. Passing a flow-doctor.yaml attaches a
+# FlowDoctorHandler at ERROR (off under pytest), so every log.error() routes
+# through flow-doctor's capture -> dedupe -> diagnose -> alert dispatch without
+# explicit plumbing. The yaml ships in the Lambda task root (Dockerfile COPY);
+# its ${VAR} secrets resolve from SSM at runtime via the role's existing
+# parameter/alpha-engine/* read. Mirrors research/lambda/handler.py. The
+# grading state is non-fatal (SF Catch) and fail-loud by design; flow-doctor
+# adds capture/diagnosis on top without changing that contract.
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = os.path.join(
+    os.environ.get(
+        "LAMBDA_TASK_ROOT",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ),
+    "flow-doctor.yaml",
+)
+setup_logging(
+    "evaluator-grading",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
-
-
-def _to_trading_day(date_str: str) -> str:
-    """Normalize a date to the most recent NYSE trading day on or before it.
-
-    DATE_CONVENTIONS: every trade artifact keys by the TRADING DAY, not the
-    calendar date. The Saturday SF threads a CALENDAR run_date (e.g. Sun
-    2026-06-07) into this Lambda's ``event['date']``, but the backtester +
-    ``evaluate.py`` (which write ``backtest/{date}/``) normalize it to the
-    trading day (Fri 2026-06-05) via ``pipeline_common.resolve_trading_day``.
-    The grading layer was the one consumer that trusted ``event['date']``
-    verbatim → it read ``backtest/2026-06-07`` and graded 0/18 artifacts
-    (``insufficient_data``) while the real artifacts sat at
-    ``backtest/2026-06-05``. Mirror the backtester's normalizer here so the
-    report card + Director key on the SAME trading day the producers do.
-
-    Idempotent (a trading-day input returns unchanged, so re-normalizing the
-    already-normalized ``now_dual().trading_day`` is a no-op). Defensive: on any
-    lib/parse failure, return the input unchanged with a WARNING — a date
-    normalization miss must not break this non-fatal observability path.
-    """
-    import datetime as _dt
-
-    try:
-        from alpha_engine_lib import trading_calendar as _tc
-
-        d = _dt.date.fromisoformat(date_str[:10])
-        td = d if _tc.is_trading_day(d) else _tc.previous_trading_day(d)
-        return td.isoformat()
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(
-            "_to_trading_day(%r) failed (%s) — using input unchanged",
-            date_str, exc,
-        )
-        return date_str
 
 
 def _resolve_run_date(event: dict) -> str:
@@ -74,13 +62,20 @@ def _resolve_run_date(event: dict) -> str:
     Precedence: explicit ``event['date']`` (the SF threads the CALENDAR
     run_date) → ``EVALUATOR_RUN_DATE`` env → ``now_dual().trading_day`` (last
     closed NYSE session). Whichever wins is then normalized to the trading day
-    via :func:`_to_trading_day` so the tiles read the ``backtest/{trading_day}``
-    keys the backtester + evaluate.py actually wrote (calendar-day is deprecated
-    as an artifact key — see DATE_CONVENTIONS).
+    via :func:`krepis.dates.resolve_trading_day` so the tiles read the
+    ``backtest/{trading_day}`` keys the backtester + evaluate.py actually wrote
+    (calendar-day is deprecated as an artifact key — see DATE_CONVENTIONS).
+
+    History: the grading layer once trusted ``event['date']`` verbatim → it
+    read ``backtest/2026-06-07`` (a Sunday) and graded 0/18 artifacts while the
+    real artifacts sat at ``backtest/2026-06-05``. The normalizer (formerly a
+    local ``_to_trading_day``, now the shared ``krepis.dates.resolve_trading_day``
+    the backtester also uses) keys the report card + Director on the SAME
+    trading day the producers wrote.
     """
     explicit = (event or {}).get("date") or os.environ.get("EVALUATOR_RUN_DATE")
     raw = explicit if explicit else now_dual().trading_day
-    return _to_trading_day(raw)
+    return resolve_trading_day(raw)
 
 
 def handler(event: dict | None = None, context=None) -> dict:
