@@ -21,7 +21,7 @@ nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.6
 langchain-anthropic~=0.3
 
 # Dev / testing
-pytest~=9.0
+pytest~=9.1
 pytest-cov~=4.1
 # moto: mocked S3 for artifact-read integration tests (added with the grading layer)
 moto~=5.0
