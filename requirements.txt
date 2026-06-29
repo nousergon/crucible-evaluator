@@ -24,4 +24,4 @@ langchain-anthropic~=0.3
 pytest~=9.1
 pytest-cov~=4.1
 # moto: mocked S3 for artifact-read integration tests (added with the grading layer)
-moto~=5.0
+moto~=5.2
