@@ -4,7 +4,7 @@ pydantic~=2.7
 pyyaml~=6.0
 
 # Numerics for grading / report-card aggregation
-numpy~=1.26
+numpy~=2.4
 pandas~=3.0
 
 # Shared contracts: MetricRecord (alpha_engine_lib.metrics), statistical
