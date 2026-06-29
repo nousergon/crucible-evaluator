@@ -44,7 +44,7 @@ jobs:
       # prompt is ever wanted in production, mirror the predictor/research
       # CONFIG_REPO_DIR staging pattern here.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
