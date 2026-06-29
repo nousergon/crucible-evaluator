@@ -26,10 +26,10 @@ import boto3
 import numpy as np
 from botocore.exceptions import ClientError
 
-from alpha_engine_lib.quant.risk_measures import historical_cvar
-from alpha_engine_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ratio
-from alpha_engine_lib.quant.stats.dsr import compute_psr
-from alpha_engine_lib.quant.stats.intervals import bootstrap_ci, wilson_score_interval
+from nousergon_lib.quant.risk_measures import historical_cvar
+from nousergon_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ratio
+from nousergon_lib.quant.stats.dsr import compute_psr
+from nousergon_lib.quant.stats.intervals import bootstrap_ci, wilson_score_interval
 
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -314,7 +314,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
 
     # 12. DSR (supporting) — needs a documented trial count; not yet tracked.
     if n_trials is not None and n_trials >= 1:
-        from alpha_engine_lib.quant.stats.dsr import compute_dsr
+        from nousergon_lib.quant.stats.dsr import compute_dsr
         dsr_res = compute_dsr(np.asarray(port), n_trials=n_trials)
         dsr_val = dsr_res.get("dsr") if dsr_res.get("status") == "ok" else None
         components.append(build_metric(

@@ -83,7 +83,7 @@ def build_report_card(
         "research": build_research_tile(bucket, run_date, s3_client=s3_client),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
         "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),
-        "substrate": build_substrate_tile(bucket, s3_client=s3_client),
+        "substrate": build_substrate_tile(bucket, run_date, s3_client=s3_client),
         "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
         "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),
     }

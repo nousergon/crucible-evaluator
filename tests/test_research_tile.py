@@ -377,6 +377,39 @@ class TestNeutralizationLiveEfficacy:
         assert m["status"] == "RED"
         assert "revert" in m["status_reason"].lower()
 
+    def test_prefers_persisted_field_producer_over_rederived(self, s3):
+        """config#1187: when the DIRECT producer neutralization_live_forward_ic
+        (joins the PERSISTED cio_evaluations.neutralized_final_score) is present,
+        the grader reads IT — the actual live ranking score's forward efficacy —
+        not the re-derived neutralized_composite_ic counterfactual."""
+        e = json.loads(json.dumps(_E2E))
+        # Re-derived block says insignificant WATCH...
+        e["neutralized_composite_ic"] = {"status": "ok", "cutover_date": "2026-06-22", "live_forward": {
+            "n_weeks": 2, "raw_mean_weekly_ic": -0.05, "neutralized_mean_weekly_ic": -0.04,
+            "mean_weekly_delta": 0.01, "delta_t_p": None, "recovers_edge_live": True, "significant": False}}
+        # ...but the persisted-field producer has a significant positive read → GREEN.
+        e["neutralization_live_forward_ic"] = {"status": "ok", "cutover_date": "2026-06-22", "live_forward": {
+            "n_weeks": 6, "raw_mean_weekly_ic": -0.09, "neutralized_mean_weekly_ic": 0.04,
+            "mean_weekly_delta": 0.13, "delta_t_p": 0.008, "recovers_edge_live": True, "significant": True}}
+        _put(s3, "e2e_lift.json", e)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 0.13          # the persisted-field value, not 0.01
+        assert m["n_samples"] == 6
+
+    def test_falls_back_to_rederived_when_persisted_skipped(self, s3):
+        """Until the persisted source has a post-cutover cohort (status skipped /
+        no weeks), the grader falls back to the re-derived live_forward."""
+        e = json.loads(json.dumps(_E2E))
+        e["neutralization_live_forward_ic"] = {"status": "skipped", "reason": "no column yet"}
+        e["neutralized_composite_ic"] = {"status": "ok", "cutover_date": "2026-06-22", "live_forward": {
+            "n_weeks": 6, "raw_mean_weekly_ic": -0.09, "neutralized_mean_weekly_ic": 0.03,
+            "mean_weekly_delta": 0.12, "delta_t_p": 0.01, "recovers_edge_live": True, "significant": True}}
+        _put(s3, "e2e_lift.json", e)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 0.12
+
 
 class TestAgentQualityComponents:
     """judge_rubric_pass_rate / pillar_emit_coverage / signal_volume_adequacy
