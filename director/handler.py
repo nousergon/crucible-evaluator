@@ -271,6 +271,31 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict) -> dict:
         return {"retro": "error", "retro_error": str(e)}
 
 
+def _run_deploy_success_best_effort(s3, bucket: str, token: str | None) -> dict:
+    """Produce the substrate tile's deploy_success_rate rollup (config#1153 Batch E).
+
+    The evaluator's grading Lambda holds no GitHub token, so the deploy health of
+    the code repos is invisible to it; the Director (which already authenticates to
+    GitHub and writes the research bucket) doubles as the weekly GH-API→S3 producer.
+    Best-effort: the action plan is the primary deliverable and is already
+    persisted, so a producer failure is WARN-logged + recorded, never fatal
+    ([[feedback_no_silent_fails]])."""
+    if not token:
+        return {"deploy_success": "skipped", "deploy_success_reason": "no GH token"}
+    try:
+        from grading.producers.deploy_success import run as run_deploy_success
+        res = run_deploy_success(s3, bucket, token)
+        return {
+            "deploy_success": "ok",
+            "deploy_success_rate": res.get("success_rate"),
+            "deploy_success_n": res.get("total_runs"),
+            "deploy_success_repos": res.get("n_repos_measured"),
+        }
+    except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
+        logger.warning("Director deploy_success producer failed (plan already written, non-fatal): %s", e)
+        return {"deploy_success": "error", "deploy_success_error": str(e)}
+
+
 def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
     """Preflight probe: exercise the Director's bootstrap/import/IAM surface with
     no Opus call and no S3 write.
@@ -391,6 +416,12 @@ def handler(event: dict | None = None, context=None) -> dict:
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
     issues_summary = _file_issues_best_effort(plan, run_date, gh_token)
 
+    # Substrate producer: the deploy-health rollup the substrate tile reads
+    # (config#1153 Batch E). The Director is the one weekly component holding both
+    # a GH token and the research bucket, so it doubles as the GH-API→S3 producer
+    # for deploy_success_rate. Best-effort — never breaks the plan.
+    deploy_summary = _run_deploy_success_best_effort(s3, bucket, gh_token)
+
     summary = {
         "status": "ok",
         "run_date": run_date,
@@ -402,6 +433,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "digest_email": "sent" if email_sent else "not_sent",
         **retro_summary,
         **issues_summary,
+        **deploy_summary,
     }
     logger.info("Director plan written: %s", summary)
     return summary
