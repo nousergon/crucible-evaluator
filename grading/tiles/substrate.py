@@ -26,9 +26,10 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import _get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,14 @@ _SCHEMA_DRIFT_METRIC = "daily_append_schema_drift_count"
 # systematically exceeding its budget, real degradation needing a root-cause).
 _WATCHDOG_TARGET = 0.0
 _WATCHDOG_RED_LINE = 2.0
+
+# deploy_success_rate (supporting, config#1153 Batch E) — CI/CD deploy-workflow
+# health across the code repos, produced weekly by the Director
+# (grading.producers.deploy_success) since the evaluator Lambda holds no GitHub
+# token. Bands: deploys should almost always ship clean → target 95% / red-line
+# 80%. A rollup older than the freshness window means the producer stopped
+# running → grade a transparent stale N/A rather than a false-confident number.
+_DEPLOY_SUCCESS_MAX_AGE_DAYS = 21
 
 
 def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
@@ -518,11 +527,57 @@ def build_substrate_tile(
                        f"(config#1151) to have run a capped phase."),
         ))
 
-    # 4-9. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
+    # 4. deploy_success_rate (supporting) — wired to the Director's weekly GH-API
+    #    rollup (config#1153 Batch E). Graded when the producer has run + the
+    #    rollup is fresh; transparent N/A naming the producer otherwise.
+    ds_src = f"s3://{bucket}/{DEPLOY_SUCCESS_KEY}"
+    ds_doc = _get_json(s3, bucket, DEPLOY_SUCCESS_KEY)
+    ds_age_days = None
+    if isinstance(ds_doc, dict):
+        gen = ds_doc.get("generated_utc")
+        if gen:
+            try:
+                gen_dt = datetime.fromisoformat(gen)
+                if gen_dt.tzinfo is None:
+                    gen_dt = gen_dt.replace(tzinfo=UTC)
+                ds_age_days = (as_of - gen_dt).total_seconds() / 86400.0
+            except ValueError:
+                ds_age_days = None
+    ds_rate = ds_doc.get("success_rate") if isinstance(ds_doc, dict) else None
+    ds_total = (ds_doc.get("total_runs") or 0) if isinstance(ds_doc, dict) else 0
+    ds_stale = ds_age_days is not None and ds_age_days > _DEPLOY_SUCCESS_MAX_AGE_DAYS
+    if ds_rate is not None and ds_total and not ds_stale:
+        ds_succ = ds_doc.get("success_runs", round(float(ds_rate) * ds_total))
+        win = ds_doc.get("window_days", "?")
+        n_repos = len(ds_doc.get("repos_measured") or [])
+        components.append(build_metric(
+            name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            estimator="deploy_workflow_success_rate", measurement_horizon=f"trailing_{win}d",
+            value=float(ds_rate), n_samples=int(ds_total), n_floor=3,
+            target=0.95, red_line=0.80, source_path=ds_src,
+            reason=(f"deploy_success_rate = {float(ds_rate):.0%} ({ds_succ}/{ds_total} terminal "
+                    f"deploy-workflow runs across {n_repos} repo(s) succeeded in {win}d) "
+                    f"vs target 95% / red-line 80%."),
+        ))
+    else:
+        if ds_stale:
+            na = (f"deploy_success_rate: rollup at {DEPLOY_SUCCESS_KEY} is {ds_age_days:.0f}d old "
+                  f"(> {_DEPLOY_SUCCESS_MAX_AGE_DAYS}d) — the Director's weekly producer has stopped running.")
+        elif isinstance(ds_doc, dict) and not ds_total:
+            na = ("deploy_success_rate: rollup present but no terminal deploy-workflow runs in the "
+                  "window — nothing to grade.")
+        else:
+            na = ("deploy_success_rate: no _substrate/deploy_success.json yet — needs the Director's "
+                  "weekly GH-API producer (grading.producers.deploy_success) to have run.")
+        components.append(build_metric(
+            name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
+            n_floor=3, target=0.95, red_line=0.80, source_path=ds_src,
+            input_present=False, na_detail=na,
+        ))
+
+    # 5-7. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
     #      each reason naming the producer to wire.
     not_impl = [
-        ("deploy_success_rate", "supporting",
-         "deploy_success_rate: needs GitHub Actions run history across the 8 repos (GH API) — outside the evaluator's S3 reach today."),
         ("alert_noise_ratio", "supporting",
          "alert_noise_ratio: needs the alerts log + a manual actionable/total tag — not yet sourced."),
         ("changelog_coverage", "diagnostic",

@@ -65,6 +65,64 @@ class TestSubstrate:
         assert tile["status"] == "WATCH"
 
 
+class TestDeploySuccessRate:
+    def _put(self, s3, doc):
+        import json
+
+        from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
+        s3.put_object(Bucket=BUCKET, Key=DEPLOY_SUCCESS_KEY,
+                      Body=json.dumps(doc).encode("utf-8"))
+
+    def test_graded_green_when_fresh_rollup_present(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator", "nousergon/crucible-predictor"],
+            "success_runs": 19, "total_runs": 20, "success_rate": 0.95,
+        })
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now)
+        ds = _comp(tile, "deploy_success_rate")
+        assert ds["value"] == 0.95
+        assert ds["status"] == "GREEN"
+        assert ds["n_samples"] == 20
+
+    def test_red_when_rate_below_red_line(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator"],
+            "success_runs": 6, "total_runs": 10, "success_rate": 0.6,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "RED"
+
+    def test_na_missing_input_when_no_rollup(self, s3):
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "producer" in ds["status_reason"]
+
+    def test_na_when_rollup_stale(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": (now - timedelta(days=30)).isoformat(), "window_days": 28,
+            "repos_measured": ["nousergon/crucible-evaluator"],
+            "success_runs": 19, "total_runs": 20, "success_rate": 0.95,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "stopped running" in ds["status_reason"]
+
+    def test_na_when_rollup_has_no_runs(self, s3):
+        now = datetime.now(UTC)
+        self._put(s3, {
+            "generated_utc": now.isoformat(), "window_days": 28,
+            "repos_measured": [], "success_runs": 0, "total_runs": 0, "success_rate": None,
+        })
+        ds = _comp(build_substrate_tile(BUCKET, s3_client=s3, as_of=now), "deploy_success_rate")
+        assert ds["status"] == "N/A-MISSING-INPUT"
+        assert "nothing to grade" in ds["status_reason"]
+
+
 _ARNS = "arn:aws:states:us-east-1:0:stateMachine:alpha-engine-saturday-pipeline"
 
 
