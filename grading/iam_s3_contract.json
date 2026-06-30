@@ -1,0 +1,40 @@
+{
+  "_doc": [
+    "Declarative IAM S3-access contract for alpha-engine-evaluator (config#1404).",
+    "",
+    "Single source of truth for every top-level s3://alpha-engine-research/<prefix>/",
+    "namespace the evaluator's grading + director code reads or writes, and the",
+    "access mode it needs. This file is the CODE-SIDE half of a cross-repo contract:",
+    "  * THIS repo (crucible-evaluator) declares the S3 access surface here and a CI",
+    "    coverage test (tests/test_iam_s3_contract.py) fails any PR that grows the",
+    "    code's S3-access surface without updating this contract.",
+    "  * The OPS repo (nous-ergon-ops) holds the deployed grant document",
+    "    alpha-engine-evaluator/infrastructure/iam/alpha-engine-evaluator-role/",
+    "    alpha-engine-evaluator-policy.json and verifies (check-iam-code-coverage.py)",
+    "    that the live policy grants exactly the prefixes declared here.",
+    "",
+    "Why this exists: a new cross-module artifact prefix could enter producer/consumer",
+    "code with no matching role grant, surfacing only as a confusing AccessDenied at",
+    "the grading canary (403-not-404 for a missing key when s3:ListBucket lacks the",
+    "prefix) -- e.g. _substrate/deploy_success.json in PR #75 (Deploy red on main).",
+    "The pre-existing live-vs-codified IAM drift check could not catch it because the",
+    "codified policy ALSO lacked the prefix (they agreed). The missing dimension is",
+    "code-referenced-prefix -> codified-grant coverage; this contract closes it.",
+    "",
+    "access modes:",
+    "  read      -> s3:ListBucket (prefix condition) + s3:GetObject on <prefix>/*",
+    "  readwrite -> the above + s3:PutObject on <prefix>/* (the code writes here)"
+  ],
+  "bucket": "alpha-engine-research",
+  "policy_source": "nous-ergon-ops/alpha-engine-evaluator/infrastructure/iam/alpha-engine-evaluator-role/alpha-engine-evaluator-policy.json",
+  "prefixes": {
+    "backtest": "read",
+    "predictor": "read",
+    "trades": "read",
+    "config": "read",
+    "signals": "read",
+    "evaluator": "readwrite",
+    "director": "readwrite",
+    "_substrate": "readwrite"
+  }
+}
