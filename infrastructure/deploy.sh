@@ -58,10 +58,18 @@ else
 fi
 
 if ! $NO_CANARY; then
+  # Canary via the shared krepis.aws invoke-canary CLI (config#1494, krepis
+  # 0.7.0) instead of a bare `aws lambda invoke`. The CLI retries ONLY on the
+  # throttle/concurrency signal and writes the response payload to --out; it
+  # takes raw JSON (boto3 path — no base64/`--cli-binary-format`). A non-zero
+  # CLI exit (non-throttle error or throttle exhaustion) refuses to promote —
+  # PRE-promotion, so the live alias is untouched.
   echo "=== Canary invoke (write=false — builds the card, no S3 write) ==="
-  aws lambda invoke --function-name "$FUNCTION" \
-    --payload "$(echo '{"write": false}' | base64)" \
-    --region "$REGION" /tmp/evaluator-canary.json --query 'StatusCode' --output text
+  python3 -m krepis.aws invoke-canary --function-name "$FUNCTION" \
+    --payload '{"write": false}' \
+    --region "$REGION" --out /tmp/evaluator-canary.json \
+    --max-attempts 6 --label "$FUNCTION-canary" \
+    || { echo "CANARY UNINVOKABLE — not promoting alias"; exit 1; }
   STATUS=$(python3 -c "import json; print(json.load(open('/tmp/evaluator-canary.json')).get('status'))")
   echo "  canary status: $STATUS"
   [[ "$STATUS" == "ok" ]] || { echo "CANARY FAILED — not promoting alias"; cat /tmp/evaluator-canary.json; exit 1; }
@@ -121,9 +129,14 @@ if ! $NO_CANARY; then
   #   - flag on   → _dry_run_probe → status: dry_run (langchain import + SSM key
   #                 fetch + ledger read validated; NO Opus call, NO S3 write)
   echo "=== Director canary (dry_run — expect 'disabled' when flag off, 'dry_run' when on) ==="
-  aws lambda invoke --function-name "$DIRECTOR_FUNCTION" \
-    --payload "$(echo '{"date": "2026-05-30", "dry_run": true}' | base64)" \
-    --region "$REGION" /tmp/director-canary.json --query 'StatusCode' --output text
+  # Canary via the shared krepis.aws invoke-canary CLI (config#1494, krepis 0.7.0);
+  # raw JSON payload (boto3 path). Non-zero CLI exit refuses to promote (the
+  # Director live alias is untouched — PRE-promotion).
+  python3 -m krepis.aws invoke-canary --function-name "$DIRECTOR_FUNCTION" \
+    --payload '{"date": "2026-05-30", "dry_run": true}' \
+    --region "$REGION" --out /tmp/director-canary.json \
+    --max-attempts 6 --label "$DIRECTOR_FUNCTION-canary" \
+    || { echo "DIRECTOR CANARY UNINVOKABLE — not promoting"; exit 1; }
   DSTATUS=$(python3 -c "import json; print(json.load(open('/tmp/director-canary.json')).get('status'))")
   echo "  director canary status: $DSTATUS"
   [[ "$DSTATUS" == "disabled" || "$DSTATUS" == "dry_run" ]] || { echo "DIRECTOR CANARY UNEXPECTED (want 'disabled' or 'dry_run') — not promoting"; cat /tmp/director-canary.json; exit 1; }
