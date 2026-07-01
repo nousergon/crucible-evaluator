@@ -12,7 +12,13 @@ pandas~=3.0
 # sortino / max_drawdown / PSR / DSR / CVaR / BH-FDR), agent schemas, secrets.
 # v0.52.0 — Phase C consumes MetricRecord + derive_* + the quant battery.
 # v0.4.0 — director/emailer.py consumes krepis.console.console_url (config#1300).
-krepis[flow_doctor]>=0.4.0
+# Bumped to >=0.6.0 (config#1450, same fix as crucible-executor#315 /
+# crucible-predictor#320/#322): krepis>=0.6.0 pins flow-doctor[diagnosis,s3]
+# >=0.6.2, whose DEFAULT_DIAGNOSIS_MODEL is the served `claude-sonnet-4-6`
+# alias. The old >=0.4.0 floor let krepis 0.4/0.5 resolve flow-doctor
+# 0.6.0rc6, whose retired `claude-sonnet-4-6-20250514` pin 404'd on every
+# flow-doctor diagnosis call from grading/handler.py and director/handler.py.
+krepis[flow_doctor]>=0.6.0
 nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.67.0
 
 # Director (Layer C) — single structured Opus call. langchain-anthropic provides
