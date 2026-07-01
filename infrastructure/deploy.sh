@@ -23,6 +23,45 @@ ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# ── Throttle-aware Lambda invoke (bounded, jittered retry) ───────────────────
+# A canary `aws lambda invoke` can throttle (TooManyRequestsException /
+# ReservedFunctionConcurrentInvocationLimitExceeded) when the function's
+# concurrency slot is momentarily occupied — an overlapping deploy's canary
+# (cancelling a GitHub Actions run does NOT stop the Lambda execution it already
+# dispatched) or an in-flight scheduled invocation. The AWS CLI's own retry
+# (max 2) can't outwait an in-flight execution, and under `set -euo pipefail`
+# the invoke's non-zero exit aborts the deploy on a transient smoke-test
+# throttle (bit crucible-research CI 2026-07-01). This retries ONLY on that
+# throttle signal (bounded exp backoff + jitter, ~3 min); non-throttle errors
+# are not retried; exhaustion returns non-zero (fail loud).
+# Args: <output-file> <aws lambda invoke flags...>  (output positional appended).
+_invoke_lambda_with_throttle_retry() {
+  local out_file="$1"; shift
+  local max_attempts=6 attempt=1 rc base sleep_s err_file
+  err_file=$(mktemp)
+  while :; do
+    rc=0
+    aws lambda invoke "$@" "$out_file" >/dev/null 2>"$err_file" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [ "$attempt" -lt "$max_attempts" ] && \
+       grep -qE 'TooManyRequestsException|ReservedFunctionConcurrentInvocationLimitExceeded' "$err_file"; then
+      base=$(( 2 ** (attempt - 1) * 5 ))   # 5, 10, 20, 40, 80s
+      sleep_s=$(( base + RANDOM % 5 ))     # + 0-4s jitter
+      echo "  Canary invoke throttled — concurrency slot busy (attempt ${attempt}/${max_attempts}); retrying in ${sleep_s}s..." >&2
+      sleep "$sleep_s"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    echo "  ERROR: canary invoke failed (exit ${rc}) after ${attempt} attempt(s):" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return "$rc"
+  done
+}
+
 echo "=== Building $FUNCTION image (linux/amd64) ==="
 docker build --platform linux/amd64 --provenance=false -t "$FUNCTION:latest" .
 
@@ -59,9 +98,14 @@ fi
 
 if ! $NO_CANARY; then
   echo "=== Canary invoke (write=false — builds the card, no S3 write) ==="
-  aws lambda invoke --function-name "$FUNCTION" \
-    --payload "$(echo '{"write": false}' | base64)" \
-    --region "$REGION" /tmp/evaluator-canary.json --query 'StatusCode' --output text
+  if ! _invoke_lambda_with_throttle_retry /tmp/evaluator-canary.json \
+      --function-name "$FUNCTION" \
+      --payload "$(echo '{"write": false}' | base64)" \
+      --region "$REGION" --query 'StatusCode' --output text; then
+    # Canary runs pre-promotion, so the live alias is untouched — refuse to
+    # promote (safe default) and fail loud.
+    echo "CANARY COULD NOT BE INVOKED (throttle/concurrency or invoke error, retries exhausted) — not promoting alias"; exit 1
+  fi
   STATUS=$(python3 -c "import json; print(json.load(open('/tmp/evaluator-canary.json')).get('status'))")
   echo "  canary status: $STATUS"
   [[ "$STATUS" == "ok" ]] || { echo "CANARY FAILED — not promoting alias"; cat /tmp/evaluator-canary.json; exit 1; }
@@ -121,9 +165,13 @@ if ! $NO_CANARY; then
   #   - flag on   → _dry_run_probe → status: dry_run (langchain import + SSM key
   #                 fetch + ledger read validated; NO Opus call, NO S3 write)
   echo "=== Director canary (dry_run — expect 'disabled' when flag off, 'dry_run' when on) ==="
-  aws lambda invoke --function-name "$DIRECTOR_FUNCTION" \
-    --payload "$(echo '{"date": "2026-05-30", "dry_run": true}' | base64)" \
-    --region "$REGION" /tmp/director-canary.json --query 'StatusCode' --output text
+  if ! _invoke_lambda_with_throttle_retry /tmp/director-canary.json \
+      --function-name "$DIRECTOR_FUNCTION" \
+      --payload "$(echo '{"date": "2026-05-30", "dry_run": true}' | base64)" \
+      --region "$REGION" --query 'StatusCode' --output text; then
+    # Canary runs pre-promotion — refuse to promote the Director alias, fail loud.
+    echo "DIRECTOR CANARY COULD NOT BE INVOKED (throttle/concurrency or invoke error, retries exhausted) — not promoting"; exit 1
+  fi
   DSTATUS=$(python3 -c "import json; print(json.load(open('/tmp/director-canary.json')).get('status'))")
   echo "  director canary status: $DSTATUS"
   [[ "$DSTATUS" == "disabled" || "$DSTATUS" == "dry_run" ]] || { echo "DIRECTOR CANARY UNEXPECTED (want 'disabled' or 'dry_run') — not promoting"; cat /tmp/director-canary.json; exit 1; }
