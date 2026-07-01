@@ -18,7 +18,11 @@ pandas~=3.0
 # alias. The old >=0.4.0 floor let krepis 0.4/0.5 resolve flow-doctor
 # 0.6.0rc6, whose retired `claude-sonnet-4-6-20250514` pin 404'd on every
 # flow-doctor diagnosis call from grading/handler.py and director/handler.py.
-krepis[flow_doctor]>=0.6.0
+# Bumped to >=0.7.0 (config#1494): deploy.sh's two canaries now CALL the
+# `krepis.aws invoke-canary` CLI (0.7.0 ships it) instead of a bare
+# `aws lambda invoke`. The invoke is now LOAD-BEARING, so krepis must be
+# importable in the deploy environment — this floor makes it a hard dep.
+krepis[flow_doctor]>=0.7.0
 nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.67.0
 
 # Director (Layer C) — single structured Opus call. langchain-anthropic provides
