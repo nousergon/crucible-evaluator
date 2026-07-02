@@ -35,7 +35,7 @@ jobs:
 
     steps:
       - name: Checkout evaluator repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The image is built purely from this repo (no proprietary config/prompt
       # is staged from alpha-engine-config — the tuned director/prompt.py is
