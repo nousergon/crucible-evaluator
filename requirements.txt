@@ -28,7 +28,7 @@ nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.6
 # Director (Layer C) — single structured Opus call. langchain-anthropic provides
 # ChatAnthropic + with_structured_output; only needed when DIRECTOR_ENABLED is on
 # (imported lazily, so the test suite + the grading path don't require it).
-langchain-anthropic~=0.3
+langchain-anthropic~=1.4
 
 # Dev / testing
 pytest~=9.1
