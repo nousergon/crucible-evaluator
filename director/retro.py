@@ -8,19 +8,48 @@ see the future at emission). One structured judge call → a ``RetroGrade``
 pattern (mirrors research ``evals/judge.py`` ``RubricEvalLLMOutput``).
 
 The LLM is injectable (``llm=``) so build/validate + tests run without a key or
-langchain; ``_default_llm()`` lazily constructs the real client. Model: the same
-Opus the Director uses (a judge of the Director should be at least as capable).
+krepis' provider SDKs; ``_default_llm()`` lazily constructs the real client.
+
+**Judge tier: Sonnet, deliberately NOT the Director's Opus.** Grading a plan
+with the same model that generated it is self-grading bias (config#1673,
+judge != generator) — see ``agent.py``'s ``DIRECTOR_MODEL`` (Opus, locked for
+plan generation, untouched here). The judge call is routed through
+``krepis.llm``'s provider-agnostic adapter (krepis>=0.9.0) rather than
+langchain's ``ChatAnthropic`` — a separate call surface from
+``agent._default_llm``. The model is config, not code: ``RETRO_JUDGE_MODEL``
+env var, default ``"claude-sonnet-4-6"``. That default is a floating alias
+with no dated snapshot — the API resolves it to a live snapshot per call, and
+both the alias (``judge_model``) and the API-resolved model (``resolved_model``)
+are stamped onto the persisted ``RetroGrade`` (``extra="allow"``) so the
+dashboard/audit trail can see exactly what ran.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 
-from director.agent import DIRECTOR_MODEL, _invoke_with_retry
+from director.agent import _invoke_with_retry
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
 logger = logging.getLogger(__name__)
+
+# Sonnet judge tier (config#1673) — env-overridable; the default is a
+# floating alias (no dated snapshot). Intentionally distinct from
+# `agent.DIRECTOR_MODEL` (Opus, plan generation) — do not import/reuse that
+# constant here; the whole point is judge != generator.
+RETRO_JUDGE_MODEL_DEFAULT = "claude-sonnet-4-6"
+
+_RETRO_JUDGE_SCHEMA_NAME = "RetroGrade"
+
+
+def _judge_model() -> str:
+    """The configured retro-judge model alias: ``RETRO_JUDGE_MODEL`` env
+    override if set, else :data:`RETRO_JUDGE_MODEL_DEFAULT`. Read at call
+    time (not frozen at import) so an operator/test override takes effect
+    without a process restart."""
+    return os.environ.get("RETRO_JUDGE_MODEL", RETRO_JUDGE_MODEL_DEFAULT)
 
 
 def _load_retro_prompt() -> str:
@@ -34,22 +63,75 @@ def _load_retro_prompt() -> str:
         return RETRO_PROMPT
 
 
-def _default_llm():
-    """Construct the real structured-output Opus judge client (lazy import).
+def _split_messages(messages: list) -> tuple[str, str]:
+    """``build_messages()``'s ``[("system", ...), ("human", ...)]`` shape ->
+    krepis.llm's flat ``(system, user_content)`` call surface. Any non-system
+    entries are joined in order — robust to the exact tuple count even though
+    ``build_messages`` currently emits exactly one of each."""
+    system = ""
+    human_parts: list[str] = []
+    for role, content in messages:
+        if role == "system":
+            system = content
+        else:
+            human_parts.append(content)
+    return system, "\n\n".join(human_parts)
 
-    Same SSM-key + langchain path as ``agent._default_llm`` — kept here so the
-    retro can be exercised independently — but bound to ``RetroGrade``.
+
+class _KrepisStructuredJudge:
+    """Adapts a ``krepis.llm.LLMClient`` to the ``.invoke(messages) ->
+    RetroGrade`` surface ``director.agent._invoke_with_retry`` expects.
+
+    Keeping this adapter shape (rather than reworking ``_invoke_with_retry``
+    or ``grade_prior_plan``) means the retro's corrective-retry wiring and the
+    Opus plan-generation path in ``agent.py`` are untouched by the judge-model
+    swap — only ``_default_llm`` (below) changes which client backs the
+    ``llm`` the retro invokes.
     """
-    from krepis.secrets import get_secret
-    from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
+    def __init__(self, client, *, judge_model: str):
+        self._client = client
+        self._judge_model = judge_model
+
+    def invoke(self, messages: list) -> RetroGrade:
+        system, user_content = _split_messages(messages)
+        result = self._client.structured(
+            system=system,
+            user_content=user_content,
+            schema=RetroGrade,
+            schema_name=_RETRO_JUDGE_SCHEMA_NAME,
+        )
+        grade: RetroGrade = result.parsed
+        # judge_model = the logical alias configured for this call (no dated
+        # snapshot); resolved_model = what the API actually resolved that
+        # alias to. Both land as extra fields — RetroGrade has extra="allow" —
+        # so they persist through model_dump()/model_dump_json() unchanged.
+        grade.judge_model = self._judge_model
+        grade.resolved_model = result.model
+        return grade
+
+
+def _default_llm() -> _KrepisStructuredJudge:
+    """Construct the real structured-output Sonnet judge client (lazy import).
+
+    Same SSM ``ANTHROPIC_API_KEY`` secret path as ``agent._default_llm`` —
+    kept here so the retro can be exercised independently — but routed
+    through ``krepis.llm.LLMClient`` (krepis>=0.9.0) bound to ``RetroGrade``,
+    not langchain's ``ChatAnthropic``. Both imports are lazy so tests + the
+    grading path never pull krepis' provider SDKs or hit SSM.
+    """
+    from krepis.llm import LLMClient
+    from krepis.llm_config import ModelSpec
+    from krepis.secrets import get_secret
+
+    judge_model = _judge_model()
     api_key = get_secret("ANTHROPIC_API_KEY")
-    # No `temperature` — claude-opus-4-8 removed the sampling params; passing one
-    # 400s ("`temperature` is deprecated for this model"). Mirrors agent._default_llm.
-    base = ChatAnthropic(
-        model=DIRECTOR_MODEL, max_tokens=2000, anthropic_api_key=api_key,
-    )
-    return base.with_structured_output(RetroGrade)
+    # No `temperature` — matches agent._default_llm's note: current-generation
+    # Claude models reject sampling params. krepis.llm's anthropic transport
+    # never sets one, so there's nothing to strip here.
+    spec = ModelSpec(provider="anthropic", model=judge_model, max_tokens=2000)
+    client = LLMClient(spec, api_key=api_key)
+    return _KrepisStructuredJudge(client, judge_model=judge_model)
 
 
 def _prior_plan_summary(prior_plan: dict) -> str:
@@ -97,7 +179,7 @@ def grade_prior_plan(
     """Judge the prior week's plan against the current Report Card → RetroGrade.
 
     ``llm`` is injectable (a structured-output runnable returning a RetroGrade);
-    defaults to the real Opus judge.
+    defaults to the real Sonnet judge.
     """
     llm = llm or _default_llm()
     messages = build_messages(prior_plan, current_card)
