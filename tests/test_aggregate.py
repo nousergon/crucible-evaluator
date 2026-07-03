@@ -108,7 +108,7 @@ class TestBuildReportCard:
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         assert set(card["tiles"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
-            "backtester", "substrate", "agent", "behavioral",
+            "backtester", "substrate", "agent", "behavioral", "director_quality",
         }
         for tile in card["tiles"].values():
             assert "status" in tile and "components" in tile

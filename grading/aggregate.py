@@ -35,6 +35,7 @@ from grading.module_agg import overall_status
 from grading.tiles.agent import build_agent_tile
 from grading.tiles.backtester import build_backtester_tile
 from grading.tiles.behavioral import build_behavioral_tile
+from grading.tiles.director_quality import build_director_quality_tile
 from grading.tiles.executor import build_executor_tile
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
 from grading.tiles.predictor import build_predictor_tile
@@ -77,6 +78,9 @@ def build_report_card(
     #   - agent (Tile 6): agent-quality transparency shell (producers not yet persisted)
     #   - behavioral (Tile 7): backtest/{date}/behavioral_anomaly + optimizer_shadow
     #     tripwire (L4514/config#698 — all components supporting/diagnostic during soak)
+    #   - director_quality (Tile 9): director/retro_trend.json — the Director's own
+    #     weekly Phase-G retro grade of its PRIOR plan (config#1674 — WATCH-only,
+    #     never cascades to overall RED, same class as agent/behavioral)
     tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
         "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client),
@@ -86,6 +90,7 @@ def build_report_card(
         "substrate": build_substrate_tile(bucket, run_date, s3_client=s3_client),
         "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
         "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),
+        "director_quality": build_director_quality_tile(bucket, run_date, s3_client=s3_client),
     }
     scorecard["tiles"] = tiles
     # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
