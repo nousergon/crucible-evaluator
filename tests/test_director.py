@@ -380,3 +380,151 @@ class TestRetro:
         assert out["status"] == "ok"  # plan still shipped
         assert out["retro"] == "error" and "judge overloaded" in out["retro_error"]
         assert json.loads(s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read())
+
+    # ── config#1673: cross-model Sonnet judge (judge != generator) ─────────
+
+    def test_judge_model_defaults_to_sonnet_and_respects_env_override(self, monkeypatch):
+        """RETRO_JUDGE_MODEL is config, not code: env override wins; the
+        default is a Sonnet alias, deliberately NOT agent.DIRECTOR_MODEL
+        (Opus) — grading a plan with the model that wrote it is self-grading
+        bias."""
+        from director.agent import DIRECTOR_MODEL
+        from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _judge_model
+
+        monkeypatch.delenv("RETRO_JUDGE_MODEL", raising=False)
+        assert _judge_model() == RETRO_JUDGE_MODEL_DEFAULT == "claude-sonnet-4-6"
+        assert _judge_model() != DIRECTOR_MODEL
+
+        monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-5")
+        assert _judge_model() == "claude-sonnet-5"
+
+    def test_grade_prior_plan_injected_llm_never_touches_real_secrets(self, monkeypatch):
+        """Test-hygiene guard (bit a previous integration): the llm= injection
+        point must short-circuit _default_llm() entirely, so an ambient
+        ANTHROPIC_API_KEY sitting in the CI environment (as this repo's own
+        runner may have) can never leak into a hermetic test path. Simulates
+        the leak by setting a fake key AND making krepis.secrets.get_secret
+        raise if it's ever called."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "leaked-ambient-key")
+        import krepis.secrets as ks
+
+        def _must_not_be_called(*a, **kw):
+            raise AssertionError(
+                "krepis.secrets.get_secret must not be called when llm= is injected"
+            )
+        monkeypatch.setattr(ks, "get_secret", _must_not_be_called)
+
+        from director.retro import grade_prior_plan
+        from director.schema import RetroGrade
+        g = RetroGrade(prior_run_date="", grounding=80, calibration=55, actionability=70)
+        out = grade_prior_plan({"run_date": "2026-05-23"}, _CARD, llm=_FakeLLM(g))
+        assert out.calibration == 55
+
+    def test_default_llm_routes_through_krepis_for_configured_judge_model(self, monkeypatch):
+        """_default_llm() must build a krepis.llm.LLMClient (not langchain's
+        ChatAnthropic) targeting the anthropic provider + the configured
+        judge alias — never agent.DIRECTOR_MODEL."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-4-6")
+        import krepis.secrets as ks
+        monkeypatch.setattr(ks, "get_secret", lambda name, **kw: "test-key")
+
+        from director.retro import _KrepisStructuredJudge, _default_llm
+        llm = _default_llm()
+        assert isinstance(llm, _KrepisStructuredJudge)
+        assert llm._judge_model == "claude-sonnet-4-6"
+        assert llm._client.spec.provider == "anthropic"
+        assert llm._client.spec.model == "claude-sonnet-4-6"
+
+    def test_krepis_judge_stamps_judge_model_and_resolved_model(self):
+        """End-to-end (hermetic, no network / no anthropic SDK): drives
+        _KrepisStructuredJudge.invoke() through a krepis.llm.LLMClient whose
+        transport is a fake injected via client_factory (krepis' own test
+        seam), simulating the API resolving the floating Sonnet alias to a
+        dated snapshot. Verifies structured-output validation against
+        RetroGrade AND that judge_model (the alias) / resolved_model (the
+        API-reported model) both land as extra fields and survive
+        model_dump()."""
+        from krepis.llm import LLMClient
+        from krepis.llm_config import ModelSpec
+        from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _KrepisStructuredJudge, build_messages
+
+        class _FakeToolUseBlock:
+            def __init__(self, name, input_):
+                self.type = "tool_use"
+                self.name = name
+                self.input = input_
+
+        class _FakeAnthropicMessage:
+            def __init__(self, content, model):
+                self.content = content
+                self.model = model
+                self.usage = None
+
+        class _FakeAnthropicClient:
+            def __init__(self):
+                self.messages = self
+
+            def create(self, **payload):
+                assert payload["model"] == RETRO_JUDGE_MODEL_DEFAULT
+                tool_input = {
+                    "prior_run_date": "2026-05-23",
+                    "grounding": 80,
+                    "calibration": 55,
+                    "actionability": 70,
+                    "notes": "Flagged risks mostly materialized.",
+                }
+                block = _FakeToolUseBlock("RetroGrade", tool_input)
+                # The API resolves the floating alias to a dated snapshot —
+                # distinct from the request's `model=` alias string.
+                return _FakeAnthropicMessage([block], model="claude-sonnet-4-6-20260115")
+
+        def _client_factory(spec, api_key):
+            assert api_key == "test-key"
+            return _FakeAnthropicClient()
+
+        spec = ModelSpec(provider="anthropic", model=RETRO_JUDGE_MODEL_DEFAULT, max_tokens=2000)
+        client = LLMClient(spec, api_key="test-key", client_factory=_client_factory)
+        judge = _KrepisStructuredJudge(client, judge_model=RETRO_JUDGE_MODEL_DEFAULT)
+
+        messages = build_messages(_plan().model_dump(), _CARD)
+        grade = judge.invoke(messages)
+
+        assert grade.calibration == 55
+        assert grade.judge_model == RETRO_JUDGE_MODEL_DEFAULT
+        assert grade.resolved_model == "claude-sonnet-4-6-20260115"
+        assert grade.judge_model != grade.resolved_model  # alias vs API-resolved snapshot
+        dumped = grade.model_dump()
+        assert dumped["judge_model"] == RETRO_JUDGE_MODEL_DEFAULT
+        assert dumped["resolved_model"] == "claude-sonnet-4-6-20260115"
+
+    def test_handler_persists_judge_model_and_resolved_model(self, s3, monkeypatch):
+        """The judge_model/resolved_model extras (RetroGrade has
+        extra="allow") must survive persistence into both the per-run
+        retro.json and the retro_trend.json ledger row — handler.py's
+        _persist_retro is unchanged; this is a regression guard on
+        model_dump()/model_dump_json() carrying the new fields through."""
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        s3.put_object(Bucket=BUCKET, Key="director/2026-05-23/action_plan.json",
+                      Body=_plan().model_dump_json().encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        import director.retro as R
+
+        def _fake_grade(prior, card, **kw):
+            g = _retro()
+            g.judge_model = "claude-sonnet-4-6"
+            g.resolved_model = "claude-sonnet-4-6-20260115"
+            return g
+        monkeypatch.setattr(R, "grade_prior_plan", _fake_grade)
+
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["retro"] == "ok"
+        retro = json.loads(s3.get_object(Bucket=BUCKET, Key=f"director/{RUN_DATE}/retro.json")["Body"].read())
+        assert retro["judge_model"] == "claude-sonnet-4-6"
+        assert retro["resolved_model"] == "claude-sonnet-4-6-20260115"
+        trend = json.loads(s3.get_object(Bucket=BUCKET, Key="director/retro_trend.json")["Body"].read())
+        assert trend["grades"][0]["judge_model"] == "claude-sonnet-4-6"
+        assert trend["grades"][0]["resolved_model"] == "claude-sonnet-4-6-20260115"
