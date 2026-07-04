@@ -40,9 +40,9 @@ PRICE_CACHE_PREFIX = "predictor/price_cache/"
 # headline. ARNs are *discovered* at runtime (list_state_machines) rather than
 # hardcoded, so no AWS account id lives in this public repo.
 _SF_NAMES = (
-    "alpha-engine-saturday-pipeline",
-    "alpha-engine-weekday-pipeline",
-    "alpha-engine-eod-pipeline",
+    "ne-weekly-freshness-pipeline",
+    "ne-preopen-trading-pipeline",
+    "ne-postclose-trading-pipeline",
 )
 _SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
 _SF_WINDOW_DAYS = 28
