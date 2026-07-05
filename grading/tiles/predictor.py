@@ -107,6 +107,24 @@ def build_predictor_tile(
     cpcv = manifest.get("meta_model_oos_ic_cpcv") or {}
     components = []
 
+    # alpha-engine-config#969: the producer (crucible-predictor#340) tags each
+    # scalar IC field with its methodological reliability (leak-free vs
+    # in-sample/overlapping-pooled) in a top-level ``ic_reliability`` map. Pass
+    # that into ``build_metric`` so a low-reliability IC surfaces "⚠ reliability
+    # LOW" in the Director digest and the Director can hedge. FORWARD/BACKWARD
+    # COMPATIBLE: an older manifest lacks the map (or a given field), in which
+    # case we pass ``reliability=None`` — build_metric then preserves TODAY's
+    # behavior (defaults value-bearing criticals to "high", leaves others
+    # untagged). We never force "high" where absence would newly raise it.
+    ic_reliability = manifest.get("ic_reliability") or {}
+
+    def _reliability_for(field_name: str) -> str | None:
+        """Reliability tag the producer assigned to ``field_name`` (the manifest
+        IC field a metric derives from), or ``None`` if the map is absent or
+        doesn't cover that field (→ preserve current behavior)."""
+        val = ic_reliability.get(field_name)
+        return val if val in ("high", "low") else None
+
     # 1. meta_l2_ic (critical) — LEAK-FREE CPCV mean, NOT the in-sample l2_ic.
     cpcv_ok = cpcv.get("status") == "ok"
     cpcv_mean = cpcv.get("mean_ic") if cpcv_ok else None
@@ -131,6 +149,7 @@ def build_predictor_tile(
         value=cpcv_mean, n_samples=n_combos, n_floor=10, target=0.05, red_line=0.0,
         ci_low=ci_low, ci_high=ci_high, ci_method=ci_method, source_path=manifest_src,
         input_present=cpcv_ok, reason=meta_reason,
+        reliability=_reliability_for("meta_model_oos_ic_cpcv"),
         na_detail="meta_l2_ic: CPCV leak-free read insufficient this cycle (single-path WF is canonical-coverage-starved — L4480).",
     ))
 
@@ -143,11 +162,13 @@ def build_predictor_tile(
         estimator="rank_ic_oos", measurement_horizon="21d",
         value=mom_ic, n_samples=n_folds, n_floor=8, target=0.03, red_line=0.0,
         source_path=manifest_src, input_present=mom_ic is not None,
+        reliability=_reliability_for("momentum_median_ic"),
     ))
     components.append(build_metric(
         name="volatility_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
         value=vol_ic, n_samples=n_folds, n_floor=8, target=0.03, red_line=0.0,
         source_path=manifest_src, input_present=vol_ic is not None,
+        reliability=_reliability_for("volatility_median_ic"),
     ))
     rescal_ic = (latest.get("l1_ic") or {}).get("research_calibrator")
     rescal_n = latest.get("research_calibrator_n_samples")
@@ -209,6 +230,7 @@ def build_predictor_tile(
         value=lift, n_samples=n_combos, n_floor=10, target=0.01, red_line=-0.01,
         source_path=manifest_src, input_present=lift_present, reason=lift_reason,
         na_detail=lift_na or "ensemble_lift: needs the leak-free meta IC and a directional standalone L1 alpha-IC.",
+        reliability=_reliability_for("meta_l1_standalone_alpha_ic"),
     ))
 
     # 6. confidence_calibration_ece (critical) — lower is better.

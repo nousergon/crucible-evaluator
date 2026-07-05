@@ -338,6 +338,76 @@ class TestSlimCacheFreshness:
         assert "price_cache_slim" in sc["status_reason"]
 
 
+class TestICReliability:
+    """alpha-engine-config#969: the producer (crucible-predictor#340) tags each
+    scalar IC field with methodological reliability in the manifest's
+    ``ic_reliability`` map; the tile passes it into build_metric so a
+    low-reliability IC flags "⚠ reliability LOW" in the Director digest.
+    Forward/backward compatible: a manifest WITHOUT the map preserves today's
+    behavior (value-bearing criticals default to "high")."""
+
+    # A manifest whose CPCV meta IC is tagged LOW and momentum WF IC tagged HIGH.
+    _RELIABILITY_MAP = {
+        "meta_model_oos_ic_cpcv": "low",
+        "momentum_median_ic": "high",
+        "volatility_median_ic": "high",
+        "meta_l1_standalone_alpha_ic": "high",
+    }
+
+    def test_low_reliability_flows_into_metric(self, s3):
+        manifest = {**_MANIFEST, "ic_reliability": self._RELIABILITY_MAP}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        meta = _comp(tile, "meta_l2_ic")
+        assert meta["reliability"] == "low"
+
+    def test_high_reliability_flows_into_metric(self, s3):
+        manifest = {**_MANIFEST, "ic_reliability": self._RELIABILITY_MAP}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        assert _comp(tile, "momentum_l1_ic")["reliability"] == "high"
+
+    def test_low_reliability_reaches_digest_warning(self, s3):
+        # End-to-end: a LOW-reliability critical metric surfaces the digest's
+        # "⚠ reliability LOW" hedge line (director/report_card_digest.py).
+        from director.report_card_digest import _component_line
+
+        manifest = {**_MANIFEST, "ic_reliability": self._RELIABILITY_MAP}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        meta = _comp(tile, "meta_l2_ic")
+        line = _component_line(meta)
+        assert "reliability LOW" in line
+
+    def test_missing_map_preserves_current_high_default(self, s3):
+        # No ic_reliability key at all (older predictor manifest). The
+        # value-bearing critical meta_l2_ic must keep TODAY's behavior:
+        # build_metric defaults it to "high" (we do NOT force it low, and we do
+        # NOT drop the field).
+        assert "ic_reliability" not in _MANIFEST
+        _seed(s3)  # default _MANIFEST, no map
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        meta = _comp(tile, "meta_l2_ic")
+        assert meta["reliability"] == "high"  # unchanged current semantics
+
+    def test_field_absent_from_map_falls_back(self, s3):
+        # Map present but does NOT cover the CPCV field → fall back to current
+        # behavior (default "high" for the value-bearing critical), don't error.
+        manifest = {**_MANIFEST, "ic_reliability": {"momentum_median_ic": "high"}}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        assert _comp(tile, "meta_l2_ic")["reliability"] == "high"
+        assert _comp(tile, "momentum_l1_ic")["reliability"] == "high"
+
+    def test_malformed_map_value_ignored(self, s3):
+        # A garbage value in the map must be ignored (fall back), never passed
+        # through as a bogus reliability.
+        manifest = {**_MANIFEST, "ic_reliability": {"meta_model_oos_ic_cpcv": "maybe"}}
+        _seed(s3, manifest=manifest)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        assert _comp(tile, "meta_l2_ic")["reliability"] == "high"
+
+
 class TestTileStatus:
     def test_dead_momentum_makes_tile_red(self, s3):
         _seed(s3)
