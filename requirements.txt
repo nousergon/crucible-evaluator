@@ -31,7 +31,7 @@ pandas~=3.0
 # still caps <0.7 on published krepis until the next krepis release raises it.
 krepis[flow_doctor]>=0.9.0
 flow-doctor[diagnosis,s3]>=0.8.0,<0.9
-nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
+nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.83.0
 
 # Director (Layer C) — single structured Opus call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_MODEL, locked to Opus). langchain-anthropic
