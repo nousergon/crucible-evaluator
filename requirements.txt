@@ -27,8 +27,11 @@ pandas~=3.0
 # introduced in krepis 0.9.0 — LOAD-BEARING for the retro's Sonnet judge call
 # (judge != generator; the Opus plan-generation call in director/agent.py is
 # untouched and stays on langchain-anthropic below).
+# config#1694: direct flow-doctor >=0.8 floor (notify_on_category); krepis extra
+# still caps <0.7 on published krepis until the next krepis release raises it.
 krepis[flow_doctor]>=0.9.0
-nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.67.0
+flow-doctor[diagnosis,s3]>=0.8.0,<0.9
+nousergon-lib[quant-stats] @ git+https://github.com/nousergon/nousergon-lib@v0.82.0
 
 # Director (Layer C) — single structured Opus call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_MODEL, locked to Opus). langchain-anthropic
