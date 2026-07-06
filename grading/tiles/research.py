@@ -767,6 +767,62 @@ def build_research_tile(
                        f"delta) — {_ATT_MISSING}"),
         ))
 
+    # 13. judge_outcome_ic (DIAGNOSTIC) — does the LLM-judge quality-score rank
+    #     correlate with realized 21d alpha? Reads the judge_outcome_ic block a
+    #     parallel backtester PR adds to backtest/{date}/agent_quality.json
+    #     (schema_version 1, FROZEN). This is observability OF THE JUDGE
+    #     ITSELF: it VALIDATES (does not steer) the rubric layer — diagnostic
+    #     criticality by design, it must never feed a gate. Producers deploy
+    #     independently: an agent_quality.json without the block (or with
+    #     status "insufficient") grades a precise N/A and self-activates once
+    #     the producer ships (graceful-forward-compat, like every unwired
+    #     producer today).
+    joi = (aq or {}).get("judge_outcome_ic") or {}
+    joi_overall = joi.get("overall") or {}
+    j_ic = joi_overall.get("date_ic_mean") if joi.get("status") == "ok" else None
+    j_hz = f"{joi.get('horizon_days', 21)}d"
+    if j_ic is not None:
+        j_p = joi_overall.get("date_ic_p")
+        j_n = joi_overall.get("n_eval_dates")
+        j_insig = j_p is None or j_p >= 0.10
+        dims = joi.get("by_dimension") or {}
+        dims_s = ", ".join(
+            f"{k}={v.get('date_ic_mean'):+.3f}(p={_fmt_p(v.get('date_ic_p'))})"
+            for k, v in sorted(dims.items())
+            if isinstance(v, dict) and v.get("date_ic_mean") is not None
+        ) or "n/a"
+        components.append(build_metric(
+            name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
+            reliability="low" if j_insig else "high",
+            value=j_ic, n_samples=j_n, n_floor=8, target=0.03, red_line=0.0,
+            source_path=aq_src, status="WATCH" if j_insig else None,
+            reason=(f"judge_outcome_ic: judge quality-score→{j_hz}-alpha date-clustered "
+                    f"rank-IC = {j_ic:+.3f} (p={_fmt_p(j_p)}, N={j_n} eval dates; pooled "
+                    f"{joi_overall.get('pooled_ic')} p={_fmt_p(joi_overall.get('pooled_ic_p'))}, "
+                    f"n={joi_overall.get('n')}; {joi.get('n_unattributable')} unattributable). "
+                    f"Per-dimension [{dims_s}]. VALIDATES (does not steer) the judge rubric "
+                    f"layer — observability of the judge itself; feeds no gate. "
+                    + ("Not yet significant — WATCH, accumulating." if j_insig
+                       else ("judge scores carry outcome signal" if j_ic > 0
+                             else "judge scores anti-correlate with outcomes"))),
+        ))
+    else:
+        joi_status = joi.get("status")
+        components.append(build_metric(
+            name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=aq_src, input_present=False,
+            na_detail=("judge_outcome_ic: "
+                       + (f"judge_outcome_ic block status={joi_status!r} this cycle "
+                          f"(insufficient judge↔realized-alpha joins — accumulating)."
+                          if joi_status == "insufficient" else
+                          "no judge_outcome_ic block in agent_quality.json this cycle "
+                          "(backtester judge-outcome producer deploys in parallel with this "
+                          "consumer — self-activates on first emission). ")
+                       + " Validates (does not steer) the judge rubric layer; feeds no gate."),
+        ))
+
     return build_tile(MODULE, components)
 
 
