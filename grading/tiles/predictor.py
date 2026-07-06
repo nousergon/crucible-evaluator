@@ -27,6 +27,7 @@ from botocore.exceptions import ClientError
 from nousergon_lib.quant.stats.intervals import bootstrap_ci
 
 from grading.artifacts import get_json_windowed
+from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -77,14 +78,23 @@ def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
 
 
 def build_predictor_tile(
-    bucket: str, run_date: str | None = None, s3_client=None, *, as_of: datetime | None = None
+    bucket: str, run_date: str | None = None, s3_client=None, *,
+    as_of: datetime | None = None, history: CardHistory | None = None,
 ) -> dict:
     """Build the Predictor tile from the predictor's metrics + weights manifest.
 
     ``run_date`` (YYYY-MM-DD) enables the cross-tile veto_gate_precision read
     from ``backtest/{run_date}/veto_analysis.json``; when omitted that one
     component grades a transparent N/A.
+
+    ``history`` (config#1836) supplies prior-card values so the headline IC
+    (``meta_l2_ic``) carries cross-cycle ``trend_4w``/``trend_13w``; omitted →
+    trends stay unpopulated (pre-#1836 behavior).
     """
+
+    def _tr(name: str, value: float | None) -> dict:
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
     latest = _get_json(s3, bucket, LATEST_KEY)
@@ -98,6 +108,7 @@ def build_predictor_tile(
             estimator="rank_ic", measurement_horizon="21d",
             n_floor=10, target=0.05, red_line=0.0, source_path=manifest_src, input_present=False,
             na_detail="predictor metrics + weights manifest both absent this cycle.",
+            **_tr("meta_l2_ic", None),
         )
         return build_tile(MODULE, [miss])
 
@@ -151,6 +162,7 @@ def build_predictor_tile(
         input_present=cpcv_ok, reason=meta_reason,
         reliability=_reliability_for("meta_model_oos_ic_cpcv"),
         na_detail="meta_l2_ic: CPCV leak-free read insufficient this cycle (single-path WF is canonical-coverage-starved — L4480).",
+        **_tr("meta_l2_ic", cpcv_mean),
     ))
 
     # 2-4. Per-L1 leak-free walk-forward median ICs.

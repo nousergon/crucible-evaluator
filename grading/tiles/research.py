@@ -28,6 +28,7 @@ from botocore.exceptions import ClientError
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
 from grading.artifacts import get_json_windowed
+from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -65,6 +66,7 @@ def _pick_clf(block: dict) -> tuple[dict | None, str]:
 def _precision_metric(
     name, clf, *, criticality, source, target=0.05, red_line=-0.02,
     lift=None, lift_label=None, missing_detail=None, horizon="5d",
+    history: CardHistory | None = None,
 ) -> dict:
     """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
@@ -80,7 +82,14 @@ def _precision_metric(
     mistaken for the canonical 21d read.
 
     base_rate = (tp+fn)/(tp+fp+fn+tn); edge = precision − base_rate.
+
+    ``history`` (config#1836) threads cross-cycle ``trend_4w``/``trend_13w``
+    from prior report cards onto whichever value branch grades.
     """
+
+    def _tr(value):
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     hz = f"[{horizon}] "
     if not clf or clf.get("precision") is None:
         return build_metric(
@@ -88,6 +97,7 @@ def _precision_metric(
             estimator="wilson_precision_edge", measurement_horizon=horizon,
             n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
+            **_tr(None),
         )
     tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
     fn, tn = int(clf.get("fn", 0)), int(clf.get("tn", 0))
@@ -108,6 +118,7 @@ def _precision_metric(
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
             reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
                     f"N={n_sel}){lift_s}." if w.get("status") == "ok" else None),
+            **_tr(precision),
         )
 
     edge = precision - base_rate
@@ -123,11 +134,24 @@ def _precision_metric(
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
                 f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}.")
         if w.get("status") == "ok" else None,
+        **_tr(edge),
     )
 
 
-def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
-    """Build the Research tile from the e2e + research diagnostic artifacts."""
+def build_research_tile(
+    bucket: str, run_date: str, s3_client=None, *, history: CardHistory | None = None,
+) -> dict:
+    """Build the Research tile from the e2e + research diagnostic artifacts.
+
+    ``history`` (config#1836) supplies prior-card values so the critical
+    score-vs-return components (research_composite_ic / cio_selection_skill /
+    sector_teams_avg / cio) carry cross-cycle ``trend_4w``/``trend_13w``;
+    omitted (standalone CLI / tests) → trends stay unpopulated.
+    """
+
+    def _tr(name: str, value: float | None) -> dict:
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     s3 = s3_client or boto3.client("s3")
     prefix = f"backtest/{run_date}"
     # Windowed resolution (config#1190): grade off the freshest artifact within the
@@ -155,6 +179,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
         lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
         missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
+        history=history,
     ))
 
     # 2. sector_teams_avg (critical) — pooled precision across the 6 sector teams.
@@ -173,6 +198,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                   "tp": tp, "fp": fp, "fn": fn, "tn": tn}
         components.append(_precision_metric(
             "sector_teams_avg", pooled, criticality="critical", source=e2e_src, horizon=team_hz,
+            history=history,
         ))
     else:
         components.append(build_metric(
@@ -180,6 +206,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="wilson_precision_edge", measurement_horizon="21d",
             n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35, source_path=e2e_src,
             input_present=False, na_detail="sector_teams_avg: no team_lift list in e2e_lift this cycle.",
+            **_tr("sector_teams_avg", None),
         ))
 
     # 3. cio (critical) — entrant-gate precision (CIO-advanced names that won).
@@ -191,6 +218,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         "cio", cl_clf, criticality="critical", source=e2e_src, horizon=cl_hz,
         lift=cl_lift, lift_label="21d-alpha-lift" if cl_hz == "21d" else "vs-ranking-lift",
         missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
+        history=history,
     ))
 
     # 3b. cio_selection_skill (critical, L4561) — does the CIO entrant gate ADVANCE
@@ -220,6 +248,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                     f"N={n_sel}{p_txt}{ic_txt}). "
                     + ("Not yet significant — WATCH, accumulating." if insignificant
                        else ("anti-selecting (gate advances worse names)" if gap < 0 else "adds selection value"))),
+            **_tr("cio_selection_skill", gap),
         ))
     else:
         components.append(build_metric(
@@ -228,6 +257,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src, input_present=False,
             na_detail="cio_selection_skill: no selection_skill_21d block in e2e_lift this cycle "
                       "(needs cio_evaluations joined to closed-21d universe_returns).",
+            **_tr("cio_selection_skill", None),
         ))
 
     # 3c. research_composite_ic (critical, L4561) — the fundamental harness question:
@@ -289,6 +319,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                     + ("Not yet significant — WATCH, accumulating." if insig
                        else ("no forward signal — composite does not predict 21d alpha" if fic <= 0
                              else "composite carries forward signal"))),
+            **_tr("research_composite_ic", fic),
         ))
     else:
         components.append(build_metric(
@@ -296,6 +327,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
             n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False,
             na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
+            **_tr("research_composite_ic", None),
         ))
 
     # 4. composite_scoring (supporting) — does higher composite score → higher

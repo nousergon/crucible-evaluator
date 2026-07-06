@@ -78,6 +78,7 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "director/handler.py": 7,
     "grading/aggregate.py": 2,
     "grading/artifacts.py": 1,
+    "grading/history.py": 2,
     "grading/producers/deploy_success.py": 1,
     "grading/tiles/agent.py": 1,
     "grading/tiles/backtester.py": 3,

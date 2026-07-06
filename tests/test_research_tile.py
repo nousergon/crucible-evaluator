@@ -472,3 +472,38 @@ class TestMomentumRegimeIC:
         _put(s3, "e2e_lift.json", self._e2e({"status": "insufficient_data", "n_weeks": 2}))
         m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
         assert m["status"] == "N/A-MISSING-INPUT"
+
+
+class TestCrossCycleTrends:
+    """config#1836 — the research tile threads prior-card trends into the
+    critical score-vs-return components when a CardHistory is supplied."""
+
+    def test_history_threads_trends_on_named_criticals(self, s3):
+        from grading.history import CardHistory
+
+        e = json.loads(json.dumps(_E2E))
+        e["cio_lift"]["layer_attribution_21d"] = {
+            "final_score_date_ic": 0.04, "final_score_date_ic_p": 0.02,
+            "n_eval_dates": 10, "final_score_ic": 0.03, "final_score_ic_p": 0.01, "n": 250,
+        }
+        _put(s3, "e2e_lift.json", e)
+        history = CardHistory({
+            ("research", "research_composite_ic"): [0.01, 0.02, 0.03],
+            ("research", "cio"): [0.20, 0.22],
+        }, 3)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3, history=history)
+
+        ric = _comp(tile, "research_composite_ic")
+        assert ric["trend_4w"] == [0.01, 0.02, 0.03, pytest.approx(0.04)]
+        assert ric["trend_decoration"] == "↑↑"
+
+        cio = _comp(tile, "cio")
+        # prior [0.20, 0.22] + this cycle's edge (0.55 − 0.29 = 0.26).
+        assert cio["trend_4w"] == [0.20, 0.22, pytest.approx(0.26)]
+
+    def test_no_history_keeps_default_trends(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        cio = _comp(tile, "cio")
+        assert cio["trend_4w"] is None
+        assert cio["trend_decoration"] == "→"
