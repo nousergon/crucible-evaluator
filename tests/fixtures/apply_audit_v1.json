@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-07-04",
+  "loops": {
+    "scoring_weights": {
+      "outcome": "blocked",
+      "blocked_by": ["significance_floor"],
+      "consecutive_blocked_weeks": 9,
+      "detail": "BH-FDR significance floor not met (adjusted p=0.21 > 0.05); recommendation withheld",
+      "proposed": {"quant": 0.65, "qual": 0.35},
+      "current": {"quant": 0.60, "qual": 0.40}
+    },
+    "executor_params": {
+      "outcome": "promoted",
+      "blocked_by": null,
+      "consecutive_blocked_weeks": 0,
+      "detail": "holdout Sharpe improved +0.12 over incumbent; params applied to config/executor_params.json",
+      "proposed": {"max_position_pct": 0.09, "drawdown_halt_pct": 0.12},
+      "current": {"max_position_pct": 0.08, "drawdown_halt_pct": 0.12}
+    },
+    "predictor_params": {
+      "outcome": "blocked",
+      "blocked_by": ["holdout_regression"],
+      "consecutive_blocked_weeks": 8,
+      "detail": "proposed veto threshold regressed holdout alpha capture; kept incumbent",
+      "proposed": {"veto_confidence": 0.70},
+      "current": {"veto_confidence": 0.65}
+    },
+    "research_params": {
+      "outcome": "insufficient_data",
+      "blocked_by": null,
+      "consecutive_blocked_weeks": 0,
+      "detail": "fewer than 60 finalized signals in the evaluation window; sweep skipped",
+      "proposed": null,
+      "current": {"signal_boost": 1.0}
+    }
+  }
+}
