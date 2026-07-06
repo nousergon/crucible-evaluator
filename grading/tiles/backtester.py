@@ -14,6 +14,8 @@ Gradable from S3 today:
   - vectorized_vs_consolidated_parity : parity_report.json divergence
   - fdr_surface_health : count of BH-FDR-significant correlations in attribution
   - auto_apply_rollback_count : objects under config/rollback_audit/
+  - apply_loop_health : per-loop outcomes from config/apply_audit/{date}.json —
+    silent non-promotion of the four auto-apply loops (config#1841)
 
 sample_size_adequacy, optimizer_churn and walk_forward_stability are WIRED
 (config#1151 Batch C) — they grade from their backtester producer artifacts
@@ -212,6 +214,85 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             n_floor=1, target=0.0, red_line=2.0, higher_is_better=False,
             source_path=f"s3://{bucket}/config/rollback_audit/", input_present=False,
             na_detail="auto_apply_rollback_count: could not list config/rollback_audit/.",
+        ))
+
+    # 6. apply_loop_health (critical, config#1841) — did the four backtester
+    #    auto-apply loops (scoring_weights / executor_params / predictor_params /
+    #    research_params) actually apply anything, or are they silently stuck?
+    #    Consumes the apply-audit producer artifact
+    #    (config/apply_audit/{date}.json, schema_version 1 — FROZEN contract,
+    #    canonical fixture tests/fixtures/apply_audit_v1.json). Live motivation:
+    #    scoring_weights + predictor_params never promoted for ~2 months and
+    #    nothing surfaced it (config#1841) — this component makes that silence
+    #    impossible. Per-loop state machine:
+    #      error                                   → RED
+    #      blocked, consecutive_blocked_weeks >= 4 → RED
+    #      blocked, weeks in [2, 3]                → WATCH
+    #      promoted / insufficient_data / disabled
+    #        / blocked < 2 weeks                   → healthy
+    #      unrecognized outcome                    → RED (producer contract
+    #        drift — fail loud, never silently green)
+    #    value = number of unhealthy (RED+WATCH) loops, so the card sorts on it;
+    #    the reason names every non-green loop with outcome + blocked_by slugs
+    #    + consecutive weeks so the Director digest carries the specifics.
+    aa, _, _, _aa_key = get_json_windowed(s3, bucket, "config/apply_audit/{date}.json", run_date)
+    aa_src = f"s3://{bucket}/{_aa_key}" if _aa_key else f"s3://{bucket}/config/apply_audit/{run_date}.json"
+    _HEALTHY_OUTCOMES = ("promoted", "insufficient_data", "disabled")
+    loops = (aa or {}).get("loops")
+    if aa is not None and not (isinstance(loops, dict) and loops):
+        # Present-but-malformed artifact (no usable "loops" block) — producer
+        # contract drift on secondary observability: WARN + specific N/A, never
+        # a crash and never a silent GREEN (the critical N/A forces tile WATCH).
+        logger.warning("apply_audit artifact at %s has no usable 'loops' block", aa_src)
+    if aa is not None and isinstance(loops, dict) and loops:
+        red: list[str] = []
+        watch: list[str] = []
+        healthy: list[str] = []
+        for loop_name in sorted(loops):
+            entry = loops[loop_name] or {}
+            outcome = entry.get("outcome")
+            weeks = int(entry.get("consecutive_blocked_weeks") or 0)
+            if outcome == "blocked":
+                slugs = ",".join(entry.get("blocked_by") or []) or "unspecified"
+                desc = f"{loop_name} blocked {weeks}w [{slugs}]"
+                if weeks >= 4:
+                    red.append(desc)
+                elif weeks >= 2:
+                    watch.append(desc)
+                else:
+                    healthy.append(f"{loop_name}=blocked({weeks}w)")
+            elif outcome == "error":
+                detail = str(entry.get("detail") or "").strip()
+                red.append(f"{loop_name} error" + (f" ({detail[:120]})" if detail else ""))
+            elif outcome in _HEALTHY_OUTCOMES:
+                healthy.append(f"{loop_name}={outcome}")
+            else:
+                red.append(f"{loop_name} unrecognized outcome {outcome!r} (producer contract drift)")
+        unhealthy = red + watch
+        status = "RED" if red else ("WATCH" if watch else "GREEN")
+        if unhealthy:
+            reason = (f"apply_loop_health: {len(unhealthy)}/{len(loops)} auto-apply loops unhealthy — "
+                      f"{'; '.join(unhealthy)} (as_of {aa.get('as_of')}).")
+        else:
+            reason = (f"apply_loop_health: all {len(loops)} auto-apply loops healthy "
+                      f"({', '.join(healthy)}) as_of {aa.get('as_of')}.")
+        components.append(build_metric(
+            name="apply_loop_health", module=MODULE, metric_type="count", criticality="critical",
+            estimator="per_loop_outcome_state_machine", measurement_horizon="per_cycle",
+            value=float(len(unhealthy)), n_samples=len(loops), n_floor=1,
+            higher_is_better=False, source_path=aa_src, status=status, reason=reason,
+        ))
+    else:
+        components.append(build_metric(
+            name="apply_loop_health", module=MODULE, metric_type="count", criticality="critical",
+            n_floor=1, higher_is_better=False, source_path=aa_src, input_present=False,
+            na_detail=(
+                f"apply_loop_health: no usable config/apply_audit/{{date}}.json in the trailing "
+                f"window ending {run_date}"
+                + (" (artifact present but its 'loops' block is absent/malformed)" if aa is not None else "")
+                + " — needs the backtester apply-audit producer (config#1841); "
+                "self-activates on first emission."
+            ),
         ))
 
     # sample_size_adequacy (critical, config#1151 Batch C) — are the per-cycle
