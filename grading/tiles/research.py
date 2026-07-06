@@ -339,21 +339,20 @@ def build_research_tile(
     #    as inverted calibration. The composite formula itself is provably
     #    monotonic in its inputs (ROADMAP L4550 — metric-quality fix, not a
     #    scoring-formula bug; the negative-edge substance lives in L4551).
-    #    SUPPORTING (config#1063): this is computed at the score_performance
-    #    horizon (10d — that table has no 21d column), BELOW the 21d strategy
-    #    horizon, so it is a leading diagnostic rather than a critical gate. The
-    #    canonical-21d composite signal is graded critically as
-    #    research_composite_ic (final_score rank-IC vs 21d alpha) above; keeping
-    #    BOTH critical would double-count the construct and let a sub-horizon
-    #    proxy drive a Director P0 (the L4551/L4562 sub-horizon-proxy concern).
+    #    SUPPORTING (config#1063): historically computed at a sub-strategy
+    #    horizon, so it stays a leading diagnostic rather than a critical gate
+    #    (promotion is a human call). The canonical-21d composite signal is
+    #    graded critically as research_composite_ic (final_score rank-IC vs 21d
+    #    alpha) above; keeping BOTH critical would double-count the construct
+    #    and let a sub-horizon proxy drive a Director P0 (L4551/L4562).
     sc_src = f"s3://{bucket}/{_score_key}" if _score_key else f"s3://{bucket}/{prefix}/score_calibration.json"
-    # The score_calibration artifact is computed from the score_performance table,
-    # which carries only 5d/10d/30d outcomes (NO 21d column) — the producer's
-    # default horizon is 10d. Report the TRUE horizon from the artifact rather
-    # than asserting the canonical 21d (config#1063: the metric was *computed* at
-    # 10d but *framed* as 21d). The canonical-21d composite signal IS graded — as
-    # research_composite_ic (final_score rank-IC vs 21d alpha) above — so this is
-    # an honest shorter-horizon calibration diagnostic, not a mislabeled 21d gate.
+    # HORIZON IS DECLARED BY THE ARTIFACT, never assumed here: we grade + label
+    # at whatever `horizon` score_calibration.json carries (config#1063 — the
+    # metric was once *computed* at 10d but *framed* as 21d; the fix is to echo
+    # the producer's declaration). A parallel backtester PR moves this artifact
+    # to the canonical primary horizon — this consumer needs no change when it
+    # lands. The "10d" fallback applies ONLY to legacy artifacts predating the
+    # `horizon` field (whose producer default was 10d).
     cal_horizon = (score_cal or {}).get("horizon") or "10d"
     if score_cal and score_cal.get("status") == "ok" and score_cal.get("spearman_rho") is not None:
         rho = float(score_cal["spearman_rho"])
@@ -605,6 +604,167 @@ def build_research_tile(
             name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
             n_floor=1, target=20.0, red_line=8.0, source_path=aq_src, input_present=False,
             na_detail="signal_volume_adequacy: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+        ))
+
+    # 10-12. Attractiveness-evaluation components (config#1389/#1392/#1398).
+    #        Source: backtest/{date}/attractiveness_eval.json (schema_version 1,
+    #        FROZEN — see tests/fixtures/attractiveness_eval_v1.json), produced
+    #        by the backtester's attractiveness evaluator. The producer PR lands
+    #        in parallel with this consumer: until it ships, every component
+    #        below grades a precise N/A-MISSING-INPUT and self-activates on the
+    #        first artifact (same forward-compat contract as agent_quality).
+    #        All alpha values in the artifact are decimal 21d log-alpha.
+    att, _, _, _att_key = get_json_windowed(
+        s3, bucket, "backtest/{date}/attractiveness_eval.json", run_date
+    )
+    att_src = f"s3://{bucket}/{_att_key}" if _att_key else f"s3://{bucket}/{prefix}/attractiveness_eval.json"
+    att_ok = bool(att) and att.get("status") == "ok"
+    att_hz = f"{(att or {}).get('horizon_days', 21)}d"
+    _ATT_MISSING = (
+        "attractiveness_eval.json absent this cycle (backtester attractiveness-eval "
+        "producer, config#1389 — deploys in parallel with this consumer)."
+        if not att else
+        f"attractiveness_eval.json status={att.get('status')!r} this cycle "
+        f"(insufficient realized-21d history to evaluate — accumulating)."
+    )
+
+    def _fmt_p(p):
+        return "n/a" if p is None else f"{p:.3g}"
+
+    def _fmt_pct(v):
+        return "n/a" if v is None else f"{v:.0%}"
+
+    # 10. attractiveness_ic (SUPPORTING — promote-to-critical is a later human
+    #     call once cross-cycle history matures). Mirrors research_composite_ic:
+    #     date-clustered (weeks-as-N) rank-IC vs realized 21d alpha, WATCH +
+    #     reliability=low while insignificant (p >= 0.10) or under-sampled —
+    #     accumulate to significance, never a confident grade on noise.
+    comp_ic = (att or {}).get("composite_ic") or {}
+    a_ic = comp_ic.get("date_ic_mean") if att_ok else None
+    if a_ic is not None:
+        a_p = comp_ic.get("date_ic_p")
+        a_n = comp_ic.get("n_eval_dates")
+        a_floor = 8  # weeks: ~8 cohorts for a stable IC t-stat (mirrors research_composite_ic)
+        a_insig = a_p is None or a_p >= 0.10 or (a_n or 0) < a_floor
+        pillar_ic = att.get("pillar_ic") or {}
+        weights = att.get("suggested_pillar_weights") or {}
+        shrink = att.get("shrinkage") or {}
+        pillars_s = ", ".join(
+            f"{k}={v.get('date_ic_mean'):+.3f}(p={_fmt_p(v.get('date_ic_p'))})"
+            for k, v in sorted(pillar_ic.items())
+            if isinstance(v, dict) and v.get("date_ic_mean") is not None
+        ) or "n/a"
+        weights_s = ", ".join(f"{k}={v:.2f}" for k, v in sorted(weights.items())) or "n/a"
+        shrink_s = (f"{shrink.get('method')} λ={shrink.get('lambda')}"
+                    if shrink.get("method") else "n/a")
+        components.append(build_metric(
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            reliability="low" if a_insig else "high",
+            value=a_ic, n_samples=a_n, n_floor=a_floor, target=0.03, red_line=0.0,
+            source_path=att_src, status="WATCH" if a_insig else None,
+            reason=(f"attractiveness_ic: attractiveness→{att_hz}-alpha date-clustered rank-IC = "
+                    f"{a_ic:+.3f} (p={_fmt_p(a_p)}, N={a_n} eval dates; pooled "
+                    f"{comp_ic.get('pooled_ic')} p={_fmt_p(comp_ic.get('pooled_ic_p'))}, "
+                    f"n={comp_ic.get('n')}). Per-pillar IC [{pillars_s}]; suggested pillar "
+                    f"weights ({shrink_s}) [{weights_s}]. "
+                    + ("Not yet significant — WATCH, accumulating." if a_insig
+                       else ("attractiveness carries forward signal" if a_ic > 0
+                             else "no forward signal — attractiveness does not predict 21d alpha"))),
+        ))
+    else:
+        components.append(build_metric(
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            na_detail=f"attractiveness_ic: {_ATT_MISSING}",
+        ))
+
+    # 11. attractiveness_trajectory_ic (DIAGNOSTIC) — does the PRE-repricing
+    #     attractiveness score predict realized 21d alpha? This is the
+    #     observe→cutover evidence for config#1392 (repricing-trajectory
+    #     substrate): a significant pre-repricing IC is the gate criterion for
+    #     cutting the live feed over to the trajectory-aware score. Informs the
+    #     gate; the flag flip itself stays a human/registry decision.
+    traj = ((att or {}).get("trajectory_ic") or {}).get("pre_repricing_score") or {}
+    t_ic = traj.get("date_ic_mean") if att_ok else None
+    if t_ic is not None:
+        t_p = traj.get("date_ic_p")
+        t_n = traj.get("n_eval_dates")
+        t_insig = t_p is None or t_p >= 0.10
+        slope = ((att or {}).get("trajectory_ic") or {}).get("attr_slope_z") or {}
+        slope_s = (f"; attr_slope_z IC {slope.get('date_ic_mean'):+.3f} "
+                   f"(p={_fmt_p(slope.get('date_ic_p'))})"
+                   if slope.get("date_ic_mean") is not None else "")
+        components.append(build_metric(
+            name="attractiveness_trajectory_ic", module=MODULE, metric_type="ic",
+            criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            reliability="low" if t_insig else "high",
+            value=t_ic, n_samples=t_n, n_floor=8, target=0.03, red_line=0.0,
+            source_path=att_src, status="WATCH" if t_insig else None,
+            reason=(f"attractiveness_trajectory_ic: pre_repricing_score→{att_hz}-alpha "
+                    f"date-clustered rank-IC = {t_ic:+.3f} (p={_fmt_p(t_p)}, N={t_n} eval "
+                    f"dates){slope_s}. This IC is the observe→cutover evidence for the "
+                    f"repricing-trajectory gate (config#1392). "
+                    + ("Not yet significant — WATCH, accumulating." if t_insig
+                       else "significant — cutover evidence accruing")),
+        ))
+    else:
+        components.append(build_metric(
+            name="attractiveness_trajectory_ic", module=MODULE, metric_type="ic",
+            criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            na_detail=(f"attractiveness_trajectory_ic: no pre_repricing_score IC block — "
+                       f"{_ATT_MISSING} Drives the config#1392 observe→cutover gate once present."),
+        ))
+
+    # 12. scanner_feed_counterfactual (SUPPORTING) — config#1398 "size the
+    #     prize", surfaced weekly: how much realized 21d log-alpha would a
+    #     top-N attractiveness feed have captured vs the LIVE scanner gate?
+    #     Headline value = mean_alpha_21d(top-N) − mean_alpha_21d(live_gate),
+    #     comparing at matched breadth (the top_n row whose N is closest to the
+    #     live gate's survivor count). No red-line: this is an opportunity
+    #     metric (positive prize → GREEN, else WATCH), never a failure RED.
+    cf = (att or {}).get("counterfactual") or {}
+    top_n = [e for e in (cf.get("top_n") or [])
+             if isinstance(e, dict) and e.get("mean_alpha_21d") is not None]
+    live_gate = cf.get("live_gate") or {}
+    lg_alpha = live_gate.get("mean_alpha_21d")
+    if att_ok and top_n and lg_alpha is not None:
+        n_surv = live_gate.get("n_survivors")
+        chosen = (min(top_n, key=lambda e: abs((e.get("n") or 0) - n_surv))
+                  if n_surv is not None else top_n[0])
+        prize = chosen["mean_alpha_21d"] - lg_alpha
+        rows_s = "; ".join(
+            f"top-{e.get('n')}{'(sector-bal)' if e.get('sector_balanced') else ''}: "
+            f"capture {_fmt_pct(e.get('capture_rate'))}, alpha {e.get('mean_alpha_21d'):+.4f}"
+            for e in top_n
+        )
+        components.append(build_metric(
+            name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
+            criticality="supporting",
+            estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
+            value=prize, n_samples=n_surv, n_floor=10, target=0.0, red_line=None,
+            higher_is_better=True, source_path=att_src,
+            reason=(f"scanner_feed_counterfactual: top-{chosen.get('n')} attractiveness feed "
+                    f"− live gate = {prize:+.4f} mean {att_hz} log-alpha (live gate: capture "
+                    f"{_fmt_pct(live_gate.get('capture_rate'))}, alpha {lg_alpha:+.4f}, "
+                    f"N={n_surv} survivors). All cohorts [{rows_s}]. Sizes the prize of an "
+                    f"attractiveness-ranked scanner feed (config#1398) — opportunity surface, "
+                    f"not a failure gate."),
+        ))
+    else:
+        components.append(build_metric(
+            name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
+            criticality="supporting",
+            estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
+            n_floor=10, target=0.0, red_line=None, higher_is_better=True,
+            source_path=att_src, input_present=False,
+            na_detail=(f"scanner_feed_counterfactual: no usable counterfactual block "
+                       f"(needs top_n rows AND a live_gate baseline for a like-for-like "
+                       f"delta) — {_ATT_MISSING}"),
         ))
 
     return build_tile(MODULE, components)
