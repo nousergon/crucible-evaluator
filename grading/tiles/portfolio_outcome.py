@@ -31,6 +31,7 @@ from nousergon_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ra
 from nousergon_lib.quant.stats.dsr import compute_psr
 from nousergon_lib.quant.stats.intervals import bootstrap_ci, wilson_score_interval
 
+from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -152,13 +153,25 @@ def _max_dd_duration_days(nav: list[float]) -> int:
 # tile builder
 # ---------------------------------------------------------------------------
 
-def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int | None = None) -> dict:
+def build_portfolio_outcome_tile(
+    bucket: str, s3_client=None, *, n_trials: int | None = None,
+    history: CardHistory | None = None,
+) -> dict:
     """Build the Portfolio Outcome tile from eod_pnl.csv.
 
     ``n_trials`` (DSR selection-bias count) is unset for the live book today —
     DSR therefore emits N/A-NOT-IMPL until a documented cumulative trial count
     lands (mirrors L4469 W1.3b's deferred trial-count tracking).
+
+    ``history`` (config#1836) supplies prior-card values so the critical
+    score-vs-return components (sharpe_ratio / alpha_vs_spy / hit_rate_daily)
+    carry cross-cycle ``trend_4w``/``trend_13w``; omitted (standalone CLI /
+    tests) → trends stay unpopulated, exactly the pre-#1836 behavior.
     """
+
+    def _tr(name: str, value: float | None) -> dict:
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     src = f"s3://{bucket}/{EOD_PNL_KEY}"
     series = read_eod_pnl(bucket, s3_client=s3_client)
 
@@ -170,6 +183,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
                 target=tgt, red_line=rl, source_path=src, input_present=False,
                 estimator=est, measurement_horizon="since_inception",
                 na_detail=f"{name}: trades/eod_pnl.csv not present this cycle — no EOD reconciliation export to grade.",
+                **_tr(name, None),
             )
 
         components = [
@@ -198,6 +212,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
         estimator="sharpe_with_bootstrap_ci", measurement_horizon="since_inception",
         value=sharpe, n_samples=n, n_floor=60, target=1.0, red_line=0.0,
         ci_low=s_lo, ci_high=s_hi, ci_method=s_m, source_path=src,
+        **_tr("sharpe_ratio", sharpe),
     ))
 
     # 2. Information ratio (critical)
@@ -231,6 +246,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
         name="alpha_vs_spy", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="cumulative_log_alpha", measurement_horizon="since_inception",
         value=log_alpha, n_samples=n, n_floor=60, target=0.0, red_line=-0.05, source_path=src,
+        **_tr("alpha_vs_spy", log_alpha),
     ))
 
     # 5. Max drawdown (critical) — point obs from the NAV series.
@@ -281,6 +297,7 @@ def build_portfolio_outcome_tile(bucket: str, s3_client=None, *, n_trials: int |
         value=hit, n_samples=n, n_floor=60, target=0.55, red_line=0.45,
         ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=src,
+        **_tr("hit_rate_daily", hit),
     ))
 
     # 10. Beta vs SPY (diagnostic, two-sided band 0.7–1.1) — explicit status.

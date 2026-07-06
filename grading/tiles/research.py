@@ -28,6 +28,7 @@ from botocore.exceptions import ClientError
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
 from grading.artifacts import get_json_windowed
+from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -65,6 +66,7 @@ def _pick_clf(block: dict) -> tuple[dict | None, str]:
 def _precision_metric(
     name, clf, *, criticality, source, target=0.05, red_line=-0.02,
     lift=None, lift_label=None, missing_detail=None, horizon="5d",
+    history: CardHistory | None = None,
 ) -> dict:
     """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
@@ -80,7 +82,14 @@ def _precision_metric(
     mistaken for the canonical 21d read.
 
     base_rate = (tp+fn)/(tp+fp+fn+tn); edge = precision − base_rate.
+
+    ``history`` (config#1836) threads cross-cycle ``trend_4w``/``trend_13w``
+    from prior report cards onto whichever value branch grades.
     """
+
+    def _tr(value):
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     hz = f"[{horizon}] "
     if not clf or clf.get("precision") is None:
         return build_metric(
@@ -88,6 +97,7 @@ def _precision_metric(
             estimator="wilson_precision_edge", measurement_horizon=horizon,
             n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
+            **_tr(None),
         )
     tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
     fn, tn = int(clf.get("fn", 0)), int(clf.get("tn", 0))
@@ -108,6 +118,7 @@ def _precision_metric(
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
             reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
                     f"N={n_sel}){lift_s}." if w.get("status") == "ok" else None),
+            **_tr(precision),
         )
 
     edge = precision - base_rate
@@ -123,11 +134,24 @@ def _precision_metric(
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
                 f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}.")
         if w.get("status") == "ok" else None,
+        **_tr(edge),
     )
 
 
-def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
-    """Build the Research tile from the e2e + research diagnostic artifacts."""
+def build_research_tile(
+    bucket: str, run_date: str, s3_client=None, *, history: CardHistory | None = None,
+) -> dict:
+    """Build the Research tile from the e2e + research diagnostic artifacts.
+
+    ``history`` (config#1836) supplies prior-card values so the critical
+    score-vs-return components (research_composite_ic / cio_selection_skill /
+    sector_teams_avg / cio) carry cross-cycle ``trend_4w``/``trend_13w``;
+    omitted (standalone CLI / tests) → trends stay unpopulated.
+    """
+
+    def _tr(name: str, value: float | None) -> dict:
+        return history.trends_for(MODULE, name, value) if history is not None else {}
+
     s3 = s3_client or boto3.client("s3")
     prefix = f"backtest/{run_date}"
     # Windowed resolution (config#1190): grade off the freshest artifact within the
@@ -155,6 +179,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
         lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
         missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
+        history=history,
     ))
 
     # 2. sector_teams_avg (critical) — pooled precision across the 6 sector teams.
@@ -173,6 +198,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                   "tp": tp, "fp": fp, "fn": fn, "tn": tn}
         components.append(_precision_metric(
             "sector_teams_avg", pooled, criticality="critical", source=e2e_src, horizon=team_hz,
+            history=history,
         ))
     else:
         components.append(build_metric(
@@ -180,6 +206,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="wilson_precision_edge", measurement_horizon="21d",
             n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35, source_path=e2e_src,
             input_present=False, na_detail="sector_teams_avg: no team_lift list in e2e_lift this cycle.",
+            **_tr("sector_teams_avg", None),
         ))
 
     # 3. cio (critical) — entrant-gate precision (CIO-advanced names that won).
@@ -191,6 +218,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         "cio", cl_clf, criticality="critical", source=e2e_src, horizon=cl_hz,
         lift=cl_lift, lift_label="21d-alpha-lift" if cl_hz == "21d" else "vs-ranking-lift",
         missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
+        history=history,
     ))
 
     # 3b. cio_selection_skill (critical, L4561) — does the CIO entrant gate ADVANCE
@@ -220,6 +248,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                     f"N={n_sel}{p_txt}{ic_txt}). "
                     + ("Not yet significant — WATCH, accumulating." if insignificant
                        else ("anti-selecting (gate advances worse names)" if gap < 0 else "adds selection value"))),
+            **_tr("cio_selection_skill", gap),
         ))
     else:
         components.append(build_metric(
@@ -228,6 +257,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src, input_present=False,
             na_detail="cio_selection_skill: no selection_skill_21d block in e2e_lift this cycle "
                       "(needs cio_evaluations joined to closed-21d universe_returns).",
+            **_tr("cio_selection_skill", None),
         ))
 
     # 3c. research_composite_ic (critical, L4561) — the fundamental harness question:
@@ -289,6 +319,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                     + ("Not yet significant — WATCH, accumulating." if insig
                        else ("no forward signal — composite does not predict 21d alpha" if fic <= 0
                              else "composite carries forward signal"))),
+            **_tr("research_composite_ic", fic),
         ))
     else:
         components.append(build_metric(
@@ -296,6 +327,7 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
             n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False,
             na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
+            **_tr("research_composite_ic", None),
         ))
 
     # 4. composite_scoring (supporting) — does higher composite score → higher
@@ -307,21 +339,20 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    as inverted calibration. The composite formula itself is provably
     #    monotonic in its inputs (ROADMAP L4550 — metric-quality fix, not a
     #    scoring-formula bug; the negative-edge substance lives in L4551).
-    #    SUPPORTING (config#1063): this is computed at the score_performance
-    #    horizon (10d — that table has no 21d column), BELOW the 21d strategy
-    #    horizon, so it is a leading diagnostic rather than a critical gate. The
-    #    canonical-21d composite signal is graded critically as
-    #    research_composite_ic (final_score rank-IC vs 21d alpha) above; keeping
-    #    BOTH critical would double-count the construct and let a sub-horizon
-    #    proxy drive a Director P0 (the L4551/L4562 sub-horizon-proxy concern).
+    #    SUPPORTING (config#1063): historically computed at a sub-strategy
+    #    horizon, so it stays a leading diagnostic rather than a critical gate
+    #    (promotion is a human call). The canonical-21d composite signal is
+    #    graded critically as research_composite_ic (final_score rank-IC vs 21d
+    #    alpha) above; keeping BOTH critical would double-count the construct
+    #    and let a sub-horizon proxy drive a Director P0 (L4551/L4562).
     sc_src = f"s3://{bucket}/{_score_key}" if _score_key else f"s3://{bucket}/{prefix}/score_calibration.json"
-    # The score_calibration artifact is computed from the score_performance table,
-    # which carries only 5d/10d/30d outcomes (NO 21d column) — the producer's
-    # default horizon is 10d. Report the TRUE horizon from the artifact rather
-    # than asserting the canonical 21d (config#1063: the metric was *computed* at
-    # 10d but *framed* as 21d). The canonical-21d composite signal IS graded — as
-    # research_composite_ic (final_score rank-IC vs 21d alpha) above — so this is
-    # an honest shorter-horizon calibration diagnostic, not a mislabeled 21d gate.
+    # HORIZON IS DECLARED BY THE ARTIFACT, never assumed here: we grade + label
+    # at whatever `horizon` score_calibration.json carries (config#1063 — the
+    # metric was once *computed* at 10d but *framed* as 21d; the fix is to echo
+    # the producer's declaration). A parallel backtester PR moves this artifact
+    # to the canonical primary horizon — this consumer needs no change when it
+    # lands. The "10d" fallback applies ONLY to legacy artifacts predating the
+    # `horizon` field (whose producer default was 10d).
     cal_horizon = (score_cal or {}).get("horizon") or "10d"
     if score_cal and score_cal.get("status") == "ok" and score_cal.get("spearman_rho") is not None:
         rho = float(score_cal["spearman_rho"])
@@ -573,6 +604,223 @@ def build_research_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
             n_floor=1, target=20.0, red_line=8.0, source_path=aq_src, input_present=False,
             na_detail="signal_volume_adequacy: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+        ))
+
+    # 10-12. Attractiveness-evaluation components (config#1389/#1392/#1398).
+    #        Source: backtest/{date}/attractiveness_eval.json (schema_version 1,
+    #        FROZEN — see tests/fixtures/attractiveness_eval_v1.json), produced
+    #        by the backtester's attractiveness evaluator. The producer PR lands
+    #        in parallel with this consumer: until it ships, every component
+    #        below grades a precise N/A-MISSING-INPUT and self-activates on the
+    #        first artifact (same forward-compat contract as agent_quality).
+    #        All alpha values in the artifact are decimal 21d log-alpha.
+    att, _, _, _att_key = get_json_windowed(
+        s3, bucket, "backtest/{date}/attractiveness_eval.json", run_date
+    )
+    att_src = f"s3://{bucket}/{_att_key}" if _att_key else f"s3://{bucket}/{prefix}/attractiveness_eval.json"
+    att_ok = bool(att) and att.get("status") == "ok"
+    att_hz = f"{(att or {}).get('horizon_days', 21)}d"
+    _ATT_MISSING = (
+        "attractiveness_eval.json absent this cycle (backtester attractiveness-eval "
+        "producer, config#1389 — deploys in parallel with this consumer)."
+        if not att else
+        f"attractiveness_eval.json status={att.get('status')!r} this cycle "
+        f"(insufficient realized-21d history to evaluate — accumulating)."
+    )
+
+    def _fmt_p(p):
+        return "n/a" if p is None else f"{p:.3g}"
+
+    def _fmt_pct(v):
+        return "n/a" if v is None else f"{v:.0%}"
+
+    # 10. attractiveness_ic (SUPPORTING — promote-to-critical is a later human
+    #     call once cross-cycle history matures). Mirrors research_composite_ic:
+    #     date-clustered (weeks-as-N) rank-IC vs realized 21d alpha, WATCH +
+    #     reliability=low while insignificant (p >= 0.10) or under-sampled —
+    #     accumulate to significance, never a confident grade on noise.
+    comp_ic = (att or {}).get("composite_ic") or {}
+    a_ic = comp_ic.get("date_ic_mean") if att_ok else None
+    if a_ic is not None:
+        a_p = comp_ic.get("date_ic_p")
+        a_n = comp_ic.get("n_eval_dates")
+        a_floor = 8  # weeks: ~8 cohorts for a stable IC t-stat (mirrors research_composite_ic)
+        a_insig = a_p is None or a_p >= 0.10 or (a_n or 0) < a_floor
+        pillar_ic = att.get("pillar_ic") or {}
+        weights = att.get("suggested_pillar_weights") or {}
+        shrink = att.get("shrinkage") or {}
+        pillars_s = ", ".join(
+            f"{k}={v.get('date_ic_mean'):+.3f}(p={_fmt_p(v.get('date_ic_p'))})"
+            for k, v in sorted(pillar_ic.items())
+            if isinstance(v, dict) and v.get("date_ic_mean") is not None
+        ) or "n/a"
+        weights_s = ", ".join(f"{k}={v:.2f}" for k, v in sorted(weights.items())) or "n/a"
+        shrink_s = (f"{shrink.get('method')} λ={shrink.get('lambda')}"
+                    if shrink.get("method") else "n/a")
+        components.append(build_metric(
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            reliability="low" if a_insig else "high",
+            value=a_ic, n_samples=a_n, n_floor=a_floor, target=0.03, red_line=0.0,
+            source_path=att_src, status="WATCH" if a_insig else None,
+            reason=(f"attractiveness_ic: attractiveness→{att_hz}-alpha date-clustered rank-IC = "
+                    f"{a_ic:+.3f} (p={_fmt_p(a_p)}, N={a_n} eval dates; pooled "
+                    f"{comp_ic.get('pooled_ic')} p={_fmt_p(comp_ic.get('pooled_ic_p'))}, "
+                    f"n={comp_ic.get('n')}). Per-pillar IC [{pillars_s}]; suggested pillar "
+                    f"weights ({shrink_s}) [{weights_s}]. "
+                    + ("Not yet significant — WATCH, accumulating." if a_insig
+                       else ("attractiveness carries forward signal" if a_ic > 0
+                             else "no forward signal — attractiveness does not predict 21d alpha"))),
+        ))
+    else:
+        components.append(build_metric(
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            na_detail=f"attractiveness_ic: {_ATT_MISSING}",
+        ))
+
+    # 11. attractiveness_trajectory_ic (DIAGNOSTIC) — does the PRE-repricing
+    #     attractiveness score predict realized 21d alpha? This is the
+    #     observe→cutover evidence for config#1392 (repricing-trajectory
+    #     substrate): a significant pre-repricing IC is the gate criterion for
+    #     cutting the live feed over to the trajectory-aware score. Informs the
+    #     gate; the flag flip itself stays a human/registry decision.
+    traj = ((att or {}).get("trajectory_ic") or {}).get("pre_repricing_score") or {}
+    t_ic = traj.get("date_ic_mean") if att_ok else None
+    if t_ic is not None:
+        t_p = traj.get("date_ic_p")
+        t_n = traj.get("n_eval_dates")
+        t_insig = t_p is None or t_p >= 0.10
+        slope = ((att or {}).get("trajectory_ic") or {}).get("attr_slope_z") or {}
+        slope_s = (f"; attr_slope_z IC {slope.get('date_ic_mean'):+.3f} "
+                   f"(p={_fmt_p(slope.get('date_ic_p'))})"
+                   if slope.get("date_ic_mean") is not None else "")
+        components.append(build_metric(
+            name="attractiveness_trajectory_ic", module=MODULE, metric_type="ic",
+            criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            reliability="low" if t_insig else "high",
+            value=t_ic, n_samples=t_n, n_floor=8, target=0.03, red_line=0.0,
+            source_path=att_src, status="WATCH" if t_insig else None,
+            reason=(f"attractiveness_trajectory_ic: pre_repricing_score→{att_hz}-alpha "
+                    f"date-clustered rank-IC = {t_ic:+.3f} (p={_fmt_p(t_p)}, N={t_n} eval "
+                    f"dates){slope_s}. This IC is the observe→cutover evidence for the "
+                    f"repricing-trajectory gate (config#1392). "
+                    + ("Not yet significant — WATCH, accumulating." if t_insig
+                       else "significant — cutover evidence accruing")),
+        ))
+    else:
+        components.append(build_metric(
+            name="attractiveness_trajectory_ic", module=MODULE, metric_type="ic",
+            criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            na_detail=(f"attractiveness_trajectory_ic: no pre_repricing_score IC block — "
+                       f"{_ATT_MISSING} Drives the config#1392 observe→cutover gate once present."),
+        ))
+
+    # 12. scanner_feed_counterfactual (SUPPORTING) — config#1398 "size the
+    #     prize", surfaced weekly: how much realized 21d log-alpha would a
+    #     top-N attractiveness feed have captured vs the LIVE scanner gate?
+    #     Headline value = mean_alpha_21d(top-N) − mean_alpha_21d(live_gate),
+    #     comparing at matched breadth (the top_n row whose N is closest to the
+    #     live gate's survivor count). No red-line: this is an opportunity
+    #     metric (positive prize → GREEN, else WATCH), never a failure RED.
+    cf = (att or {}).get("counterfactual") or {}
+    top_n = [e for e in (cf.get("top_n") or [])
+             if isinstance(e, dict) and e.get("mean_alpha_21d") is not None]
+    live_gate = cf.get("live_gate") or {}
+    lg_alpha = live_gate.get("mean_alpha_21d")
+    if att_ok and top_n and lg_alpha is not None:
+        n_surv = live_gate.get("n_survivors")
+        chosen = (min(top_n, key=lambda e: abs((e.get("n") or 0) - n_surv))
+                  if n_surv is not None else top_n[0])
+        prize = chosen["mean_alpha_21d"] - lg_alpha
+        rows_s = "; ".join(
+            f"top-{e.get('n')}{'(sector-bal)' if e.get('sector_balanced') else ''}: "
+            f"capture {_fmt_pct(e.get('capture_rate'))}, alpha {e.get('mean_alpha_21d'):+.4f}"
+            for e in top_n
+        )
+        components.append(build_metric(
+            name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
+            criticality="supporting",
+            estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
+            value=prize, n_samples=n_surv, n_floor=10, target=0.0, red_line=None,
+            higher_is_better=True, source_path=att_src,
+            reason=(f"scanner_feed_counterfactual: top-{chosen.get('n')} attractiveness feed "
+                    f"− live gate = {prize:+.4f} mean {att_hz} log-alpha (live gate: capture "
+                    f"{_fmt_pct(live_gate.get('capture_rate'))}, alpha {lg_alpha:+.4f}, "
+                    f"N={n_surv} survivors). All cohorts [{rows_s}]. Sizes the prize of an "
+                    f"attractiveness-ranked scanner feed (config#1398) — opportunity surface, "
+                    f"not a failure gate."),
+        ))
+    else:
+        components.append(build_metric(
+            name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
+            criticality="supporting",
+            estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
+            n_floor=10, target=0.0, red_line=None, higher_is_better=True,
+            source_path=att_src, input_present=False,
+            na_detail=(f"scanner_feed_counterfactual: no usable counterfactual block "
+                       f"(needs top_n rows AND a live_gate baseline for a like-for-like "
+                       f"delta) — {_ATT_MISSING}"),
+        ))
+
+    # 13. judge_outcome_ic (DIAGNOSTIC) — does the LLM-judge quality-score rank
+    #     correlate with realized 21d alpha? Reads the judge_outcome_ic block a
+    #     parallel backtester PR adds to backtest/{date}/agent_quality.json
+    #     (schema_version 1, FROZEN). This is observability OF THE JUDGE
+    #     ITSELF: it VALIDATES (does not steer) the rubric layer — diagnostic
+    #     criticality by design, it must never feed a gate. Producers deploy
+    #     independently: an agent_quality.json without the block (or with
+    #     status "insufficient") grades a precise N/A and self-activates once
+    #     the producer ships (graceful-forward-compat, like every unwired
+    #     producer today).
+    joi = (aq or {}).get("judge_outcome_ic") or {}
+    joi_overall = joi.get("overall") or {}
+    j_ic = joi_overall.get("date_ic_mean") if joi.get("status") == "ok" else None
+    j_hz = f"{joi.get('horizon_days', 21)}d"
+    if j_ic is not None:
+        j_p = joi_overall.get("date_ic_p")
+        j_n = joi_overall.get("n_eval_dates")
+        j_insig = j_p is None or j_p >= 0.10
+        dims = joi.get("by_dimension") or {}
+        dims_s = ", ".join(
+            f"{k}={v.get('date_ic_mean'):+.3f}(p={_fmt_p(v.get('date_ic_p'))})"
+            for k, v in sorted(dims.items())
+            if isinstance(v, dict) and v.get("date_ic_mean") is not None
+        ) or "n/a"
+        components.append(build_metric(
+            name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
+            reliability="low" if j_insig else "high",
+            value=j_ic, n_samples=j_n, n_floor=8, target=0.03, red_line=0.0,
+            source_path=aq_src, status="WATCH" if j_insig else None,
+            reason=(f"judge_outcome_ic: judge quality-score→{j_hz}-alpha date-clustered "
+                    f"rank-IC = {j_ic:+.3f} (p={_fmt_p(j_p)}, N={j_n} eval dates; pooled "
+                    f"{joi_overall.get('pooled_ic')} p={_fmt_p(joi_overall.get('pooled_ic_p'))}, "
+                    f"n={joi_overall.get('n')}; {joi.get('n_unattributable')} unattributable). "
+                    f"Per-dimension [{dims_s}]. VALIDATES (does not steer) the judge rubric "
+                    f"layer — observability of the judge itself; feeds no gate. "
+                    + ("Not yet significant — WATCH, accumulating." if j_insig
+                       else ("judge scores carry outcome signal" if j_ic > 0
+                             else "judge scores anti-correlate with outcomes"))),
+        ))
+    else:
+        joi_status = joi.get("status")
+        components.append(build_metric(
+            name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=aq_src, input_present=False,
+            na_detail=("judge_outcome_ic: "
+                       + (f"judge_outcome_ic block status={joi_status!r} this cycle "
+                          f"(insufficient judge↔realized-alpha joins — accumulating)."
+                          if joi_status == "insufficient" else
+                          "no judge_outcome_ic block in agent_quality.json this cycle "
+                          "(backtester judge-outcome producer deploys in parallel with this "
+                          "consumer — self-activates on first emission). ")
+                       + " Validates (does not steer) the judge rubric layer; feeds no gate."),
         ))
 
     return build_tile(MODULE, components)

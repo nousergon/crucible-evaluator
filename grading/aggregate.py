@@ -30,6 +30,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
+from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
 from grading.module_agg import overall_status
 from grading.tiles.agent import build_agent_tile
@@ -63,6 +64,12 @@ def build_report_card(
     inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
     scorecard = compute_scorecard(**inputs)
 
+    # Cross-cycle trend history (config#1836): prior weekly CARDS are the SSOT
+    # for graded values — the tiles thread trend_4w/trend_13w from these into
+    # their critical score-vs-return components. Short/absent history WARNs
+    # inside the loader and degrades to empty trends (never blocks the build).
+    history = load_card_history(bucket, run_date, s3_client=s3_client)
+
     # RC v2 MetricRecord tiles (value + CI + N + status), nested under "tiles".
     # These read their own sources independently of the backtest/{date}/
     # artifacts and land alongside the v1 raw-dict scorecard (research /
@@ -82,9 +89,9 @@ def build_report_card(
     #     weekly Phase-G retro grade of its PRIOR plan (config#1674 — WATCH-only,
     #     never cascades to overall RED, same class as agent/behavioral)
     tiles = {
-        "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client),
-        "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client),
-        "research": build_research_tile(bucket, run_date, s3_client=s3_client),
+        "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client, history=history),
+        "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
+        "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
         "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),
         "substrate": build_substrate_tile(bucket, run_date, s3_client=s3_client),

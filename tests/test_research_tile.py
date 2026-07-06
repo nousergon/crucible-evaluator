@@ -472,3 +472,124 @@ class TestMomentumRegimeIC:
         _put(s3, "e2e_lift.json", self._e2e({"status": "insufficient_data", "n_weeks": 2}))
         m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "momentum_regime_ic")
         assert m["status"] == "N/A-MISSING-INPUT"
+
+
+class TestJudgeOutcomeIC:
+    """judge_outcome_ic — DIAGNOSTIC observability OF THE JUDGE ITSELF, read
+    from the frozen judge_outcome_ic block in agent_quality.json. Validates
+    (never steers) the rubric layer: diagnostic criticality means it cannot
+    move the module status, and the producer deploys independently — absent
+    block ⇒ honest N/A (graceful-forward-compat)."""
+
+    _JOI = {
+        "schema_version": 1, "status": "ok", "horizon_days": 21,
+        "overall": {"date_ic_mean": 0.045, "date_ic_t": 2.4, "date_ic_p": 0.03,
+                    "n_eval_dates": 10, "pooled_ic": 0.031, "pooled_ic_p": 0.02, "n": 240},
+        "by_dimension": {
+            "evidence_grounding": {"date_ic_mean": 0.052, "date_ic_p": 0.04, "n_eval_dates": 10},
+            "thesis_coherence": {"date_ic_mean": 0.011, "date_ic_p": 0.61, "n_eval_dates": 10},
+        },
+        "n_unattributable": 3,
+    }
+
+    def _put_aq(self, s3, joi=None, **extra):
+        doc = {"status": "ok", **extra}
+        if joi is not None:
+            doc["judge_outcome_ic"] = joi
+        s3.put_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/agent_quality.json",
+                      Body=json.dumps(doc).encode())
+
+    def test_significant_grades_from_overall_date_ic(self, s3):
+        self._put_aq(s3, joi=self._JOI)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "judge_outcome_ic")
+        assert m["criticality"] == "diagnostic"  # must NOT feed any gate
+        assert m["value"] == pytest.approx(0.045)
+        assert m["n_samples"] == 10
+        assert m["status"] == "GREEN"
+        assert m["reliability"] == "high"
+        # The reason declares the validates-not-steers posture + per-dimension ride-along.
+        assert "VALIDATES (does not steer)" in m["status_reason"]
+        assert "feeds no gate" in m["status_reason"]
+        assert "evidence_grounding=+0.052" in m["status_reason"]
+        assert "3 unattributable" in m["status_reason"]
+
+    def test_insignificant_watch_low_reliability(self, s3):
+        joi = json.loads(json.dumps(self._JOI))
+        joi["overall"]["date_ic_p"] = 0.42
+        self._put_aq(s3, joi=joi)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "judge_outcome_ic")
+        assert m["status"] == "WATCH"
+        assert m["reliability"] == "low"
+        assert "accumulating" in m["status_reason"]
+
+    def test_diagnostic_never_moves_module_status(self, s3):
+        # Even a significantly NEGATIVE judge-outcome IC (RED component) must
+        # not gate the module — diagnostics are excluded from module_status.
+        joi = json.loads(json.dumps(self._JOI))
+        joi["overall"]["date_ic_mean"] = -0.06
+        joi["overall"]["date_ic_p"] = 0.01
+        self._put_aq(s3, joi=joi)
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        m = _comp(tile, "judge_outcome_ic")
+        assert m["status"] == "RED"
+        # Module status is driven by the critical/supporting families only;
+        # a RED diagnostic alone leaves it wherever they put it (WATCH here —
+        # criticals are WATCH/N-A in this fixture — and never a diagnostic-RED).
+        assert tile["status"] == "WATCH"
+
+    def test_block_absent_na_forward_compat(self, s3):
+        # agent_quality.json exists but the parallel producer hasn't shipped the
+        # block — the consumer grades a precise N/A and self-activates later.
+        self._put_aq(s3, joi=None, judge_rubric_pass_rate={"value": 0.9, "n": 20})
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "judge_outcome_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "deploys in parallel" in m["status_reason"]
+        assert "does not steer" in m["status_reason"].lower() or "validates" in m["status_reason"].lower()
+
+    def test_insufficient_status_na(self, s3):
+        self._put_aq(s3, joi={"schema_version": 1, "status": "insufficient",
+                              "horizon_days": 21, "overall": {}, "by_dimension": {},
+                              "n_unattributable": 12})
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "judge_outcome_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "insufficient" in m["status_reason"]
+
+    def test_no_agent_quality_at_all_na(self, s3):
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "judge_outcome_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+
+class TestCrossCycleTrends:
+    """config#1836 — the research tile threads prior-card trends into the
+    critical score-vs-return components when a CardHistory is supplied."""
+
+    def test_history_threads_trends_on_named_criticals(self, s3):
+        from grading.history import CardHistory
+
+        e = json.loads(json.dumps(_E2E))
+        e["cio_lift"]["layer_attribution_21d"] = {
+            "final_score_date_ic": 0.04, "final_score_date_ic_p": 0.02,
+            "n_eval_dates": 10, "final_score_ic": 0.03, "final_score_ic_p": 0.01, "n": 250,
+        }
+        _put(s3, "e2e_lift.json", e)
+        history = CardHistory({
+            ("research", "research_composite_ic"): [0.01, 0.02, 0.03],
+            ("research", "cio"): [0.20, 0.22],
+        }, 3)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3, history=history)
+
+        ric = _comp(tile, "research_composite_ic")
+        assert ric["trend_4w"] == [0.01, 0.02, 0.03, pytest.approx(0.04)]
+        assert ric["trend_decoration"] == "↑↑"
+
+        cio = _comp(tile, "cio")
+        # prior [0.20, 0.22] + this cycle's edge (0.55 − 0.29 = 0.26).
+        assert cio["trend_4w"] == [0.20, 0.22, pytest.approx(0.26)]
+
+    def test_no_history_keeps_default_trends(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        cio = _comp(tile, "cio")
+        assert cio["trend_4w"] is None
+        assert cio["trend_decoration"] == "→"
