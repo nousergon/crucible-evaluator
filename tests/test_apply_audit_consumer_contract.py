@@ -96,7 +96,7 @@ class TestRed:
         assert m["n_samples"] == 4
         # Director-digest specificity: loop + outcome + blocked_by slug + weeks.
         assert "scoring_weights blocked 9w [significance_floor]" in m["status_reason"]
-        assert "predictor_params blocked 8w [holdout_regression]" in m["status_reason"]
+        assert "predictor_params blocked 8w [oos_degradation]" in m["status_reason"]
 
     def test_error_outcome_red(self, s3):
         doc = _all_green_doc()
@@ -129,12 +129,12 @@ class TestWatch:
     def test_blocked_2_or_3_weeks_watch(self, s3, weeks):
         doc = _all_green_doc()
         doc["loops"]["predictor_params"].update(
-            outcome="blocked", blocked_by=["holdout_regression"], consecutive_blocked_weeks=weeks)
+            outcome="blocked", blocked_by=["oos_degradation"], consecutive_blocked_weeks=weeks)
         _put(s3, doc)
         m = _health(s3)
         assert m["status"] == "WATCH"
         assert m["value"] == 1.0
-        assert f"predictor_params blocked {weeks}w [holdout_regression]" in m["status_reason"]
+        assert f"predictor_params blocked {weeks}w [oos_degradation]" in m["status_reason"]
 
 
 class TestGreen:

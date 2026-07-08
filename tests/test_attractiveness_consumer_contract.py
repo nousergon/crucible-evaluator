@@ -1,14 +1,19 @@
-"""Consumer-side contract test: research tile vs attractiveness_eval.json v1.
+"""Consumer-side contract test: research tile vs attractiveness_eval.json.
 
 M0 contract discipline: ``backtest/{date}/attractiveness_eval.json`` is a
-FROZEN schema_version-1 producer/consumer contract (producer: the backtester's
-attractiveness evaluator, landing in a parallel PR; consumer: the research
-tile's attractiveness_ic / attractiveness_trajectory_ic /
-scanner_feed_counterfactual components). This test grades the tile against the
-canonical fixture (tests/fixtures/attractiveness_eval_v1.json) so any consumer
-drift from the frozen shape fails HERE, in this repo's CI — mirroring the
-cross-repo consumer-contract pattern (test_scanner_consumer_contract.py in
-crucible-research).
+producer/consumer contract (producer: the backtester's attractiveness
+evaluator; consumer: the research tile's attractiveness_ic /
+attractiveness_trajectory_ic / scanner_feed_counterfactual components). The
+canonical schema now lives in ``nousergon_lib.contracts`` (config#1861).
+
+config#1861 rename window: the field ``mean_alpha_21d`` (v1) is renamed to
+``mean_alpha`` (v2, horizon carried by top-level ``horizon_days``). This
+consumer is deployed FIRST and must tolerate BOTH the v1 artifacts still in S3
+and the v2 artifacts the producer starts emitting after its own cutover — so
+this test parametrizes over both canonical fixtures (v1 + v2) and asserts the
+tile reads the counterfactual prize correctly from EITHER. The v2 fixture also
+round-trips through the lib schema (contracts.validate). The v1 fixture proves
+the dual-tolerance fallback (drop after the ~2026-07-15 S3 window).
 
 Forward-compat is part of the contract: the producer deploys independently, so
 an ABSENT artifact (or status="insufficient_data") must grade an honest,
@@ -21,12 +26,21 @@ from pathlib import Path
 import boto3
 import pytest
 from moto import mock_aws
+from nousergon_lib import contracts
 
 from grading.tiles.research import build_research_tile
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-07-04"
-FIXTURE = Path(__file__).parent / "fixtures" / "attractiveness_eval_v1.json"
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE = FIXTURES / "attractiveness_eval_v1.json"
+FIXTURE_V2 = FIXTURES / "attractiveness_eval_v2.json"
+
+# (fixture path, alpha field name for that schema version) for parametrization.
+ALL_FIXTURES = [
+    pytest.param(FIXTURE, 1, "mean_alpha_21d", id="v1"),
+    pytest.param(FIXTURE_V2, 2, "mean_alpha", id="v2"),
+]
 
 
 @pytest.fixture
@@ -51,9 +65,10 @@ def _comp(tile, name):
 
 
 class TestFixtureShape:
-    def test_fixture_carries_the_frozen_v1_shape(self):
-        doc = _fixture()
-        assert doc["schema_version"] == 1
+    @pytest.mark.parametrize("path, version, alpha_field", ALL_FIXTURES)
+    def test_fixture_carries_the_expected_shape(self, path, version, alpha_field):
+        doc = json.loads(path.read_text())
+        assert doc["schema_version"] == version
         assert doc["status"] in ("ok", "insufficient_data")
         assert doc["horizon_days"] == 21
         for k in ("date_ic_mean", "date_ic_t", "date_ic_p", "n_eval_dates",
@@ -65,10 +80,39 @@ class TestFixtureShape:
         assert set(doc["suggested_pillar_weights"]) == set(doc["pillar_ic"])
         assert doc["shrinkage"]["method"] == "demiguel_1overN"
         assert set(doc["trajectory_ic"]) == {"pre_repricing_score", "attr_slope_z"}
+        # The counterfactual alpha field is the version-appropriate one:
+        # {n,sector_balanced,capture_rate,mean_alpha_21d} for v1,
+        # {n,sector_balanced,capture_rate,mean_alpha} for v2.
         for entry in doc["counterfactual"]["top_n"]:
-            assert set(entry) == {"n", "sector_balanced", "capture_rate", "mean_alpha_21d"}
+            assert set(entry) == {"n", "sector_balanced", "capture_rate", alpha_field}
         assert set(doc["counterfactual"]["live_gate"]) == {
-            "capture_rate", "mean_alpha_21d", "n_survivors"}
+            "capture_rate", alpha_field, "n_survivors"}
+
+    def test_v2_fixture_conforms_to_lib_schema(self):
+        # The v2 fixture must round-trip through the canonical lib contract —
+        # this is the schema crucible-evaluator validates in production once the
+        # producer emits v2 (config#1861).
+        v2 = json.loads(FIXTURE_V2.read_text())
+        contracts.validate("attractiveness_eval", v2)  # raises on non-conformance
+
+
+class TestDualToleranceCounterfactual:
+    """The tile must read the counterfactual prize from BOTH schema versions.
+
+    This is the crux of the consumer-tolerant-before-producer-cutover order:
+    the v1 fixture exercises the ``mean_alpha_21d`` fallback and the v2 fixture
+    the renamed ``mean_alpha`` — both must yield the same matched-breadth prize.
+    """
+
+    @pytest.mark.parametrize("path, version, alpha_field", ALL_FIXTURES)
+    def test_prize_reads_from_either_schema_version(self, s3, path, version, alpha_field):
+        _put_att(s3, json.loads(path.read_text()))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "scanner_feed_counterfactual")
+        # live_gate n_survivors=27 → matched-breadth row is top-25 (non-balanced);
+        # prize = 0.0121 − 0.0063, identical across v1/v2 (only the field renamed).
+        assert m["value"] == pytest.approx(0.0121 - 0.0063)
+        assert m["status"] == "GREEN"
 
 
 class TestAttractivenessIc:

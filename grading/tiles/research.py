@@ -25,6 +25,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
+from nousergon_lib import contracts
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
 from grading.artifacts import get_json_windowed
@@ -620,6 +621,11 @@ def build_research_tile(
     att_src = f"s3://{bucket}/{_att_key}" if _att_key else f"s3://{bucket}/{prefix}/attractiveness_eval.json"
     att_ok = bool(att) and att.get("status") == "ok"
     att_hz = f"{(att or {}).get('horizon_days', 21)}d"
+    # config#1861: validate against the lib contract, but only once the producer
+    # emits v2 — v1 artifacts still sitting in S3 during the S3 cutover window
+    # (~2026-07-15) predate the schema move and must not fail the v2 schema.
+    if att and (att.get("schema_version") or 0) >= 2:
+        contracts.validate("attractiveness_eval", att)
     _ATT_MISSING = (
         "attractiveness_eval.json absent this cycle (backtester attractiveness-eval "
         "producer, config#1389 — deploys in parallel with this consumer)."
@@ -633,6 +639,11 @@ def build_research_tile(
 
     def _fmt_pct(v):
         return "n/a" if v is None else f"{v:.0%}"
+
+    def _alpha(d):
+        # dual-tolerance for the config#1861 v1→v2 field rename; drop the
+        # `mean_alpha_21d` fallback after the 1-week S3 window (~2026-07-15).
+        return d.get("mean_alpha", d.get("mean_alpha_21d"))
 
     # 10. attractiveness_ic (SUPPORTING — promote-to-critical is a later human
     #     call once cross-cycle history matures). Mirrors research_composite_ic:
@@ -729,17 +740,17 @@ def build_research_tile(
     #     metric (positive prize → GREEN, else WATCH), never a failure RED.
     cf = (att or {}).get("counterfactual") or {}
     top_n = [e for e in (cf.get("top_n") or [])
-             if isinstance(e, dict) and e.get("mean_alpha_21d") is not None]
+             if isinstance(e, dict) and _alpha(e) is not None]
     live_gate = cf.get("live_gate") or {}
-    lg_alpha = live_gate.get("mean_alpha_21d")
+    lg_alpha = _alpha(live_gate)
     if att_ok and top_n and lg_alpha is not None:
         n_surv = live_gate.get("n_survivors")
         chosen = (min(top_n, key=lambda e: abs((e.get("n") or 0) - n_surv))
                   if n_surv is not None else top_n[0])
-        prize = chosen["mean_alpha_21d"] - lg_alpha
+        prize = _alpha(chosen) - lg_alpha
         rows_s = "; ".join(
             f"top-{e.get('n')}{'(sector-bal)' if e.get('sector_balanced') else ''}: "
-            f"capture {_fmt_pct(e.get('capture_rate'))}, alpha {e.get('mean_alpha_21d'):+.4f}"
+            f"capture {_fmt_pct(e.get('capture_rate'))}, alpha {_alpha(e):+.4f}"
             for e in top_n
         )
         components.append(build_metric(
