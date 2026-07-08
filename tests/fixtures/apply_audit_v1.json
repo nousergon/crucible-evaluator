@@ -20,7 +20,7 @@
     },
     "predictor_params": {
       "outcome": "blocked",
-      "blocked_by": ["holdout_regression"],
+      "blocked_by": ["oos_degradation"],
       "consecutive_blocked_weeks": 8,
       "detail": "proposed veto threshold regressed holdout alpha capture; kept incumbent",
       "proposed": {"veto_confidence": 0.70},

@@ -1,0 +1,65 @@
+{
+  "_doc": "schema_version 2 fixture for backtest/{date}/attractiveness_eval.json (config#1861) — copy of the v1 fixture with schema_version bumped to 2 and every counterfactual `mean_alpha_21d` renamed to `mean_alpha` (the horizon is carried by top-level `horizon_days`). The canonical schema now lives in nousergon_lib.contracts (attractiveness_eval, v2); this fixture exercises the consumer's dual-tolerance during the v1→v2 S3 cutover window and its lib validation on v2 artifacts. Alpha values are decimal 21d log-alpha.",
+  "schema_version": 2,
+  "status": "ok",
+  "as_of": "2026-07-04",
+  "horizon_days": 21,
+  "composite_ic": {
+    "date_ic_mean": 0.062,
+    "date_ic_t": 2.31,
+    "date_ic_p": 0.041,
+    "n_eval_dates": 11,
+    "pooled_ic": 0.048,
+    "pooled_ic_p": 0.012,
+    "n": 264
+  },
+  "pillar_ic": {
+    "quant": {"date_ic_mean": 0.055, "date_ic_p": 0.06, "n_eval_dates": 11},
+    "qual": {"date_ic_mean": 0.021, "date_ic_p": 0.44, "n_eval_dates": 11},
+    "macro": {"date_ic_mean": -0.008, "date_ic_p": 0.81, "n_eval_dates": 11}
+  },
+  "suggested_pillar_weights": {
+    "quant": 0.45,
+    "qual": 0.33,
+    "macro": 0.22
+  },
+  "shrinkage": {
+    "method": "demiguel_1overN",
+    "lambda": 0.61,
+    "n_eval_dates": 11
+  },
+  "trajectory_ic": {
+    "pre_repricing_score": {
+      "status": "ok",
+      "date_ic_mean": 0.071,
+      "date_ic_t": 2.55,
+      "date_ic_p": 0.029,
+      "n_eval_dates": 11,
+      "pooled_ic": 0.052,
+      "pooled_ic_p": 0.009,
+      "n": 264
+    },
+    "attr_slope_z": {
+      "status": "ok",
+      "date_ic_mean": 0.018,
+      "date_ic_t": 0.62,
+      "date_ic_p": 0.55,
+      "n_eval_dates": 11,
+      "pooled_ic": 0.011,
+      "pooled_ic_p": 0.48,
+      "n": 264
+    }
+  },
+  "counterfactual": {
+    "top_n": [
+      {"n": 10, "sector_balanced": false, "capture_rate": 0.34, "mean_alpha": 0.0182},
+      {"n": 25, "sector_balanced": false, "capture_rate": 0.52, "mean_alpha": 0.0121},
+      {"n": 25, "sector_balanced": true, "capture_rate": 0.49, "mean_alpha": 0.0114}
+    ],
+    "live_gate": {
+      "capture_rate": 0.41,
+      "mean_alpha": 0.0063,
+      "n_survivors": 27
+    }
+  }
+}

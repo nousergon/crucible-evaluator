@@ -36,6 +36,8 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
+from nousergon_lib import contracts
+
 from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -237,6 +239,19 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
     #    + consecutive weeks so the Director digest carries the specifics.
     aa, _, _, _aa_key = get_json_windowed(s3, bucket, "config/apply_audit/{date}.json", run_date)
     aa_src = f"s3://{bucket}/{_aa_key}" if _aa_key else f"s3://{bucket}/config/apply_audit/{run_date}.json"
+    # config#1861: apply_audit is the lifted-unchanged v1 contract. Surface any
+    # conformance drift against the canonical lib schema whenever an artifact is
+    # present — but observability-only (WARN, never raise): this critical tile's
+    # standing contract is to grade malformed/drifted artifacts as a specific
+    # N/A / RED (see the loops-None and unrecognized-outcome paths below), never
+    # to crash the whole backtester tile on a producer contract break.
+    if aa:
+        _aa_errs = contracts.conformance_errors("apply_audit", aa)
+        if _aa_errs:
+            logger.warning(
+                "apply_audit artifact at %s violates the lib contract "
+                "(config#1861): %s", aa_src, "; ".join(_aa_errs),
+            )
     _HEALTHY_OUTCOMES = ("promoted", "insufficient_data", "disabled")
     loops = (aa or {}).get("loops")
     if aa is not None and not (isinstance(loops, dict) and loops):
