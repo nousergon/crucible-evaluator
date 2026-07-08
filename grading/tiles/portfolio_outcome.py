@@ -21,6 +21,7 @@ import csv
 import io
 import logging
 import math
+from statistics import NormalDist
 
 import boto3
 import numpy as np
@@ -29,7 +30,7 @@ from botocore.exceptions import ClientError
 from nousergon_lib.quant.risk_measures import historical_cvar
 from nousergon_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ratio
 from nousergon_lib.quant.stats.dsr import compute_psr
-from nousergon_lib.quant.stats.intervals import bootstrap_ci, wilson_score_interval
+from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wilson_score_interval
 
 from grading.history import CardHistory
 from grading.metric_record import build_metric
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 MODULE = "portfolio_outcome"
 EOD_PNL_KEY = "trades/eod_pnl.csv"
 _TRADING_DAYS = 252
+_TRADING_DAYS_PER_MONTH = 21
+_ALPHA_TREND_N_FLOOR = 60
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,125 @@ def _max_dd_duration_days(nav: list[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# alpha_trend — OLS slope of daily alpha with HAC (Newey-West) SE (config#1962)
+# ---------------------------------------------------------------------------
+
+def _ols_slope_hac(y: list[float]) -> dict | None:
+    """OLS slope of ``y`` on a trading-day index, with a HAC (Newey-West) SE.
+
+    The OLS normal equations make ``sum(x_t * e_t) == 0`` exactly (``x_t`` the
+    demeaned day index, ``e_t`` the fit residual), so that product series is
+    zero-mean by construction — which means ``newey_west_se``'s "HAC variance of
+    a series mean" machinery gives the HAC variance of the slope estimator
+    directly: ``Var(b) = n * LRV(x*e) / S_xx**2``. This reuses the lib's Bartlett-
+    kernel estimator rather than adding a statsmodels/scipy dependency for a
+    single coefficient SE.
+    """
+    n = len(y)
+    if n < 2:
+        return None
+    t = np.arange(n, dtype=float)
+    x = t - t.mean()
+    s_xx = float(np.dot(x, x))
+    if s_xx <= 0:
+        return None
+    y_arr = np.asarray(y, dtype=float)
+    b = float(np.dot(x, y_arr) / s_xx)
+    a = float(y_arr.mean() - b * t.mean())
+    resid = y_arr - (a + b * t)
+    nw = newey_west_se(x * resid)
+    if nw.get("status") != "ok":
+        return None
+    se_b = n * nw["se"] / s_xx
+    return {"slope": b, "se": se_b, "resid": resid}
+
+
+def _effective_n(resid: np.ndarray) -> int:
+    """Autocorrelation-adjusted effective N: ``n * Var_iid / Var_HAC``, measured
+    on the DETRENDED residuals (not the raw series).
+
+    Daily alpha is autocorrelated (overlapping positions), so the raw row count
+    overstates how many *independent* observations back the trend read. Using
+    the residuals (rather than the raw series) isolates the autocorrelation of
+    the noise around the trend line from the trend itself — a strong genuine
+    drift must not get penalized as "low information" just because the level
+    series it produces is highly autocorrelated.
+    """
+    n = len(resid)
+    if n < 2:
+        return n
+    centered = resid - resid.mean()
+    gamma0 = float(np.dot(centered, centered) / n)
+    nw = newey_west_se(resid)
+    if nw.get("status") != "ok" or gamma0 <= 0:
+        return n
+    inflation = (nw["se"] ** 2) * n / gamma0
+    if inflation <= 0:
+        return n
+    return max(1, min(n, int(round(n / inflation))))
+
+
+def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
+    """``alpha_trend`` component: is daily alpha statistically improving?
+
+    Descriptive dashboard (crucible-dashboard PR350) shows the monthly-bucket
+    alpha; per derive-don't-transcribe this is the statistical answer the
+    dashboard must not adjudicate itself — an OLS trend on the full
+    ``daily_alpha_pct`` history, HAC SE, honestly gated on an
+    autocorrelation-adjusted effective N (not the raw row count).
+    """
+    name = "alpha_trend"
+    n = len(alpha_pct)
+    fit = _ols_slope_hac(alpha_pct)
+    n_eff = _effective_n(fit["resid"]) if fit is not None else n
+
+    if fit is None or n_eff < 0.5 * _ALPHA_TREND_N_FLOOR:
+        return build_metric(
+            name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
+            estimator="ols_slope_newey_west_hac", measurement_horizon="since_inception",
+            n_floor=_ALPHA_TREND_N_FLOOR, n_samples=n_eff, source_path=src,
+            status="N/A-LOW-N",
+            reason=(
+                f"{name}: N_eff={n_eff} (raw N={n}) below the autocorrelation-adjusted "
+                f"floor ({0.5 * _ALPHA_TREND_N_FLOOR:.0f}); daily alpha is autocorrelated via "
+                f"overlapping positions, so too few independent observations exist yet for a "
+                f"trend read."
+            ),
+        )
+
+    monthly = fit["slope"] * _TRADING_DAYS_PER_MONTH
+    se_monthly = fit["se"] * _TRADING_DAYS_PER_MONTH
+    z = fit["slope"] / fit["se"] if fit["se"] > 0 else 0.0
+    # Two-sided p on the raw slope test — NOT BH-FDR-adjusted (this is a single
+    # diagnostic metric, not a family of critical tests); reusing the schema's
+    # only p-value slot since MetricRecord has no separate raw-p field.
+    p = 2.0 * (1.0 - NormalDist().cdf(abs(z))) if fit["se"] > 0 else 1.0
+    ci_low = monthly - 1.96 * se_monthly
+    ci_high = monthly + 1.96 * se_monthly
+
+    if ci_low > 0:
+        status, verdict = "GREEN", "statistically significant positive drift"
+    elif ci_high < 0:
+        status, verdict = "RED", "statistically significant negative drift"
+    else:
+        status, verdict = "WATCH", "not distinguishable from zero"
+    direction = "positive" if monthly >= 0 else "negative"
+
+    reason = (
+        f"{name}: {direction} drift ({monthly:+.2f}%/mo), {verdict} at n={n} "
+        f"(n_eff={n_eff}, 95% CI [{ci_low:+.2f}, {ci_high:+.2f}]%/mo, p={p:.2f})."
+    )
+
+    return build_metric(
+        name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
+        estimator="ols_slope_newey_west_hac", measurement_horizon="since_inception",
+        value=monthly, n_samples=n_eff, n_floor=_ALPHA_TREND_N_FLOOR,
+        target=0.0, ci_low=ci_low, ci_high=ci_high, ci_method="newey-west",
+        bh_fdr_adjusted_p=p, source_path=src, status=status, reason=reason,
+    )
+
+
+# ---------------------------------------------------------------------------
 # tile builder
 # ---------------------------------------------------------------------------
 
@@ -195,6 +317,7 @@ def build_portfolio_outcome_tile(
             miss("sortino_ratio", "sharpe", "supporting", 60, 1.5, 0.5),
             miss("calmar_ratio", "ratio", "supporting", 90, 1.0, 0.0),
             miss("cvar_95_daily", "ratio", "supporting", 60, -0.01, -0.04),
+            miss("alpha_trend", "pct", "diagnostic", _ALPHA_TREND_N_FLOOR, 0.0, None, "ols_slope_newey_west_hac"),
         ]
         return build_tile(MODULE, components)
 
@@ -355,6 +478,9 @@ def build_portfolio_outcome_tile(
                    "(bull/bear/neutral/caution) to decompose; eod_pnl.csv carries only "
                    "date/nav/returns. Needs a regime join — ROADMAP follow-up."),
     ))
+
+    # 14. Alpha trend (diagnostic) — is daily alpha statistically improving?
+    components.append(_build_alpha_trend([a * 100.0 for a in active], src))
 
     return build_tile(MODULE, components)
 
