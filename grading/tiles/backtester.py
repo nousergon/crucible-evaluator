@@ -24,6 +24,13 @@ fall to a transparent N/A only when the artifact is absent. backtest_vs_live_par
 still needs a synthetic-backtest-IC-vs-live-IC drift series not yet persisted →
 transparent N/A-NOT-IMPL.
 
+risk_ratio_ci is WIRED (config#976, Director L4558) — grades from
+backtest/{date}/risk_ratio_ci.json's block-bootstrap magnitude-certainty flag
+for Sharpe/Sortino/Information Ratio (GREEN when the 95% CIs are resolved off
+zero at an adequate sample size, WATCH — not RED — while the magnitude is
+still uncertain; a no-action monitor, not a regression signal), falling to a
+transparent N/A when the artifact is absent.
+
 Spec: ``system-report-card-revamp-260522.md`` Tile 4.
 """
 
@@ -342,6 +349,41 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             input_present=False,
             na_detail=(f"sample_size_adequacy: no ok sample_size.json in the trailing window ending {run_date} "
                        f"(status={(ss or {}).get('status')!r}); needs the backtester producer (config#1151)."),
+        ))
+
+    # risk_ratio_ci (critical, config#976 / Director L4558) — is the block-
+    # bootstrap magnitude of the risk-adjusted ratios (Sharpe/Sortino/IR)
+    # actually resolved, or does the 95% CI still straddle zero at this sample
+    # size? A NO-ACTION monitor: False doesn't mean anything is broken, it means
+    # the point estimate's magnitude can't be trusted yet — remediation should be
+    # sized by DIRECTION only until the CI clears. Graded GREEN when
+    # all_magnitude_certain, else WATCH (not RED — an under-powered CI is a data
+    # state to wait out, not a regression to alarm on).
+    rr, _, _, _rr_key = get_json_windowed(s3, bucket, "backtest/{date}/risk_ratio_ci.json", run_date)
+    rr_src = f"s3://{bucket}/{_rr_key}" if _rr_key else f"s3://{bucket}/{prefix}/risk_ratio_ci.json"
+    if rr and rr.get("status") == "ok" and rr.get("all_magnitude_certain") is not None:
+        certain = bool(rr["all_magnitude_certain"])
+        n = rr.get("n_samples")
+        floor = rr.get("sample_floor")
+        ratios = rr.get("ratios") or {}
+        uncertain = [k for k, v in ratios.items() if isinstance(v, dict) and not v.get("magnitude_certain")]
+        components.append(build_metric(
+            name="risk_ratio_ci", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="block_bootstrap_ci_magnitude_certainty", measurement_horizon="per_cycle",
+            value=1.0 if certain else 0.0, n_samples=n, n_floor=1, source_path=rr_src,
+            status="GREEN" if certain else "WATCH",
+            reason=(f"risk_ratio_ci: all_magnitude_certain={certain} (N={n} vs floor {floor}); "
+                    + (f"still straddling zero: {', '.join(sorted(uncertain))}. Size remediation by "
+                       "point-estimate DIRECTION only until the CI clears (config#976 L4558)."
+                       if uncertain else "Sharpe/Sortino/IR CIs all resolved off zero.")),
+        ))
+    else:
+        components.append(build_metric(
+            name="risk_ratio_ci", module=MODULE, metric_type="pct", criticality="critical",
+            n_floor=1, source_path=rr_src, input_present=False,
+            na_detail=(f"risk_ratio_ci: no ok risk_ratio_ci.json in the trailing window ending {run_date} "
+                       f"(status={(rr or {}).get('status')!r}); needs the backtester producer "
+                       "(nousergon/alpha-engine-config#976)."),
         ))
 
     # optimizer_churn (critical, config#1151 Batch C) — how hard did the weight
