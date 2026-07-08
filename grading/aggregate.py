@@ -88,6 +88,9 @@ def build_report_card(
     #   - director_quality (Tile 9): director/retro_trend.json — the Director's own
     #     weekly Phase-G retro grade of its PRIOR plan (config#1674 — WATCH-only,
     #     never cascades to overall RED, same class as agent/behavioral)
+    # NINE tiles total; the historical numbering skips 8 (0–7 then 9) — there
+    # is no Tile 8. This dict is the membership source of truth (pinned by
+    # tests/test_aggregate.py + test_handler.py).
     tiles = {
         "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client, history=history),
         "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),

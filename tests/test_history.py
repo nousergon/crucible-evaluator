@@ -198,3 +198,27 @@ class TestBuildReportCardThreadsTrends:
         assert sharpe["trend_4w"] is None
         assert sharpe["trend_13w"] is None
         assert sharpe["trend_decoration"] == "→"
+
+
+class TestLoadCardHistoryFailLoud:
+    """config#1958 gap-closer: a REAL S3 error must raise, never degrade to
+    empty history (only 404/corrupt/short degrade, each with a WARN)."""
+
+    def test_non_404_get_error_raises(self):
+        from unittest.mock import MagicMock
+
+        from botocore.exceptions import ClientError
+
+        s3 = MagicMock()
+        s3.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "evaluator/2026-06-27/report_card.json"}]}
+        ]
+        s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject"
+        )
+        try:
+            load_card_history("b", "2026-07-04", s3_client=s3)
+        except ClientError as e:
+            assert e.response["Error"]["Code"] == "AccessDenied"
+        else:
+            raise AssertionError("AccessDenied should have raised, not degraded")
