@@ -85,6 +85,7 @@ class TestBuildTileFull:
             "sharpe_ratio", "information_ratio", "psr", "alpha_vs_spy", "max_drawdown",
             "sortino_ratio", "calmar_ratio", "cvar_95_daily", "hit_rate_daily",
             "beta_vs_spy", "max_dd_duration_days", "dsr", "regime_weighted_alpha",
+            "alpha_trend",
         }
         assert expected <= names
 
@@ -132,3 +133,62 @@ class TestBuildTileFull:
         psr = next(c for c in tile["components"] if c["name"] == "psr")
         assert psr["value"] is not None
         assert 0.0 <= psr["value"] <= 1.0
+
+
+class TestAlphaTrend:
+    """config#1962 — statistical answer to 'is alpha improving?'."""
+
+    def test_missing_input_is_na(self, s3):
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
+        assert trend["status"] == "N/A-MISSING-INPUT"
+        assert trend["criticality"] == "diagnostic"
+
+    def test_short_series_is_low_n(self, s3):
+        _put_eod(s3, _synth_csv(10))
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
+        assert trend["status"] == "N/A-LOW-N"
+        assert trend["value"] is None
+
+    def test_flat_oscillating_alpha_has_ci_and_estimator(self, s3):
+        _put_eod(s3, _synth_csv(80))
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
+        assert trend["status"] in {"WATCH", "GREEN", "RED"}
+        assert trend["ci_low"] is not None and trend["ci_high"] is not None
+        assert trend["ci_method"] == "newey-west"
+        assert trend.get("estimator") == "ols_slope_newey_west_hac"
+        assert trend["bh_fdr_adjusted_p"] is not None
+
+    def test_clear_upward_drift_is_green(self, s3):
+        rows = [_HEADER]
+        nav = 1_000_000.0
+        for i in range(120):
+            alpha_pct = 0.001 * i  # steadily widening daily alpha
+            port_pct = 0.05 + alpha_pct
+            spy_pct = 0.05
+            nav *= 1 + port_pct / 100.0
+            d = f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}"
+            rows.append(f"{d},{nav:.2f},{port_pct},{spy_pct},{alpha_pct},{{}},2026-01-01T00:00:00+00:00")
+        _put_eod(s3, "\n".join(rows) + "\n")
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
+        assert trend["status"] == "GREEN"
+        assert trend["value"] > 0
+
+    def test_clear_downward_drift_is_red(self, s3):
+        rows = [_HEADER]
+        nav = 1_000_000.0
+        for i in range(120):
+            alpha_pct = -0.001 * i  # steadily worsening daily alpha
+            port_pct = 0.05 + alpha_pct
+            spy_pct = 0.05
+            nav *= 1 + port_pct / 100.0
+            d = f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}"
+            rows.append(f"{d},{nav:.2f},{port_pct},{spy_pct},{alpha_pct},{{}},2026-01-01T00:00:00+00:00")
+        _put_eod(s3, "\n".join(rows) + "\n")
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
+        assert trend["status"] == "RED"
+        assert trend["value"] < 0
