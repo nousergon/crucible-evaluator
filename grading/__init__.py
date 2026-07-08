@@ -1,8 +1,10 @@
 """grading — Layer B: the System Report Card v2 aggregation.
 
 Reads the raw per-module analysis artifacts that the backtester and predictor
-persist to S3, and aggregates them into graded ``MetricRecord`` tiles (research /
-predictor / executor / backtester / substrate / agent / portfolio outcome).
+persist to S3, and aggregates them into graded ``MetricRecord`` tiles — NINE,
+per the ``grading/aggregate.py`` registry (the single source of truth for
+membership): portfolio_outcome / predictor / research / executor / backtester /
+substrate / agent / behavioral / director_quality.
 
 Built natively here (not lifted from the backtester) per the measurement-first
 plan: the backtester produces + persists raw analyses; this layer judges them.

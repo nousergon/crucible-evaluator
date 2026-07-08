@@ -116,3 +116,33 @@ class TestBuildTile:
         # components are JSON-serializable dicts (model_dump mode=json).
         assert isinstance(tile["components"][0], dict)
         assert tile["components"][0]["name"]
+
+
+class TestOverallStatusTrustBattery:
+    """Gap-closers from the config#1958 trust battery (2026-07-08)."""
+
+    def test_substrate_red_cascades_overall_red(self):
+        tiles = {"portfolio_outcome": "GREEN", "substrate": "RED", "agent": "GREEN"}
+        assert overall_status(tiles) == "RED"
+
+    def test_all_na_is_not_run(self):
+        tiles = {"portfolio_outcome": "N/A-NOT-RUN", "research": "N/A-MISSING-INPUT"}
+        assert overall_status(tiles) == "N/A-NOT-RUN"
+
+    def test_portfolio_na_holds_watch_never_false_green(self):
+        # The lead tile ungraded must not let the overall claim GREEN off the
+        # remaining tiles alone — mirrors module_status's critical-N/A rule.
+        tiles = {"portfolio_outcome": "N/A-MISSING-INPUT", "research": "GREEN",
+                 "predictor": "GREEN", "executor": "GREEN"}
+        assert overall_status(tiles) == "WATCH"
+
+    def test_portfolio_absent_from_dict_holds_watch(self):
+        assert overall_status({"research": "GREEN", "predictor": "GREEN"}) == "WATCH"
+
+    def test_single_non_portfolio_watch_stays_green(self):
+        tiles = {"portfolio_outcome": "GREEN", "research": "WATCH", "predictor": "GREEN"}
+        assert overall_status(tiles) == "GREEN"
+
+    def test_portfolio_na_plus_watch_is_watch(self):
+        tiles = {"portfolio_outcome": "N/A-LOW-N", "research": "WATCH", "predictor": "GREEN"}
+        assert overall_status(tiles) == "WATCH"

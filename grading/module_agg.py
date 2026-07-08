@@ -87,8 +87,14 @@ def overall_status(tiles: dict[str, StatusLiteral]) -> StatusLiteral:
 
     Portfolio outcome leads (the system exists to produce alpha); a RED in any
     cascade module (research/predictor/executor/substrate) also fails overall.
+    The lead tile being N/A holds the overall at WATCH — the same
+    never-a-false-GREEN rule ``module_status`` applies to critical components
+    (trust-battery fix, config#1958: previously an ungraded portfolio_outcome
+    let the overall claim GREEN off the remaining tiles alone).
     """
     if not tiles:
+        return "N/A-NOT-RUN"
+    if all(s.startswith("N/A") for s in tiles.values()):
         return "N/A-NOT-RUN"
     if tiles.get("portfolio_outcome") == "RED":
         return "RED"
@@ -97,8 +103,8 @@ def overall_status(tiles: dict[str, StatusLiteral]) -> StatusLiteral:
     n_watch = sum(1 for s in tiles.values() if s == "WATCH")
     if tiles.get("portfolio_outcome") == "WATCH" or n_watch >= 2:
         return "WATCH"
-    if all(s.startswith("N/A") for s in tiles.values()):
-        return "N/A-NOT-RUN"
+    if (tiles.get("portfolio_outcome") or "N/A").startswith("N/A"):
+        return "WATCH"
     return "GREEN"
 
 
