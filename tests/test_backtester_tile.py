@@ -264,3 +264,69 @@ class TestSampleSizeAdequacy:
             "per_analysis": {"signal_quality": {"n": 72, "floor": 60, "adequacy_ratio": 1.2}}})
         m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "sample_size_adequacy")
         assert m["status"] == "GREEN" and m["value"] == 1.2
+
+
+class TestRiskRatioCI:
+    """risk_ratio_ci reads backtest/{date}/risk_ratio_ci.json (config#976,
+    Director L4558's magnitude-certainty no-action monitor)."""
+
+    def _put_rr(self, s3, all_certain, n_samples=200, sample_floor=126, ratios=None):
+        ratios = ratios if ratios is not None else {
+            "sharpe_ratio": {"point": 1.1, "ci_95": [0.4, 1.8], "straddles_zero": False,
+                              "magnitude_certain": all_certain},
+            "sortino_ratio": {"point": 1.4, "ci_95": [0.6, 2.2], "straddles_zero": False,
+                               "magnitude_certain": all_certain},
+            "information_ratio": {"point": 0.3, "ci_95": [-0.1, 0.7], "straddles_zero": not all_certain,
+                                   "magnitude_certain": all_certain},
+        }
+        _put(s3, f"backtest/{RUN_DATE}/risk_ratio_ci.json", {
+            "status": "ok", "n_samples": n_samples, "sample_floor": sample_floor,
+            "n_adequate": n_samples >= sample_floor, "ratios": ratios,
+            "all_magnitude_certain": all_certain,
+            "note": "Director L4558: size remediation by direction, not magnitude, until certain.",
+        })
+
+    def test_missing_input(self, s3):
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "config#976" in m["status_reason"]
+        assert m["criticality"] == "critical"
+
+    def test_all_certain_green(self, s3):
+        self._put_rr(s3, all_certain=True, n_samples=200)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
+        assert m["status"] == "GREEN"
+        assert m["value"] == 1.0
+        assert m["n_samples"] == 200
+
+    def test_magnitude_uncertain_watch_not_red(self, s3):
+        # A no-action monitor: CI-straddles-zero is a data state to wait out,
+        # not a regression — must grade WATCH, never RED.
+        self._put_rr(s3, all_certain=False, n_samples=63)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
+        assert m["status"] == "WATCH"
+        assert m["value"] == 0.0
+        assert "information_ratio" in m["status_reason"]
+        assert "DIRECTION" in m["status_reason"]
+
+    def test_insufficient_data_status_grades_na(self, s3):
+        _put(s3, f"backtest/{RUN_DATE}/risk_ratio_ci.json", {
+            "status": "insufficient_data", "n_samples": 1, "sample_floor": 126,
+            "n_adequate": False, "ratios": {}, "all_magnitude_certain": False,
+            "note": "Fewer than 2 aligned daily returns — no ratio estimable.",
+        })
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
+        assert m["status"].startswith("N/A")
+
+    def test_windowed_grades_off_earlier_date(self, s3):
+        _put(s3, "backtest/2026-06-05/risk_ratio_ci.json", {
+            "status": "ok", "n_samples": 300, "sample_floor": 126, "n_adequate": True,
+            "ratios": {
+                "sharpe_ratio": {"point": 0.9, "ci_95": [0.2, 1.6], "straddles_zero": False,
+                                  "magnitude_certain": True},
+            },
+            "all_magnitude_certain": True,
+            "note": "x",
+        })
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
+        assert m["status"] == "GREEN" and m["value"] == 1.0
