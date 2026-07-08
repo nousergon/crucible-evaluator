@@ -1,11 +1,15 @@
 """Tests for grading/tiles/portfolio_outcome.py — Tile 0 from eod_pnl.csv."""
 
+import json
+import math
+
 import boto3
 import pytest
 from moto import mock_aws
 
 from grading.tiles.portfolio_outcome import (
     EOD_PNL_KEY,
+    SIGNALS_KEY_TEMPLATE,
     build_portfolio_outcome_tile,
     read_eod_pnl,
 )
@@ -40,6 +44,33 @@ def s3():
 
 def _put_eod(s3, body):
     s3.put_object(Bucket=BUCKET, Key=EOD_PNL_KEY, Body=body.encode("utf-8"))
+
+
+def _put_regime(s3, date, regime=None, extra=None):
+    """Write a synthetic signals.json for ``date``. ``regime=None`` writes a
+    payload with no top-level market_regime key (malformed-but-present case).
+    """
+    payload = dict(extra or {})
+    if regime is not None:
+        payload["market_regime"] = regime
+    key = SIGNALS_KEY_TEMPLATE.format(date=date)
+    s3.put_object(Bucket=BUCKET, Key=key, Body=json.dumps(payload).encode("utf-8"))
+
+
+def _regime_csv(n, alpha_by_index):
+    """Build an eod_pnl.csv where ``alpha_by_index(i)`` (percent) drives both
+    daily_return_pct and daily_alpha_pct (spy pinned at 0%, so port == alpha).
+    Returns (csv_body, dates)."""
+    rows = [_HEADER]
+    nav = 1_000_000.0
+    dates = []
+    for i in range(n):
+        alpha_pct = alpha_by_index(i)
+        nav *= 1 + alpha_pct / 100.0
+        d = f"2026-{(i // 28) + 1:02d}-{(i % 28) + 1:02d}"
+        dates.append(d)
+        rows.append(f"{d},{nav:.2f},{alpha_pct},0.0,{alpha_pct},{{}},2026-01-01T00:00:00+00:00")
+    return "\n".join(rows) + "\n", dates
 
 
 class TestReadEodPnl:
@@ -192,3 +223,94 @@ class TestAlphaTrend:
         trend = next(c for c in tile["components"] if c["name"] == "alpha_trend")
         assert trend["status"] == "RED"
         assert trend["value"] < 0
+
+
+class TestRegimeWeightedAlpha:
+    """config#857 C2-fu — regime join against signals/{date}/signals.json's
+    top-level market_regime field."""
+
+    def _rwa(self, tile):
+        return next(c for c in tile["components"] if c["name"] == "regime_weighted_alpha")
+
+    def test_populated_with_two_qualifying_regimes(self, s3):
+        # 40 days tagged "bull" at +1.0%/day, 40 days tagged "bear" at +2.0%/day
+        # — two regimes, each well above the 5-sample bucket floor and 30 total.
+        body, dates = _regime_csv(80, lambda i: 1.0 if i < 40 else 2.0)
+        _put_eod(s3, body)
+        for d in dates[:40]:
+            _put_regime(s3, d, "bull")
+        for d in dates[40:]:
+            _put_regime(s3, d, "bear")
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        rwa = self._rwa(tile)
+
+        expected = (math.log1p(0.01) + math.log1p(0.02)) / 2.0
+        assert rwa["value"] == pytest.approx(expected, rel=1e-9)
+        assert rwa["n_samples"] == 80
+        assert rwa["criticality"] == "critical"
+        assert rwa["estimator"] == "regime_weighted_log_alpha"
+        assert rwa["status"] in {"GREEN", "WATCH", "RED"}
+        assert not rwa["status"].startswith("N/A")
+
+    def test_na_with_fewer_than_two_qualifying_regimes(self, s3):
+        # All 80 days tagged the single regime "bull" — decomposition needs >=2.
+        body, dates = _regime_csv(80, lambda i: 1.0)
+        _put_eod(s3, body)
+        for d in dates:
+            _put_regime(s3, d, "bull")
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        rwa = self._rwa(tile)
+
+        assert rwa["status"] == "N/A-MISSING-INPUT"
+        assert rwa["value"] is None
+        reason = rwa["status_reason"].lower()
+        assert "bull" in reason
+        assert "80" in rwa["status_reason"]
+        assert "≥2" in rwa["status_reason"] or ">=2" in rwa["status_reason"] or "2 qualifying" in reason
+
+    def test_na_with_insufficient_total_samples(self, s3):
+        # Two qualifying regimes (5 samples each, right at the per-bucket floor)
+        # but only 10 total joined samples — well below the n_floor=30 gate.
+        body, dates = _regime_csv(80, lambda i: 1.0 if i % 2 == 0 else 2.0)
+        _put_eod(s3, body)
+        for d in dates[:5]:
+            _put_regime(s3, d, "bull")
+        for d in dates[5:10]:
+            _put_regime(s3, d, "bear")
+        # Remaining 70 dates deliberately left with no signals.json at all.
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        rwa = self._rwa(tile)
+
+        assert rwa["status"] == "N/A-MISSING-INPUT"
+        assert rwa["value"] is None
+        assert rwa["n_samples"] == 10
+        reason = rwa["status_reason"]
+        assert "bull" in reason and "bear" in reason
+        assert "30" in reason
+
+    def test_missing_or_malformed_signals_json_skipped_without_error(self, s3):
+        # Only every-other date has a signals.json; one present-but-malformed
+        # (no market_regime key) date is thrown in too. Nothing should raise,
+        # and the join should simply exclude the untagged dates.
+        body, dates = _regime_csv(80, lambda i: 1.0 if i % 2 == 0 else 2.0)
+        _put_eod(s3, body)
+        tagged_dates = dates[::2]  # 40 dates get a signals.json
+        for i, d in enumerate(tagged_dates):
+            if i == 0:
+                _put_regime(s3, d, regime=None)  # present but no market_regime key
+            elif i < 20:
+                _put_regime(s3, d, "bull")
+            else:
+                _put_regime(s3, d, "bear")
+        # The other 40 dates get no signals.json object at all (NoSuchKey).
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        rwa = self._rwa(tile)
+
+        # 19 bull + 20 bear = 39 joined samples, two qualifying regimes, >=30 total.
+        assert rwa["value"] is not None
+        assert rwa["n_samples"] == 39
+        assert not rwa["status"].startswith("N/A")

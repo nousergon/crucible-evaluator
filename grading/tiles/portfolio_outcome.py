@@ -11,14 +11,17 @@ divide by 100 to get the daily fractions the lib quant battery expects).
 Each component is a ``MetricRecord`` with value + CI + N vs floor + target /
 red-line + status, per the Tile-0 spec in
 ``system-report-card-revamp-260522.md``. Metrics not supportable from this CSV
-alone (DSR's trial count, regime-weighted alpha's macro tags) emit a *specific*
-N/A — never a silent omission.
+alone (DSR's trial count) emit a *specific* N/A — never a silent omission.
+``regime_weighted_alpha`` decomposes daily alpha by macro regime — it joins
+``eod_pnl.csv`` dates against the per-date ``market_regime`` tag persisted at
+``s3://{bucket}/signals/{date}/signals.json`` (config#857 C2-fu).
 """
 
 from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import math
 from statistics import NormalDist
@@ -40,9 +43,13 @@ logger = logging.getLogger(__name__)
 
 MODULE = "portfolio_outcome"
 EOD_PNL_KEY = "trades/eod_pnl.csv"
+SIGNALS_KEY_TEMPLATE = "signals/{date}/signals.json"
 _TRADING_DAYS = 252
 _TRADING_DAYS_PER_MONTH = 21
 _ALPHA_TREND_N_FLOOR = 60
+_REGIME_ALPHA_N_FLOOR = 30
+_REGIME_MIN_BUCKET_N = 5     # min daily samples for one regime bucket to qualify
+_REGIME_MIN_BUCKETS = 2      # min qualifying regime buckets to decompose at all
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +279,131 @@ def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
 
 
 # ---------------------------------------------------------------------------
+# regime_weighted_alpha — market-regime decomposition of daily alpha (config#857 C2-fu)
+# ---------------------------------------------------------------------------
+
+def _read_regime_for_dates(bucket: str, dates: list[str], s3_client=None) -> dict[str, str]:
+    """Join each ``eod_pnl.csv`` date to its ``market_regime`` tag.
+
+    Reads ``s3://{bucket}/signals/{date}/signals.json`` for every date and pulls
+    the TOP-LEVEL ``market_regime`` field (``bull``/``neutral``/``caution``/
+    ``bear`` — matches ``crucible-research/scripts/backfill_calibrator_v1_context.py``'s
+    ``payload.get("market_regime")``). A date with no ``signals.json``
+    (``NoSuchKey`` — weekends/holidays already shouldn't reach ``eod_pnl.csv``,
+    but be defensive) or no ``market_regime`` key is SKIPPED, never fabricated —
+    the caller sees it simply absent from the returned mapping. Any other S3
+    error is fail-loud (mirrors ``read_eod_pnl``'s posture: a real S3 problem
+    must not be silently read as "this date has no regime").
+
+    One ``get_object`` per date — ``eod_pnl.csv``'s date range is bounded to the
+    still-young live book's since-inception history (tens to low hundreds of
+    rows today), so N sequential GETs is fine; revisit (parallelize / batch) if
+    the live book's history grows materially.
+    """
+    s3 = s3_client or boto3.client("s3")
+    regimes: dict[str, str] = {}
+    for d in dates:
+        key = SIGNALS_KEY_TEMPLATE.format(date=d)
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=key)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                continue
+            logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
+            raise
+        try:
+            payload = json.loads(resp["Body"].read())
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Skipping corrupt signals.json at s3://%s/%s", bucket, key)
+            continue
+        regime = payload.get("market_regime") if isinstance(payload, dict) else None
+        if regime:
+            regimes[d] = regime
+    return regimes
+
+
+def _regime_na_detail(
+    bucket_counts: dict[str, int], qualifying: dict[str, float], total_joined: int,
+    *, n_floor: int, min_bucket_n: int, min_buckets: int,
+) -> str:
+    """Specific N/A reason naming exactly which regimes/samples were available."""
+    if not bucket_counts:
+        return (
+            "regime_weighted_alpha: no eod_pnl.csv date could be joined to a "
+            "signals.json market_regime tag (signals.json absent, or missing the "
+            "top-level market_regime field, for every date since inception) — "
+            "cannot decompose regime-weighted alpha."
+        )
+    bucket_summary = ", ".join(
+        f"{r} (n={c})" for r, c in sorted(bucket_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    if len(qualifying) < min_buckets:
+        return (
+            f"regime_weighted_alpha: only {len(qualifying)} of {len(bucket_counts)} observed "
+            f"regime(s) meet the ≥{min_bucket_n}-sample floor ({bucket_summary}) since "
+            f"inception — cannot decompose regime-weighted alpha without ≥{min_buckets} "
+            f"qualifying regimes."
+        )
+    return (
+        f"regime_weighted_alpha: only {total_joined} total regime-joined daily samples since "
+        f"inception ({bucket_summary}), below the n_floor={n_floor} needed for a confident "
+        f"regime-decomposed reading."
+    )
+
+
+def _compute_regime_weighted_alpha(
+    dates: list[str], alpha: list[float], regime_by_date: dict[str, str],
+    *, n_floor: int = _REGIME_ALPHA_N_FLOOR, min_bucket_n: int = _REGIME_MIN_BUCKET_N,
+    min_buckets: int = _REGIME_MIN_BUCKETS,
+) -> dict:
+    """Regime-decompose daily alpha into the equal-weight mean log-alpha across
+    qualifying regime buckets (config#857 C2-fu design spec).
+
+    Each date's daily active return (fraction) is converted to log-alpha
+    (``ln(1 + alpha)``) and grouped by its joined regime. A regime bucket
+    "qualifies" at ``>= min_bucket_n`` daily samples. ``regime_weighted_alpha``
+    is the SIMPLE (equal-weight) mean of the qualifying buckets' mean log-alpha
+    — deliberately NOT a time-weighted mean of all daily observations, so a
+    strategy that has only traded through one dominant regime can't get a
+    headline number that looks validated across regimes it has never seen.
+
+    Returns a dict: ``value`` (None if not decomposable), ``n_samples`` (total
+    joined samples across qualifying buckets only), ``na_detail`` (None when
+    populated), ``bucket_counts`` (all observed regimes, for diagnostics).
+    """
+    buckets: dict[str, list[float]] = {}
+    for d, a in zip(dates, alpha):
+        regime = regime_by_date.get(d)
+        if regime is None or (1 + a) <= 0:
+            continue
+        buckets.setdefault(regime, []).append(math.log1p(a))
+
+    bucket_counts = {r: len(vals) for r, vals in buckets.items()}
+    total_joined = sum(bucket_counts.values())
+    qualifying_means = {r: sum(vals) / len(vals) for r, vals in buckets.items() if len(vals) >= min_bucket_n}
+
+    if len(qualifying_means) < min_buckets or total_joined < n_floor:
+        return {
+            "value": None,
+            "n_samples": total_joined,
+            "bucket_counts": bucket_counts,
+            "na_detail": _regime_na_detail(
+                bucket_counts, qualifying_means, total_joined,
+                n_floor=n_floor, min_bucket_n=min_bucket_n, min_buckets=min_buckets,
+            ),
+        }
+
+    qualifying_n = sum(bucket_counts[r] for r in qualifying_means)
+    value = sum(qualifying_means.values()) / len(qualifying_means)
+    return {
+        "value": value,
+        "n_samples": qualifying_n,
+        "bucket_counts": bucket_counts,
+        "na_detail": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # tile builder
 # ---------------------------------------------------------------------------
 
@@ -469,14 +601,20 @@ def build_portfolio_outcome_tile(
             na_detail="dsr: needs a documented cumulative strategy-trial count for the live book; tracked under L4469 W1.3b.",
         ))
 
-    # 13. Regime-weighted alpha (critical) — needs macro regime tags per date.
+    # 13. Regime-weighted alpha (critical) — market-regime decomposition of daily
+    #     alpha via a join against signals/{date}/signals.json's market_regime
+    #     tag (config#857 C2-fu). Equal-weight mean log-alpha across regime
+    #     buckets meeting the sample floor; N/A (not a guess) if the book hasn't
+    #     yet traded through >=2 regimes with enough days in each.
+    regime_by_date = _read_regime_for_dates(bucket, series.dates, s3_client=s3_client)
+    rwa = _compute_regime_weighted_alpha(series.dates, active, regime_by_date)
     components.append(build_metric(
         name="regime_weighted_alpha", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="regime_weighted_log_alpha", measurement_horizon="since_inception",
-        n_floor=30, target=0.0, red_line=0.0, source_path=src, input_present=False,
-        na_detail=("regime_weighted_alpha: requires per-date macro regime tags "
-                   "(bull/bear/neutral/caution) to decompose; eod_pnl.csv carries only "
-                   "date/nav/returns. Needs a regime join — ROADMAP follow-up."),
+        value=rwa["value"], n_samples=rwa["n_samples"], n_floor=_REGIME_ALPHA_N_FLOOR,
+        target=0.0, red_line=0.0, source_path=src,
+        input_present=rwa["na_detail"] is None,
+        na_detail=rwa["na_detail"],
     ))
 
     # 14. Alpha trend (diagnostic) — is daily alpha statistically improving?
