@@ -307,9 +307,10 @@ class TestAgent:
         assert jk["status"] == "N/A-NOT-IMPL"
         assert "decision_artifacts" in jk["status_reason"]
 
-    def test_seven_components(self, s3):
+    def test_eleven_components(self, s3):
+        # 11 = the original 7 + the four groom_* pipeline records (config#2151).
         tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
-        assert tile["n_components"] == 7
+        assert tile["n_components"] == 11
 
     def test_wired_validation_failure_rate_grades(self, s3):
         """A healthy producer artifact grades the critical component GREEN."""
