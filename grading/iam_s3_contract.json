@@ -35,6 +35,7 @@
     "signals": "read",
     "evaluator": "readwrite",
     "director": "readwrite",
-    "_substrate": "readwrite"
+    "_substrate": "readwrite",
+    "groom": "read"
   }
 }

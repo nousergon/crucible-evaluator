@@ -29,6 +29,11 @@ blind-Step-1-operator labeling pass (config Batch E #1153), not just a
 producer. ``stance_source_provenance`` is N/A-MISSING-INPUT until the
 ``signals.json`` ``stance_source`` field lands (crucible-research#297).
 
+The four ``groom_*`` components (config#2151) grade the backlog-groom
+pipeline's LLM-agent runs from ``groom/{date}/*.json`` — computed in
+``grading/tiles/groom.py`` and appended here (the groom pipeline is an
+agent-quality surface, not a trading-behavior one).
+
 Spec: ``system-report-card-revamp-260522.md`` Tile 6.
 """
 
@@ -43,6 +48,7 @@ from botocore.exceptions import ClientError
 from grading.artifacts import get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.tiles.groom import build_groom_components
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +210,11 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         n_floor=1, source_path=f"s3://{bucket}/decision_artifacts/_calibration/", implemented=False,
         na_detail="judge_calibration_cohen_kappa: needs the blind-Step-1-operator vs LLM-judge κ from decision_artifacts/_calibration/*.jsonl — human labeling, not a producer (config#1153).",
     ))
+
+    # 8-11. groom_* (supporting/diagnostic, config#2151) — groom-pipeline
+    #    throughput/efficiency from the trailing week of groom/{date}/*.json
+    #    run artifacts. See grading/tiles/groom.py for definitions + posture.
+    components.extend(build_groom_components(bucket, run_date, s3_client=s3))
 
     return build_tile(MODULE, components)
 
