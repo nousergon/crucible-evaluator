@@ -132,6 +132,7 @@ def build_metric(
     status: StatusLiteral | None = None,
     reason: str | None = None,
     na_detail: str | None = None,
+    permanent_na_reason: str | None = None,
     last_updated_utc: datetime | None = None,
     estimator: str | None = None,
     measurement_horizon: str | None = None,
@@ -155,7 +156,24 @@ def build_metric(
     defaults to ``"high"`` for a declared critical estimator; pass ``"low"``
     explicitly for a metric with a known validity caveat (e.g. an in-sample-
     prone IC) so the digest can flag it and the Director can hedge.
+
+    ``permanent_na_reason`` (config#1153, operator Option A 2026-07-11) marks an
+    "accepted permanent honest-N/A" — a metric deliberately NOT built. It stays
+    an N/A-NOT-IMPL (so it never blocks a supporting/diagnostic tile's GREEN)
+    but its ``status_reason`` becomes ``"Accepted permanent N/A — <reason>"`` and
+    the record carries ``permanent_na=True`` so the cliff-inventory can tell it
+    apart from a transient "producer not yet wired" gap.
     """
+    # config#1153 (operator ruling 2026-07-11, Option A): an "accepted permanent
+    # honest-N/A" — a metric deliberately NOT built (a product decision), as
+    # opposed to a transient "producer not yet wired" gap. It renders as an
+    # ordinary N/A-NOT-IMPL (letter "N/A"; never blocks GREEN for a
+    # supporting/diagnostic tile) but carries a documented reason plus a
+    # permanent_na flag so the report-card cliff-inventory / dashboard can list
+    # it as accepted-and-closed rather than pending work.
+    if permanent_na_reason is not None and value is None:
+        implemented = False  # ⇒ derive_status yields N/A-NOT-IMPL
+
     # Contract applies to VALUE-BEARING criticals — the ones that can produce a
     # GREEN/WATCH/RED the Director acts on. An N/A-* critical (value is None:
     # not-impl / not-run / missing-input) carries no graded signal, so it is
@@ -196,18 +214,23 @@ def build_metric(
     trend_source = trend_4w if trend_4w else trend_13w
     decoration = derive_trend_decoration(trend_source, higher_is_better=higher_is_better)
 
-    status_reason = reason or _default_reason(
-        status=status,
-        name=name,
-        value=value,
-        n_samples=n_samples,
-        n_floor=n_floor,
-        target=target,
-        red_line=red_line,
-        ci_low=ci_low,
-        ci_high=ci_high,
-        na_detail=na_detail,
-    )
+    if reason is not None:
+        status_reason = reason
+    elif permanent_na_reason is not None:
+        status_reason = f"Accepted permanent N/A — {permanent_na_reason}"
+    else:
+        status_reason = _default_reason(
+            status=status,
+            name=name,
+            value=value,
+            n_samples=n_samples,
+            n_floor=n_floor,
+            target=target,
+            red_line=red_line,
+            ci_low=ci_low,
+            ci_high=ci_high,
+            na_detail=na_detail,
+        )
 
     return MetricRecord(
         name=name,
@@ -235,4 +258,7 @@ def build_metric(
         estimator=estimator,
         measurement_horizon=measurement_horizon,
         reliability=reliability,
+        # config#1153: accepted-permanent-N/A marker (extra fields).
+        permanent_na=permanent_na_reason is not None,
+        permanent_na_reason=permanent_na_reason,
     )

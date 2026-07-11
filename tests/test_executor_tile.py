@@ -37,8 +37,12 @@ class TestMissing:
         tile = build_executor_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert tile["module"] == "executor"
         assert _comp(tile, "entry_triggers")["status"] == "N/A-MISSING-INPUT"
-        # position_sizing is genuinely unwired → NOT-IMPL, not MISSING-INPUT.
-        assert _comp(tile, "position_sizing")["status"] == "N/A-NOT-IMPL"
+        # position_sizing is an accepted permanent honest-N/A (config#1153
+        # Option A) → NOT-IMPL, marked permanent, not MISSING-INPUT.
+        ps = _comp(tile, "position_sizing")
+        assert ps["status"] == "N/A-NOT-IMPL"
+        assert ps["permanent_na"] is True
+        assert ps["status_reason"].startswith("Accepted permanent N/A")
         # reconciliation_integrity is now IMPLEMENTED (config#859) — absent
         # artifact → MISSING-INPUT, not NOT-IMPL.
         assert _comp(tile, "reconciliation_integrity")["status"] == "N/A-MISSING-INPUT"

@@ -190,11 +190,14 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             na_detail="excursion: portfolio_excursion.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
 
-    # 5. position_sizing (supporting) — B1c-deferred (sizing_ab genuinely unwired).
+    # 5. position_sizing (supporting) — accepted permanent honest-N/A
+    #    (config#1153 Batch E, operator ruling 2026-07-11 Option A): the sizing
+    #    A/B producer (ROADMAP B1c) is a non-critical-3 build the ruling declined.
     components.append(build_metric(
         name="position_sizing", module=MODULE, metric_type="ratio", criticality="supporting",
-        n_floor=20, target=0.0, red_line=-0.3, source_path=src("sizing_ab.json"), implemented=False,
-        na_detail="position_sizing: sizing_ab analysis genuinely unwired (evaluate.py hardcodes None) — ROADMAP B1c.",
+        n_floor=20, target=0.0, red_line=-0.3, source_path=src("sizing_ab.json"),
+        permanent_na_reason=("position_sizing: would need the sizing_ab A/B producer built (evaluate.py "
+                             "hardcodes None; ROADMAP B1c) — not building it (config#1153 Option A)."),
     ))
 
     # 6. action_entropy (diagnostic, config#1151 Batch C) — is the decision
