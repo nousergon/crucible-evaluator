@@ -575,20 +575,27 @@ def build_substrate_tile(
             input_present=False, na_detail=na,
         ))
 
-    # 5-7. Producers not yet reachable by the evaluator — transparent N/A-NOT-IMPL,
-    #      each reason naming the producer to wire.
-    not_impl = [
+    # 5-7. Accepted permanent honest-N/A (config#1153 Batch E, operator ruling
+    #      2026-07-11 Option A): each of these needs a producer/convention that
+    #      the ruling declined to build (only the critical-3 — judge_calibration,
+    #      backtest_vs_live, dsr — stay prioritized). They render as N/A but are
+    #      marked permanent_na so the cliff-inventory reads them as closed, not
+    #      pending. The reason still names what WOULD unblock them if revisited.
+    permanent_na = [
         ("alert_noise_ratio", "supporting",
-         "alert_noise_ratio: needs the alerts log + a manual actionable/total tag — not yet sourced."),
+         "alert_noise_ratio: would need the alerts log + a manual actionable/total tagging convention — "
+         "not building the tagging convention (config#1153 Option A)."),
         ("changelog_coverage", "diagnostic",
-         "changelog_coverage: needs an expected-event-source set to compute % writing to the changelog — not yet defined."),
+         "changelog_coverage: would need an expected-event-source set defined to compute % writing to the "
+         "changelog — not defining that set (config#1153 Option A)."),
         ("iam_drift", "diagnostic",
-         "iam_drift: needs CFN detect-drift delta — not yet exposed to the evaluator."),
+         "iam_drift: would need a CFN detect-drift → S3 producer + a cross-repo ops IAM grant the evaluator "
+         "lacks — not building it (config#1153 Option A)."),
     ]
-    for name, crit, detail in not_impl:
+    for name, crit, detail in permanent_na:
         components.append(build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=crit, n_floor=1,
-            source_path=f"s3://{bucket}/", implemented=False, na_detail=detail,
+            source_path=f"s3://{bucket}/", permanent_na_reason=detail,
         ))
 
     return build_tile(MODULE, components)

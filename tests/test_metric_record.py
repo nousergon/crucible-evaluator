@@ -137,6 +137,50 @@ class TestBuildMetricNA:
         assert m.status == "WATCH"
 
 
+class TestPermanentNA:
+    """config#1153 (operator Option A 2026-07-11) — accepted-permanent honest-N/A:
+    a metric deliberately NOT built, distinguished from a transient not-impl gap."""
+
+    def _mk(self, **kw):
+        base = dict(
+            name="iam_drift", module="substrate", metric_type="pct", n_floor=1,
+            source_path="s3://b/", criticality="diagnostic",
+            permanent_na_reason="iam_drift: not building the CFN detect-drift producer (config#1153 Option A).",
+        )
+        base.update(kw)
+        return build_metric(**base)
+
+    def test_renders_as_na_not_impl(self):
+        m = self._mk()
+        assert m.status == "N/A-NOT-IMPL"
+        assert m.derived_letter == "N/A"
+        assert m.is_na
+
+    def test_reason_prefixed_accepted_permanent(self):
+        m = self._mk()
+        assert m.status_reason.startswith("Accepted permanent N/A — ")
+        assert "config#1153" in m.status_reason
+
+    def test_carries_permanent_na_flag(self):
+        m = self._mk()
+        assert m.permanent_na is True
+        assert "config#1153" in m.permanent_na_reason
+
+    def test_ordinary_na_not_marked_permanent(self):
+        # A transient not-impl (no permanent_na_reason) must NOT be flagged.
+        m = build_metric(
+            name="x", module="substrate", metric_type="pct", n_floor=1,
+            source_path="s3://b/", implemented=False, na_detail="producer not yet wired.",
+        )
+        assert m.permanent_na is False
+        assert not m.status_reason.startswith("Accepted permanent N/A")
+
+    def test_explicit_reason_still_wins(self):
+        m = self._mk(reason="custom override")
+        assert m.status_reason == "custom override"
+        assert m.permanent_na is True  # flag still set regardless of reason source
+
+
 class TestBuildMetricExtras:
     def test_status_override_for_band_metric(self):
         m = build_metric(

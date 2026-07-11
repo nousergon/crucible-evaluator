@@ -58,6 +58,18 @@ class TestSubstrate:
         assert tile["n_components"] == 10
         assert tile["module"] == "substrate"
 
+    def test_batch_e_rows_are_accepted_permanent_na(self, s3):
+        # config#1153 Option A: alert_noise_ratio / changelog_coverage / iam_drift
+        # are accepted permanent honest-N/A — NOT-IMPL, marked permanent, and
+        # never blocking GREEN (all supporting/diagnostic).
+        tile = build_substrate_tile(BUCKET, s3_client=s3)
+        for name in ("alert_noise_ratio", "changelog_coverage", "iam_drift"):
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-NOT-IMPL", name
+            assert c["permanent_na"] is True, name
+            assert c["status_reason"].startswith("Accepted permanent N/A"), name
+            assert "config#1153" in c["status_reason"], name
+
     def test_tile_watch_when_only_freshness_real(self, s3):
         # price_cache fresh GREEN but critical sf/data_quality/schema N/A-NOT-IMPL → WATCH.
         s3.put_object(Bucket=BUCKET, Key=f"{PRICE_CACHE_PREFIX}A.parquet", Body=b"x")
