@@ -47,6 +47,11 @@ SLIM_CACHE_PREFIX = "predictor/price_cache_slim/"
 # IS directional and IS included. (config#1062 false-RED fix.)
 _DIRECTIONAL_L1_FEATURES = ("expected_move", "research_calibrator_prob", "momentum_score", "momentum")
 
+# The confusion matrix's class labels (crucible-backtester analysis/predictor_confusion.py
+# DIRECTIONS — mirrored here rather than cross-repo imported, since this tile only
+# reads the persisted JSON, never the backtester's Python).
+_CM_DIRECTIONS = ("UP", "FLAT", "DOWN")
+
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
     try:
@@ -321,6 +326,101 @@ def build_predictor_tile(
             n_floor=30, target=0.60, red_line=0.40, source_path=veto_src, input_present=False,
             na_detail=na,
         ))
+    # direction_accuracy_vs_majority_baseline + per-class precision-vs-base-rate
+    # (config#2298): the direction head's binary UP/FLAT/DOWN classification had
+    # no baseline-comparison surface at all — the 2026-06 incident (39.96%
+    # accuracy vs a 60.6% always-DOWN majority-class baseline, confusion_matrix.json
+    # n=1379) sat invisible behind a GREEN meta_l2_ic rank-IC tile because rank-IC
+    # and directional classification are different axes of skill. Cross-tile read
+    # from the backtester's backtest/{run_date}/confusion_matrix.json (already
+    # persisted per-cycle, previously with no downstream consumer). "supporting"
+    # (not critical): sub-baseline direction WATCHes the tile rather than gating
+    # the whole module RED — the report card's real gate is the leak-free
+    # meta_l2_ic rank-IC above; this tile exists so a sub-baseline direction head
+    # can never again go unnoticed.
+    cm, _, _, _cm_key = (
+        get_json_windowed(s3, bucket, "backtest/{date}/confusion_matrix.json", run_date)
+        if run_date else (None, None, None, None)
+    )
+    cm_src = f"s3://{bucket}/{_cm_key}" if _cm_key else latest_src
+    cm_ok = isinstance(cm, dict) and cm.get("status") == "ok" and isinstance(cm.get("per_class"), dict)
+
+    def _cm_na(metric_name: str) -> str:
+        if run_date is None:
+            return f"{metric_name}: run_date not provided to the predictor tile; cross-tile confusion_matrix.json read skipped."
+        if cm is None:
+            return f"{metric_name}: confusion_matrix.json absent in the trailing window ending {run_date}."
+        return f"{metric_name}: confusion_matrix.json has no usable accuracy/per_class breakdown (status={cm.get('status')}) this cycle."
+
+    if cm_ok:
+        n_total = cm.get("n")
+        per_class = cm["per_class"]
+        base_rates = {
+            d: (per_class[d]["n_actual"] / n_total)
+            for d in _CM_DIRECTIONS
+            if d in per_class and isinstance(n_total, int) and n_total > 0
+        }
+    else:
+        n_total = None
+        per_class = {}
+        base_rates = {}
+
+    # direction_accuracy_vs_majority_baseline (supporting) — overall directional
+    # accuracy vs the trivial always-predict-the-majority-class baseline.
+    if cm_ok and base_rates and cm.get("accuracy") is not None:
+        accuracy = cm["accuracy"]
+        majority_class = max(base_rates, key=lambda d: base_rates[d])
+        baseline = base_rates[majority_class]
+        acc_lift = accuracy - baseline
+        components.append(build_metric(
+            name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
+            criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
+            value=acc_lift, n_samples=n_total, n_floor=30, target=0.03, red_line=0.0,
+            source_path=cm_src,
+            reason=(f"direction_accuracy = {accuracy:.2%} vs always-{majority_class} majority-class "
+                    f"baseline {baseline:.2%} (N={n_total}) — lift {acc_lift:+.2%} vs target "
+                    f"+3pp / red-line 0pp."),
+        ))
+    else:
+        components.append(build_metric(
+            name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
+            criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
+            n_floor=30, target=0.03, red_line=0.0, source_path=cm_src, input_present=False,
+            na_detail=_cm_na("direction_accuracy_vs_majority_baseline"),
+        ))
+
+    # {up,down}_precision_vs_base_rate (supporting) — per-class precision vs the
+    # trivial base rate of that class, matching the granularity of the original
+    # incident's manual analysis (UP precision 31.3% vs 36.0% base rate; DOWN
+    # precision 55.2% vs 60.6% base rate).
+    for cls in ("UP", "DOWN"):
+        name = f"{cls.lower()}_precision_vs_base_rate"
+        cls_stats = per_class.get(cls) if cm_ok else None
+        precision = cls_stats.get("precision") if cls_stats else None
+        base_rate = base_rates.get(cls)
+        if precision is not None and base_rate is not None:
+            n_pred = cls_stats.get("n_predicted")
+            prec_lift = precision - base_rate
+            components.append(build_metric(
+                name=name, module=MODULE, metric_type="lift",
+                criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
+                value=prec_lift, n_samples=n_pred, n_floor=30, target=0.03, red_line=0.0,
+                source_path=cm_src,
+                reason=(f"{name}: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
+                        f"(N={n_pred} predicted-{cls}) — lift {prec_lift:+.2%} vs target +3pp / red-line 0pp."),
+            ))
+        else:
+            na = (
+                _cm_na(name) if not cm_ok
+                else f"{name}: no {cls}-predicted rows this cycle (n_predicted=0) — precision undefined."
+            )
+            components.append(build_metric(
+                name=name, module=MODULE, metric_type="lift",
+                criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
+                n_floor=30, target=0.03, red_line=0.0, source_path=cm_src, input_present=False,
+                na_detail=na,
+            ))
+
     # inference_coverage (critical) — fraction of the intended tradable universe
     # that got a prediction. The producer persists the denominator + covered
     # count (config#1075); we grade covered/universe ∈ [0,1]. Honest N/A until

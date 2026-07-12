@@ -100,6 +100,75 @@ def _coverage(grading: dict) -> tuple[float | None, int, int]:
     return (graded / total if total else None), graded, total
 
 
+# fdr_surface_health calibration (config#2305).
+#
+# The tile originally used a fixed "3-15 significant" healthy band, sized for
+# the ~8-9-test surface attribution.py ran before the 2026-06-30 canonical-
+# alpha cutover (config#1456: 2 sub-scores x 4 horizons -> 2 sub-scores x 2
+# canonical horizons). The post-cutover surface is only 4-5 tests (2 sub-
+# scores x 2 horizons, +1 optional predictor test) — a fixed absolute band of
+# "3-15" is nearly unreachable on 4-5 tests (BH's rank-1 threshold at n=4 is
+# already 0.0125, a much taller bar than at n=8-9) and "15" is now
+# structurally impossible (there are never more than 5 tests). This produced
+# a live 0-significant RED reading (2026-07-10) that was mathematically
+# correct given the shrunk surface — NOT evidence the underlying
+# quant/qual/predictor signal went flat.
+#
+# Fix: scale the band to the ACTUAL number of tests that fed the shared
+# BH-FDR correction (attribution.py's new `n_fdr_tests` field), falling back
+# to the legacy fixed band only for older artifacts that predate the field
+# (graceful degradation, not a hard requirement bump).
+_LEGACY_FDR_GREEN_LO, _LEGACY_FDR_GREEN_HI = 3, 15
+_LEGACY_FDR_WATCH_HI = 30
+
+
+#  BH-FDR mechanics at small n make "0 survivors" the norm, not an anomaly:
+#  at n_fdr_tests=4 the rank-1 acceptance threshold is (1/4)*0.05 = 0.0125 —
+#  a raw p=0.034 (itself "significant" uncorrected) still fails. Only once
+#  the surface has enough tests for the correction to have real discriminating
+#  power does "zero survivors" become informative about a genuinely flat
+#  surface rather than an artifact of a tiny correction pool.
+_FDR_MIN_TESTS_FOR_ZERO_TO_BE_RED = 10
+
+
+def _fdr_surface_status(n_sig: int, n_fdr_tests: int | None) -> tuple[str, str]:
+    """Return (status, band_description) for the fdr_surface_health metric.
+
+    With ``n_fdr_tests`` known, the healthy band is proportional to the test
+    count rather than a fixed absolute range: GREEN when the significant
+    fraction falls in [0.15, 0.60] of tests (both "genuinely flat" and
+    "everything significant = likely overfit" are unhealthy extremes), WATCH
+    on the fringes. 0 significant is WATCH (not RED) unless the surface has
+    at least ``_FDR_MIN_TESTS_FOR_ZERO_TO_BE_RED`` tests — below that, BH's
+    small-n correction threshold makes 0 survivors the statistically expected
+    outcome even under a real, modest effect (see the 2026-07-10 live case:
+    n_fdr_tests=4, best raw p=0.034, correctly 0 significant post-correction —
+    not evidence of a flat surface). Falls back to the pre-config#2305 fixed
+    3-15 band when ``n_fdr_tests`` is absent (older attribution.json
+    artifacts written before this field existed) so this is a backward-
+    compatible, not a breaking, change.
+    """
+    if not n_fdr_tests or n_fdr_tests <= 0:
+        # Legacy artifact without n_fdr_tests, or a degenerate 0-test surface
+        # (shouldn't happen when status=="ok", but fail safe to the old rule).
+        if _LEGACY_FDR_GREEN_LO <= n_sig <= _LEGACY_FDR_GREEN_HI:
+            return "GREEN", f"healthy band {_LEGACY_FDR_GREEN_LO}-{_LEGACY_FDR_GREEN_HI} (legacy, n_fdr_tests unknown)"
+        if 1 <= n_sig < _LEGACY_FDR_GREEN_LO or _LEGACY_FDR_GREEN_HI < n_sig <= _LEGACY_FDR_WATCH_HI:
+            return "WATCH", f"healthy band {_LEGACY_FDR_GREEN_LO}-{_LEGACY_FDR_GREEN_HI} (legacy, n_fdr_tests unknown)"
+        return "RED", f"healthy band {_LEGACY_FDR_GREEN_LO}-{_LEGACY_FDR_GREEN_HI} (legacy, n_fdr_tests unknown)"
+
+    band_desc = f"a proportional band scaled to n_fdr_tests={n_fdr_tests}"
+    if n_sig == 0:
+        if n_fdr_tests >= _FDR_MIN_TESTS_FOR_ZERO_TO_BE_RED:
+            return "RED", band_desc
+        return "WATCH", band_desc
+
+    frac = n_sig / n_fdr_tests
+    if 0.15 <= frac <= 0.60:
+        return "GREEN", band_desc
+    return "WATCH", band_desc
+
+
 def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: datetime | None = None) -> dict:
     """Build the Backtester self-grade tile."""
     s3 = s3_client or boto3.client("s3")
@@ -186,13 +255,12 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
             1 for label in corr.values() if isinstance(label, dict)
             for k, v in label.items() if k.endswith("_fdr_significant") and v
         )
-        # Healthy band 3–15 rejections (too few = no signal; too many = overfit).
-        status = "GREEN" if 3 <= n_sig <= 15 else ("WATCH" if (1 <= n_sig < 3 or 15 < n_sig <= 30) else "RED")
+        status, band_desc = _fdr_surface_status(n_sig, attr.get("n_fdr_tests"))
         components.append(build_metric(
             name="fdr_surface_health", module=MODULE, metric_type="count", criticality="supporting",
             value=float(n_sig), n_samples=attr.get("rows_analyzed"), n_floor=1, source_path=a_src,
             status=status,
-            reason=f"fdr_surface_health = {n_sig} BH-FDR-significant correlations (α=0.05) vs healthy band 3–15.",
+            reason=f"fdr_surface_health = {n_sig} BH-FDR-significant correlations (α=0.05) vs {band_desc}.",
         ))
     else:
         components.append(build_metric(
