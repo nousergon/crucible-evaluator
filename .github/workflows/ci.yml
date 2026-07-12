@@ -32,12 +32,85 @@ jobs:
           pip install pip-audit
           pip-audit || true
 
+  # Builds the actual deploy artifact (Dockerfile) and runs the test suite
+  # AGAINST THE PACKAGES INSTALLED INSIDE THE BUILT IMAGE, pre-merge. The
+  # `test` job above only ever runs against runner pip — it cannot catch a
+  # dependency that resolves in the runner's pip environment but not inside
+  # the image (missing extra, stale/duplicated pin, a transitive import that
+  # only breaks under the Lambda base image's Python/OS).
+  #
+  # A bare `docker run ... -c "import grading.handler, director.handler"` is
+  # NOT sufficient here and was deliberately rejected: the actual 9-day
+  # Director outage (config#1310 — see test_dockerfile_lib_pin_lockstep.py's
+  # docstring) was a LAZY import inside nousergon_lib.contracts, reached only
+  # when grading/tiles/backtester.py's build_backtester_tile() actually calls
+  # contracts.conformance_errors(...) on a real apply_audit artifact — module
+  # import alone does not touch that code path and would NOT have caught it
+  # (verified while building this job: a bare import stayed green against a
+  # rebuilt image missing the `contracts` extra; the full suite below failed
+  # 12 tests on the same image). Running the existing moto-backed test suite
+  # against the image's installed packages exercises those lazy/runtime-only
+  # imports for real, using fixtures that already exist
+  # (tests/test_apply_audit_consumer_contract.py, tests/test_aggregate.py,
+  # etc.) instead of adding a second, narrower assertion mechanism.
+  #
+  # pytest/moto are intentionally NOT baked into the image (Dockerfile trims
+  # them — they're dev-only weight in a Lambda image), so this job installs
+  # them into a throwaway container ON TOP of the already-built image and
+  # mounts tests/ read-only, rather than re-declaring/duplicating deps.
+  #
+  # Excluded: the three purely-static, repo-structure tests that need `.git`
+  # / the Dockerfile / infrastructure/iam/ on disk — none of which ship in
+  # the trimmed image by design. They already run (and gate) in the `test`
+  # job above against the full checkout; re-running them here would just
+  # fail on missing files, not on anything image-specific.
+  #
+  # Kept as a SEPARATE pre-merge gate rather than folded into deploy.yml's
+  # canary: deploy.sh's canaries need real AWS creds + a live Lambda function
+  # and are deliberately post-merge/post-deploy only. This job needs neither,
+  # and runs on every PR instead of only after merge to main.
+  docker-image-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build evaluator image
+        run: |
+          docker build --platform linux/amd64 --provenance=false \
+            -t alpha-engine-evaluator:ci .
+
+      # Both `grading.handler.handler` and `director.handler.handler` are live
+      # Lambda entrypoints (infrastructure/deploy.sh deploys the grading
+      # handler as the primary function's CMD and the director handler as a
+      # second function sharing this same image via a CMD override — see that
+      # script's comments). Mounting tests/ read-only and running the suite
+      # with the image's own site-packages on sys.path (not the runner's)
+      # means every assertion above runs against exactly what would ship.
+      - name: Run test suite against the built image's installed packages
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/tests:/var/task/tests:ro" \
+            --entrypoint bash \
+            alpha-engine-evaluator:ci \
+            -c "set -euo pipefail
+                pip install --quiet pytest pytest-cov moto python-dotenv
+                cd /var/task
+                python -m pytest tests/ -q \
+                  --ignore=tests/test_dockerfile_handler_import_completeness.py \
+                  --ignore=tests/test_dockerfile_lib_pin_lockstep.py \
+                  --ignore=tests/test_iam_s3_contract.py"
+
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds (mid-fix commits, cross-repo lib-tag merge-order
   # races) stay silent. Reusable workflow + transport in nousergon-lib.
   # See alpha-engine-config#1128.
   notify-main-failure:
-    needs: [test]
+    needs: [test, docker-image-tests]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit
