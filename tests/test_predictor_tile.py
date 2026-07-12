@@ -415,3 +415,59 @@ class TestTileStatus:
         # momentum_l1_ic is critical + RED → module RED (honest: a dead critical L1).
         assert tile["status"] == "RED"
         assert tile["letter"] == "F"
+
+
+class TestCrossCycleTrends:
+    """config#1836/#1958 — the predictor tile threads prior-card trends into
+    its headline critical (meta_l2_ic) when a CardHistory is supplied, same
+    contract as the research/portfolio_outcome tiles (grading/history.py:
+    N/A weeks skipped, never zero-filled; no history → default trends)."""
+
+    def test_history_threads_trends_onto_meta_l2_ic(self, s3):
+        from grading.history import CardHistory
+
+        _seed(s3)  # default _MANIFEST → cpcv_mean == 0.18 (mean of _CPCV_ICS)
+        history = CardHistory({("predictor", "meta_l2_ic"): [0.10, 0.12, 0.14]}, 3)
+        tile = build_predictor_tile(BUCKET, s3_client=s3, history=history)
+
+        meta = _comp(tile, "meta_l2_ic")
+        assert meta["trend_4w"] == [0.10, 0.12, 0.14, pytest.approx(0.18)]
+        assert meta["trend_13w"] == meta["trend_4w"]
+        # Monotonic improvement across all 4 points → an up glyph, not the
+        # perpetual default "→".
+        assert meta["trend_decoration"] in ("↑", "↑↑")
+
+    def test_gap_week_skipped_not_zero_filled(self, s3):
+        # A prior N/A week for meta_l2_ic must contribute no point to the
+        # series (CardHistory itself enforces the skip at extraction time;
+        # this pins that the tile carries the already-skipped series through
+        # untouched rather than re-introducing a zero-fill at the call site).
+        from grading.history import CardHistory
+
+        _seed(s3)
+        history = CardHistory({("predictor", "meta_l2_ic"): [0.20, 0.24]}, 3)
+        tile = build_predictor_tile(BUCKET, s3_client=s3, history=history)
+        meta = _comp(tile, "meta_l2_ic")
+        # Prior series has only 2 points (the middle N/A week already absent,
+        # never a 0.0) + this cycle's value appended.
+        assert meta["trend_4w"] == [0.20, 0.24, pytest.approx(0.18)]
+        assert 0.0 not in meta["trend_4w"]
+
+    def test_no_history_keeps_default_trends(self, s3):
+        _seed(s3)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)
+        meta = _comp(tile, "meta_l2_ic")
+        assert meta["trend_4w"] is None
+        assert meta["trend_13w"] is None
+        assert meta["trend_decoration"] == "→"
+
+    def test_na_current_value_uses_prior_history_only(self, s3):
+        # meta_l2_ic grades N/A this cycle (both artifacts absent) — the
+        # tile must still ride the prior series without appending a
+        # nonexistent current value.
+        from grading.history import CardHistory
+
+        history = CardHistory({("predictor", "meta_l2_ic"): [0.10, 0.12]}, 2)
+        tile = build_predictor_tile(BUCKET, s3_client=s3, history=history)
+        meta = _comp(tile, "meta_l2_ic")
+        assert meta["trend_4w"] == [0.10, 0.12]
