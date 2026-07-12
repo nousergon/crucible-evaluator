@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 MODULE = "research"
 _PRECISION_FLOOR = 30  # selected names needed for a confident precision read
 
+# config#2318: since the 2026-06-29 attractiveness champion-feed cutover, the
+# scanner block in e2e_lift.json (``scanner_lift`` / ``scanner_evaluations.
+# quant_filter_pass``) reflects only the retired tech_score baseline gate — it
+# no longer feeds live candidate generation. Label the scanner tile component
+# with this arm explicitly so it is never mistaken for a live-scanner read
+# (matches the label crucible-backtester's ``analysis/end_to_end.py`` now
+# stamps onto ``scanner_lift`` / ``actual_scanner_pass``).
+_SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
+
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
     try:
@@ -67,7 +76,7 @@ def _pick_clf(block: dict) -> tuple[dict | None, str]:
 def _precision_metric(
     name, clf, *, criticality, source, target=0.05, red_line=-0.02,
     lift=None, lift_label=None, missing_detail=None, horizon="5d",
-    history: CardHistory | None = None,
+    history: CardHistory | None = None, arm=None,
 ) -> dict:
     """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
@@ -86,18 +95,27 @@ def _precision_metric(
 
     ``history`` (config#1836) threads cross-cycle ``trend_4w``/``trend_13w``
     from prior report cards onto whichever value branch grades.
+
+    ``arm`` (config#2318) optionally labels which measurement arm this metric
+    was computed from (e.g. the retired tech_score baseline scanner, post the
+    2026-06-29 champion-feed cutover). Passed through to the ``MetricRecord``
+    (extra field) and woven into the reason string so the Director's evidence
+    walker — which reads ``status_reason``/``reason`` generically — inherits
+    the label with no director/-side changes needed.
     """
 
     def _tr(value):
         return history.trends_for(MODULE, name, value) if history is not None else {}
 
     hz = f"[{horizon}] "
+    arm_s = f" [arm: {arm}]" if arm else ""
     if not clf or clf.get("precision") is None:
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
             estimator="wilson_precision_edge", measurement_horizon=horizon,
             n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
+            arm=arm,
             **_tr(None),
         )
     tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
@@ -118,7 +136,8 @@ def _precision_metric(
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
             reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
-                    f"N={n_sel}){lift_s}." if w.get("status") == "ok" else None),
+                    f"N={n_sel}){lift_s}{arm_s}." if w.get("status") == "ok" else None),
+            arm=arm,
             **_tr(precision),
         )
 
@@ -133,8 +152,9 @@ def _precision_metric(
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
         reason=(f"{hz}{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
-                f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}.")
+                f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}{arm_s}.")
         if w.get("status") == "ok" else None,
+        arm=arm,
         **_tr(edge),
     )
 
@@ -180,7 +200,7 @@ def build_research_tile(
         "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
         lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
         missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
-        history=history,
+        history=history, arm=_SCANNER_METRIC_ARM,
     ))
 
     # 2. sector_teams_avg (critical) — pooled precision across the 6 sector teams.

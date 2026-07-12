@@ -137,6 +137,7 @@ def build_metric(
     estimator: str | None = None,
     measurement_horizon: str | None = None,
     reliability: str | None = None,
+    arm: str | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
 
@@ -163,6 +164,13 @@ def build_metric(
     but its ``status_reason`` becomes ``"Accepted permanent N/A — <reason>"`` and
     the record carries ``permanent_na=True`` so the cliff-inventory can tell it
     apart from a transient "producer not yet wired" gap.
+
+    ``arm`` (config#2318) optionally labels which measurement arm a metric was
+    computed from — e.g. a retired baseline vs a newer live/champion feed —
+    when a producer's underlying data source has been superseded but a metric
+    keeps measuring the old source. ``MetricRecord`` allows extra fields, so
+    this passes straight through (same low-risk pattern as ``estimator`` /
+    ``reliability`` / ``permanent_na``, config#1153 / L4562).
     """
     # config#1153 (operator ruling 2026-07-11, Option A): an "accepted permanent
     # honest-N/A" — a metric deliberately NOT built (a product decision), as
@@ -261,4 +269,6 @@ def build_metric(
         # config#1153: accepted-permanent-N/A marker (extra fields).
         permanent_na=permanent_na_reason is not None,
         permanent_na_reason=permanent_na_reason,
+        # config#2318: optional measurement-arm label (extra field).
+        arm=arm,
     )
