@@ -1,4 +1,4 @@
-"""The Dockerfile must not hardcode a second, independent nousergon-lib pin.
+"""First-party package pins must not drift across requirements.txt and Dockerfile/workflows.
 
 Root-caused 2026-07-11: the Dockerfile's dependency-install RUN line used to
 hardcode `nousergon-lib[quant-stats] @ git+https://.../nousergon-lib@v0.83.0`
@@ -13,10 +13,10 @@ live ReportCard invocation for 9+ days, which cascaded into the Director
 Lambda never receiving a valid card to build a weekly plan from
 (config#1310 investigation, alpha-engine-config repo).
 
-This test asserts the Dockerfile reads the pin dynamically out of
-requirements.txt (`grep '^nousergon-lib' requirements.txt`) rather than
-duplicating it as a literal `@vX.Y.Z` string — the only way to make this
-class of drift structurally impossible instead of re-syncing it once more.
+This test asserts both the Dockerfile and workflow files read first-party
+pins dynamically out of requirements.txt (via `grep`) rather than duplicating
+them as literals — the only way to make this class of drift structurally
+impossible instead of re-syncing it once more.
 """
 from __future__ import annotations
 
@@ -65,3 +65,30 @@ def test_requirements_txt_nousergon_lib_pin_has_contracts_extra() -> None:
         "test module's docstring for the 2026-07-11 incident this guards "
         "against."
     )
+
+
+def test_workflows_do_not_hardcode_first_party_package_pins() -> None:
+    requirements = (REPO_ROOT / "requirements.txt").read_text()
+    first_party_packages = {"nousergon-lib", "krepis"}
+
+    workflow_dir = REPO_ROOT / ".github" / "workflows"
+    if not workflow_dir.exists():
+        return
+
+    for workflow_file in workflow_dir.glob("*.yml"):
+        workflow = workflow_file.read_text()
+
+        for package in first_party_packages:
+            hardcoded_pin = re.search(
+                rf'{package}\[[^\]]*\]\s*(?:>=|==|@|~=)\s*[\d.]+',
+                workflow
+            )
+            assert hardcoded_pin is None, (
+                f"{workflow_file.name} hardcodes a literal {package} pin "
+                f"({hardcoded_pin.group(0)!r}) instead of reading it from "
+                "requirements.txt. This is the dual-source-of-truth pattern "
+                "that caused the 2026-07-11 evaluator drift incident. Workflow "
+                "files must extract first-party package versions dynamically "
+                "(via `grep '^<package>' requirements.txt`) to keep them in "
+                "sync with the canonical requirements.txt."
+            )

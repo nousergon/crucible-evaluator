@@ -65,7 +65,7 @@ jobs:
       # every canary invoke dies with `ModuleNotFoundError: No module named
       # 'krepis'` (surfaced 2026-07-01, config#1494 follow-up: the CLI
       # conversion wired the call but never installed it on the caller).
-      # Pin matches requirements.txt's `krepis[flow_doctor]>=0.7.0` floor;
+      # Pin is derived dynamically from requirements.txt to prevent drift;
       # setup-python pins the interpreter so the pip install target doesn't
       # drift with GH's ubuntu-latest image updates.
       - name: Set up Python
@@ -74,7 +74,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install krepis (runner-side canary CLI)
-        run: pip install "krepis[flow_doctor]>=0.7.0"
+        run: pip install "$(grep '^krepis\[flow_doctor\]' requirements.txt)"
 
       # deploy.sh builds the single ECR image and deploys BOTH the grading
       # Lambda (alpha-engine-evaluator) and the Director Lambda
