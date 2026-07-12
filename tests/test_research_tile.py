@@ -90,6 +90,23 @@ class TestPrecisionComponents:
         assert cio["value"] == pytest.approx(0.55 - 0.29)
         assert "vs-ranking-lift" in cio["status_reason"]
 
+    def test_scanner_labels_retired_baseline_arm(self, s3):
+        # config#2318: since the 2026-06-29 attractiveness champion-feed
+        # cutover, scanner_lift in e2e_lift.json reflects only the retired
+        # tech_score baseline gate. The scanner tile component must carry an
+        # explicit `arm` label (and the reason string must state it) so the
+        # Director's generic evidence walker inherits the label automatically.
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        scanner = _comp(tile, "scanner")
+        assert scanner["arm"] == "tech_score_baseline (retired from live feed 2026-06-29)"
+        assert "retired from live feed 2026-06-29" in scanner["status_reason"]
+        # sibling tiles are NOT the retired scanner gate — must not be tagged.
+        teams = _comp(tile, "sector_teams_avg")
+        cio = _comp(tile, "cio")
+        assert teams.get("arm") is None
+        assert cio.get("arm") is None
+
 
 class TestCioSelectionSkill:
     """L4561 — the CIO selection-skill instrument, graded under the L4562

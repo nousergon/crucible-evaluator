@@ -181,6 +181,28 @@ class TestPermanentNA:
         assert m.permanent_na is True  # flag still set regardless of reason source
 
 
+class TestMeasurementArm:
+    """config#2318 — optional ``arm`` label distinguishing which measurement
+    arm (e.g. a retired baseline vs a live/champion feed) a metric was
+    computed from. MetricRecord allows extra fields (same low-risk pattern as
+    estimator/reliability/permanent_na, config#1153 / L4562)."""
+
+    def test_arm_defaults_to_none(self):
+        m = build_metric(
+            name="x", module="research", metric_type="pct", n_floor=10,
+            source_path="s3://b/x",
+        )
+        assert m.arm is None
+
+    def test_arm_passes_through(self):
+        m = build_metric(
+            name="scanner", module="research", metric_type="pct", n_floor=10,
+            value=0.1, n_samples=50, source_path="s3://b/x",
+            arm="tech_score_baseline (retired from live feed 2026-06-29)",
+        )
+        assert m.arm == "tech_score_baseline (retired from live feed 2026-06-29)"
+
+
 class TestBuildMetricExtras:
     def test_status_override_for_band_metric(self):
         m = build_metric(
