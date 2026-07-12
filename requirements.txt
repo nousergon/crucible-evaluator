@@ -3,6 +3,11 @@ boto3~=1.43
 pydantic~=2.13
 pyyaml~=6.0
 
+# THROWAWAY PROOF PIN — DO NOT MERGE. Deliberately vulnerable version
+# (PYSEC-2026-1873 / PYSEC-2026-1872 / CVE-2026-25645) to demonstrate the
+# new blocking pip-audit CI step actually fails. Ref alpha-engine-config#2342.
+requests==2.31.0
+
 # Numerics for grading / report-card aggregation
 numpy~=2.5
 pandas~=3.0
