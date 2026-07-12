@@ -1,0 +1,13 @@
+# pip-audit ignore list (nousergon/alpha-engine-config#2342)
+# Every entry below MUST carry a dated rationale comment directly above it.
+# No blanket suppression — each accepted advisory is named individually.
+# Format:
+#   # <rationale> — accepted 2026-07-12, revisit <YYYY-MM-DD or "when a fix is released">
+#   <VULN-ID>
+#
+# 2026-07-12: pip-audit against the full resolved dependency set in
+# requirements.txt (89 packages, direct + transitive) reported zero known
+# vulnerabilities. No entries are needed at this time. This file exists so
+# ci.yml's Security audit step has something to read; the first future
+# finding that can't be safely bumped should be added here individually,
+# with its own dated rationale, per the format above.
