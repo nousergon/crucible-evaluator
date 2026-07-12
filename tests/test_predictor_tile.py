@@ -310,6 +310,125 @@ class TestVetoGatePrecision:
         assert "insufficient_data" in vg["status_reason"]
 
 
+def _put_confusion(s3, payload, run_date=_RUN_DATE):
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{run_date}/confusion_matrix.json",
+        Body=json.dumps(payload).encode(),
+    )
+
+
+class TestDirectionAccuracyVsBaseline:
+    """config#2298: direction-classification accuracy vs the majority-class
+    baseline, plus per-class (UP/DOWN) precision vs base rate — reproducing
+    the original incident's manual read (39.96% accuracy vs 60.6% always-DOWN
+    baseline; UP precision 31.3% vs 36.0% base rate; DOWN precision 55.2% vs
+    60.6% base rate) as a standing report-card tile."""
+
+    # Mirrors the original incident's numbers (confusion_matrix.json n=1379).
+    _CM = {
+        "status": "ok", "n": 1379, "accuracy": 0.3996,
+        "matrix": {
+            "UP": {"UP": 156, "FLAT": 100, "DOWN": 200},
+            "FLAT": {"UP": 50, "FLAT": 40, "DOWN": 60},
+            "DOWN": {"UP": 150, "FLAT": 120, "DOWN": 503},
+        },
+        "per_class": {
+            "UP": {"precision": 0.313, "recall": 0.4, "f1": 0.35, "n_predicted": 456, "n_actual": 356},
+            "FLAT": {"precision": 0.267, "recall": 0.2, "f1": 0.23, "n_predicted": 150, "n_actual": 260},
+            "DOWN": {"precision": 0.552, "recall": 0.65, "f1": 0.6, "n_predicted": 773, "n_actual": 763},
+        },
+        "up_threshold": 0.005, "horizons_days": [21],
+    }
+
+    def test_accuracy_lift_matches_incident_and_is_red(self, s3):
+        _seed(s3)
+        _put_confusion(s3, self._CM)
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "direction_accuracy_vs_majority_baseline")
+        baseline = 763 / 1379  # DOWN is the majority actual class
+        assert c["value"] == pytest.approx(0.3996 - baseline, abs=1e-4)
+        assert c["status"] == "RED"  # deeply sub-baseline, mirrors the 2026-06 incident
+        assert "DOWN" in c["status_reason"]
+        assert c["n_samples"] == 1379
+
+    def test_up_precision_lift_matches_incident(self, s3):
+        _seed(s3)
+        _put_confusion(s3, self._CM)
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "up_precision_vs_base_rate")
+        base_rate = 356 / 1379
+        assert c["value"] == pytest.approx(0.313 - base_rate, abs=1e-3)
+        assert c["n_samples"] == 456
+
+    def test_down_precision_lift_matches_incident(self, s3):
+        _seed(s3)
+        _put_confusion(s3, self._CM)
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "down_precision_vs_base_rate")
+        base_rate = 763 / 1379
+        assert c["value"] == pytest.approx(0.552 - base_rate, abs=1e-3)
+        assert c["n_samples"] == 773
+
+    def test_beats_baseline_is_green(self, s3):
+        _seed(s3)
+        cm = {
+            "status": "ok", "n": 500, "accuracy": 0.70,
+            "per_class": {
+                "UP": {"precision": 0.65, "recall": 0.6, "f1": 0.62, "n_predicted": 200, "n_actual": 190},
+                "FLAT": {"precision": 0.10, "recall": 0.1, "f1": 0.10, "n_predicted": 20, "n_actual": 20},
+                "DOWN": {"precision": 0.75, "recall": 0.7, "f1": 0.72, "n_predicted": 280, "n_actual": 290},
+            },
+        }
+        _put_confusion(s3, cm)
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "direction_accuracy_vs_majority_baseline")
+        # majority baseline = 290/500 = 0.58; accuracy 0.70 → lift +0.12, well above +3pp target.
+        assert c["status"] == "GREEN"
+
+    def test_absent_artifact_missing_input(self, s3):
+        _seed(s3)  # no confusion_matrix.json
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        for name in (
+            "direction_accuracy_vs_majority_baseline",
+            "up_precision_vs_base_rate", "down_precision_vs_base_rate",
+        ):
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT"
+            assert "absent" in c["status_reason"]
+
+    def test_no_run_date_missing_input(self, s3):
+        _seed(s3)
+        _put_confusion(s3, self._CM)
+        tile = build_predictor_tile(BUCKET, s3_client=s3)  # no run_date
+        c = _comp(tile, "direction_accuracy_vs_majority_baseline")
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "run_date not provided" in c["status_reason"]
+
+    def test_insufficient_data_status_is_missing_input(self, s3):
+        _seed(s3)
+        _put_confusion(s3, {"status": "insufficient_data", "n": 10, "min_required": 30})
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "direction_accuracy_vs_majority_baseline")
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "insufficient_data" in c["status_reason"]
+
+    def test_zero_predicted_class_precision_undefined_na(self, s3):
+        _seed(s3)
+        cm = {
+            "status": "ok", "n": 100, "accuracy": 0.5,
+            "per_class": {
+                "UP": {"precision": None, "recall": None, "f1": None, "n_predicted": 0, "n_actual": 30},
+                "FLAT": {"precision": 0.4, "recall": 0.3, "f1": 0.34, "n_predicted": 30, "n_actual": 20},
+                "DOWN": {"precision": 0.6, "recall": 0.7, "f1": 0.65, "n_predicted": 70, "n_actual": 50},
+            },
+        }
+        _put_confusion(s3, cm)
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        c = _comp(tile, "up_precision_vs_base_rate")
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "n_predicted=0" in c["status_reason"]
+
+
 class TestSlimCacheFreshness:
     def test_wired_from_s3_lastmodified(self, s3):
         # config#859: slim_cache_freshness is now sourced from the slim-cache
