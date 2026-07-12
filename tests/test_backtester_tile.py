@@ -7,7 +7,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from grading.tiles.backtester import _coverage, build_backtester_tile
+from grading.tiles.backtester import _coverage, _fdr_surface_status, build_backtester_tile
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-07"
@@ -103,16 +103,70 @@ class TestParity:
 
 
 class TestFdrSurface:
-    def test_healthy_band_green(self, s3):
+    """config#2305: the band scales with n_fdr_tests (the actual size of the
+    shared BH-FDR correction pool), not a fixed absolute count — the fixed
+    3-15 band was calibrated for the pre-config#1456 ~8-9-test surface and is
+    unreachable/misleading on the post-cutover 4-5-test surface. Legacy
+    artifacts without n_fdr_tests still get the old fixed-band behavior."""
+
+    def test_healthy_band_green_with_n_fdr_tests(self, s3):
+        # 3 of 10 tests significant = 0.30 fraction, within [0.15, 0.60].
+        corr = {f"f{i}": {"r10_fdr_significant": i < 3} for i in range(10)}
+        _put(s3, f"backtest/{RUN_DATE}/attribution.json",
+             {"status": "ok", "rows_analyzed": 500, "n_fdr_tests": 10, "correlations": corr})
+        tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        fdr = _comp(tile, "fdr_surface_health")
+        assert fdr["value"] == 3.0
+        assert fdr["status"] == "GREEN"
+
+    def test_zero_significant_on_small_surface_is_watch_not_red(self, s3):
+        """The live 2026-07-10 scenario: 4 tests (2 sub-scores x 2 canonical
+        horizons post-config#1456), 0 survive BH correction — this is the
+        statistically EXPECTED outcome at this sample size (best raw p=0.034
+        still fails the n=4 rank-1 threshold of 0.0125), not evidence the
+        surface went flat. Must be WATCH, not RED (the config#2305 bug)."""
+        corr = {
+            "quant": {"beat_spy_21d_fdr_significant": False, "return_21d_fdr_significant": False},
+            "qual": {"beat_spy_21d_fdr_significant": False, "return_21d_fdr_significant": False},
+        }
+        _put(s3, f"backtest/{RUN_DATE}/attribution.json",
+             {"status": "ok", "rows_analyzed": 402, "n_fdr_tests": 4, "correlations": corr})
+        tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        fdr = _comp(tile, "fdr_surface_health")
+        assert fdr["value"] == 0.0
+        assert fdr["status"] == "WATCH"
+
+    def test_zero_significant_on_large_surface_is_red(self, s3):
+        """0 survivors IS informative once the correction pool is large
+        enough for the test to have real discriminating power."""
+        corr = {f"f{i}": {"r_fdr_significant": False} for i in range(12)}
+        _put(s3, f"backtest/{RUN_DATE}/attribution.json",
+             {"status": "ok", "rows_analyzed": 500, "n_fdr_tests": 12, "correlations": corr})
+        tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert _comp(tile, "fdr_surface_health")["status"] == "RED"
+
+    def test_all_significant_is_watch_not_green(self, s3):
+        """Every test surviving correction reads as overfit-suspicious, not
+        healthy — fraction 1.0 is outside the [0.15, 0.60] GREEN band."""
+        corr = {f"f{i}": {"r_fdr_significant": True} for i in range(4)}
+        _put(s3, f"backtest/{RUN_DATE}/attribution.json",
+             {"status": "ok", "rows_analyzed": 500, "n_fdr_tests": 4, "correlations": corr})
+        tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert _comp(tile, "fdr_surface_health")["status"] == "WATCH"
+
+    def test_legacy_artifact_without_n_fdr_tests_uses_fixed_band(self, s3):
+        """Older attribution.json artifacts (written before config#2305)
+        lack n_fdr_tests entirely — must fall back to the original fixed
+        3-15 band rather than erroring or silently reinterpreting."""
         corr = {f"f{i}": {"r10_fdr_significant": True} for i in range(5)}
         _put(s3, f"backtest/{RUN_DATE}/attribution.json",
-             {"status": "ok", "rows_analyzed": 500, "correlations": corr})
+             {"status": "ok", "rows_analyzed": 500, "correlations": corr})  # no n_fdr_tests key
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
         fdr = _comp(tile, "fdr_surface_health")
         assert fdr["value"] == 5.0
-        assert fdr["status"] == "GREEN"  # 3 ≤ 5 ≤ 15
+        assert fdr["status"] == "GREEN"  # 3 <= 5 <= 15, legacy band
 
-    def test_zero_significant_red(self, s3):
+    def test_legacy_zero_significant_red(self, s3):
         _put(s3, f"backtest/{RUN_DATE}/attribution.json",
              {"status": "ok", "rows_analyzed": 500, "correlations": {"f1": {"r10_fdr_significant": False}}})
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
@@ -123,6 +177,38 @@ class TestFdrSurface:
         _put(s3, f"backtest/{RUN_DATE}/attribution.json", "", raw=True)
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert _comp(tile, "fdr_surface_health")["status"] == "N/A-MISSING-INPUT"
+
+
+class TestFdrSurfaceStatusHelper:
+    """Direct unit tests for `_fdr_surface_status` — pins the calibration
+    contract independent of the S3/tile plumbing."""
+
+    def test_none_n_fdr_tests_uses_legacy_band(self):
+        assert _fdr_surface_status(5, None)[0] == "GREEN"
+        assert _fdr_surface_status(0, None)[0] == "RED"
+        assert _fdr_surface_status(2, None)[0] == "WATCH"
+        assert _fdr_surface_status(20, None)[0] == "WATCH"
+        assert _fdr_surface_status(40, None)[0] == "RED"
+
+    def test_zero_tests_edge_case_falls_back_to_legacy(self):
+        # n_fdr_tests=0 shouldn't happen when status=="ok", but must not crash.
+        status, _ = _fdr_surface_status(0, 0)
+        assert status == "RED"  # legacy rule: n_sig=0 -> RED
+
+    def test_small_surface_zero_sig_is_watch(self):
+        for n in (1, 2, 3, 4, 5, 9):
+            assert _fdr_surface_status(0, n)[0] == "WATCH", f"n_fdr_tests={n}"
+
+    def test_large_surface_zero_sig_is_red(self):
+        for n in (10, 15, 50):
+            assert _fdr_surface_status(0, n)[0] == "RED", f"n_fdr_tests={n}"
+
+    def test_proportional_green_band(self):
+        # 0.15 <= frac <= 0.60
+        assert _fdr_surface_status(2, 10)[0] == "GREEN"   # 0.20
+        assert _fdr_surface_status(6, 10)[0] == "GREEN"   # 0.60 (inclusive)
+        assert _fdr_surface_status(1, 10)[0] == "WATCH"   # 0.10, below floor
+        assert _fdr_surface_status(7, 10)[0] == "WATCH"   # 0.70, above ceiling
 
 
 class TestRollbackAndNA:
