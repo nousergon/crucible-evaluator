@@ -7,7 +7,9 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from grading.history import CardHistory
 from grading.tiles.backtester import _coverage, _fdr_surface_status, build_backtester_tile
+from grading.tiles.predictor import LATEST_KEY, MANIFEST_KEY
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-07"
@@ -219,14 +221,14 @@ class TestRollbackAndNA:
         rb = _comp(tile, "auto_apply_rollback_count")
         assert rb["value"] == 2.0
 
-    def test_not_impl_components(self, s3):
+    def test_no_more_stub_components(self, s3):
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
-        # sample_size_adequacy, optimizer_churn, walk_forward_stability are now
-        # WIRED (config#1151) — they read producer artifacts, so absent ⇒
-        # N/A-MISSING-INPUT, not N/A-NOT-IMPL. Only backtest_vs_live_parity is
-        # still a genuine stub.
-        assert _comp(tile, "backtest_vs_live_parity")["status"] == "N/A-NOT-IMPL"
-        for name in ("optimizer_churn", "walk_forward_stability"):
+        # sample_size_adequacy, optimizer_churn, walk_forward_stability
+        # (config#1151) and backtest_vs_live_parity (config#1153) are all now
+        # WIRED — they read producer artifacts, so absent input ⇒
+        # N/A-MISSING-INPUT, never N/A-NOT-IMPL. No genuine stub remains on
+        # this tile.
+        for name in ("backtest_vs_live_parity", "optimizer_churn", "walk_forward_stability"):
             assert _comp(tile, name)["status"] == "N/A-MISSING-INPUT"
 
 
@@ -416,3 +418,138 @@ class TestRiskRatioCI:
         })
         m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "risk_ratio_ci")
         assert m["status"] == "GREEN" and m["value"] == 1.0
+
+
+class TestBacktestVsLiveParity:
+    """backtest_vs_live_parity (config#1153 critical-3) — diffs the predictor's
+    live 30d rolling IC (predictor/metrics/latest.json::ic_30d) against its own
+    leak-free CPCV backtest-expected IC (predictor/weights/meta/manifest.json::
+    meta_model_oos_ic_cpcv.mean_ic). Sign convention: drift = live − backtest-
+    promised; drift <= red_line (-0.05) is the actionable/bad direction (live
+    underperforming what the backtest promised)."""
+
+    def _put_manifest(self, s3, mean_ic=0.18, status="ok"):
+        _put(s3, MANIFEST_KEY, {"meta_model_oos_ic_cpcv": {"status": status, "mean_ic": mean_ic, "n_combos": 12}})
+
+    def _put_latest(self, s3, ic_30d=0.15, rolling_n=40):
+        _put(s3, LATEST_KEY, {"ic_30d": ic_30d, "rolling_n": rolling_n})
+
+    def test_both_present_computes_drift(self, s3):
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(0.15 - 0.18)
+        assert m["n_samples"] == 40
+        assert m["criticality"] == "critical"
+        assert m["estimator"] == "ic_delta"
+
+    def test_live_matching_backtest_is_green(self, s3):
+        # drift == target (0.0) exactly → GREEN.
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.18, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(0.0)
+        assert m["status"] == "GREEN"
+
+    def test_live_beating_backtest_is_green(self, s3):
+        self._put_manifest(s3, mean_ic=0.10)
+        self._put_latest(s3, ic_30d=0.20, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(0.10)
+        assert m["status"] == "GREEN"
+
+    def test_mild_underperformance_is_watch(self, s3):
+        # drift = -0.03: below target 0.0, above red-line -0.05 → WATCH.
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(-0.03)
+        assert m["status"] == "WATCH"
+
+    def test_severe_underperformance_is_red(self, s3):
+        # drift = -0.10: at/below red-line -0.05 → RED — the actionable direction.
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.08, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(-0.10)
+        assert m["status"] == "RED"
+        assert "underperforming" in m["status_reason"].lower()
+
+    def test_missing_manifest_is_na(self, s3):
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "manifest.json absent" in m["status_reason"]
+        assert m["value"] is None
+
+    def test_missing_latest_is_na(self, s3):
+        self._put_manifest(s3, mean_ic=0.18)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "latest.json absent" in m["status_reason"]
+
+    def test_both_absent_is_na(self, s3):
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "manifest.json absent" in m["status_reason"]
+        assert "latest.json absent" in m["status_reason"]
+
+    def test_null_ic_30d_below_producer_floor_is_na(self, s3):
+        # Producer leaves ic_30d null when <10 valid pairs in the trailing 30d
+        # (crucible-backtester pipeline_common.py _MIN_IC_SAMPLES) — must NOT
+        # silently default to 0.0 or any placeholder (fail-loud doctrine).
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=None, rolling_n=6)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "ic_30d null" in m["status_reason"]
+        assert m["value"] is None
+
+    def test_cpcv_not_ok_is_na(self, s3):
+        self._put_manifest(s3, mean_ic=0.18, status="insufficient_data")
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert "meta_model_oos_ic_cpcv" in m["status_reason"]
+
+    def test_source_path_names_both_artifacts(self, s3):
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert MANIFEST_KEY in m["source_path"]
+        assert LATEST_KEY in m["source_path"]
+
+    def test_history_threads_trend(self, s3):
+        # Mirrors predictor.py's meta_l2_ic trend-threading (config#1836).
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        history = CardHistory({("backtester", "backtest_vs_live_parity"): [-0.01, -0.02]}, 2)
+        tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3, history=history)
+        m = _comp(tile, "backtest_vs_live_parity")
+        assert m["trend_4w"] == [-0.01, -0.02, pytest.approx(-0.03)]
+
+    def test_no_history_keeps_default_trends(self, s3):
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["trend_4w"] is None
+        assert m["trend_decoration"] == "→"
+
+
+class TestBacktestVsLiveParitySourceVerification:
+    """Source-verification style (crucible-evaluator#100/#106 trust-battery
+    harness, tests/test_source_verification.py): re-derive the graded value
+    independently of the tile's own arithmetic and assert exact agreement,
+    rather than asserting against a hand-copied constant."""
+
+    def test_drift_matches_independent_subtraction(self, s3):
+        live_ic, cpcv_ic = 0.1234567891, 0.0987654321
+        self._put_manifest_and_latest(s3, cpcv_ic, live_ic)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        # Independent re-derivation: plain subtraction, no tile helper reuse.
+        expected = live_ic - cpcv_ic
+        assert m["value"] == pytest.approx(expected, abs=1e-9)
+
+    def _put_manifest_and_latest(self, s3, cpcv_ic, live_ic):
+        _put(s3, MANIFEST_KEY, {"meta_model_oos_ic_cpcv": {"status": "ok", "mean_ic": cpcv_ic, "n_combos": 12}})
+        _put(s3, LATEST_KEY, {"ic_30d": live_ic, "rolling_n": 40})

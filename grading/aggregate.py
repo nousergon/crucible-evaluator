@@ -81,6 +81,7 @@ def build_report_card(
     #   - research (Tile 1): backtest/{date}/e2e_lift + score_calibration + macro_eval + portfolio_calibration
     #   - executor (Tile 3): backtest/{date}/trigger_scorecard + shadow_book + exit_timing + portfolio_excursion
     #   - backtester (Tile 4): grading.json coverage audit + parity + attribution FDR + freshness + rollbacks
+    #     + live-vs-backtest-promised IC drift (backtest_vs_live_parity, config#1153)
     #   - substrate (Tile 5): price-cache freshness (+ SF/data-quality producers N/A until wired)
     #   - agent (Tile 6): agent-quality transparency shell (producers not yet persisted)
     #   - behavioral (Tile 7): backtest/{date}/behavioral_anomaly + optimizer_shadow
@@ -96,7 +97,7 @@ def build_report_card(
         "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
-        "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client),
+        "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history),
         "substrate": build_substrate_tile(bucket, run_date, s3_client=s3_client),
         "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
         "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),

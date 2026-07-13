@@ -21,8 +21,10 @@ sample_size_adequacy, optimizer_churn and walk_forward_stability are WIRED
 (config#1151 Batch C) — they grade from their backtester producer artifacts
 (backtest/{date}/{sample_size,optimizer_churn,walk_forward_stability}.json) and
 fall to a transparent N/A only when the artifact is absent. backtest_vs_live_parity
-still needs a synthetic-backtest-IC-vs-live-IC drift series not yet persisted →
-transparent N/A-NOT-IMPL.
+is WIRED (config#1153 critical-3) — it diffs the predictor's own leak-free CPCV
+backtest-expected IC against its live 30d rolling IC (see the component below
+for the sign convention) and falls to a transparent N/A when either ingredient
+is absent/insufficient.
 
 risk_ratio_ci is WIRED (config#976, Director L4558) — grades from
 backtest/{date}/risk_ratio_ci.json's block-bootstrap magnitude-certainty flag
@@ -46,8 +48,10 @@ from botocore.exceptions import ClientError
 from nousergon_lib import contracts
 
 from grading.artifacts import get_json_windowed
+from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.tiles.predictor import LATEST_KEY, MANIFEST_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -169,12 +173,23 @@ def _fdr_surface_status(n_sig: int, n_fdr_tests: int | None) -> tuple[str, str]:
     return "WATCH", band_desc
 
 
-def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: datetime | None = None) -> dict:
-    """Build the Backtester self-grade tile."""
+def build_backtester_tile(
+    bucket: str, run_date: str, s3_client=None, *,
+    as_of: datetime | None = None, history: CardHistory | None = None,
+) -> dict:
+    """Build the Backtester self-grade tile.
+
+    ``history`` (config#1836) supplies prior-card values so ``backtest_vs_live_parity``
+    carries cross-cycle ``trend_4w``/``trend_13w``, mirroring the predictor tile's
+    ``meta_l2_ic`` trend-threading; omitted → trends stay unpopulated.
+    """
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
     prefix = f"backtest/{run_date}"
     components = []
+
+    def _tr(name: str, value: float | None) -> dict:
+        return history.trends_for(MODULE, name, value) if history is not None else {}
 
     def src(name):
         return f"s3://{bucket}/{prefix}/{name}"
@@ -485,12 +500,83 @@ def build_backtester_tile(bucket: str, run_date: str, s3_client=None, *, as_of: 
                        f"this cycle (config#1151)."),
         ))
 
-    # backtest_vs_live_parity — still genuinely unwired (no producer artifact).
-    components.append(build_metric(
-        name="backtest_vs_live_parity", module=MODULE, metric_type="ratio", criticality="critical",
-        n_floor=1, source_path=f"s3://{bucket}/{prefix}/", implemented=False,
-        na_detail="backtest_vs_live_parity: needs the predictor synthetic-backtest IC vs live L2 IC drift series — not yet persisted.",
-    ))
+    # backtest_vs_live_parity (critical, config#1153 critical-3) — does the
+    # predictor's LIVE rolling skill track what its own leak-free backtest
+    # promised? Two ingredients, both read from the exact keys/fields the
+    # predictor tile already sources (grading/tiles/predictor.py):
+    #   - synthetic-backtest IC: MANIFEST_KEY (predictor/weights/meta/
+    #     manifest.json) :: meta_model_oos_ic_cpcv.mean_ic — the leak-free
+    #     combinatorial-purged-CV walk-forward OOS IC (NOT the in-sample
+    #     l2_ic; see predictor.py's module docstring for why that distinction
+    #     is load-bearing).
+    #   - live IC: LATEST_KEY (predictor/metrics/latest.json) :: ic_30d — a
+    #     30-day rolling Pearson IC of net_signal vs realized canonical_actual,
+    #     written by crucible-backtester's push_predictor_rolling_metrics().
+    #     That producer requires >=10 valid (net_signal, actual) pairs in the
+    #     trailing 30d or leaves ic_30d null (its own _MIN_IC_SAMPLES floor).
+    #
+    # SIGN CONVENTION (not obvious — documented here, not just in a comment
+    # buried in the reason string): drift = ic_30d − meta_model_oos_ic_cpcv,
+    # i.e. LIVE minus BACKTEST-PROMISED.
+    #   - drift <= 0 (live at/below the backtest's own OOS expectation) is the
+    #     ACTIONABLE / bad direction — either the backtest over-promised or
+    #     live skill has decayed post-training. This is what red_line gates.
+    #   - drift > 0 (live matching/beating the backtest's own OOS expectation)
+    #     is healthy; unlike e.g. optimizer_churn there is no "too good" upper
+    #     danger zone for this metric, so higher_is_better=True with no ceiling.
+    #
+    # THRESHOLDS (judgment call — flagging for human sanity-check): mirrors
+    # predictor.py's ensemble_lift_over_best_l1, the codebase's only other
+    # "IC-vs-IC delta" (estimator=ic_delta) precedent, but widens the red-line
+    # band from that component's ±0.01 to target=0.0/red_line=-0.05. Rationale:
+    # ensemble_lift compares two CPCV/walk-forward estimates with comparable N
+    # (tens of purged-CV paths / weekly folds); here ic_30d is a single Pearson
+    # r over a much smaller, noisier live window (as few as 10 pairs), so a
+    # ±0.01 band would trip WATCH/RED on live sampling noise rather than real
+    # degradation. This first-cut band is UNVALIDATED against real drift data
+    # — treat it the way fdr_surface_health's original fixed band was treated
+    # pre-config#2305: expect to recalibrate once live drift observations
+    # accrue, not as an authoritative institutional threshold today.
+    manifest = _get_json(s3, bucket, MANIFEST_KEY)
+    latest = _get_json(s3, bucket, LATEST_KEY)
+    manifest_src = f"s3://{bucket}/{MANIFEST_KEY}"
+    latest_src = f"s3://{bucket}/{LATEST_KEY}"
+    bvlp_src = f"{manifest_src} + {latest_src}"
+
+    cpcv_block = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
+    cpcv_ic = cpcv_block.get("mean_ic") if cpcv_block.get("status") == "ok" else None
+    live_ic = (latest or {}).get("ic_30d")
+    rolling_n = (latest or {}).get("rolling_n")
+
+    if cpcv_ic is not None and live_ic is not None:
+        drift = float(live_ic) - float(cpcv_ic)
+        components.append(build_metric(
+            name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
+            estimator="ic_delta", measurement_horizon="30d_live_vs_cpcv_oos",
+            value=drift, n_samples=rolling_n, n_floor=10, target=0.0, red_line=-0.05,
+            source_path=bvlp_src,
+            reason=(f"backtest_vs_live_parity = {drift:+.3g} (live 30d rolling IC {live_ic:.3g} "
+                    f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.3g}) "
+                    f"vs target 0.0 / red-line -0.05. Negative = live underperforming what the "
+                    f"leak-free backtest promised (config#1153)."),
+            **_tr("backtest_vs_live_parity", drift),
+        ))
+    else:
+        missing = []
+        if manifest is None:
+            missing.append("manifest.json absent")
+        elif cpcv_ic is None:
+            missing.append(f"meta_model_oos_ic_cpcv not ok/absent (status={cpcv_block.get('status')!r})")
+        if latest is None:
+            missing.append("latest.json absent")
+        elif live_ic is None:
+            missing.append("ic_30d null (producer needs >=10 resolved outcomes in the trailing 30d)")
+        components.append(build_metric(
+            name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
+            n_floor=10, target=0.0, red_line=-0.05, source_path=bvlp_src, input_present=False,
+            na_detail=f"backtest_vs_live_parity: {'; '.join(missing)}.",
+            **_tr("backtest_vs_live_parity", None),
+        ))
 
     # walk_forward_stability (supporting, config#1151 Batch C) — do the weekly
     # weight recommendations converge or oscillate? The producer emits
