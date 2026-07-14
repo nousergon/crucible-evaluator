@@ -413,9 +413,15 @@ def build_portfolio_outcome_tile(
 ) -> dict:
     """Build the Portfolio Outcome tile from eod_pnl.csv.
 
-    ``n_trials`` (DSR selection-bias count) is unset for the live book today —
-    DSR therefore emits N/A-NOT-IMPL until a documented cumulative trial count
-    lands (mirrors L4469 W1.3b's deferred trial-count tracking).
+    ``n_trials`` (DSR selection-bias count, config#2454) is read by the
+    caller (``grading/aggregate.py``) from the shared
+    ``nousergon_lib.quant.stats.trial_accumulator`` cumulative counter —
+    incremented by crucible-backtester's 4 sweep producers on every cycle
+    that ran real (non-skipped) trials — and passed in here. DSR emits
+    N/A-NOT-IMPL only when the caller passes ``None`` (e.g. the counter
+    artifact doesn't exist yet / hasn't been backfilled) or 0. Standalone
+    CLI / tests that don't pass ``n_trials`` explicitly get the same
+    pre-#2454 N/A behavior.
 
     ``history`` (config#1836) supplies prior-card values so the critical
     score-vs-return components (sharpe_ratio / alpha_vs_spy / hit_rate_daily)
@@ -584,7 +590,11 @@ def build_portfolio_outcome_tile(
         target=30.0, red_line=90.0, higher_is_better=False, source_path=src,
     ))
 
-    # 12. DSR (supporting) — needs a documented trial count; not yet tracked.
+    # 12. DSR (supporting) — deflated Sharpe, corrected for the
+    #     multiple-testing selection bias of picking the deployed config out
+    #     of n_trials candidates (config#2454). n_trials is the cumulative
+    #     trial count the caller reads from the shared
+    #     nousergon_lib.quant.stats.trial_accumulator counter.
     if n_trials is not None and n_trials >= 1:
         from nousergon_lib.quant.stats.dsr import compute_dsr
         dsr_res = compute_dsr(np.asarray(port), n_trials=n_trials)
@@ -598,7 +608,11 @@ def build_portfolio_outcome_tile(
         components.append(build_metric(
             name="dsr", module=MODULE, metric_type="pct", criticality="supporting",
             n_floor=60, target=0.95, red_line=0.50, source_path=src, implemented=False,
-            na_detail="dsr: needs a documented cumulative strategy-trial count for the live book; tracked under L4469 W1.3b.",
+            na_detail=(
+                "dsr: cumulative trial count unavailable this cycle "
+                "(s3://{bucket}/backtest/cumulative_trial_count.json missing, "
+                "empty, or not yet backfilled — see config#2454)."
+            ).format(bucket=bucket),
         ))
 
     # 13. Regime-weighted alpha (critical) — market-regime decomposition of daily

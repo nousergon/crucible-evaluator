@@ -33,6 +33,7 @@ from grading.artifacts import read_scorecard_inputs
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
 from grading.module_agg import overall_status
+from nousergon_lib.quant.stats.trial_accumulator import read_cumulative_trial_count
 from grading.tiles.agent import build_agent_tile
 from grading.tiles.backtester import build_backtester_tile
 from grading.tiles.behavioral import build_behavioral_tile
@@ -70,6 +71,29 @@ def build_report_card(
     # inside the loader and degrades to empty trends (never blocks the build).
     history = load_card_history(bucket, run_date, s3_client=s3_client)
 
+    # config#2454: DSR (portfolio_outcome's dsr metric) needs the cumulative
+    # count of strategy configurations trialed since inception across ALL
+    # 4 backtester sweep producers (optimizer_param_sweep / gamma_sweep /
+    # cov_estimator_sweep / predictor_param_sweep) — the multiple-testing
+    # correction Bailey & Lopez de Prado's DSR formula deflates the observed
+    # Sharpe by. crucible-backtester increments the shared counter after
+    # each producer's real (non-skipped) cycle; read it here so
+    # build_portfolio_outcome_tile can compute a real dsr value instead of
+    # emitting N/A-NOT-IMPL. Best-effort: an artifact-read failure (e.g. the
+    # counter hasn't been backfilled/seeded yet) degrades to n_trials=None,
+    # which portfolio_outcome.py already treats as its pre-existing N/A path
+    # — never blocks the report-card build.
+    n_trials: int | None = None
+    try:
+        trial_state = read_cumulative_trial_count(bucket, s3_client=s3_client)
+        if trial_state.get("total"):
+            n_trials = int(trial_state["total"])
+    except Exception as exc:  # noqa: BLE001 — advisory read, dsr degrades to N/A
+        logger.warning(
+            "build_report_card: cumulative_trial_count read failed (dsr will "
+            "report N/A this cycle): %s", exc,
+        )
+
     # RC v2 MetricRecord tiles (value + CI + N + status), nested under "tiles".
     # These read their own sources independently of the backtest/{date}/
     # artifacts and land alongside the v1 raw-dict scorecard (research /
@@ -93,7 +117,9 @@ def build_report_card(
     # is no Tile 8. This dict is the membership source of truth (pinned by
     # tests/test_aggregate.py + test_handler.py).
     tiles = {
-        "portfolio_outcome": build_portfolio_outcome_tile(bucket, s3_client=s3_client, history=history),
+        "portfolio_outcome": build_portfolio_outcome_tile(
+            bucket, s3_client=s3_client, history=history, n_trials=n_trials,
+        ),
         "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),

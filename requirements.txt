@@ -31,6 +31,11 @@ pandas~=3.0
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
 # is >=0.10.3 — the extra alone resolves flow-doctor 0.8.x.
 krepis[flow_doctor]>=0.11.2
+# config#2454: grading/aggregate.py imports
+# nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
+# reader) — that module ships in the nousergon-lib PR this evaluator PR is
+# cross-linked to. BUMP THIS PIN to the tag/commit that PR lands as once it
+# merges; v0.93.0 predates the module and this import will fail until then.
 nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.93.0
 
 # Director (Layer C) — single structured Opus call for PLAN GENERATION

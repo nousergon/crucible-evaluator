@@ -118,6 +118,78 @@ class TestBuildReportCard:
         )
 
 
+def _put_eod_pnl(s3):
+    """Seed a minimal-but-sufficient trades/eod_pnl.csv (80 rows clears the
+    dsr/psr n_floor=60) so portfolio_outcome's build path reaches the dsr
+    component instead of short-circuiting the whole tile to N/A on a
+    missing CSV."""
+    s3.put_object(
+        Bucket=BUCKET, Key="trades/eod_pnl.csv",
+        Body=(
+            "date,portfolio_nav,daily_return_pct,spy_return_pct,"
+            "daily_alpha_pct,positions_snapshot,created_at\n"
+            + "\n".join(
+                f"2026-01-{(i % 28) + 1:02d},{1_000_000 * (1 + 0.001 * i):.2f},"
+                f"0.12,0.04,0.08,{{}},2026-01-01T00:00:00+00:00"
+                for i in range(80)
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+class TestCumulativeTrialCountWiring:
+    """config#2454: build_report_card reads the shared cumulative
+    trial-count counter and threads it into portfolio_outcome's dsr
+    metric via n_trials — best-effort, never blocks the card build."""
+
+    def test_dsr_na_when_counter_artifact_absent(self, s3):
+        """No cumulative_trial_count.json yet (counter not seeded/backfilled)
+        → n_trials stays None → dsr keeps reporting N/A, exactly the
+        pre-#2454 behavior. Never an error."""
+        _put_eod_pnl(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        dsr = next(
+            c for c in card["tiles"]["portfolio_outcome"]["components"]
+            if c["name"] == "dsr"
+        )
+        assert dsr["status"] == "N/A-NOT-IMPL"
+
+    def test_dsr_computed_when_counter_seeded(self, s3):
+        """A seeded cumulative_trial_count.json flows through to a real
+        (non-N/A) dsr value."""
+        from nousergon_lib.quant.stats.trial_accumulator import (
+            increment_trial_count,
+        )
+        increment_trial_count(
+            "gamma_sweep", 250, RUN_DATE, bucket=BUCKET, s3_client=s3,
+        )
+        _put_eod_pnl(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        dsr = next(
+            c for c in card["tiles"]["portfolio_outcome"]["components"]
+            if c["name"] == "dsr"
+        )
+        assert dsr["status"] != "N/A-NOT-IMPL"
+        assert dsr["value"] is not None
+
+    def test_counter_read_failure_degrades_gracefully(self, s3, monkeypatch):
+        """A broken/corrupt counter artifact must not fail the whole report-
+        card build — dsr just falls back to N/A this cycle."""
+        _put_eod_pnl(s3)
+        s3.put_object(
+            Bucket=BUCKET, Key="backtest/cumulative_trial_count.json",
+            Body=b"{not valid json",
+        )
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert card is not None
+        dsr = next(
+            c for c in card["tiles"]["portfolio_outcome"]["components"]
+            if c["name"] == "dsr"
+        )
+        assert dsr["status"] == "N/A-NOT-IMPL"
+
+
 class TestWriteReportCard:
     def test_writes_to_evaluator_namespace(self, s3):
         _seed_full(s3)
