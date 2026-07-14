@@ -40,7 +40,6 @@ lambda/package/
 vendor/
 
 # Local docs / scratch
-CLAUDE.md
 *-design-*.md
 *-design.md
 run.log
