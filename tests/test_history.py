@@ -14,7 +14,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from grading.aggregate import build_report_card, report_card_key
+from grading.aggregate import build_report_card, latest_report_card_key, report_card_key
 from grading.history import (
     MAX_HISTORY_CARDS,
     CardHistory,
@@ -65,6 +65,26 @@ class TestCardKeyPattern:
         assert _CARD_KEY_RE.match(report_card_key("2026-07-04"))
         assert not _CARD_KEY_RE.match("evaluator/2026-07-04/other.json")
         assert not _CARD_KEY_RE.match("backtest/2026-07-04/report_card.json")
+
+    def test_regex_does_not_match_the_latest_pointer_key(self):
+        # config-I2556: the standing evaluator/latest/report_card.json pointer
+        # must never be picked up as a dated weekly card instance — it is
+        # continuously overwritten and would corrupt the cross-cycle trend
+        # series (a "week" that is actually today's most-recent build).
+        assert not _CARD_KEY_RE.match(latest_report_card_key())
+
+
+class TestLoadCardHistoryIgnoresLatestPointer:
+    def test_latest_key_present_alongside_dated_cards_is_ignored(self, s3):
+        # config-I2556: the grading handler now writes evaluator/latest/
+        # report_card.json on every non-dry invoke. It must not be listed or
+        # read as a prior weekly card by the history loader.
+        _put_card(s3, "2026-06-27", _card(sharpe=0.7))
+        s3.put_object(Bucket=BUCKET, Key=latest_report_card_key(),
+                      Body=json.dumps(_card(sharpe=999.0)).encode())
+        h = load_card_history(BUCKET, RUN_DATE, s3_client=s3)
+        assert h.n_cards_found == 1
+        assert h.prior_values("portfolio_outcome", "sharpe_ratio") == [0.7]
 
 
 class TestLoadCardHistory:

@@ -173,6 +173,18 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
+    """Read the FROZEN weekly snapshot for this run date.
+
+    config-I2556: the grading Lambda now ALSO maintains a continuously-updated
+    ``evaluator/latest/report_card.json`` pointer that any producer can
+    refresh on its own cadence. This deliberately keeps reading the DATED
+    ``evaluator/{run_date}/report_card.json`` key (never ``latest``) — the
+    Director's advisory input must be the stable card the Saturday
+    ``ReportCard`` state froze for THIS run, not whatever a same-day or
+    later tail-invoke has since overwritten ``latest`` with. No change
+    needed here; this docstring exists so a future edit doesn't "helpfully"
+    repoint this at ``latest``.
+    """
     from botocore.exceptions import ClientError
     key = f"evaluator/{run_date}/report_card.json"
     try:

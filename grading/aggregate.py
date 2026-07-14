@@ -49,6 +49,20 @@ logger = logging.getLogger(__name__)
 REPORT_CARD_PREFIX = "evaluator"
 REPORT_CARD_FILENAME = "report_card.json"
 
+# The standing, continuously-maintained pointer (config-I2556): every
+# non-dry-run invocation of the grading handler overwrites this key with a
+# freshly-rebuilt full card, regardless of the `snapshot` flag. The dated
+# `report_card_key(run_date)` below stays the FROZEN weekly record, written
+# only when `snapshot=True` — the deliberate archival copy OF this standing
+# card, not a second independent build. Deliberately keyed beside the dated
+# convention (`evaluator/latest/report_card.json`, same filename, "latest" in
+# place of the date segment) rather than a flat `evaluator/latest.json`, so it
+# reads as the same namespace/convention as the dated keys. Deliberately NOT a
+# `YYYY-MM-DD`-shaped path segment — `history.py`'s `_CARD_KEY_RE` (dated-only)
+# and its S3 `list_objects_v2` prefix walk must never pick this key up as a
+# weekly card instance (see test_history.py's regression test).
+LATEST_REPORT_CARD_KEY = f"{REPORT_CARD_PREFIX}/latest/{REPORT_CARD_FILENAME}"
+
 # Provenance: the grader source this build instantiates. Bump when scorecard.py
 # is re-synced from the backtester (until the Phase C cutover removes the
 # backtester copy).
@@ -129,23 +143,61 @@ def report_card_key(run_date: str) -> str:
     return f"{REPORT_CARD_PREFIX}/{run_date}/{REPORT_CARD_FILENAME}"
 
 
+def latest_report_card_key() -> str:
+    return LATEST_REPORT_CARD_KEY
+
+
 def write_report_card(
     bucket: str,
     run_date: str,
     scorecard: dict,
     s3_client=None,
-) -> str:
-    """Persist the report card to the evaluator namespace. Returns the S3 key."""
+    *,
+    snapshot: bool = True,
+) -> dict:
+    """Persist the report card (config-I2556: persistent surface + weekly snapshot).
+
+    Always overwrites the standing ``evaluator/latest/report_card.json``
+    pointer with this (full-rebuild) card — the continuously-maintained
+    surface any producer can refresh on its own cadence by tail-invoking the
+    grading Lambda. ``snapshot=True`` ALSO writes the dated
+    ``evaluator/{run_date}/report_card.json`` — the frozen weekly record that
+    ``history.py``'s cross-cycle trend loader and the Director's advisory read
+    (``director/handler.py``) consume; a moving ``latest`` must never leak
+    into either of those (stable-snapshot inputs).
+
+    ``snapshot`` DEFAULT: STAGED BACK-COMPAT per config-I2556. Today's
+    behavior (pre this change) wrote the dated card on every non-dry invoke;
+    keeping the default ``True`` here (mirrored by
+    ``grading.handler.handler``'s ``event.get("snapshot", True)``) preserves
+    that until the nousergon-data callers on
+    ``feat/weekly-sf-advisory-child-and-sunday-zoo`` — which pass the flag
+    explicitly (``True`` for the Saturday advisory-child freeze, ``False`` for
+    the Sunday ModelZoo re-grade tail invoke) — are merged. Do NOT flip this
+    default without that merge landing first (it would otherwise leave a
+    window with no dated weekly snapshot at all).
+
+    Returns ``{"latest_key": str, "dated_key": str | None}`` (``dated_key`` is
+    ``None`` when ``snapshot=False``).
+    """
     s3 = s3_client or boto3.client("s3")
-    key = report_card_key(run_date)
+    body = json.dumps(scorecard, indent=2, default=str).encode("utf-8")
+
+    latest_key = LATEST_REPORT_CARD_KEY
     s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(scorecard, indent=2, default=str).encode("utf-8"),
-        ContentType="application/json",
+        Bucket=bucket, Key=latest_key, Body=body, ContentType="application/json",
     )
-    logger.info("Wrote report card to s3://%s/%s", bucket, key)
-    return key
+    logger.info("Wrote report card to s3://%s/%s (latest)", bucket, latest_key)
+
+    dated_key = None
+    if snapshot:
+        dated_key = report_card_key(run_date)
+        s3.put_object(
+            Bucket=bucket, Key=dated_key, Body=body, ContentType="application/json",
+        )
+        logger.info("Wrote report card to s3://%s/%s (weekly snapshot)", bucket, dated_key)
+
+    return {"latest_key": latest_key, "dated_key": dated_key}
 
 
 def _letters(scorecard: dict) -> dict[str, str]:
@@ -201,7 +253,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build the evaluator report card from S3 artifacts (observe mode).")
     parser.add_argument("--date", required=True, help="run date (ISO, e.g. 2026-06-06)")
     parser.add_argument("--bucket", default="alpha-engine-research", help="S3 bucket")
-    parser.add_argument("--write", action="store_true", help="persist to s3://{bucket}/evaluator/{date}/report_card.json")
+    parser.add_argument("--write", action="store_true", help="persist to the evaluator namespace (always overwrites evaluator/latest/report_card.json)")
+    parser.add_argument("--no-snapshot", dest="snapshot", action="store_false", default=True,
+                         help="with --write: skip the dated evaluator/{date}/report_card.json weekly snapshot (writes latest only)")
     parser.add_argument("--compare", action="store_true", help="diff letter grades vs the backtester's grading.json")
     args = parser.parse_args(argv)
 
@@ -216,8 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(parity, indent=2, default=str))
 
     if args.write:
-        key = write_report_card(args.bucket, args.date, scorecard)
-        print(f"\nWrote s3://{args.bucket}/{key}")
+        written = write_report_card(args.bucket, args.date, scorecard, snapshot=args.snapshot)
+        print(f"\nWrote s3://{args.bucket}/{written['latest_key']} (latest)")
+        if written["dated_key"]:
+            print(f"Wrote s3://{args.bucket}/{written['dated_key']} (weekly snapshot)")
 
     return 0
 
