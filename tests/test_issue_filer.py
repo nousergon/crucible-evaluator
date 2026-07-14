@@ -15,17 +15,17 @@ from director import issue_filer as IF
 from director.schema import ActionItem, DirectorWeeklyActionPlan
 
 
-def _item(slug: str, *, priority="P1", owner="research", title=None) -> ActionItem:
+def _item(slug: str, *, priority="P1", owner="research", title=None, evidence=None, confidence=70) -> ActionItem:
     return ActionItem(
         id=slug,
         title=title or f"Do the thing {slug}",
         rationale=f"Because metric X is bad for {slug}",
-        evidence=["metrics.json::sharpe_ratio", "research_tile"],
+        evidence=evidence if evidence is not None else ["metrics.json::sharpe_ratio", "research_tile"],
         proposed_owner=owner,
         priority=priority,
         horizon="this_week",
         suggested_change_type="investigation",
-        confidence=70,
+        confidence=confidence,
     )
 
 
@@ -218,3 +218,129 @@ def test_recently_closed_digest_skips_prs_and_handles_bad_date():
     assert digest == ""               # only a PR present → nothing
     # Unparseable run_date → empty digest, no raise (best-effort).
     assert IF.recently_closed_proposals_digest("r/x", "tok", run_date="not-a-date", gh_request=gh) == ""
+
+
+# ── parse_evidence_from_body / find_reconfirm_match ──────────────────────────
+
+
+def _closed_proposal(number, evidence, *, closed_at="2026-06-24T00:00:00Z", title="[director] prior (id=old-slug)"):
+    """A structured closed-issue dict carrying a rendered ``## Evidence`` section,
+    as ``fetch_recently_closed_proposals``/``FakeGitHub`` would return it."""
+    _, body = IF.render_issue(_item("old-slug", evidence=evidence), "2026-06-01")
+    return {"number": number, "title": title, "body": body, "closed_at": closed_at}
+
+
+def test_parse_evidence_from_body_recovers_rendered_evidence():
+    _, body = IF.render_issue(_item("x", evidence=["a::b", "tile_c"]), "2026-06-01")
+    assert IF.parse_evidence_from_body(body) == {"a::b", "tile_c"}
+
+
+def test_parse_evidence_from_body_empty_on_no_section_or_placeholder():
+    assert IF.parse_evidence_from_body("") == set()
+    assert IF.parse_evidence_from_body("no evidence heading here") == set()
+    _, body = IF.render_issue(_item("x", evidence=[]), "2026-06-01")
+    assert IF.parse_evidence_from_body(body) == set()  # "see report card" placeholder
+
+
+def test_find_reconfirm_match_on_evidence_overlap():
+    prior = _closed_proposal(1168, ["metrics.json::cio_selection_skill", "metrics.json::research_composite_ic"])
+    new_item = _item("validate-reliability-low-research-metrics",
+                      evidence=["metrics.json::cio_selection_skill", "metrics.json::research_composite_ic"])
+    matches = IF.find_reconfirm_match(new_item, [prior])
+    assert matches == [prior]
+
+
+def test_find_reconfirm_match_no_match_on_disjoint_evidence():
+    prior = _closed_proposal(1168, ["metrics.json::unrelated_metric"])
+    new_item = _item("fresh", evidence=["metrics.json::cio_selection_skill"])
+    assert IF.find_reconfirm_match(new_item, [prior]) == []
+
+
+def test_find_reconfirm_match_no_evidence_never_matches():
+    prior = _closed_proposal(1168, ["metrics.json::cio_selection_skill"])
+    new_item = _item("no-evidence", evidence=[])
+    assert IF.find_reconfirm_match(new_item, [prior]) == []
+
+
+# ── render_reconfirm_issue ────────────────────────────────────────────────────
+
+
+def test_render_reconfirm_issue_links_prior_and_caps_priority_confidence():
+    item = _item("validate-reliability-low-research-metrics", priority="P1", confidence=80,
+                  evidence=["metrics.json::cio_selection_skill"])
+    prior = [{"number": 1061, "closed_at": "2026-06-14T00:00:00Z", "title": "[director] first pass"},
+             {"number": 1168, "closed_at": "2026-06-24T00:00:00Z", "title": "[director] second pass"}]
+    title, body, priority = IF.render_reconfirm_issue(item, "2026-07-03", prior)
+    assert "Re-confirm" in title
+    assert "id=validate-reliability-low-research-metrics" in title
+    assert "#1061" in title and "#1168" in title
+    assert priority == "P2"  # capped, P1 -> P2
+    assert "#1061" in body and "#1168" in body
+    assert "Confidence:** 50/100" in body  # 80 - 30
+    assert "reconfirm_of=#1061, #1168" in body
+
+
+def test_render_reconfirm_issue_caps_confidence_at_floor():
+    item = _item("x", confidence=20)
+    title, body, priority = IF.render_reconfirm_issue(item, "2026-07-03", [{"number": 1}])
+    assert "Confidence:** 10/100" in body  # floor, not negative
+
+
+def test_render_reconfirm_issue_never_escalates_p2_p3():
+    for original in ("P2", "P3"):
+        item = _item("x", priority=original)
+        _, _, priority = IF.render_reconfirm_issue(item, "2026-07-03", [{"number": 1}])
+        assert priority == original
+
+
+# ── file_director_issues: end-to-end re-confirm dedup (config#2307) ─────────
+
+
+def test_file_issues_reconfirms_instead_of_fresh_p1_for_prior_closed_evidence():
+    """Regression test for config#2307: simulate the exact failure mode that let
+    config#1639 re-file as a NEW P1 investigation of the same metric pair
+    config#1061 (closed 2026-06-14) and config#1168 (closed 2026-06-24) already
+    validated twice as 'noisy but sound, no action'. The new item's slug is
+    DELIBERATELY DIFFERENT from any prior slug (the LLM names slugs freely) so
+    the exact-slug idempotency skip alone would NOT catch it — only the
+    evidence-overlap check does. Assert the Director does NOT file a fresh P1;
+    it must file the lower-confidence re-confirm variant referencing #1168."""
+    prior_evidence = ["metrics.json::cio_selection_skill", "metrics.json::research_composite_ic"]
+    gh = FakeGitHub(closed=[_closed_proposal(1168, prior_evidence, closed_at="2026-06-24T00:00:00Z",
+                                              title="[director] Validate reliability-LOW cio_selection_skill + "
+                                                    "research_composite_ic (id=validate-cio-selection-skill-metric)")])
+    new_item = _item(
+        "validate-reliability-low-research-metrics",  # NEW slug, distinct from the #1168 slug
+        priority="P1", confidence=75, evidence=prior_evidence,
+    )
+    plan = DirectorWeeklyActionPlan(
+        run_date="2026-07-03", system_summary="x", top_risks=["r"], action_items=[new_item],
+    )
+    res = IF.file_director_issues(plan, "2026-07-03", token="tok", gh_request=gh)
+
+    assert res["status"] == "ok"
+    assert res["n_filed"] == 1
+    assert len(gh.posted) == 1
+    posted = gh.posted[0]
+    # NOT filed at the original suggested P1 — capped to P2 as a re-confirm.
+    assert posted["labels"] == ["area:director-proposals", "P2"]
+    assert "Re-confirm" in posted["title"]
+    assert "#1168" in posted["title"]
+    assert "#1168" in posted["body"]
+    assert res["issues"][0]["reconfirm_of"] == [1168]
+
+
+def test_file_issues_files_fresh_p1_when_no_prior_closed_evidence_matches():
+    # sanity check: an item with genuinely new evidence still files at full priority.
+    gh = FakeGitHub(closed=[_closed_proposal(1168, ["metrics.json::unrelated_metric"])])
+    new_item = _item("brand-new-investigation", priority="P1",
+                      evidence=["metrics.json::totally_different_metric"])
+    plan = DirectorWeeklyActionPlan(
+        run_date="2026-07-03", system_summary="x", top_risks=["r"], action_items=[new_item],
+    )
+    res = IF.file_director_issues(plan, "2026-07-03", token="tok", gh_request=gh)
+    assert res["status"] == "ok"
+    posted = gh.posted[0]
+    assert posted["labels"] == ["area:director-proposals", "P1"]
+    assert "Re-confirm" not in posted["title"]
+    assert res["issues"][0]["reconfirm_of"] == []
