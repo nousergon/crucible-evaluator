@@ -221,6 +221,23 @@ class TestHandler:
         assert out["director_issues"] == "skipped"
         assert out["director_issues_reason"] == "no token configured"
 
+    def test_check_deploy_drift_dispatches_before_enabled_flag(self, monkeypatch):
+        # config#2348: the drift probe must run even when DIRECTOR_ENABLED is
+        # off (the default) — a dormant-but-stale image is still stale.
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(
+            dd, "check_deploy_drift",
+            lambda *, function_name: {"has_drift": True, "function_name": function_name},
+        )
+
+        class _Ctx:
+            function_name = "alpha-engine-evaluator-director"
+
+        out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
+        assert out == {"has_drift": True, "function_name": "alpha-engine-evaluator-director"}
+
     def test_issues_filed_when_token_present(self, s3, monkeypatch):
         # Phase H (repointed): with a PAT, the handler files area:director-proposals
         # issues and threads the live open-issue backlog digest into the plan build.
