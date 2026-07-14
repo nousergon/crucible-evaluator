@@ -7,8 +7,10 @@ import pytest
 from moto import mock_aws
 
 from grading.aggregate import (
+    LATEST_REPORT_CARD_KEY,
     build_report_card,
     compare_to_backtester,
+    latest_report_card_key,
     report_card_key,
     write_report_card,
 )
@@ -117,22 +119,55 @@ class TestBuildReportCard:
             "GREEN", "WATCH", "RED", "N/A-NOT-RUN",
         )
 
-
-class TestWriteReportCard:
-    def test_writes_to_evaluator_namespace(self, s3):
+    def test_tiles_carry_per_tile_freshness_stamps(self, s3):
+        # config-I2556: every tile carries as_of + source_artifact_dates.
         _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        key = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3)
-        assert key == f"evaluator/{RUN_DATE}/report_card.json"
+        for name, tile in card["tiles"].items():
+            assert "as_of" in tile and tile["as_of"], f"{name} missing as_of"
+            assert "source_artifact_dates" in tile
+            assert isinstance(tile["source_artifact_dates"], list)
+        # research reads dated backtest/{RUN_DATE}/*.json artifacts seeded
+        # above → its source_artifact_dates should surface that real date.
+        assert RUN_DATE in card["tiles"]["research"]["source_artifact_dates"]
+
+
+class TestWriteReportCard:
+    def test_writes_latest_and_dated_by_default(self, s3):
+        # config-I2556 staged back-compat default: snapshot defaults True, so
+        # today's behavior (dated card on every non-dry write) is preserved,
+        # AND the new standing `latest` pointer is now also written.
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3)
+        assert written["dated_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert written["latest_key"] == "evaluator/latest/report_card.json"
         # Does NOT clobber the backtester's grading.json namespace.
-        assert key != f"backtest/{RUN_DATE}/grading.json"
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        roundtrip = json.loads(obj["Body"].read())
-        assert roundtrip["status"] == card["status"]
-        assert roundtrip["overall"]["letter"] == card["overall"]["letter"]
+        assert written["dated_key"] != f"backtest/{RUN_DATE}/grading.json"
+        for key in (written["dated_key"], written["latest_key"]):
+            obj = s3.get_object(Bucket=BUCKET, Key=key)
+            roundtrip = json.loads(obj["Body"].read())
+            assert roundtrip["status"] == card["status"]
+            assert roundtrip["overall"]["letter"] == card["overall"]["letter"]
+
+    def test_snapshot_false_writes_latest_only(self, s3):
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=False)
+        assert written["dated_key"] is None
+        assert written["latest_key"] == "evaluator/latest/report_card.json"
+        # latest was written...
+        s3.get_object(Bucket=BUCKET, Key=written["latest_key"])
+        # ...but the dated weekly key was NOT.
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
+        assert listing.get("KeyCount", 0) == 0
 
     def test_report_card_key_helper(self):
         assert report_card_key("2026-01-02") == "evaluator/2026-01-02/report_card.json"
+
+    def test_latest_report_card_key_helper(self):
+        assert latest_report_card_key() == "evaluator/latest/report_card.json"
+        assert LATEST_REPORT_CARD_KEY == "evaluator/latest/report_card.json"
 
 
 class TestCompareToBacktester:

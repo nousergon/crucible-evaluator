@@ -76,7 +76,11 @@ _ACCESS_SITE_RE = re.compile(
 EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "director/carryover.py": 2,
     "director/handler.py": 7,
-    "grading/aggregate.py": 2,
+    # config-I2556: write_report_card gained a second put_object (the standing
+    # evaluator/latest/report_card.json pointer) alongside the existing dated
+    # snapshot write -- same "evaluator" prefix, already granted readwrite;
+    # no contract/IAM change, just a pin bump.
+    "grading/aggregate.py": 3,
     "grading/artifacts.py": 1,
     "grading/history.py": 2,
     "grading/producers/deploy_success.py": 1,

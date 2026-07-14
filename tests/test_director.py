@@ -207,6 +207,29 @@ class TestHandler:
         assert written["run_date"] == RUN_DATE
         assert out["ledger_size"] == 1
 
+    def test_reads_dated_snapshot_not_latest_pointer(self, s3, monkeypatch):
+        # config-I2556: the grading Lambda now ALSO maintains a continuously
+        # updated evaluator/latest/report_card.json. Seed it with DIFFERENT
+        # content than the dated snapshot and confirm the Director's plan is
+        # built from the dated (frozen) card, never the moving latest one.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        stale_latest = {**_CARD, "tiles_overall_status": "GREEN"}
+        s3.put_object(Bucket=BUCKET, Key="evaluator/latest/report_card.json",
+                      Body=json.dumps(stale_latest).encode())
+        from director import handler as H
+        captured = {}
+
+        def _fake_build(card, **kw):
+            captured["card"] = card
+            return _plan()
+
+        monkeypatch.setattr(H, "build_action_plan", _fake_build)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert captured["card"]["tiles_overall_status"] == "RED"  # the dated card, not "GREEN"
+
     def test_issue_filing_skipped_when_no_token(self, s3, monkeypatch):
         # Phase H (repointed): no PAT configured → the issue channel records a
         # skip (no silent swallow) and the plan still writes. Non-fatal advisory.

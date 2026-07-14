@@ -71,24 +71,68 @@ class TestHandler:
         assert out["status"] == "ok"
         assert out["run_date"] == RUN_DATE
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        # config-I2556: latest.json convention key + resolved snapshot flag,
+        # additive on the summary.
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
+        assert out["snapshot"] is True
         # all 9 tiles present in the per-tile status map.
         assert set(out["tile_status"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
             "backtester", "substrate", "agent", "behavioral", "director_quality",
         }
         assert out["tiles_overall_status"] in ("GREEN", "WATCH", "RED", "N/A-NOT-RUN")
-        # the written object round-trips.
-        obj = s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])
-        card = json.loads(obj["Body"].read())
-        assert card["tiles_overall_status"] == out["tiles_overall_status"]
+        # both written objects round-trip.
+        for key in (out["report_card_key"], out["latest_key"]):
+            obj = s3.get_object(Bucket=BUCKET, Key=key)
+            card = json.loads(obj["Body"].read())
+            assert card["tiles_overall_status"] == out["tiles_overall_status"]
 
     def test_no_write_skips_persist(self, s3):
         _seed_eod(s3)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False})
         assert out["report_card_key"] is None
-        # nothing written under evaluator/.
+        assert out["latest_key"] is None
+        # nothing written under evaluator/ at all (neither dated nor latest).
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="evaluator/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_true_writes_dated_key(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["snapshot"] is True
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])  # exists
+
+    def test_snapshot_false_skips_dated_key_writes_latest_only(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": False})
+        assert out["snapshot"] is False
+        assert out["report_card_key"] is None
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
+        s3.get_object(Bucket=BUCKET, Key=out["latest_key"])  # latest exists
+        # the dated weekly key was NOT written.
         listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
         assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_absent_defaults_true_back_compat(self, s3):
+        # config-I2556 staged back-compat: an absent flag must preserve
+        # today's behavior (dated card written on every non-dry invoke) until
+        # the nousergon-data callers passing the flag explicitly are merged.
+        _seed_eod(s3)
+        event = {"date": RUN_DATE, "bucket": BUCKET}
+        assert "snapshot" not in event  # sanity: no explicit flag passed
+        out = H.handler(event)
+        assert out["snapshot"] is True
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+
+    def test_latest_written_every_non_dry_invoke_regardless_of_snapshot(self, s3):
+        # config-I2556 core behavior: `latest` is refreshed on EVERY non-dry
+        # invocation, whether or not this cycle also freezes a dated snapshot.
+        _seed_eod(s3)
+        for snap in (True, False):
+            out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": snap})
+            assert out["latest_key"] == "evaluator/latest/report_card.json"
+            s3.get_object(Bucket=BUCKET, Key=out["latest_key"])
 
     def test_real_graded_counts_present(self, s3):
         _seed_eod(s3)

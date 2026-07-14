@@ -104,9 +104,25 @@ def handler(event: dict | None = None, context=None) -> dict:
     dry_run = bool(event.get("dry_run", False))
     write = event.get("write", not dry_run)
 
+    # `snapshot` (config-I2556): the evaluator report card is now a PERSISTENT
+    # surface — every non-dry invocation rebuilds the full card and overwrites
+    # the standing `evaluator/latest/report_card.json` pointer (see
+    # write_report_card). `snapshot=True` ALSO freezes the dated
+    # `evaluator/{run_date}/report_card.json` weekly record.
+    #
+    # STAGED BACK-COMPAT DEFAULT — do NOT flip without the merge below: today's
+    # (pre-config-I2556) behavior wrote the dated card on every non-dry
+    # invoke, so an absent flag must preserve that until the nousergon-data
+    # callers on `feat/weekly-sf-advisory-child-and-sunday-zoo` — which pass
+    # this flag explicitly (True for the Saturday advisory-child freeze, False
+    # for the Sunday ModelZoo re-grade tail invoke) — are merged. Flip this
+    # default to False ONLY after that PR lands; flipping earlier would leave
+    # a window where no dated weekly snapshot is written at all.
+    snapshot = bool(event.get("snapshot", True))
+
     logger.info(
-        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s)",
-        run_date, bucket, write, dry_run,
+        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s)",
+        run_date, bucket, write, dry_run, snapshot,
     )
     card = build_report_card(bucket, run_date)
 
@@ -117,9 +133,12 @@ def handler(event: dict | None = None, context=None) -> dict:
         for name, t in tiles.items()
     }
 
-    key = None
+    latest_key = None
+    dated_key = None
     if write:
-        key = write_report_card(bucket, run_date, card)
+        written = write_report_card(bucket, run_date, card, snapshot=snapshot)
+        latest_key = written["latest_key"]
+        dated_key = written["dated_key"]
 
     summary = {
         "status": "ok",
@@ -129,7 +148,9 @@ def handler(event: dict | None = None, context=None) -> dict:
         "tiles_overall_status": card.get("tiles_overall_status"),
         "tile_status": tile_status,
         "real_graded": real_graded,
-        "report_card_key": key,
+        "report_card_key": dated_key,
+        "latest_key": latest_key,
+        "snapshot": snapshot,
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),
     }
     logger.info(
@@ -147,9 +168,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover
     parser.add_argument("--date", default=None)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--no-write", action="store_true")
+    parser.add_argument("--no-snapshot", action="store_true",
+                         help="skip the dated weekly snapshot; refresh evaluator/latest/report_card.json only")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    out = handler({"date": args.date, "bucket": args.bucket, "write": not args.no_write})
+    out = handler({
+        "date": args.date, "bucket": args.bucket, "write": not args.no_write,
+        "snapshot": not args.no_snapshot,
+    })
     print(json.dumps(out, indent=2, default=str))
     return 0
 

@@ -117,6 +117,66 @@ class TestBuildTile:
         assert isinstance(tile["components"][0], dict)
         assert tile["components"][0]["name"]
 
+    def test_empty_components_still_gets_as_of(self):
+        # No components (e.g. a wholly-unwired tile) → as_of falls back to
+        # "now" rather than being absent.
+        tile = build_tile("agent", [])
+        assert tile["as_of"]
+        assert tile["source_artifact_dates"] == []
+
+
+class TestBuildTileFreshnessStamps:
+    """config-I2556: per-tile as_of + source_artifact_dates."""
+
+    def test_as_of_is_max_component_timestamp(self):
+        older = _crit("GREEN")
+        older.last_updated_utc = older.last_updated_utc.replace(year=2020)
+        newer = _sup("GREEN")
+        tile = build_tile("m", [older, newer])
+        # as_of reflects the freshest (newer) component, not the older one.
+        assert tile["as_of"] == newer.last_updated_utc.isoformat().replace("+00:00", "Z")
+
+    def test_source_artifact_dates_mined_from_dated_source_path(self):
+        c = build_metric(
+            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
+            source_path="s3://bucket/backtest/2026-06-05/e2e_lift.json",
+            status="GREEN", reason="x",
+        )
+        tile = build_tile("research", [c])
+        assert tile["source_artifact_dates"] == ["2026-06-05"]
+
+    def test_multiple_dates_deduped_and_sorted(self):
+        c1 = build_metric(
+            name="a", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
+            source_path="s3://bucket/backtest/2026-06-07/x.json", status="GREEN", reason="x",
+        )
+        c2 = build_metric(
+            name="b", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
+            source_path="s3://bucket/backtest/2026-06-05/y.json", status="GREEN", reason="x",
+        )
+        c3 = build_metric(
+            name="c", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
+            source_path="s3://bucket/backtest/2026-06-05/z.json", status="GREEN", reason="x",
+        )
+        tile = build_tile("research", [c1, c2, c3])
+        assert tile["source_artifact_dates"] == ["2026-06-05", "2026-06-07"]
+
+    def test_undated_source_path_contributes_no_date(self):
+        # A "latest" pointer artifact (no embedded date) is an honest gap, not
+        # a fabricated attribution.
+        c = build_metric(
+            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
+            source_path="s3://bucket/predictor/metrics/latest.json",
+            status="GREEN", reason="x",
+        )
+        tile = build_tile("predictor", [c])
+        assert tile["source_artifact_dates"] == []
+
 
 class TestOverallStatusTrustBattery:
     """Gap-closers from the config#1958 trust battery (2026-07-08)."""
