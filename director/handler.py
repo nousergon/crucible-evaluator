@@ -333,8 +333,21 @@ def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
 
 
 def handler(event: dict | None = None, context=None) -> dict:
-    """Build + persist the weekly Director action plan (flag-gated)."""
+    """Build + persist the weekly Director action plan (flag-gated).
+
+    ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
+    Step Function gate — checked BEFORE the ``DIRECTOR_ENABLED`` flag (the
+    drift probe must run regardless of whether the Director itself is
+    active, since a dormant-but-stale Director Lambda is still the thing an
+    operator will flip on later). Compares this Lambda's baked image SHA
+    against ``origin/main`` HEAD; see ``grading/deploy_drift.py`` (shared
+    with the grading Lambda — same image, same stamp file).
+    """
     event = event or {}
+    if event.get("action") == "check_deploy_drift":
+        from grading.deploy_drift import _resolve_function_name, check_deploy_drift
+        return check_deploy_drift(function_name=_resolve_function_name(context))
+
     if not _enabled():
         logger.info("Director disabled (DIRECTOR_ENABLED off) — no-op.")
         return {"status": "disabled", "reason": "DIRECTOR_ENABLED is off"}

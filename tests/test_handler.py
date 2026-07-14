@@ -116,3 +116,37 @@ class TestHandler:
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True})
         assert out["dry_run"] is True
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+
+
+class TestCheckDeployDriftDispatch:
+    """config#2348: action=check_deploy_drift short-circuits BEFORE the normal
+    report-card build path — no S3/bucket resolution, no tile compute."""
+
+    def test_dispatches_to_deploy_drift_probe(self, monkeypatch):
+        captured = {}
+
+        def _fake_check_deploy_drift(*, function_name):
+            captured["function_name"] = function_name
+            return {"has_drift": False, "function_name": function_name}
+
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", _fake_check_deploy_drift)
+
+        class _Ctx:
+            function_name = "alpha-engine-evaluator"
+
+        out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
+        assert out == {"has_drift": False, "function_name": "alpha-engine-evaluator"}
+        assert captured["function_name"] == "alpha-engine-evaluator"
+
+    def test_does_not_touch_bucket_or_s3(self, monkeypatch):
+        # No S3 client/bucket resolution should occur — this must be a pure,
+        # pre-boot gate. Deliberately don't provide the `s3` fixture / moto
+        # mock_aws context; a real boto3 call here would error/hang.
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(
+            dd, "check_deploy_drift",
+            lambda *, function_name: {"has_drift": False, "function_name": function_name},
+        )
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+        assert out["has_drift"] is False

@@ -83,8 +83,17 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     Returns a compact summary (the SF state output): overall status, per-tile
     statuses, real-graded coverage, and the S3 key written.
+
+    ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
+    Step Function gate: compares this Lambda's baked image SHA against
+    ``origin/main`` HEAD and returns immediately — no report-card build, no
+    S3 reads beyond the local stamp file. See ``grading/deploy_drift.py``.
     """
     event = event or {}
+    if event.get("action") == "check_deploy_drift":
+        from grading.deploy_drift import _resolve_function_name, check_deploy_drift
+        return check_deploy_drift(function_name=_resolve_function_name(context))
+
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
     run_date = _resolve_run_date(event)
     # dry_run = the Friday-PM Preflight Pipeline (SF passes dry_run=$.research_dry,

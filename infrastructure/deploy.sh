@@ -23,8 +23,17 @@ ECR_REPO="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${FUNCTION}"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# config#2348: stamp the image with the commit it's built from (CI uses
+# $GITHUB_SHA; local dev falls back to the checked-out HEAD) so the weekly
+# SF's Lambda-SHA drift probe can compare it against origin/main. Mirrors
+# crucible-predictor/infrastructure/deploy.sh's GIT_SHA stamping exactly.
+GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+echo "  Stamping image with GIT_SHA=${GIT_SHA}"
+
 echo "=== Building $FUNCTION image (linux/amd64) ==="
-docker build --platform linux/amd64 --provenance=false -t "$FUNCTION:latest" .
+docker build --platform linux/amd64 --provenance=false \
+  --build-arg "GIT_SHA=${GIT_SHA}" \
+  -t "$FUNCTION:latest" .
 
 echo "=== ECR login + ensure repo ==="
 aws ecr get-login-password --region "$REGION" | \

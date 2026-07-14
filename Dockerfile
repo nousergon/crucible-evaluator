@@ -5,6 +5,16 @@ FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 # manager. Mirrors the research/predictor Lambda images.
 RUN microdnf install -y git && microdnf clean all
 
+# config#2348: stamp the image with the commit it was built from, so the
+# weekly SF's new Lambda-SHA drift probe (grading/deploy_drift.py,
+# nousergon_lib.preflight._fetch_origin_main_sha) can compare this against
+# origin/main HEAD and catch a failed/skipped post-merge deploy leaving
+# :live behind main. `--build-arg GIT_SHA=<sha>` (CI uses $GITHUB_SHA; local
+# dev via infrastructure/deploy.sh defaults to `git rev-parse HEAD`).
+# Mirrors crucible-predictor's Dockerfile stamping convention exactly.
+ARG GIT_SHA=unknown
+RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt
+
 # Dependencies. nousergon-lib is installed in its own layer (ahead of the
 # rest of requirements.txt) purely so the slow git+https clone/build gets its
 # own Docker cache layer, invalidated only when requirements.txt's
