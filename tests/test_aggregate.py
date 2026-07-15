@@ -133,13 +133,25 @@ class TestBuildReportCard:
 
 
 class TestWriteReportCard:
-    def test_writes_latest_and_dated_by_default(self, s3):
-        # config-I2556 staged back-compat default: snapshot defaults True, so
-        # today's behavior (dated card on every non-dry write) is preserved,
-        # AND the new standing `latest` pointer is now also written.
+    def test_writes_latest_only_by_default(self, s3):
+        # config-I2556: snapshot defaults False — an absent flag refreshes the
+        # standing `latest` pointer only; production callers (the Saturday
+        # advisory-child freeze, the Sunday ModelZoo re-grade) both pass the
+        # flag explicitly (nousergon-data PR #832, merged 2026-07-14).
         _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3)
+        assert written["dated_key"] is None
+        assert written["latest_key"] == "evaluator/latest/report_card.json"
+        obj = s3.get_object(Bucket=BUCKET, Key=written["latest_key"])
+        roundtrip = json.loads(obj["Body"].read())
+        assert roundtrip["status"] == card["status"]
+        assert roundtrip["overall"]["letter"] == card["overall"]["letter"]
+
+    def test_writes_latest_and_dated_when_snapshot_true(self, s3):
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=True)
         assert written["dated_key"] == f"evaluator/{RUN_DATE}/report_card.json"
         assert written["latest_key"] == "evaluator/latest/report_card.json"
         # Does NOT clobber the backtester's grading.json namespace.

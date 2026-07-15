@@ -153,7 +153,7 @@ def write_report_card(
     scorecard: dict,
     s3_client=None,
     *,
-    snapshot: bool = True,
+    snapshot: bool = False,
 ) -> dict:
     """Persist the report card (config-I2556: persistent surface + weekly snapshot).
 
@@ -166,16 +166,15 @@ def write_report_card(
     (``director/handler.py``) consume; a moving ``latest`` must never leak
     into either of those (stable-snapshot inputs).
 
-    ``snapshot`` DEFAULT: STAGED BACK-COMPAT per config-I2556. Today's
-    behavior (pre this change) wrote the dated card on every non-dry invoke;
-    keeping the default ``True`` here (mirrored by
-    ``grading.handler.handler``'s ``event.get("snapshot", True)``) preserves
-    that until the nousergon-data callers on
-    ``feat/weekly-sf-advisory-child-and-sunday-zoo`` — which pass the flag
-    explicitly (``True`` for the Saturday advisory-child freeze, ``False`` for
-    the Sunday ModelZoo re-grade tail invoke) — are merged. Do NOT flip this
-    default without that merge landing first (it would otherwise leave a
-    window with no dated weekly snapshot at all).
+    ``snapshot`` DEFAULT: ``False`` (mirrored by ``grading.handler.handler``'s
+    ``event.get("snapshot", False)``). ``feat/weekly-sf-advisory-child-and-
+    sunday-zoo`` (nousergon-data PR #832) merged 2026-07-14 — both production
+    callers now pass this flag explicitly (``True`` for the Saturday
+    advisory-child freeze, ``False`` for the Sunday ModelZoo re-grade tail
+    invoke), so an absent flag no longer needs to preserve the old
+    always-dated behavior; it now means "refresh latest only," the correct
+    default for the persistent-surface model where a frozen weekly snapshot
+    is the deliberate exception.
 
     Returns ``{"latest_key": str, "dated_key": str | None}`` (``dated_key`` is
     ``None`` when ``snapshot=False``).
