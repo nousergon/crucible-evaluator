@@ -110,15 +110,16 @@ def handler(event: dict | None = None, context=None) -> dict:
     # write_report_card). `snapshot=True` ALSO freezes the dated
     # `evaluator/{run_date}/report_card.json` weekly record.
     #
-    # STAGED BACK-COMPAT DEFAULT — do NOT flip without the merge below: today's
-    # (pre-config-I2556) behavior wrote the dated card on every non-dry
-    # invoke, so an absent flag must preserve that until the nousergon-data
-    # callers on `feat/weekly-sf-advisory-child-and-sunday-zoo` — which pass
-    # this flag explicitly (True for the Saturday advisory-child freeze, False
-    # for the Sunday ModelZoo re-grade tail invoke) — are merged. Flip this
-    # default to False ONLY after that PR lands; flipping earlier would leave
-    # a window where no dated weekly snapshot is written at all.
-    snapshot = bool(event.get("snapshot", True))
+    # Default is False: `feat/weekly-sf-advisory-child-and-sunday-zoo`
+    # (nousergon-data PR #832) merged 2026-07-14 and both production callers
+    # now pass this flag explicitly — the Saturday advisory-child `ReportCard`
+    # state (`infrastructure/step_function_advisory.json`) passes `true` for
+    # the weekly freeze; the Sunday ModelZoo `GradingLambdaReGrade` state
+    # (`infrastructure/step_function_modelzoo.json`) passes `false` for the
+    # re-grade-only tail invoke. An absent flag now means "refresh latest
+    # only" — the honest default for the persistent-surface model, where a
+    # frozen weekly snapshot is the deliberate exception, not the norm.
+    snapshot = bool(event.get("snapshot", False))
 
     logger.info(
         "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s)",
