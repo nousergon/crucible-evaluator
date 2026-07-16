@@ -11,9 +11,16 @@ notify:
   - type: s3
     bucket: alpha-engine-research
     subsystem: evaluator
+# DynamoDB, not ephemeral /tmp SQLite: this Lambda's /tmp is wiped between
+# separate invocations (and never shared across concurrent ones), so a
+# sqlite file here can't durably track state -- dedup_cooldown_minutes below
+# would silently never suppress a repeat alert (alpha-engine-config#2418;
+# already bit nousergon-data once). DynamoDB persists across invocations so
+# the cooldown actually works.
 store:
-  type: sqlite
-  path: /tmp/flow_doctor.db
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
 dedup_cooldown_minutes: 60
 dependencies: []
 rate_limits:
