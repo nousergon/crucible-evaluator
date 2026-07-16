@@ -67,7 +67,7 @@ class TestResolveRunDate:
 class TestHandler:
     def test_writes_report_card_and_returns_summary(self, s3):
         _seed_eod(s3)
-        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
         assert out["status"] == "ok"
         assert out["run_date"] == RUN_DATE
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
@@ -114,16 +114,18 @@ class TestHandler:
         listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
         assert listing.get("KeyCount", 0) == 0
 
-    def test_snapshot_absent_defaults_true_back_compat(self, s3):
-        # config-I2556 staged back-compat: an absent flag must preserve
-        # today's behavior (dated card written on every non-dry invoke) until
-        # the nousergon-data callers passing the flag explicitly are merged.
+    def test_snapshot_absent_defaults_false(self, s3):
+        # config-I2556: nousergon-data PR #832 (both the Saturday advisory-child
+        # freeze and the Sunday ModelZoo re-grade tail invoke) merged
+        # 2026-07-14 and passes this flag explicitly, so an absent flag now
+        # means "refresh latest only" — no dated weekly snapshot.
         _seed_eod(s3)
         event = {"date": RUN_DATE, "bucket": BUCKET}
         assert "snapshot" not in event  # sanity: no explicit flag passed
         out = H.handler(event)
-        assert out["snapshot"] is True
-        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert out["snapshot"] is False
+        assert out["report_card_key"] is None
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
 
     def test_latest_written_every_non_dry_invoke_regardless_of_snapshot(self, s3):
         # config-I2556 core behavior: `latest` is refreshed on EVERY non-dry
@@ -157,7 +159,10 @@ class TestHandler:
     def test_explicit_write_overrides_dry_run(self, s3):
         # Operator escape hatch: an explicit write=True wins even under dry_run.
         _seed_eod(s3)
-        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True})
+        out = H.handler({
+            "date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True,
+            "snapshot": True,
+        })
         assert out["dry_run"] is True
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
 
