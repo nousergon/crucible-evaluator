@@ -36,7 +36,7 @@ pandas~=3.0
 # config#1694: notify_on_category required flow-doctor >=0.8; krepis flow_doctor
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
 # is >=0.10.3 — the extra alone resolves flow-doctor 0.8.x.
-krepis[flow_doctor]>=0.11.2
+krepis[flow_doctor]>=0.13.0
 nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.93.0
 
 # Director (Layer C) — single structured Opus call for PLAN GENERATION
