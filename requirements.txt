@@ -33,10 +33,8 @@ pandas~=3.0
 krepis[flow_doctor]>=0.11.2
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
-# reader) — that module ships in the nousergon-lib PR this evaluator PR is
-# cross-linked to. BUMP THIS PIN to the tag/commit that PR lands as once it
-# merges; v0.93.0 predates the module and this import will fail until then.
-nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.93.0
+# reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
+nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.3
 
 # Director (Layer C) — single structured Opus call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_MODEL, locked to Opus). langchain-anthropic
