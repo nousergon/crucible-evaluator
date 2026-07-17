@@ -83,8 +83,17 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     Returns a compact summary (the SF state output): overall status, per-tile
     statuses, real-graded coverage, and the S3 key written.
+
+    ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
+    Step Function gate: compares this Lambda's baked image SHA against
+    ``origin/main`` HEAD and returns immediately — no report-card build, no
+    S3 reads beyond the local stamp file. See ``grading/deploy_drift.py``.
     """
     event = event or {}
+    if event.get("action") == "check_deploy_drift":
+        from grading.deploy_drift import _resolve_function_name, check_deploy_drift
+        return check_deploy_drift(function_name=_resolve_function_name(context))
+
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
     run_date = _resolve_run_date(event)
     # dry_run = the Friday-PM Preflight Pipeline (SF passes dry_run=$.research_dry,
@@ -95,9 +104,26 @@ def handler(event: dict | None = None, context=None) -> dict:
     dry_run = bool(event.get("dry_run", False))
     write = event.get("write", not dry_run)
 
+    # `snapshot` (config-I2556): the evaluator report card is now a PERSISTENT
+    # surface — every non-dry invocation rebuilds the full card and overwrites
+    # the standing `evaluator/latest/report_card.json` pointer (see
+    # write_report_card). `snapshot=True` ALSO freezes the dated
+    # `evaluator/{run_date}/report_card.json` weekly record.
+    #
+    # Default is False: `feat/weekly-sf-advisory-child-and-sunday-zoo`
+    # (nousergon-data PR #832) merged 2026-07-14 and both production callers
+    # now pass this flag explicitly — the Saturday advisory-child `ReportCard`
+    # state (`infrastructure/step_function_advisory.json`) passes `true` for
+    # the weekly freeze; the Sunday ModelZoo `GradingLambdaReGrade` state
+    # (`infrastructure/step_function_modelzoo.json`) passes `false` for the
+    # re-grade-only tail invoke. An absent flag now means "refresh latest
+    # only" — the honest default for the persistent-surface model, where a
+    # frozen weekly snapshot is the deliberate exception, not the norm.
+    snapshot = bool(event.get("snapshot", False))
+
     logger.info(
-        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s)",
-        run_date, bucket, write, dry_run,
+        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s)",
+        run_date, bucket, write, dry_run, snapshot,
     )
     card = build_report_card(bucket, run_date)
 
@@ -108,9 +134,12 @@ def handler(event: dict | None = None, context=None) -> dict:
         for name, t in tiles.items()
     }
 
-    key = None
+    latest_key = None
+    dated_key = None
     if write:
-        key = write_report_card(bucket, run_date, card)
+        written = write_report_card(bucket, run_date, card, snapshot=snapshot)
+        latest_key = written["latest_key"]
+        dated_key = written["dated_key"]
 
     summary = {
         "status": "ok",
@@ -120,7 +149,9 @@ def handler(event: dict | None = None, context=None) -> dict:
         "tiles_overall_status": card.get("tiles_overall_status"),
         "tile_status": tile_status,
         "real_graded": real_graded,
-        "report_card_key": key,
+        "report_card_key": dated_key,
+        "latest_key": latest_key,
+        "snapshot": snapshot,
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),
     }
     logger.info(
@@ -138,9 +169,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover
     parser.add_argument("--date", default=None)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--no-write", action="store_true")
+    parser.add_argument("--no-snapshot", action="store_true",
+                         help="skip the dated weekly snapshot; refresh evaluator/latest/report_card.json only")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    out = handler({"date": args.date, "bucket": args.bucket, "write": not args.no_write})
+    out = handler({
+        "date": args.date, "bucket": args.bucket, "write": not args.no_write,
+        "snapshot": not args.no_snapshot,
+    })
     print(json.dumps(out, indent=2, default=str))
     return 0
 

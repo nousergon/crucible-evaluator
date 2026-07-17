@@ -173,6 +173,18 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
+    """Read the FROZEN weekly snapshot for this run date.
+
+    config-I2556: the grading Lambda now ALSO maintains a continuously-updated
+    ``evaluator/latest/report_card.json`` pointer that any producer can
+    refresh on its own cadence. This deliberately keeps reading the DATED
+    ``evaluator/{run_date}/report_card.json`` key (never ``latest``) — the
+    Director's advisory input must be the stable card the Saturday
+    ``ReportCard`` state froze for THIS run, not whatever a same-day or
+    later tail-invoke has since overwritten ``latest`` with. No change
+    needed here; this docstring exists so a future edit doesn't "helpfully"
+    repoint this at ``latest``.
+    """
     from botocore.exceptions import ClientError
     key = f"evaluator/{run_date}/report_card.json"
     try:
@@ -333,8 +345,21 @@ def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
 
 
 def handler(event: dict | None = None, context=None) -> dict:
-    """Build + persist the weekly Director action plan (flag-gated)."""
+    """Build + persist the weekly Director action plan (flag-gated).
+
+    ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
+    Step Function gate — checked BEFORE the ``DIRECTOR_ENABLED`` flag (the
+    drift probe must run regardless of whether the Director itself is
+    active, since a dormant-but-stale Director Lambda is still the thing an
+    operator will flip on later). Compares this Lambda's baked image SHA
+    against ``origin/main`` HEAD; see ``grading/deploy_drift.py`` (shared
+    with the grading Lambda — same image, same stamp file).
+    """
     event = event or {}
+    if event.get("action") == "check_deploy_drift":
+        from grading.deploy_drift import _resolve_function_name, check_deploy_drift
+        return check_deploy_drift(function_name=_resolve_function_name(context))
+
     if not _enabled():
         logger.info("Director disabled (DIRECTOR_ENABLED off) — no-op.")
         return {"status": "disabled", "reason": "DIRECTOR_ENABLED is off"}

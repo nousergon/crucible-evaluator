@@ -207,6 +207,29 @@ class TestHandler:
         assert written["run_date"] == RUN_DATE
         assert out["ledger_size"] == 1
 
+    def test_reads_dated_snapshot_not_latest_pointer(self, s3, monkeypatch):
+        # config-I2556: the grading Lambda now ALSO maintains a continuously
+        # updated evaluator/latest/report_card.json. Seed it with DIFFERENT
+        # content than the dated snapshot and confirm the Director's plan is
+        # built from the dated (frozen) card, never the moving latest one.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        stale_latest = {**_CARD, "tiles_overall_status": "GREEN"}
+        s3.put_object(Bucket=BUCKET, Key="evaluator/latest/report_card.json",
+                      Body=json.dumps(stale_latest).encode())
+        from director import handler as H
+        captured = {}
+
+        def _fake_build(card, **kw):
+            captured["card"] = card
+            return _plan()
+
+        monkeypatch.setattr(H, "build_action_plan", _fake_build)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert captured["card"]["tiles_overall_status"] == "RED"  # the dated card, not "GREEN"
+
     def test_issue_filing_skipped_when_no_token(self, s3, monkeypatch):
         # Phase H (repointed): no PAT configured → the issue channel records a
         # skip (no silent swallow) and the plan still writes. Non-fatal advisory.
@@ -220,6 +243,23 @@ class TestHandler:
         assert out["status"] == "ok"
         assert out["director_issues"] == "skipped"
         assert out["director_issues_reason"] == "no token configured"
+
+    def test_check_deploy_drift_dispatches_before_enabled_flag(self, monkeypatch):
+        # config#2348: the drift probe must run even when DIRECTOR_ENABLED is
+        # off (the default) — a dormant-but-stale image is still stale.
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(
+            dd, "check_deploy_drift",
+            lambda *, function_name: {"has_drift": True, "function_name": function_name},
+        )
+
+        class _Ctx:
+            function_name = "alpha-engine-evaluator-director"
+
+        out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
+        assert out == {"has_drift": True, "function_name": "alpha-engine-evaluator-director"}
 
     def test_issues_filed_when_token_present(self, s3, monkeypatch):
         # Phase H (repointed): with a PAT, the handler files area:director-proposals

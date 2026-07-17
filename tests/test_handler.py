@@ -67,28 +67,74 @@ class TestResolveRunDate:
 class TestHandler:
     def test_writes_report_card_and_returns_summary(self, s3):
         _seed_eod(s3)
-        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
         assert out["status"] == "ok"
         assert out["run_date"] == RUN_DATE
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        # config-I2556: latest.json convention key + resolved snapshot flag,
+        # additive on the summary.
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
+        assert out["snapshot"] is True
         # all 9 tiles present in the per-tile status map.
         assert set(out["tile_status"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
             "backtester", "substrate", "agent", "behavioral", "director_quality",
         }
         assert out["tiles_overall_status"] in ("GREEN", "WATCH", "RED", "N/A-NOT-RUN")
-        # the written object round-trips.
-        obj = s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])
-        card = json.loads(obj["Body"].read())
-        assert card["tiles_overall_status"] == out["tiles_overall_status"]
+        # both written objects round-trip.
+        for key in (out["report_card_key"], out["latest_key"]):
+            obj = s3.get_object(Bucket=BUCKET, Key=key)
+            card = json.loads(obj["Body"].read())
+            assert card["tiles_overall_status"] == out["tiles_overall_status"]
 
     def test_no_write_skips_persist(self, s3):
         _seed_eod(s3)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False})
         assert out["report_card_key"] is None
-        # nothing written under evaluator/.
+        assert out["latest_key"] is None
+        # nothing written under evaluator/ at all (neither dated nor latest).
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="evaluator/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_true_writes_dated_key(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["snapshot"] is True
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])  # exists
+
+    def test_snapshot_false_skips_dated_key_writes_latest_only(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": False})
+        assert out["snapshot"] is False
+        assert out["report_card_key"] is None
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
+        s3.get_object(Bucket=BUCKET, Key=out["latest_key"])  # latest exists
+        # the dated weekly key was NOT written.
         listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
         assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_absent_defaults_false(self, s3):
+        # config-I2556: nousergon-data PR #832 (both the Saturday advisory-child
+        # freeze and the Sunday ModelZoo re-grade tail invoke) merged
+        # 2026-07-14 and passes this flag explicitly, so an absent flag now
+        # means "refresh latest only" — no dated weekly snapshot.
+        _seed_eod(s3)
+        event = {"date": RUN_DATE, "bucket": BUCKET}
+        assert "snapshot" not in event  # sanity: no explicit flag passed
+        out = H.handler(event)
+        assert out["snapshot"] is False
+        assert out["report_card_key"] is None
+        assert out["latest_key"] == "evaluator/latest/report_card.json"
+
+    def test_latest_written_every_non_dry_invoke_regardless_of_snapshot(self, s3):
+        # config-I2556 core behavior: `latest` is refreshed on EVERY non-dry
+        # invocation, whether or not this cycle also freezes a dated snapshot.
+        _seed_eod(s3)
+        for snap in (True, False):
+            out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": snap})
+            assert out["latest_key"] == "evaluator/latest/report_card.json"
+            s3.get_object(Bucket=BUCKET, Key=out["latest_key"])
 
     def test_real_graded_counts_present(self, s3):
         _seed_eod(s3)
@@ -113,6 +159,43 @@ class TestHandler:
     def test_explicit_write_overrides_dry_run(self, s3):
         # Operator escape hatch: an explicit write=True wins even under dry_run.
         _seed_eod(s3)
-        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True})
+        out = H.handler({
+            "date": RUN_DATE, "bucket": BUCKET, "dry_run": True, "write": True,
+            "snapshot": True,
+        })
         assert out["dry_run"] is True
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+
+
+class TestCheckDeployDriftDispatch:
+    """config#2348: action=check_deploy_drift short-circuits BEFORE the normal
+    report-card build path — no S3/bucket resolution, no tile compute."""
+
+    def test_dispatches_to_deploy_drift_probe(self, monkeypatch):
+        captured = {}
+
+        def _fake_check_deploy_drift(*, function_name):
+            captured["function_name"] = function_name
+            return {"has_drift": False, "function_name": function_name}
+
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", _fake_check_deploy_drift)
+
+        class _Ctx:
+            function_name = "alpha-engine-evaluator"
+
+        out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
+        assert out == {"has_drift": False, "function_name": "alpha-engine-evaluator"}
+        assert captured["function_name"] == "alpha-engine-evaluator"
+
+    def test_does_not_touch_bucket_or_s3(self, monkeypatch):
+        # No S3 client/bucket resolution should occur — this must be a pure,
+        # pre-boot gate. Deliberately don't provide the `s3` fixture / moto
+        # mock_aws context; a real boto3 call here would error/hang.
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(
+            dd, "check_deploy_drift",
+            lambda *, function_name: {"has_drift": False, "function_name": function_name},
+        )
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+        assert out["has_drift"] is False

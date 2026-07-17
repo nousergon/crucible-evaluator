@@ -19,11 +19,28 @@ Authoritative: ``system-report-card-revamp-260522.md`` §"Aggregation methodolog
 
 from __future__ import annotations
 
+import re
+from datetime import UTC, datetime
+
 from krepis.metrics import MetricRecord, StatusLiteral
 from nousergon_lib.quant.stats.multiple_testing import benjamini_hochberg
 
 # Modules whose RED cascades to an overall RED (RC v2 module→overall rule).
 _CASCADE_MODULES = ("research", "predictor", "executor", "substrate")
+
+# Per-tile freshness stamps (config-I2556). Every component already threads a
+# real S3 `source_path` (and a `last_updated_utc` construction timestamp)
+# through `metric_record.build_metric` — this is genuine per-artifact
+# provenance, not a guess. `_ARTIFACT_DATE_RE` mines any embedded
+# ``YYYY-MM-DD`` segment out of a component's `source_path` (e.g.
+# ``s3://bucket/backtest/2026-07-10/e2e_lift.json`` — and, via
+# ``grading.artifacts.get_json_windowed``'s backward-walk, the REAL date the
+# artifact was last written, not necessarily the run_date, when a tile fell
+# back to an older instance). A `source_path` that points at a non-dated
+# pointer artifact (e.g. ``predictor/metrics/latest.json``,
+# ``signals/latest.json``) contributes no date — that is an honest gap in
+# per-artifact dating, not an omission on our part.
+_ARTIFACT_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def bh_fdr_significant(p_values: list[float], alpha: float = 0.05) -> bool:
@@ -150,15 +167,40 @@ def numeric_grade(components: list[MetricRecord]) -> float | None:
 
 
 def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.05) -> dict:
-    """Assemble a tile summary from its components."""
+    """Assemble a tile summary from its components.
+
+    Adds the RC v2 per-tile freshness stamps (config-I2556):
+      - ``as_of``: ISO UTC time this tile finished computing — the max of its
+        components' ``last_updated_utc`` (each stamped ``datetime.now(UTC)`` at
+        ``build_metric`` construction time), so tiles that legitimately update
+        on different cadences each carry their own honest timestamp rather than
+        one card-global build time.
+      - ``source_artifact_dates``: the distinct ``YYYY-MM-DD`` dates mined from
+        each component's real ``source_path`` (see ``_ARTIFACT_DATE_RE`` above)
+        — genuine per-tile attribution derived from data every tile builder
+        already threads through ``build_metric``, not a guessed/global rollup.
+    """
     from krepis.metrics import derive_letter
 
     status = module_status(components, alpha=alpha)
+    dumped = [c.model_dump(mode="json") for c in components]
+
+    stamps = [d for c in dumped if (d := c.get("last_updated_utc"))]
+    as_of = max(stamps) if stamps else datetime.now(UTC).isoformat()
+
+    source_artifact_dates = sorted({
+        m.group(0)
+        for c in dumped
+        if (m := _ARTIFACT_DATE_RE.search(c.get("source_path") or ""))
+    })
+
     return {
         "module": module,
         "status": status,
         "letter": derive_letter(status),
         "numeric_grade": numeric_grade(components),
         "n_components": len(components),
-        "components": [c.model_dump(mode="json") for c in components],
+        "as_of": as_of,
+        "source_artifact_dates": source_artifact_dates,
+        "components": dumped,
     }

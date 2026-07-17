@@ -3,6 +3,12 @@ boto3~=1.43
 pydantic~=2.13
 pyyaml~=6.0
 
+# setuptools floor for PYSEC-2026-3447 (newly disclosed; CI's pip-audit gate
+# started failing 2026-07-14 against the default 79.0.1 bundled by the
+# GH Actions Python 3.11 image). Not a build-backend requirement here — direct
+# pin exists solely to satisfy the security-audit gate.
+setuptools>=83.0.0
+
 # Numerics for grading / report-card aggregation
 numpy~=2.5
 pandas~=3.0
@@ -30,7 +36,7 @@ pandas~=3.0
 # config#1694: notify_on_category required flow-doctor >=0.8; krepis flow_doctor
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
 # is >=0.10.3 — the extra alone resolves flow-doctor 0.8.x.
-krepis[flow_doctor]>=0.11.2
+krepis[flow_doctor]>=0.14.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
