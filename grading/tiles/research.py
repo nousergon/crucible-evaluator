@@ -47,6 +47,19 @@ _PRECISION_FLOOR = 30  # selected names needed for a confident precision read
 # stamps onto ``scanner_lift`` / ``actual_scanner_pass``).
 _SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
 
+# config-I2994: the live champion feed's ranking score IS the scanner universe-
+# board attractiveness_score (copied verbatim into signals.json by crucible-
+# research scoring/signals_envelope.py). ``attractiveness_ic`` (attractiveness_
+# eval.json ``composite_ic`` vs realized 21d alpha) is therefore the honestly-
+# named live-arm score-IC that REPLACES the retired, CIO-sourced
+# ``research_composite_ic`` — promoted supporting→critical (Brian ruling: it
+# measures the live feed's ranking power; a critical WATCH while it accumulates
+# to the 8-week floor is the honest read, not pollution).
+_LIVE_ARM_SCANNER = (
+    "scanner_attractiveness (live champion feed — universe-board "
+    "attractiveness_score, config-I2994)"
+)
+
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
     try:
@@ -186,6 +199,33 @@ def build_research_tile(
 
     e2e = e2e or {}
 
+    # config#1580 / config-I2993: the six-team+CIO research orchestration was
+    # RETIRED (last producing cycle 2026-07-11). When the backtester emits the
+    # ``research_graph_retired`` marker, the four graph-sourced components
+    # (sector_teams_avg / cio / cio_selection_skill / research_composite_ic)
+    # render as RETIRED (accepted-permanent-N/A, DIAGNOSTIC so they never drag
+    # the tile to WATCH) with the retired_date surfaced — NOT scored, NOT
+    # critical-failing. Both-format tolerance: an OLD e2e_lift.json without the
+    # marker still scores them exactly as before (graceful rollout).
+    graph_retired = e2e.get("research_graph_retired")
+    _RETIRED_SUPERSEDED = (
+        "the live-arm scanner attractiveness IC (attractiveness_ic, config-I2994) "
+        "+ the thinktank_coverage challenger arm"
+    )
+
+    def _retired_component(name: str, metric_type: str):
+        rd = (graph_retired or {}).get("retired_date")
+        return build_metric(
+            name=name, module=MODULE, metric_type=metric_type, criticality="diagnostic",
+            n_floor=1, source_path=e2e_src, arm=f"six_team_cio (retired {rd})",
+            permanent_na_reason=(
+                f"retired {rd}: six-team+CIO research orchestration removed "
+                f"(config#1580 / config-I2993) — measured a graph that no longer "
+                f"produces. Superseded by {_RETIRED_SUPERSEDED}."
+            ),
+            **_tr(name, None),
+        )
+
     # All three selectors are graded on the CANONICAL 21d horizon (beat_spy_21d
     # precision) when the producer emits it — the picks are 21-day theses, and
     # the legacy 5d window collapsed precision toward the base rate (ROADMAP
@@ -203,9 +243,12 @@ def build_research_tile(
         history=history, arm=_SCANNER_METRIC_ARM,
     ))
 
-    # 2. sector_teams_avg (critical) — pooled precision across the 6 sector teams.
+    # 2. sector_teams_avg — RETIRED with the six-team graph (config-I2993) when
+    #    the marker is present; otherwise pooled precision across the 6 teams.
     team_lift = e2e.get("team_lift")
-    if isinstance(team_lift, list) and team_lift:
+    if graph_retired:
+        components.append(_retired_component("sector_teams_avg", "pct"))
+    elif isinstance(team_lift, list) and team_lift:
         # Pool whichever horizon each team carries; 21d when present (the modern
         # producer emits it for every team), else legacy 5d. A homogeneous slate
         # is the norm, so derive the tile horizon from the pooled blocks chosen.
@@ -230,17 +273,21 @@ def build_research_tile(
             **_tr("sector_teams_avg", None),
         ))
 
-    # 3. cio (critical) — entrant-gate precision (CIO-advanced names that won).
+    # 3. cio — RETIRED with the CIO gate (config-I2993) when the marker is
+    #    present; otherwise entrant-gate precision (CIO-advanced names that won).
     cl = e2e.get("cio_lift") or {}
-    cl_clf, cl_hz = _pick_clf(cl)
-    cl_lift = ((cl.get("lift_21d_log") or {}).get("lift") if cl_hz == "21d"
-               else (e2e.get("cio_vs_ranking") or {}).get("lift"))
-    components.append(_precision_metric(
-        "cio", cl_clf, criticality="critical", source=e2e_src, horizon=cl_hz,
-        lift=cl_lift, lift_label="21d-alpha-lift" if cl_hz == "21d" else "vs-ranking-lift",
-        missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
-        history=history,
-    ))
+    if graph_retired:
+        components.append(_retired_component("cio", "pct"))
+    else:
+        cl_clf, cl_hz = _pick_clf(cl)
+        cl_lift = ((cl.get("lift_21d_log") or {}).get("lift") if cl_hz == "21d"
+                   else (e2e.get("cio_vs_ranking") or {}).get("lift"))
+        components.append(_precision_metric(
+            "cio", cl_clf, criticality="critical", source=e2e_src, horizon=cl_hz,
+            lift=cl_lift, lift_label="21d-alpha-lift" if cl_hz == "21d" else "vs-ranking-lift",
+            missing_detail="cio: e2e_lift.json absent or has no cio classification this cycle.",
+            history=history,
+        ))
 
     # 3b. cio_selection_skill (critical, L4561) — does the CIO entrant gate ADVANCE
     #     the names that realize higher 21d alpha than the ones it REJECTs? The
@@ -251,7 +298,9 @@ def build_research_tile(
     #     rubric on noise.
     sel = cl.get("selection_skill_21d") or {}
     gap = sel.get("selection_gap_21d")
-    if gap is not None:
+    if graph_retired:
+        components.append(_retired_component("cio_selection_skill", "log_return"))
+    elif gap is not None:
         gp = sel.get("selection_gap_p")
         n_sel = (sel.get("n_advance") or 0) + (sel.get("n_reject") or 0)
         cic = sel.get("conviction_ic_21d")
@@ -302,7 +351,15 @@ def build_research_tile(
     pooled_ic = attr.get("final_score_ic")
     use_clustered = date_ic is not None
     fic = date_ic if use_clustered else pooled_ic
-    if fic is not None:
+    if graph_retired:
+        # RETIRED (config-I2994): research_composite_ic was entirely CIO-sourced
+        # (final_score rank-IC from the retired layer_attribution_21d block). It
+        # is NOT resurrected — the live champion feed's ranking power is measured
+        # honestly by the promoted, critical ``attractiveness_ic`` component
+        # (scanner attractiveness_score→21d-alpha IC), with the challenger arm as
+        # ``thinktank_coverage_ic``. Rendered retired, not scored.
+        components.append(_retired_component("research_composite_ic", "ic"))
+    elif fic is not None:
         if use_clustered:
             fp = attr.get("final_score_date_ic_p")
             n_at = attr.get("n_eval_dates")
@@ -349,6 +406,47 @@ def build_research_tile(
             n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False,
             na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
             **_tr("research_composite_ic", None),
+        ))
+
+    # 3d. thinktank_coverage_ic (config-I2994, INFORMATIONAL/diagnostic) — the
+    #     observe-only Think Tank challenger's shadow score vs realized 21d alpha,
+    #     the ONLY research-authored composite score left in the system. Same
+    #     date-clustered rank-IC estimator as the scanner arm (methodological
+    #     parity). Diagnostic: labeled, never gates. Warms up on the 21d
+    #     realization lag — an insufficient_data block grades a precise N/A and
+    #     self-activates once a shadow cycle has realized 21d alpha.
+    tt = (e2e.get("live_arm_score_ic") or {}).get("thinktank_coverage") or {}
+    tt_hz = f"{tt.get('horizon_days', 21)}d"
+    tt_arm = tt.get("arm") or "thinktank_coverage (observe-only challenger shadow)"
+    tt_ic = tt.get("date_ic_mean") if tt.get("status") == "ok" else None
+    if tt_ic is not None:
+        tt_p = tt.get("date_ic_p")
+        tt_n = tt.get("n_eval_dates")
+        tt_insig = tt_p is None or tt_p >= 0.10 or (tt_n or 0) < 8
+        components.append(build_metric(
+            name="thinktank_coverage_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=tt_hz,
+            reliability="low" if tt_insig else "high",
+            value=tt_ic, n_samples=tt_n, n_floor=8, target=0.03, red_line=0.0,
+            source_path=e2e_src, status="WATCH" if tt_insig else None, arm=tt_arm,
+            reason=(f"thinktank_coverage_ic: challenger shadow score→{tt_hz}-alpha "
+                    f"date-clustered rank-IC = {tt_ic:+.3f} "
+                    f"(p={tt_p if tt_p is None else round(tt_p, 3)}, N={tt_n} eval dates; "
+                    f"series_start {tt.get('series_start')}, pooled {tt.get('pooled_ic')}). "
+                    f"Observe-only challenger arm [arm: {tt_arm}] — informational, feeds no gate. "
+                    + ("Not yet significant — WATCH, accumulating." if tt_insig
+                       else ("challenger score carries forward signal" if tt_ic > 0
+                             else "challenger score does not predict 21d alpha"))),
+        ))
+    else:
+        tt_na = tt.get("reason") or "no thinktank_coverage block in live_arm_score_ic this cycle"
+        components.append(build_metric(
+            name="thinktank_coverage_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+            estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=tt_hz,
+            n_floor=8, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False, arm=tt_arm,
+            na_detail=(f"thinktank_coverage_ic: {tt_na} (observe-only challenger shadow "
+                       f"scores, config-I2994; warms up on the 21d realization lag). "
+                       f"Feeds no gate."),
         ))
 
     # 4. composite_scoring (supporting) — does higher composite score → higher
@@ -665,9 +763,11 @@ def build_research_tile(
         # `mean_alpha_21d` fallback after the 1-week S3 window (~2026-07-15).
         return d.get("mean_alpha", d.get("mean_alpha_21d"))
 
-    # 10. attractiveness_ic (SUPPORTING — promote-to-critical is a later human
-    #     call once cross-cycle history matures). Mirrors research_composite_ic:
-    #     date-clustered (weeks-as-N) rank-IC vs realized 21d alpha, WATCH +
+    # 10. attractiveness_ic (CRITICAL, config-I2994 — the live-arm scanner
+    #     attractiveness score-IC that REPLACES the retired research_composite_ic;
+    #     promoted supporting→critical per Brian's ruling since the universe-board
+    #     attractiveness_score IS the live champion feed's ranking signal).
+    #     Date-clustered (weeks-as-N) rank-IC vs realized 21d alpha, WATCH +
     #     reliability=low while insignificant (p >= 0.10) or under-sampled —
     #     accumulate to significance, never a confident grade on noise.
     comp_ic = (att or {}).get("composite_ic") or {}
@@ -689,26 +789,31 @@ def build_research_tile(
         shrink_s = (f"{shrink.get('method')} λ={shrink.get('lambda')}"
                     if shrink.get("method") else "n/a")
         components.append(build_metric(
-            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
-            reliability="low" if a_insig else "high",
+            reliability="low" if a_insig else "high", arm=_LIVE_ARM_SCANNER,
             value=a_ic, n_samples=a_n, n_floor=a_floor, target=0.03, red_line=0.0,
             source_path=att_src, status="WATCH" if a_insig else None,
             reason=(f"attractiveness_ic: attractiveness→{att_hz}-alpha date-clustered rank-IC = "
                     f"{a_ic:+.3f} (p={_fmt_p(a_p)}, N={a_n} eval dates; pooled "
                     f"{comp_ic.get('pooled_ic')} p={_fmt_p(comp_ic.get('pooled_ic_p'))}, "
                     f"n={comp_ic.get('n')}). Per-pillar IC [{pillars_s}]; suggested pillar "
-                    f"weights ({shrink_s}) [{weights_s}]. "
+                    f"weights ({shrink_s}) [{weights_s}]. Live champion-feed ranking metric "
+                    f"[arm: {_LIVE_ARM_SCANNER}] — replaces the retired research_composite_ic "
+                    f"(config-I2994). "
                     + ("Not yet significant — WATCH, accumulating." if a_insig
                        else ("attractiveness carries forward signal" if a_ic > 0
                              else "no forward signal — attractiveness does not predict 21d alpha"))),
         ))
     else:
         components.append(build_metric(
-            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="supporting",
+            name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
             n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
-            na_detail=f"attractiveness_ic: {_ATT_MISSING}",
+            arm=_LIVE_ARM_SCANNER,
+            na_detail=(f"attractiveness_ic: {_ATT_MISSING} Live champion-feed ranking metric "
+                       f"[arm: {_LIVE_ARM_SCANNER}] — replaces the retired research_composite_ic "
+                       f"(config-I2994)."),
         ))
 
     # 11. attractiveness_trajectory_ic (DIAGNOSTIC) — does the PRE-repricing

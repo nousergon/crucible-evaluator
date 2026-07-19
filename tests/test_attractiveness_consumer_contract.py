@@ -119,7 +119,14 @@ class TestAttractivenessIc:
     def test_grades_from_date_clustered_ic(self, s3):
         _put_att(s3, _fixture())
         m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "attractiveness_ic")
-        assert m["criticality"] == "supporting"
+        # config-I2994: promoted supporting→critical as the live-arm scanner
+        # attractiveness score-IC that replaces the retired research_composite_ic.
+        assert m["criticality"] == "critical"
+        assert m["arm"] == (
+            "scanner_attractiveness (live champion feed — universe-board "
+            "attractiveness_score, config-I2994)"
+        )
+        assert "replaces the retired research_composite_ic" in m["status_reason"]
         assert m["value"] == pytest.approx(0.062)
         assert m["n_samples"] == 11
         assert m["estimator"] == "date_clustered_rank_ic_vs_21d_alpha"

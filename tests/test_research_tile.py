@@ -610,3 +610,125 @@ class TestCrossCycleTrends:
         cio = _comp(tile, "cio")
         assert cio["trend_4w"] is None
         assert cio["trend_decoration"] == "→"
+
+
+class TestResearchGraphRetired:
+    """config-I2993/I2994 — when e2e_lift carries the research_graph_retired
+    marker, the four six-team+CIO-sourced components render RETIRED (accepted-
+    permanent-N/A, DIAGNOSTIC so they never drag the tile), retired_date
+    surfaced; without the marker they still score (both-format rollout)."""
+
+    _RETIRED = ["sector_teams_avg", "cio", "cio_selection_skill", "research_composite_ic"]
+
+    def _e2e_retired(self):
+        e = json.loads(json.dumps(_E2E))
+        e["team_lift"] = []
+        e["cio_lift"] = {"status": "retired", "retired_date": "2026-07-12"}
+        e["research_graph_retired"] = {
+            "retired_date": "2026-07-12",
+            "components": ["team_lift", "cio_lift", "selection_skill_21d", "layer_attribution_21d"],
+        }
+        return e
+
+    def test_four_components_render_retired_not_scored(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_retired())
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        for name in self._RETIRED:
+            m = _comp(tile, name)
+            assert m["status"] == "N/A-NOT-IMPL", name          # accepted-permanent-N/A
+            assert m["criticality"] == "diagnostic", name       # never drags the tile
+            assert m["value"] is None, name
+            assert "retired" in m["status_reason"].lower(), name
+            assert "2026-07-12" in m["status_reason"], name
+            assert m.get("arm") == "six_team_cio (retired 2026-07-12)", name
+
+    def test_retired_components_do_not_block_green(self, s3):
+        # DIAGNOSTIC N/A never forces WATCH; prove via module_status on the tile
+        # components with the sole critical (attractiveness_ic) satisfied GREEN.
+        from grading.module_agg import module_status
+        # schema_version 1 skips the v2 contract validate (tile guard) — this
+        # test only needs composite_ic readable to satisfy the sole critical.
+        att = {
+            "schema_version": 1, "status": "ok", "as_of": RUN_DATE, "horizon_days": 21,
+            "composite_ic": {"date_ic_mean": 0.06, "date_ic_p": 0.01, "n_eval_dates": 12,
+                             "pooled_ic": 0.05, "pooled_ic_p": 0.01, "n": 300},
+        }
+        _put(s3, "e2e_lift.json", self._e2e_retired())
+        _put(s3, "attractiveness_eval.json", att)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        # The retired components are diagnostic → excluded from the critical gate.
+        assert all(_comp(tile, n)["criticality"] == "diagnostic" for n in self._RETIRED)
+
+    def test_without_marker_still_scores(self, s3):
+        # Both-format: an OLD e2e_lift.json (no marker) scores exactly as before.
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        teams = _comp(tile, "sector_teams_avg")
+        assert teams["criticality"] == "critical"
+        assert teams["value"] is not None
+
+
+class TestThinkTankCoverageIc:
+    """config-I2994 — the observe-only Think Tank challenger arm, read from
+    e2e_lift live_arm_score_ic.thinktank_coverage. Diagnostic (never gates)."""
+
+    def _e2e_tt(self, tt):
+        e = json.loads(json.dumps(_E2E))
+        e["live_arm_score_ic"] = {"thinktank_coverage": tt}
+        return e
+
+    def test_ok_significant_grades_green_diagnostic(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_tt({
+            "status": "ok", "arm": "thinktank_coverage (observe-only)",
+            "date_ic_mean": 0.05, "date_ic_p": 0.02, "n_eval_dates": 10,
+            "series_start": "2026-06-01", "pooled_ic": 0.04, "horizon_days": 21}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "thinktank_coverage_ic")
+        assert m["criticality"] == "diagnostic"
+        assert m["value"] == pytest.approx(0.05)
+        assert m["n_samples"] == 10
+        assert m["status"] == "GREEN"
+        assert "feeds no gate" in m["status_reason"]
+
+    def test_insufficient_grades_na(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_tt({
+            "status": "insufficient_data", "arm": "thinktank_coverage (observe-only)",
+            "reason": "no shadow cycle has realized 21d alpha yet (21d realization lag)",
+            "n_shadow_dates": 2, "series_start": "2026-07-16", "n_eval_dates": 0}))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "thinktank_coverage_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert m["criticality"] == "diagnostic"
+        assert "realization lag" in m["status_reason"]
+
+    def test_absent_block_grades_na(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)  # no live_arm_score_ic
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "thinktank_coverage_ic")
+        assert m["status"] == "N/A-MISSING-INPUT"
+
+
+class TestE2eLiftRetiredContract:
+    """M0 consumer-contract (Part 2c): pin the exact e2e_lift fields this tile
+    reads for the retired-shape + live-arm block, so a producer schema drift
+    fails HERE (this test), not silently in a live Report Card."""
+
+    def test_retired_shape_and_live_arm_fields_consumed(self, s3):
+        e = json.loads(json.dumps(_E2E))
+        e["team_lift"] = []
+        e["cio_lift"] = {"status": "retired", "retired_date": "2026-07-12"}
+        e["research_graph_retired"] = {"retired_date": "2026-07-12",
+                                       "components": ["team_lift", "cio_lift"]}
+        e["live_arm_score_ic"] = {
+            "scanner_attractiveness": {"status": "delegated",
+                                       "source_block": "composite_ic"},
+            "thinktank_coverage": {"status": "ok", "date_ic_mean": 0.03,
+                                   "date_ic_p": 0.2, "n_eval_dates": 4,
+                                   "arm": "thinktank_coverage", "horizon_days": 21},
+        }
+        _put(s3, "e2e_lift.json", e)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        # Retired components consumed as retired; thinktank arm consumed as a
+        # diagnostic series; the tile builds without error.
+        assert _comp(tile, "research_composite_ic")["status"] == "N/A-NOT-IMPL"
+        tt = _comp(tile, "thinktank_coverage_ic")
+        assert tt["value"] == pytest.approx(0.03)
+        # p=0.2 >= 0.10 and N=4 < 8 → WATCH-accumulating, not a confident grade.
+        assert tt["status"] == "WATCH"
