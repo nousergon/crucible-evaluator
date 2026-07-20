@@ -428,6 +428,85 @@ class TestNeutralizationLiveEfficacy:
         assert m["value"] == 0.12
 
 
+class TestNeutralizationLiveEfficacyRetired:
+    """alpha-engine-config-I3000 (I2993 pattern extension, ruling: diagnostic
+    demotion) — when the neutralization pair (neutralized_composite_ic /
+    neutralization_live_forward_ic) carries the backtester's retired marker
+    (they sourced the retired six-team+CIO graph; the pre-existing
+    cutover_date label alone did not stop that), neutralization_live_efficacy
+    demotes to DIAGNOSTIC with a permanent_na_reason surfacing the
+    retired_date — the exact _retired_component convention PR128 used for the
+    four six-team+CIO components. Old-format artifacts (no retired marker)
+    are unaffected — see TestNeutralizationLiveEfficacy above, still green."""
+
+    def _e2e_neu_retired(self, *, via="neutralization_live_forward_ic"):
+        e = json.loads(json.dumps(_E2E))
+        retired_block = {
+            "status": "retired", "retired_date": "2026-07-12", "cutover_date": "2026-06-22",
+            "note": "six-team+CIO graph retired (config#1580 / config-I2993)",
+        }
+        # Both producers ship the retired marker together in practice (the
+        # backtester emits both), but the tile must demote off EITHER carrying
+        # it — pin both directions.
+        if via == "neutralization_live_forward_ic":
+            e["neutralization_live_forward_ic"] = retired_block
+            e["neutralized_composite_ic"] = dict(retired_block)
+        else:
+            e["neutralized_composite_ic"] = retired_block
+            e["neutralization_live_forward_ic"] = dict(retired_block)
+        return e
+
+    def test_demotes_to_diagnostic_with_permanent_na_reason(self, s3):
+        _put(s3, "e2e_lift.json", self._e2e_neu_retired())
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["criticality"] == "diagnostic"
+        assert m["status"] == "N/A-NOT-IMPL"          # accepted-permanent-N/A
+        assert m["value"] is None
+        assert "retired" in m["status_reason"].lower()
+        assert "2026-07-12" in m["status_reason"]
+        assert m.get("arm") == "six_team_cio (retired 2026-07-12)"
+
+    def test_demotes_when_retired_via_composite_ic_only(self, s3):
+        # Pin the OTHER direction: neutralized_composite_ic carries the marker.
+        _put(s3, "e2e_lift.json", self._e2e_neu_retired(via="neutralized_composite_ic"))
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["criticality"] == "diagnostic"
+        assert m["status"] == "N/A-NOT-IMPL"
+
+    def test_retired_never_drags_tile_to_watch(self, s3):
+        # DIAGNOSTIC N/A must never force WATCH — prove via module_status with
+        # the tile's other criticals satisfied.
+        att = {
+            "schema_version": 1, "status": "ok", "as_of": RUN_DATE, "horizon_days": 21,
+            "composite_ic": {"date_ic_mean": 0.06, "date_ic_p": 0.01, "n_eval_dates": 12,
+                             "pooled_ic": 0.05, "pooled_ic_p": 0.01, "n": 300},
+        }
+        e = self._e2e_neu_retired()
+        e["research_graph_retired"] = {"retired_date": "2026-07-12",
+                                       "components": ["team_lift", "cio_lift"]}
+        e["team_lift"] = []
+        e["cio_lift"] = {"status": "retired", "retired_date": "2026-07-12"}
+        _put(s3, "e2e_lift.json", e)
+        _put(s3, "attractiveness_eval.json", att)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        m = _comp(tile, "neutralization_live_efficacy")
+        assert m["criticality"] == "diagnostic"
+
+    def test_without_retired_marker_still_scores_critical(self, s3):
+        # Both-format tolerance: an e2e_lift WITHOUT the retired marker (old
+        # format, or a re-derived/persisted block that is genuinely "ok")
+        # keeps grading neutralization_live_efficacy as critical — unaffected
+        # by this change (see TestNeutralizationLiveEfficacy above).
+        e = json.loads(json.dumps(_E2E))
+        e["neutralized_composite_ic"] = {"status": "ok", "cutover_date": "2026-06-22", "live_forward": {
+            "n_weeks": 6, "raw_mean_weekly_ic": -0.09, "neutralized_mean_weekly_ic": 0.03,
+            "mean_weekly_delta": 0.12, "delta_t_p": 0.01, "recovers_edge_live": True, "significant": True}}
+        _put(s3, "e2e_lift.json", e)
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3), "neutralization_live_efficacy")
+        assert m["criticality"] == "critical"
+        assert m["status"] == "GREEN"
+
+
 class TestAgentQualityComponents:
     """judge_rubric_pass_rate / pillar_emit_coverage / signal_volume_adequacy
     read backtest/{date}/agent_quality.json (config Batch A #1149)."""
