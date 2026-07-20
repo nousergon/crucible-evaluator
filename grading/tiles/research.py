@@ -608,7 +608,41 @@ def build_research_tile(
     # post-cutover cohort. The grading contract is identical for both.
     nlf = e2e.get("neutralization_live_forward_ic") or {}
     nci = e2e.get("neutralized_composite_ic") or {}
-    if nlf.get("status") == "ok" and (nlf.get("live_forward") or {}).get("n_weeks"):
+
+    # alpha-engine-config-I3000 (I2993 pattern extension, ruling: diagnostic
+    # demotion): the neutralization pair already carried a ``cutover_date``
+    # label, but the label alone did not stop them sourcing the RETIRED
+    # six-team+CIO graph (``team_candidates`` / ``cio_evaluations``) — the
+    # backtester now emits ``{"status": "retired", ...}`` for both (mirroring
+    # the ``cio_lift`` shape). This still-critical component reads that
+    # retired pair, so a silent frozen-sourced read is no longer possible; per
+    # the deliberate ruling (option b — no live-path neutralization efficacy
+    # series exists yet, config-I1187 tracks that follow-up), demote to
+    # DIAGNOSTIC with a permanent_na_reason surfacing the retired_date, using
+    # the exact same ``_retired_component`` convention PR128 used for the
+    # four six-team+CIO components above.
+    neu_retired = nlf if nlf.get("status") == "retired" else (
+        nci if nci.get("status") == "retired" else None)
+    if neu_retired is not None:
+        _neu_rd = neu_retired.get("retired_date")
+        components.append(build_metric(
+            name="neutralization_live_efficacy", module=MODULE, metric_type="ic",
+            criticality="diagnostic", n_floor=1, source_path=e2e_src,
+            arm=f"six_team_cio (retired {_neu_rd})",
+            permanent_na_reason=(
+                f"retired {_neu_rd}: six-team+CIO research orchestration removed "
+                f"(config#1580 / config-I2993) — neutralization_live_efficacy read "
+                f"the neutralized_composite_ic / neutralization_live_forward_ic pair, "
+                f"which sourced that retired graph (team_candidates / "
+                f"cio_evaluations); the cutover_date label alone did not stop it "
+                f"aggregating frozen history at live weight (alpha-engine-config-"
+                f"I3000). No live-path neutralization efficacy series exists yet "
+                f"(config-I1187 tracks that follow-up) — demoted diagnostic rather "
+                f"than left silently reading frozen CIO-era data."
+            ),
+            **_tr("neutralization_live_efficacy", None),
+        ))
+    elif nlf.get("status") == "ok" and (nlf.get("live_forward") or {}).get("n_weeks"):
         lf = nlf.get("live_forward")
         cutover_date = nlf.get("cutover_date")
     elif nci.get("status") == "ok" and (nci.get("live_forward") or {}).get("n_weeks"):
@@ -617,7 +651,10 @@ def build_research_tile(
     else:
         lf = None
         cutover_date = nlf.get("cutover_date") or nci.get("cutover_date")
-    if lf is not None and lf.get("n_weeks"):
+
+    if neu_retired is not None:
+        pass  # already appended as a diagnostic retired component above.
+    elif lf is not None and lf.get("n_weeks"):
         delta = lf.get("mean_weekly_delta")
         p = lf.get("delta_t_p")
         nwk = lf.get("n_weeks")
