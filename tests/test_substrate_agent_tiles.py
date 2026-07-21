@@ -1,5 +1,6 @@
 """Tests for grading/tiles/substrate.py + agent.py — Tiles 5 & 6."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ import pytest
 from moto import mock_aws
 
 from grading.tiles.agent import build_agent_tile
-from grading.tiles.substrate import PRICE_CACHE_PREFIX, build_substrate_tile
+from grading.tiles.substrate import PRICE_CACHE_FRESHNESS_SENTINEL_KEY, build_substrate_tile
 
 BUCKET = "alpha-engine-research"
 
@@ -25,9 +26,20 @@ def _comp(tile, name):
     return next(c for c in tile["components"] if c["name"] == name)
 
 
+def _put_price_cache_sentinel(s3, timestamp: datetime):
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
+        Body=json.dumps({
+            "timestamp": timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "writer": "nousergon-data:weekly_collector.py",
+        }).encode("utf-8"),
+    )
+
+
 class TestSubstrate:
     def test_price_cache_freshness_fresh_green(self, s3):
-        s3.put_object(Bucket=BUCKET, Key=f"{PRICE_CACHE_PREFIX}A.parquet", Body=b"x")
+        _put_price_cache_sentinel(s3, datetime.now(UTC))
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC))
         pcf = _comp(tile, "price_cache_freshness")
         assert pcf["value"] is not None
@@ -35,8 +47,9 @@ class TestSubstrate:
         assert pcf["status"] == "GREEN"
 
     def test_price_cache_freshness_stale_red(self, s3):
-        s3.put_object(Bucket=BUCKET, Key=f"{PRICE_CACHE_PREFIX}A.parquet", Body=b"x")
-        future = datetime.now(UTC) + timedelta(days=20)  # > 14d red-line
+        now = datetime.now(UTC)
+        _put_price_cache_sentinel(s3, now)
+        future = now + timedelta(days=20)  # > 14d red-line
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=future)
         assert _comp(tile, "price_cache_freshness")["status"] == "RED"
 
@@ -72,7 +85,7 @@ class TestSubstrate:
 
     def test_tile_watch_when_only_freshness_real(self, s3):
         # price_cache fresh GREEN but critical sf/data_quality/schema N/A-NOT-IMPL → WATCH.
-        s3.put_object(Bucket=BUCKET, Key=f"{PRICE_CACHE_PREFIX}A.parquet", Body=b"x")
+        _put_price_cache_sentinel(s3, datetime.now(UTC))
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC))
         assert tile["status"] == "WATCH"
 

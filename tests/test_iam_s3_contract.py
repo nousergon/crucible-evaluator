@@ -93,7 +93,7 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "grading/tiles/portfolio_outcome.py": 2,
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
-    "grading/tiles/substrate.py": 2,
+    "grading/tiles/substrate.py": 1,
 }
 
 
