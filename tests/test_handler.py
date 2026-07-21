@@ -29,8 +29,38 @@ def s3():
 def _seed_eod(s3):
     s3.put_object(
         Bucket=BUCKET, Key="trades/eod_pnl.csv",
-        Body=(b"date,portfolio_nav,daily_return_pct,spy_return_pct,daily_alpha_pct,positions_snapshot,created_at\n"
-              b"2026-06-06,1000000,0.1,0.05,0.05,{},x\n"),
+        Body=(f"date,portfolio_nav,daily_return_pct,spy_return_pct,daily_alpha_pct,positions_snapshot,created_at\n"
+              f"{RUN_DATE},1000000,0.1,0.05,0.05,{{}},x\n").encode("utf-8"),
+    )
+    _seed_freshness_inputs(s3)
+
+
+def _seed_freshness_inputs(s3):
+    """Every OTHER artifact grading.freshness_preflight.assert_input_freshness
+    hard-requires (eod_pnl.csv is seeded separately by _seed_eod above, since
+    several tests want control over its exact row shape), all dated exactly
+    RUN_DATE — the trivially-fresh baseline so TestHandler's tests can focus
+    on the handler-level behavior they actually name rather than the
+    freshness gate itself (that gate has its own dedicated coverage in
+    tests/test_freshness_preflight.py)."""
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/metrics.json",
+        Body=json.dumps({"run_date": RUN_DATE, "status": "ok"}).encode("utf-8"),
+    )
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/e2e_lift.json",
+        Body=json.dumps({"status": "ok"}).encode("utf-8"),
+    )
+    s3.put_object(
+        Bucket=BUCKET, Key="predictor/weights/meta/manifest.json",
+        Body=json.dumps({
+            "training_date": RUN_DATE,
+            "meta_model_oos_ic_cpcv": {"status": "ok", "n_combos": 4, "mean_ic": 0.1, "frac_positive": 0.75, "ics": [0.1, 0.1, 0.1, 0.1]},
+        }).encode("utf-8"),
+    )
+    s3.put_object(
+        Bucket=BUCKET, Key=f"signals/{RUN_DATE}/signals.json",
+        Body=json.dumps({"market_regime": "neutral"}).encode("utf-8"),
     )
 
 

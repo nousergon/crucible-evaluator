@@ -164,6 +164,33 @@ class TestBuildReportCardThreadsTrends:
     history-derived trends onto the named critical components and skips N/A
     weeks."""
 
+    def _seed_freshness_inputs(self, s3):
+        """The non-eod_pnl artifacts grading.freshness_preflight hard-requires,
+        dated exactly RUN_DATE. e2e_lift.json is seeded with NO
+        layer_attribution_21d block (mirrors an artifact that exists but
+        predates the research_composite_ic producer) so it satisfies the
+        preflight's presence+in-week check while research_composite_ic stays
+        N/A this cycle — preserving this test class's own closes-when."""
+        s3.put_object(
+            Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/metrics.json",
+            Body=json.dumps({"run_date": RUN_DATE, "status": "ok"}).encode(),
+        )
+        s3.put_object(
+            Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/e2e_lift.json",
+            Body=json.dumps({"status": "ok"}).encode(),
+        )
+        s3.put_object(
+            Bucket=BUCKET, Key="predictor/weights/meta/manifest.json",
+            Body=json.dumps({
+                "training_date": RUN_DATE,
+                "meta_model_oos_ic_cpcv": {"status": "ok", "n_combos": 4, "mean_ic": 0.1, "frac_positive": 0.75, "ics": [0.1, 0.1, 0.1, 0.1]},
+            }).encode(),
+        )
+        s3.put_object(
+            Bucket=BUCKET, Key=f"signals/{RUN_DATE}/signals.json",
+            Body=json.dumps({"market_regime": "neutral"}).encode(),
+        )
+
     def _seed_priors(self, s3):
         # 3 prior weekly cards; the middle week is N/A for sharpe_ratio.
         _put_card(s3, "2026-06-13", _card(sharpe=0.50, ic=0.010))
@@ -171,12 +198,19 @@ class TestBuildReportCardThreadsTrends:
         _put_card(s3, "2026-06-27", _card(sharpe=0.70, ic=0.030))
 
     def _seed_eod_pnl(self, s3, n_days=70):
+        # Dates END at RUN_DATE (walking backward) so the freshest row also
+        # satisfies grading.freshness_preflight's eod_reconcile_pnl check —
+        # this method now doubles as that fixture, not just the dsr n_floor.
+        import datetime as _dt
+
+        end = _dt.date.fromisoformat(RUN_DATE)
         rows = ["date,portfolio_nav,daily_return_pct,spy_return_pct,daily_alpha_pct"]
         nav = 100000.0
         for i in range(n_days):
             r = 0.10 + (i % 3) * 0.05           # gently positive daily % returns
             nav *= 1 + r / 100
-            rows.append(f"2026-{3 + i // 28:02d}-{i % 28 + 1:02d},{nav:.2f},{r},{0.05},{r - 0.05}")
+            d = (end - _dt.timedelta(days=n_days - 1 - i)).isoformat()
+            rows.append(f"{d},{nav:.2f},{r},{0.05},{r - 0.05}")
         s3.put_object(Bucket=BUCKET, Key="trades/eod_pnl.csv",
                       Body="\n".join(rows).encode())
 
@@ -186,6 +220,7 @@ class TestBuildReportCardThreadsTrends:
     def test_trends_threaded_and_na_weeks_skipped(self, s3):
         self._seed_priors(s3)
         self._seed_eod_pnl(s3)
+        self._seed_freshness_inputs(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
 
         sharpe = self._comp(card, "portfolio_outcome", "sharpe_ratio")
@@ -206,6 +241,7 @@ class TestBuildReportCardThreadsTrends:
         _put_card(s3, "2026-06-20", _card(sharpe=-1.5))
         _put_card(s3, "2026-06-27", _card(sharpe=-1.0))
         self._seed_eod_pnl(s3)  # positive returns → current sharpe > -1.0
+        self._seed_freshness_inputs(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         sharpe = self._comp(card, "portfolio_outcome", "sharpe_ratio")
         assert len(sharpe["trend_4w"]) == 4
@@ -213,6 +249,7 @@ class TestBuildReportCardThreadsTrends:
 
     def test_no_prior_cards_trends_stay_default(self, s3):
         self._seed_eod_pnl(s3)
+        self._seed_freshness_inputs(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         sharpe = self._comp(card, "portfolio_outcome", "sharpe_ratio")
         assert sharpe["trend_4w"] is None
