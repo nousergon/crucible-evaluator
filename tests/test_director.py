@@ -183,6 +183,33 @@ class TestCarryover:
         with pytest.raises(Exception):
             load_ledger("nonexistent-bucket-xyz", s3_client=s3)
 
+    def test_new_item_starts_carry_count_zero(self, s3):
+        merged = merge_plan_into_ledger({"items": []}, _plan(), RUN_DATE)
+        row = merged["items"][0]
+        assert row["carry_count"] == 0
+        assert row["escalated"] is False
+        assert row["issue_number"] is None
+
+    def test_carry_count_increments_while_not_resolved(self, s3):
+        ledger = {"items": [{"id": "revive-momentum-l1", "status": "carried_over",
+                             "first_seen": "2026-05-23", "carry_count": 1, "escalated": False,
+                             "issue_number": 501}]}
+        merged = merge_plan_into_ledger(ledger, _plan(), RUN_DATE)  # _plan()'s item defaults to "proposed"
+        row = next(r for r in merged["items"] if r["id"] == "revive-momentum-l1")
+        assert row["carry_count"] == 2
+        assert row["issue_number"] == 501  # preserved — not derivable from the plan
+
+    def test_carry_count_resets_on_resolved(self, s3):
+        ledger = {"items": [{"id": "revive-momentum-l1", "status": "carried_over",
+                             "first_seen": "2026-05-23", "carry_count": 3, "escalated": True,
+                             "issue_number": 501}]}
+        plan = _plan()
+        plan.action_items[0].status = "resolved"
+        merged = merge_plan_into_ledger(ledger, plan, RUN_DATE)
+        row = next(r for r in merged["items"] if r["id"] == "revive-momentum-l1")
+        assert row["carry_count"] == 0
+        assert row["escalated"] is False
+
 
 class TestHandler:
     def test_disabled_is_noop(self, s3, monkeypatch):
