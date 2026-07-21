@@ -3,8 +3,9 @@ substrate.py — Tile 5: Substrate Reliability (RC v2).
 
 Operational substrate — a flaky substrate invalidates everything above it
 (RC v2 Principle 8). One component is sourceable from S3 today
-(``price_cache_freshness`` via the price-cache objects' LastModified); the rest
-need producers the evaluator can't yet reach (SF/CW execution history, the
+(``price_cache_freshness`` via the content-derived freshness sentinel,
+config#2350); the rest need producers the evaluator can't yet reach (SF/CW
+execution history, the
 data-quality substrate inventory, GitHub Actions, CFN drift), so they grade a
 **transparent N/A-NOT-IMPL whose reason names the producer to build** — the
 report card says "the substrate is mostly unmeasured" out loud rather than
@@ -34,7 +35,14 @@ from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
 logger = logging.getLogger(__name__)
 
 MODULE = "substrate"
-PRICE_CACHE_PREFIX = "predictor/price_cache/"
+# predictor/price_cache/ stopped being written after the Wave-3 PR4 cutover
+# moved the live per-ticker cache to reference/price_cache/ (crucible-predictor
+# regime/features.py reads the new location; see ARTIFACT_REGISTRY.yaml's
+# grandfathered-legacy entry for predictor/price_cache/). Grading raw S3 mtimes
+# under the dead legacy prefix produced a monotonically-growing false RED that
+# no refresh could ever clear (config#3142) — read the content-derived
+# freshness sentinel (config#2350) that the live writer stamps instead.
+PRICE_CACHE_FRESHNESS_SENTINEL_KEY = "reference/price_cache/_freshness.json"
 
 # The 3 orchestration Step Functions whose rolling success rate IS the substrate
 # headline. ARNs are *discovered* at runtime (list_state_machines) rather than
@@ -244,22 +252,6 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
     }
 
 
-def _latest_mtime(s3, bucket: str, prefix: str) -> datetime | None:
-    """Max LastModified across objects under ``prefix`` (None if empty)."""
-    latest = None
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                lm = obj["LastModified"]
-                if latest is None or lm > latest:
-                    latest = lm
-    except ClientError as e:
-        logger.error("S3 list failed for s3://%s/%s: %s", bucket, prefix, e)
-        raise
-    return latest
-
-
 def build_substrate_tile(
     bucket: str,
     run_date: str | None = None,
@@ -280,9 +272,19 @@ def build_substrate_tile(
     as_of = as_of or datetime.now(UTC)
     components = []
 
-    # 1. price_cache_freshness (critical) — days since the price cache last wrote.
-    pc_src = f"s3://{bucket}/{PRICE_CACHE_PREFIX}"
-    latest = _latest_mtime(s3, bucket, PRICE_CACHE_PREFIX)
+    # 1. price_cache_freshness (critical) — days since the price cache last wrote,
+    # per the content-derived sentinel the live writer stamps (config#2350/#3142).
+    pc_src = f"s3://{bucket}/{PRICE_CACHE_FRESHNESS_SENTINEL_KEY}"
+    sentinel = _get_json(s3, bucket, PRICE_CACHE_FRESHNESS_SENTINEL_KEY)
+    latest = None
+    ts_raw = sentinel.get("timestamp") if isinstance(sentinel, dict) else None
+    if ts_raw:
+        try:
+            latest = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=UTC)
+        except ValueError:
+            latest = None
     if latest is not None:
         age_d = (as_of - latest).total_seconds() / 86400.0
         components.append(build_metric(
@@ -298,7 +300,7 @@ def build_substrate_tile(
             estimator="freshness_age",
             n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=pc_src,
             input_present=False,
-            na_detail="price_cache_freshness: no objects under predictor/price_cache/ to date-stamp.",
+            na_detail=f"price_cache_freshness: no readable timestamp at {PRICE_CACHE_FRESHNESS_SENTINEL_KEY}.",
         ))
 
     # 2. sf_success_rate_4w (critical) + unattended_first_pass_rate (supporting) —

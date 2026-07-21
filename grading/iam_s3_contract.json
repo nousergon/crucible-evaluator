@@ -30,6 +30,7 @@
   "prefixes": {
     "backtest": "read",
     "predictor": "read",
+    "reference": "read",
     "trades": "read",
     "config": "read",
     "signals": "read",
