@@ -82,6 +82,11 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # no contract/IAM change, just a pin bump.
     "grading/aggregate.py": 3,
     "grading/artifacts.py": 1,
+    # config#3058: freshness_preflight reads metrics.json/e2e_lift.json (via
+    # get_object) and probes signals.json instance dates (via head_object) --
+    # all under the already-granted "backtest"/"predictor"/"signals"/"trades"
+    # read prefixes, no contract/IAM change.
+    "grading/freshness_preflight.py": 3,
     "grading/history.py": 2,
     "grading/producers/deploy_success.py": 1,
     "grading/tiles/agent.py": 1,
