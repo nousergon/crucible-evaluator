@@ -52,13 +52,42 @@ def _as_dict(plan: Any) -> dict:
     return {}
 
 
+_LOOP_SUMMARY_LABELS = (
+    ("open", "open"),
+    ("closed_verified", "closed & verified"),
+    ("closed_unrecovered", "closed but UNRECOVERED (reopened)"),
+    ("closed_unverifiable", "closed, unverifiable"),
+    ("escalated", "escalated to Decision Queue"),
+)
+
+
+def _loop_summary_line(loop_summary: dict | None) -> str | None:
+    """One line reporting Director-loop status (config#3145 point 4): items
+    open / closed-and-verified / closed-but-unrecovered / escalated. ``None``
+    if the pass didn't run this cycle (no GH token, or an error — those cases
+    still show up in the Lambda's own summary/logs, not worth cluttering the
+    digest email over)."""
+    if not loop_summary or loop_summary.get("director_loop") != "ok":
+        return None
+    parts = [
+        f"{loop_summary.get(f'director_loop_{key}', 0)} {label}"
+        for key, label in _LOOP_SUMMARY_LABELS
+    ]
+    return "Director loop: " + ", ".join(parts)
+
+
 def build_director_digest(
-    plan: Any, run_date: str, *, console_base_url: str | None = None
+    plan: Any, run_date: str, *, console_base_url: str | None = None,
+    loop_summary: dict | None = None,
 ) -> tuple[str, str, str]:
     """Build ``(subject, plain_body, html_body)`` for the weekly action plan.
 
     Thin by design — the full rationale/evidence/carry-over/self-grade stays on
-    the console Director page this links to.
+    the console Director page this links to. ``loop_summary`` (the return of
+    ``director.loop_verification.verify_and_correct``, folded into the
+    handler's summary dict) adds a one-line status report on last week's
+    carried-over items (config#3145 point 4) — open / closed-and-verified /
+    closed-but-unrecovered / escalated.
     """
     p = _as_dict(plan)
     url = director_plan_url(run_date, console_base_url)
@@ -98,6 +127,9 @@ def build_director_digest(
             )
     else:
         plain_lines.append("  (none proposed this week)")
+    loop_line = _loop_summary_line(loop_summary)
+    if loop_line:
+        plain_lines += ["", loop_line]
     plain_lines += ["", f"Full detail (rationale, evidence, carry-over, self-grade): {url}"]
     plain_body = "\n".join(plain_lines)
 
@@ -129,7 +161,8 @@ def build_director_digest(
         "<th style='padding:3px 8px;'>Owner</th><th style='padding:3px 8px;'>Horizon</th>"
         "<th style='padding:3px 8px;'>Conf</th></tr>"
         f"{rows}</table>"
-        "<p style='font-size:10px;color:#aaa;margin-top:20px;'>"
+        + (f"<p style='font-size:12px;'>{loop_line}</p>" if loop_line else "")
+        + "<p style='font-size:10px;color:#aaa;margin-top:20px;'>"
         "Advisory only — the Director proposes; rationale, evidence, carry-over, "
         f"and self-grade are on the console Director page (<a href=\"{url}\">link</a>).</p>"
         "</body></html>"
@@ -138,14 +171,15 @@ def build_director_digest(
 
 
 def send_director_digest(
-    plan: Any, run_date: str, *, console_base_url: str | None = None
+    plan: Any, run_date: str, *, console_base_url: str | None = None,
+    loop_summary: dict | None = None,
 ) -> bool:
     """Build + send the Director digest. Best-effort: returns the send result and
     NEVER raises (transport is the lib's fire-and-forget ``send_email``; the
     build is wrapped so a malformed plan can't break the Director run)."""
     try:
         subject, plain_body, html_body = build_director_digest(
-            plan, run_date, console_base_url=console_base_url
+            plan, run_date, console_base_url=console_base_url, loop_summary=loop_summary,
         )
     except Exception:  # noqa: BLE001 — the email must never break the Director
         log.warning("Director digest: build failed — skipping email", exc_info=True)

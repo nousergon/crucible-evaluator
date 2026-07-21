@@ -39,6 +39,7 @@ from director.issue_filer import (
     open_issues_digest,
     recently_closed_proposals_digest,
 )
+from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from grading.handler import _resolve_run_date
 from krepis.logging import setup_logging
@@ -170,6 +171,30 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
     except Exception as e:  # noqa: BLE001 — advisory channel; plan already shipped
         logger.warning("Director issue filing failed (plan already written, non-fatal): %s", e)
         return {"director_issues": "error", "director_issues_error": str(e)}
+
+
+def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None) -> dict:
+    """Phase H+ (config#3145): close the Director loop. Runs BEFORE this
+    week's ledger write so any correction it makes (backfilled issue
+    numbers, a sticky ``escalated`` flag) persists in the same write —
+    reopen-if-unrecovered and carryover-escalation both mutate ``ledger``'s
+    items in place. Best-effort + fail-loud (WARN + recorded, never fatal):
+    the plan + ledger are the primary deliverables and must ship even if
+    GitHub is unreachable this week."""
+    if not token:
+        return {"director_loop": "skipped", "director_loop_reason": "no GH token"}
+    try:
+        items = ledger.get("items") or []
+        n_backfilled = backfill_issue_numbers(items, repo=DEFAULT_REPO, token=token)
+        result = verify_and_correct(items, card, repo=DEFAULT_REPO, token=token)
+        return {
+            "director_loop": "ok",
+            "director_loop_backfilled": n_backfilled,
+            **{f"director_loop_{k}": v for k, v in result.items()},
+        }
+    except Exception as e:  # noqa: BLE001 — advisory correction pass; ledger already valid
+        logger.warning("Director loop-verification failed (non-fatal): %s", e)
+        return {"director_loop": "error", "director_loop_error": str(e)}
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
@@ -415,6 +440,15 @@ def handler(event: dict | None = None, context=None) -> dict:
         ContentType="application/json",
     )
     merged = merge_plan_into_ledger(ledger, plan, run_date)
+
+    # Phase H+ — close the Director loop (config#3145): verify last week's
+    # closed issues actually recovered their cited metric (reopen if not),
+    # and escalate any item carried >= 2 runs to the Decision Queue. Runs
+    # BEFORE the ledger write so its in-place corrections (backfilled
+    # issue_number, sticky escalated flag) land in this week's persisted
+    # ledger.
+    loop_summary = _verify_loop_best_effort(merged, card, gh_token)
+
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
     # Digest email — a thin summary that deep-links to the console Director page
@@ -427,7 +461,7 @@ def handler(event: dict | None = None, context=None) -> dict:
     email_sent = False
     try:
         from director.emailer import send_director_digest
-        email_sent = send_director_digest(plan, run_date)
+        email_sent = send_director_digest(plan, run_date, loop_summary=loop_summary)
     except Exception:  # noqa: BLE001 — the email must never break the Director
         logger.warning("Director: digest email failed (non-fatal)", exc_info=True)
 
@@ -457,6 +491,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "ledger_size": len(merged.get("items", [])),
         "digest_email": "sent" if email_sent else "not_sent",
         **retro_summary,
+        **loop_summary,
         **issues_summary,
         **deploy_summary,
     }
