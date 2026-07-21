@@ -344,3 +344,23 @@ def test_file_issues_files_fresh_p1_when_no_prior_closed_evidence_matches():
     assert posted["labels"] == ["area:director-proposals", "P1"]
     assert "Re-confirm" not in posted["title"]
     assert res["issues"][0]["reconfirm_of"] == []
+
+
+# ── slug_issue_number_map (config#3145 backfill source) ─────────────────────
+
+
+def test_slug_issue_number_map_extracts_from_title_and_body():
+    gh = FakeGitHub(existing=[
+        {"title": "[director] Foo (id=foo-slug)", "body": "x", "number": 601},
+        {"title": "[director] Bar", "body": "marker id=bar-slug here", "number": 602},
+    ])
+    m = IF.slug_issue_number_map("r/x", "tok", gh_request=gh)
+    assert m == {"foo-slug": 601, "bar-slug": 602}
+
+
+def test_slug_issue_number_map_skips_prs():
+    gh = FakeGitHub(existing=[
+        {"title": "[director] Foo (id=foo-slug)", "body": "x", "number": 601,
+         "pull_request": {"url": "..."}},
+    ])
+    assert IF.slug_issue_number_map("r/x", "tok", gh_request=gh) == {}
