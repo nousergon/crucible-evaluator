@@ -30,6 +30,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
+from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
 from grading.module_agg import overall_status
@@ -75,7 +76,20 @@ def build_report_card(
     run_date: str,
     s3_client=None,
 ) -> dict:
-    """Read artifacts → grade → attach provenance. Pure of writes."""
+    """Read artifacts → grade → attach provenance. Pure of writes.
+
+    Hard input-freshness preflight FIRST (alpha-engine-config#3058, Brian
+    ruling 2026-07-20): "if the evaluator is evaluating on stale data its
+    report is COMPLETELY USELESS — it should hard-fail before evaluating
+    stale outputs." ``assert_input_freshness`` raises
+    ``MissingInputArtifactError``/``StaleInputArtifactError`` (uncaught here
+    by design — the SF state must fail loud, rc != 0) before ANY tile reads
+    an artifact. This runs unconditionally, including on a ``skip_*``-
+    flagged partial rerun — the exact scenario (a recovery rerun that skips
+    the producer stage) that makes a consumer-side gate load-bearing.
+    """
+    freshness_provenance = assert_input_freshness(bucket, run_date, s3_client=s3_client)
+
     inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
     scorecard = compute_scorecard(**inputs)
 
@@ -156,6 +170,7 @@ def build_report_card(
         "run_date": run_date,
         "grader_source": GRADER_SOURCE,
         "artifacts": report.as_dict(),
+        "freshness_preflight": freshness_provenance,
     }
     logger.info(
         "Report card for %s: status=%s overall=%s (%d artifacts read, %d absent)",
@@ -204,8 +219,22 @@ def write_report_card(
 
     Returns ``{"latest_key": str, "dated_key": str | None}`` (``dated_key`` is
     ``None`` when ``snapshot=False``).
+
+    Freshness preflight mirror (alpha-engine-config#3058): ``snapshot=True``
+    freezes the dated weekly record — the worst-case outcome the issue names
+    is a FROZEN stale report, so the gate is re-asserted here, independent of
+    whether the caller already ran it via ``build_report_card``. Belt-and-
+    braces: a future caller that builds a card once and snapshots it later
+    (or re-snapshots a previously-built card) must not bypass the gate. Not
+    re-run for a bare ``latest``-only refresh (``snapshot=False``) — that
+    path never freezes a weekly record, so it stays governed by
+    ``build_report_card``'s own preflight.
     """
     s3 = s3_client or boto3.client("s3")
+
+    if snapshot:
+        assert_input_freshness(bucket, run_date, s3_client=s3)
+
     body = json.dumps(scorecard, indent=2, default=str).encode("utf-8")
 
     latest_key = LATEST_REPORT_CARD_KEY

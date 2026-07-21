@@ -14,6 +14,7 @@ from grading.aggregate import (
     report_card_key,
     write_report_card,
 )
+from grading.freshness_preflight import MissingInputArtifactError, StaleInputArtifactError
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-06"
@@ -35,8 +36,77 @@ def _put(s3, filename, data):
     )
 
 
+def _put_eod_pnl(s3, *, n_rows=80, month="01"):
+    """Seed a minimal-but-sufficient trades/eod_pnl.csv (80 rows clears the
+    dsr/psr n_floor=60) so portfolio_outcome's build path reaches the dsr
+    component instead of short-circuiting the whole tile to N/A on a
+    missing CSV. Dates default to Jan 2026 so callers grading a LATER
+    RUN_DATE (e.g. the freshness-preflight fixtures below) can still exercise
+    the dsr path without also having to satisfy the freshness gate via this
+    same CSV — use ``_put_eod_pnl_fresh`` when the gate itself is under test."""
+    s3.put_object(
+        Bucket=BUCKET, Key="trades/eod_pnl.csv",
+        Body=(
+            "date,portfolio_nav,daily_return_pct,spy_return_pct,"
+            "daily_alpha_pct,positions_snapshot,created_at\n"
+            + "\n".join(
+                f"2026-{month}-{(i % 28) + 1:02d},{1_000_000 * (1 + 0.001 * i):.2f},"
+                f"0.12,0.04,0.08,{{}},2026-01-01T00:00:00+00:00"
+                for i in range(n_rows)
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def _put_eod_pnl_fresh(s3, run_date=RUN_DATE, *, n_rows=80):
+    """eod_pnl.csv whose freshest row IS run_date — satisfies both the dsr
+    n_floor AND the freshness preflight's eod_reconcile_pnl check."""
+    import datetime as _dt
+
+    end = _dt.date.fromisoformat(run_date)
+    rows = [
+        (end - _dt.timedelta(days=i)).isoformat()
+        for i in range(n_rows)
+    ]
+    s3.put_object(
+        Bucket=BUCKET, Key="trades/eod_pnl.csv",
+        Body=(
+            "date,portfolio_nav,daily_return_pct,spy_return_pct,"
+            "daily_alpha_pct,positions_snapshot,created_at\n"
+            + "\n".join(
+                f"{d},{1_000_000 * (1 + 0.001 * i):.2f},0.12,0.04,0.08,{{}},"
+                "2026-01-01T00:00:00+00:00"
+                for i, d in enumerate(rows)
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def _seed_freshness_inputs(s3, run_date=RUN_DATE):
+    """Seed every artifact `grading.freshness_preflight.assert_input_freshness`
+    hard-requires, all dated exactly `run_date` (the trivially-fresh case) —
+    the baseline every test that isn't itself exercising the freshness gate
+    should call, so it can focus on the behavior it actually names."""
+    s3.put_object(
+        Bucket=BUCKET, Key="predictor/weights/meta/manifest.json",
+        Body=json.dumps({
+            "training_date": run_date,
+            "walk_forward": {"n_folds": 16},
+            "meta_model_oos_ic_cpcv": {"status": "ok", "n_combos": 4, "mean_ic": 0.1, "frac_positive": 0.75, "ics": [0.1, 0.1, 0.1, 0.1]},
+        }).encode("utf-8"),
+    )
+    s3.put_object(
+        Bucket=BUCKET, Key=f"signals/{run_date}/signals.json",
+        Body=json.dumps({"market_regime": "neutral"}).encode("utf-8"),
+    )
+    _put_eod_pnl_fresh(s3, run_date)
+
+
 def _seed_full(s3):
     """Seed a realistic full artifact set (mirrors the scorecard full-data test)."""
+    _seed_freshness_inputs(s3)
     s3.put_object(
         Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/metrics.json",
         Body=json.dumps({
@@ -78,14 +148,13 @@ def _seed_full(s3):
 
 
 class TestBuildReportCard:
-    def test_empty_bucket_insufficient_with_provenance(self, s3):
-        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        assert card["status"] == "insufficient_data"
-        prov = card["_provenance"]
-        assert prov["run_date"] == RUN_DATE
-        assert prov["artifacts"]["n_read"] == 0
-        assert prov["artifacts"]["n_missing"] > 0
-        assert "grader_source" in prov
+    def test_empty_bucket_hard_fails_freshness_preflight(self, s3):
+        # alpha-engine-config#3058: an empty bucket has NO declared input
+        # artifacts at all — this is a MissingInputArtifactError (hard fail),
+        # not the old "insufficient_data" graded card. The preflight runs
+        # BEFORE any tile/scorecard computation.
+        with pytest.raises(MissingInputArtifactError):
+            build_report_card(BUCKET, RUN_DATE, s3_client=s3)
 
     def test_full_artifacts_produce_ok_status(self, s3):
         _seed_full(s3)
@@ -97,9 +166,20 @@ class TestBuildReportCard:
         assert card["executor"]["grade"] is not None
         # Provenance records exactly what was read.
         assert "e2e_lift.json" in card["_provenance"]["artifacts"]["artifacts_read"]
+        # Provenance also records the freshness preflight that ran first.
+        assert card["_provenance"]["freshness_preflight"]["run_date"] == RUN_DATE
+        checked_ids = {c["artifact_id"] for c in card["_provenance"]["freshness_preflight"]["checks"]}
+        assert "e2e_lift_json" in checked_ids
+        assert "eod_reconcile_pnl" in checked_ids
 
     def test_partial_artifacts_grade_na_loudly(self, s3):
-        # Only macro present → research partial, others N/A; the gap is in provenance.
+        # Only macro present (+ the hard-required freshness inputs) → research
+        # partial, others N/A; the gap is in provenance. This is testing the
+        # TILES' own graceful-N/A posture for artifacts the preflight does NOT
+        # hard-gate (shadow_book.json etc.) — distinct from the freshness gate.
+        _seed_freshness_inputs(s3)
+        _put(s3, "metrics.json", {"run_date": RUN_DATE, "status": "ok"})
+        _put(s3, "e2e_lift.json", {"status": "ok"})
         _put(s3, "macro_eval.json", {"status": "ok", "accuracy_lift": 2.0, "alpha_lift": 0.5})
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         assert card["predictor"]["grade"] is None
@@ -107,6 +187,7 @@ class TestBuildReportCard:
 
     def test_v2_tiles_attached(self, s3):
         # RC v2 MetricRecord tiles are nested under "tiles" (portfolio + predictor).
+        _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         assert set(card["tiles"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
@@ -132,26 +213,6 @@ class TestBuildReportCard:
         assert RUN_DATE in card["tiles"]["research"]["source_artifact_dates"]
 
 
-def _put_eod_pnl(s3):
-    """Seed a minimal-but-sufficient trades/eod_pnl.csv (80 rows clears the
-    dsr/psr n_floor=60) so portfolio_outcome's build path reaches the dsr
-    component instead of short-circuiting the whole tile to N/A on a
-    missing CSV."""
-    s3.put_object(
-        Bucket=BUCKET, Key="trades/eod_pnl.csv",
-        Body=(
-            "date,portfolio_nav,daily_return_pct,spy_return_pct,"
-            "daily_alpha_pct,positions_snapshot,created_at\n"
-            + "\n".join(
-                f"2026-01-{(i % 28) + 1:02d},{1_000_000 * (1 + 0.001 * i):.2f},"
-                f"0.12,0.04,0.08,{{}},2026-01-01T00:00:00+00:00"
-                for i in range(80)
-            )
-            + "\n"
-        ).encode("utf-8"),
-    )
-
-
 class TestCumulativeTrialCountWiring:
     """config#2454: build_report_card reads the shared cumulative
     trial-count counter and threads it into portfolio_outcome's dsr
@@ -161,7 +222,9 @@ class TestCumulativeTrialCountWiring:
         """No cumulative_trial_count.json yet (counter not seeded/backfilled)
         → n_trials stays None → dsr keeps reporting N/A, exactly the
         pre-#2454 behavior. Never an error."""
-        _put_eod_pnl(s3)
+        _seed_freshness_inputs(s3)
+        _put(s3, "metrics.json", {"run_date": RUN_DATE, "status": "ok"})
+        _put(s3, "e2e_lift.json", {"status": "ok"})
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         dsr = next(
             c for c in card["tiles"]["portfolio_outcome"]["components"]
@@ -178,7 +241,9 @@ class TestCumulativeTrialCountWiring:
         increment_trial_count(
             "gamma_sweep", 250, RUN_DATE, bucket=BUCKET, s3_client=s3,
         )
-        _put_eod_pnl(s3)
+        _seed_freshness_inputs(s3)
+        _put(s3, "metrics.json", {"run_date": RUN_DATE, "status": "ok"})
+        _put(s3, "e2e_lift.json", {"status": "ok"})
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         dsr = next(
             c for c in card["tiles"]["portfolio_outcome"]["components"]
@@ -190,7 +255,9 @@ class TestCumulativeTrialCountWiring:
     def test_counter_read_failure_degrades_gracefully(self, s3, monkeypatch):
         """A broken/corrupt counter artifact must not fail the whole report-
         card build — dsr just falls back to N/A this cycle."""
-        _put_eod_pnl(s3)
+        _seed_freshness_inputs(s3)
+        _put(s3, "metrics.json", {"run_date": RUN_DATE, "status": "ok"})
+        _put(s3, "e2e_lift.json", {"status": "ok"})
         s3.put_object(
             Bucket=BUCKET, Key="backtest/cumulative_trial_count.json",
             Body=b"{not valid json",
@@ -245,6 +312,34 @@ class TestWriteReportCard:
         # ...but the dated weekly key was NOT.
         listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
         assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_true_reasserts_freshness_and_raises_if_now_stale(self, s3):
+        # alpha-engine-config#3058: the snapshot step re-asserts freshness
+        # independent of build_report_card's own gate — belt-and-braces so a
+        # frozen weekly record (the worst-case artifact per the issue) can
+        # never be produced from a stale state, even if a future/alternate
+        # caller builds a card once and snapshots it later. Simulate that by
+        # building a valid card, then rot the e2e_lift.json instance so the
+        # SAME run_date now reads stale at snapshot time.
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        s3.delete_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/e2e_lift.json")
+        with pytest.raises(MissingInputArtifactError):
+            write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=True)
+        # And the moving `latest` pointer must not have been written either —
+        # the gate runs BEFORE either put_object.
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="evaluator/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_snapshot_false_does_not_reassert_freshness(self, s3):
+        # A bare latest-only refresh never freezes a weekly record, so it
+        # stays governed by build_report_card's own preflight only — no
+        # redundant re-check here.
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        s3.delete_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/e2e_lift.json")
+        written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=False)
+        assert written["latest_key"] == "evaluator/latest/report_card.json"
 
     def test_report_card_key_helper(self):
         assert report_card_key("2026-01-02") == "evaluator/2026-01-02/report_card.json"
