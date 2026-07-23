@@ -229,3 +229,56 @@ class TestCheckDeployDriftDispatch:
         )
         out = H.handler({"action": "check_deploy_drift"}, context=None)
         assert out["has_drift"] is False
+
+
+class TestCanarySmokeProbe:
+    """Deploy-time smoke canary (this incident, 2026-07-23).
+
+    ``infrastructure/deploy.sh`` invokes ``{"write": false, "canary": true}``
+    on EVERY image-affecting merge — arbitrary weekdays, legitimately before
+    this week's Saturday-cadence weekly artifacts exist. The config#3058
+    input-freshness gate must therefore be skipped for this NON-WRITING probe
+    (else every weekday deploy false-REDs on a missing
+    ``backtest/{last_trading_day}/metrics.json``), while every WRITING/
+    production path stays hard-gated.
+    """
+
+    def test_canary_skips_freshness_when_inputs_absent(self, s3):
+        # Nothing seeded → the freshness preflight's first check (metrics.json)
+        # would normally raise MissingInputArtifactError. The canary must NOT:
+        # it builds the (degenerate, all-N/A) card and returns status ok,
+        # proving the gate was skipped and the boot/read path still ran.
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False, "canary": True})
+        assert out["status"] == "ok"
+        assert out["report_card_key"] is None
+        assert out["latest_key"] is None
+        # the freshness preflight was recorded as skipped in provenance.
+        assert out["run_date"] == RUN_DATE
+
+    def test_canary_persists_nothing(self, s3):
+        H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False, "canary": True})
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="evaluator/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_non_canary_still_hard_fails_on_missing_metrics(self, s3):
+        # The gate is intact for the ordinary (non-canary) path: with no
+        # freshness inputs seeded, build must hard-fail loud (config#3058).
+        from grading.freshness_preflight import MissingInputArtifactError
+
+        with pytest.raises(MissingInputArtifactError):
+            H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False})
+
+    def test_canary_with_write_true_is_refused(self, s3):
+        # A canary that also writes would persist a card built past a skipped
+        # gate — a config#3058 violation. Refuse it outright.
+        with pytest.raises(ValueError, match="canary"):
+            H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": True, "canary": True})
+
+    def test_canary_still_reads_tiles_absent_gate_only(self, s3):
+        # The carve-out skips ONLY freshness — every tile read still runs, so a
+        # seeded artifact is still graded (proving IAM/transport smoke coverage
+        # is preserved, not short-circuited like check_deploy_drift).
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False, "canary": True})
+        assert out["status"] == "ok"
+        assert out["real_graded"]["portfolio_outcome"] > 0

@@ -73,9 +73,18 @@ if ! $NO_CANARY; then
   # takes raw JSON (boto3 path — no base64/`--cli-binary-format`). A non-zero
   # CLI exit (non-throttle error or throttle exhaustion) refuses to promote —
   # PRE-promotion, so the live alias is untouched.
-  echo "=== Canary invoke (write=false — builds the card, no S3 write) ==="
+  # write=false → no S3 write; canary=true → skip the config#3058 input-freshness
+  # preflight for THIS smoke probe only (a deploy runs on arbitrary weekdays,
+  # legitimately before this week's Saturday-cadence weekly artifacts exist — a
+  # freshness gate here false-REDs every weekday deploy; freshness is enforced at
+  # assessment time by the SF preflight + freshness monitor, not at deploy time).
+  # The canary still exercises boot + every tile's S3 read (incl. the substrate
+  # reference/ read whose AccessDenied it exists to catch), so its IAM-drift smoke
+  # value is preserved; only the freshness assertion is skipped. See
+  # grading/handler.py `canary` handling + grading/aggregate.py `enforce_freshness`.
+  echo "=== Canary invoke (write=false, canary=true — boot+IAM smoke, no S3 write, freshness gate skipped) ==="
   python3 -m krepis.aws invoke-canary --function-name "$FUNCTION" \
-    --payload '{"write": false}' \
+    --payload '{"write": false, "canary": true}' \
     --region "$REGION" --out /tmp/evaluator-canary.json \
     --max-attempts 6 --label "$FUNCTION-canary" \
     || { echo "CANARY UNINVOKABLE — not promoting alias"; exit 1; }

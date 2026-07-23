@@ -121,11 +121,32 @@ def handler(event: dict | None = None, context=None) -> dict:
     # frozen weekly snapshot is the deliberate exception, not the norm.
     snapshot = bool(event.get("snapshot", False))
 
+    # `canary` (this incident, 2026-07-23): the deploy-time smoke probe
+    # (`infrastructure/deploy.sh`, `{"write": false, "canary": true}`). It runs
+    # on EVERY image-affecting merge — arbitrary weekdays, before this week's
+    # Saturday-cadence weekly artifacts exist — so the config#3058 input-
+    # freshness gate would false-RED the deploy (metrics.json for "last trading
+    # day" legitimately absent). The canary is a boot + IAM/transport probe, NOT
+    # a written assessment, so it skips ONLY the freshness preflight (every tile
+    # read still runs — incl. the substrate `reference/` read whose AccessDenied
+    # the canary exists to catch, config#1404). The carve-out is honoured ONLY
+    # on the non-writing path: a canary that also writes is a contradiction (it
+    # would persist a card built past a skipped gate), so refuse it outright —
+    # config#3058 stays absolute for every path that produces a consumed card.
+    canary = bool(event.get("canary", False))
+    if canary and write:
+        raise ValueError(
+            "canary=true is a non-writing deploy smoke probe and must not persist "
+            "a card built with the freshness gate skipped; pass write=false "
+            "(config#3058)."
+        )
+    enforce_freshness = not canary
+
     logger.info(
-        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s)",
-        run_date, bucket, write, dry_run, snapshot,
+        "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s, canary=%s)",
+        run_date, bucket, write, dry_run, snapshot, canary,
     )
-    card = build_report_card(bucket, run_date)
+    card = build_report_card(bucket, run_date, enforce_freshness=enforce_freshness)
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}

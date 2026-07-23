@@ -75,6 +75,8 @@ def build_report_card(
     bucket: str,
     run_date: str,
     s3_client=None,
+    *,
+    enforce_freshness: bool = True,
 ) -> dict:
     """Read artifacts → grade → attach provenance. Pure of writes.
 
@@ -84,11 +86,40 @@ def build_report_card(
     stale outputs." ``assert_input_freshness`` raises
     ``MissingInputArtifactError``/``StaleInputArtifactError`` (uncaught here
     by design — the SF state must fail loud, rc != 0) before ANY tile reads
-    an artifact. This runs unconditionally, including on a ``skip_*``-
-    flagged partial rerun — the exact scenario (a recovery rerun that skips
-    the producer stage) that makes a consumer-side gate load-bearing.
+    an artifact. This runs unconditionally for every path that PRODUCES a
+    consumed assessment, including on a ``skip_*``-flagged partial rerun —
+    the exact scenario (a recovery rerun that skips the producer stage) that
+    makes a consumer-side gate load-bearing.
+
+    ``enforce_freshness`` (keyword-only, default ``True``): the sole carve-out
+    is the **deploy-time smoke canary** (``infrastructure/deploy.sh`` →
+    handler ``canary=true, write=false``). That canary is a boot + IAM/
+    transport probe that runs on EVERY image-affecting merge — i.e. on
+    arbitrary weekdays, legitimately BEFORE this week's Saturday-cadence
+    weekly artifacts exist — so coupling it to live input-freshness turns a
+    correct "no fresh weekly data yet" state into a false deploy-RED (this
+    incident, 2026-07-23: ``backtest/2026-07-22/metrics.json`` absent on a
+    Thursday deploy). Freshness is a RUN-TIME property of the WRITTEN weekly
+    assessment, not of a deploy — the SF's own preflight + the freshness
+    monitor enforce it at assessment time. Passing ``False`` skips ONLY the
+    preflight; every tile read (including the substrate ``reference/`` read
+    whose AccessDenied the canary exists to catch, config#1404) still runs,
+    so the canary keeps its IAM-drift-catching value. This never weakens
+    config#3058: it is honoured ONLY on the non-writing canary path (the
+    handler refuses ``canary`` with ``write=true``), and ``write_report_card``
+    re-asserts freshness independently on the ``snapshot`` freeze, so no
+    written/consumed card can ever be built past a skipped gate.
     """
-    freshness_provenance = assert_input_freshness(bucket, run_date, s3_client=s3_client)
+    if enforce_freshness:
+        freshness_provenance = assert_input_freshness(bucket, run_date, s3_client=s3_client)
+    else:
+        logger.warning(
+            "build_report_card: input-freshness preflight SKIPPED "
+            "(enforce_freshness=False) — deploy-canary smoke path ONLY; a "
+            "written/consumed assessment must NEVER reach this branch "
+            "(config#3058)."
+        )
+        freshness_provenance = {"run_date": run_date, "checks": [], "skipped": "enforce_freshness=False"}
 
     inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
     scorecard = compute_scorecard(**inputs)
