@@ -24,6 +24,8 @@ import json
 import logging
 import os
 
+import boto3
+
 from krepis.dates import now_dual, resolve_trading_day
 from krepis.logging import setup_logging
 
@@ -78,6 +80,41 @@ def _resolve_run_date(event: dict) -> str:
     return resolve_trading_day(raw)
 
 
+def _canary_probe(bucket: str) -> dict:
+    """Deploy boot-probe (invoked as ``{"action": "canary"}`` by
+    ``infrastructure/deploy.sh`` after pushing the new image).
+
+    A deploy canary's job is to prove the artifact it just shipped can BOOT
+    and its handler wiring is healthy — NOT to assert the state of weekly
+    production data. Reaching this function already proves the container
+    initialized and every module-level first-party import resolved under the
+    new image (``grading.aggregate`` pulls in all tile modules at import
+    time) — exactly the failure a dependency bump introduces (this deploy was
+    triggered by #137's langchain-anthropic bump, the canonical thing a boot
+    probe must catch). On top of that it exercises run-date resolution and
+    boto3 S3-client construction (region/credential wiring), then returns
+    ``status: ok``.
+
+    It DELIBERATELY does NOT call :func:`grading.aggregate.build_report_card`,
+    and therefore never runs the hard input-freshness preflight
+    (``assert_input_freshness``, alpha-engine-config#3058). That preflight is
+    a deliberate, unconditional, Brian-ruled fail-loud gate for the WEEKLY
+    ASSESSMENT — a real build on stale/absent data is "COMPLETELY USELESS" and
+    must hard-fail — and it stays fully in force on every real
+    build/CLI/snapshot path (untouched here). But a deploy runs on ARBITRARY
+    days: the current trading day's weekly ``backtest/{date}/metrics.json``
+    (and its siblings) legitimately do not exist yet on any off-cycle deploy,
+    so routing the deploy canary through the freshness-gated build made every
+    off-cycle deploy hard-fail on a MissingInputArtifactError that reflects a
+    healthy image, not a broken one. Input freshness is the weekly run's gate;
+    boot health is the deploy's — keep them on separate paths.
+    """
+    run_date = _resolve_run_date({})
+    boto3.client("s3")  # construct (region/credential wiring) — no read; freshness-agnostic
+    logger.info("Canary boot-probe OK (run_date=%s, bucket=%s)", run_date, bucket)
+    return {"status": "ok", "probe": "canary", "run_date": run_date, "bucket": bucket}
+
+
 def handler(event: dict | None = None, context=None) -> dict:
     """Build + persist the Report Card v2 for a run date.
 
@@ -88,6 +125,10 @@ def handler(event: dict | None = None, context=None) -> dict:
     Step Function gate: compares this Lambda's baked image SHA against
     ``origin/main`` HEAD and returns immediately — no report-card build, no
     S3 reads beyond the local stamp file. See ``grading/deploy_drift.py``.
+
+    ``action="canary"`` (config#3058 follow-up) is the deploy boot-probe:
+    ``infrastructure/deploy.sh`` invokes it post-deploy to smoke-test the
+    freshly-pushed image and returns immediately — see ``_canary_probe``.
     """
     event = event or {}
     if event.get("action") == "check_deploy_drift":
@@ -95,6 +136,10 @@ def handler(event: dict | None = None, context=None) -> dict:
         return check_deploy_drift(function_name=_resolve_function_name(context))
 
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
+
+    if event.get("action") == "canary":
+        return _canary_probe(bucket)
+
     run_date = _resolve_run_date(event)
     # dry_run = the Friday-PM Preflight Pipeline (SF passes dry_run=$.research_dry,
     # the canonical shell-run-dry signal). It still exercises the full read+compute

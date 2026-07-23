@@ -73,9 +73,20 @@ if ! $NO_CANARY; then
   # takes raw JSON (boto3 path — no base64/`--cli-binary-format`). A non-zero
   # CLI exit (non-throttle error or throttle exhaustion) refuses to promote —
   # PRE-promotion, so the live alias is untouched.
-  echo "=== Canary invoke (write=false — builds the card, no S3 write) ==="
+  # Boot probe (config#3058 follow-up), NOT a report-card build. The old
+  # `{"write": false}` canary invoked build_report_card, which since config#3058
+  # runs an UNCONDITIONAL hard input-freshness preflight (assert_input_freshness)
+  # — correct for the weekly assessment, but it hard-fails whenever the current
+  # trading day's weekly backtest artifacts (backtest/{date}/metrics.json, …)
+  # aren't present yet, which is TRUE on every off-cycle deploy (e.g. a routine
+  # dependency bump). A deploy canary must validate that the freshly-pushed image
+  # BOOTS and its handler wiring resolves — not assert the state of weekly
+  # production data (that gate belongs to the weekly run, where the preflight
+  # stays fully in force). `{"action": "canary"}` is the freshness-agnostic
+  # boot-probe path (grading/handler.py::_canary_probe); it returns status "ok".
+  echo "=== Canary invoke (action=canary — boot probe, no card build, no S3 write) ==="
   python3 -m krepis.aws invoke-canary --function-name "$FUNCTION" \
-    --payload '{"write": false}' \
+    --payload '{"action": "canary"}' \
     --region "$REGION" --out /tmp/evaluator-canary.json \
     --max-attempts 6 --label "$FUNCTION-canary" \
     || { echo "CANARY UNINVOKABLE — not promoting alias"; exit 1; }

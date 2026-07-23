@@ -36,7 +36,7 @@ pandas~=3.0
 # config#1694: notify_on_category required flow-doctor >=0.8; krepis flow_doctor
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
 # is >=0.10.3 — the extra alone resolves flow-doctor 0.8.x.
-krepis[flow_doctor]>=0.14.0
+krepis[flow_doctor]>=0.18.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
@@ -49,7 +49,7 @@ nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergo
 # path don't require it). The Phase-G retro JUDGE call (director/retro.py)
 # is a separate model tier (Sonnet) routed through krepis.llm instead —
 # see the krepis>=0.9.0 bump above.
-langchain-anthropic~=1.4
+langchain-anthropic~=1.5
 
 # Dev / testing
 pytest~=9.1

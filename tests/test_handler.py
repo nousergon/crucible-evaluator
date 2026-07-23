@@ -229,3 +229,35 @@ class TestCheckDeployDriftDispatch:
         )
         out = H.handler({"action": "check_deploy_drift"}, context=None)
         assert out["has_drift"] is False
+
+
+class TestCanaryProbeDispatch:
+    """config#3058 follow-up: action=canary is the deploy BOOT probe. It must
+    short-circuit BEFORE build_report_card so it NEVER runs the hard
+    input-freshness preflight — a deploy runs on off-cycle days when the
+    current trading day's weekly backtest artifacts legitimately don't exist,
+    and the old {"write": false} canary hard-failed every such deploy on a
+    MissingInputArtifactError that reflects a healthy image, not a broken one.
+    """
+
+    def test_returns_ok_without_building_the_card(self, monkeypatch):
+        # If the probe touched build_report_card at all, this would raise —
+        # proving the probe is decoupled from the freshness-gated build path.
+        def _boom(*a, **k):
+            raise AssertionError("canary probe must not call build_report_card")
+
+        monkeypatch.setattr(H, "build_report_card", _boom)
+        out = H.handler({"action": "canary"})
+        assert out["status"] == "ok"
+        assert out["probe"] == "canary"
+        assert out["run_date"]  # run-date resolution exercised
+
+    def test_immune_to_missing_input_artifacts(self):
+        # The exact failure that broke the deploy: no artifacts in the bucket
+        # (so assert_input_freshness WOULD raise MissingInputArtifactError if
+        # the build ran). The boot probe must pass regardless.
+        with mock_aws():
+            boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=BUCKET)
+            out = H.handler({"action": "canary", "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["probe"] == "canary"
