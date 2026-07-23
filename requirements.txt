@@ -49,7 +49,7 @@ nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergo
 # path don't require it). The Phase-G retro JUDGE call (director/retro.py)
 # is a separate model tier (Sonnet) routed through krepis.llm instead —
 # see the krepis>=0.9.0 bump above.
-langchain-anthropic~=1.4
+langchain-anthropic~=1.5
 
 # Dev / testing
 pytest~=9.1
