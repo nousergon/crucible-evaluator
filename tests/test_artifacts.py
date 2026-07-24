@@ -14,6 +14,19 @@ from grading.artifacts import (
     read_scorecard_inputs,
 )
 
+# Identity contract (config#1190 / alpha-engine-config#3104): the evaluator's
+# artifact-resolution symbols MUST be the nousergon_lib SSoT, not a local fork.
+# If this assertion fails, a local redefinition has silently reappeared.
+from grading import artifacts as _artifacts
+from nousergon_lib import artifact_resolution as _artifact_resolution
+
+
+def test_artifact_resolution_is_lib_ssot():
+    """Assert identity, not just behavior — the fork must not re-emerge."""
+    assert _artifacts.get_json_windowed is _artifact_resolution.get_json_windowed
+    assert _artifacts.DEFAULT_ARTIFACT_MAX_AGE_DAYS is _artifact_resolution.DEFAULT_ARTIFACT_MAX_AGE_DAYS
+    assert _artifacts.get_json is _artifact_resolution.get_json
+
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-06"
 
