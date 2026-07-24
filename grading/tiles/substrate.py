@@ -27,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from grading.artifacts import _get_json, get_json_windowed
+from grading.artifacts import get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
@@ -275,7 +275,7 @@ def build_substrate_tile(
     # 1. price_cache_freshness (critical) — days since the price cache last wrote,
     # per the content-derived sentinel the live writer stamps (config#2350/#3142).
     pc_src = f"s3://{bucket}/{PRICE_CACHE_FRESHNESS_SENTINEL_KEY}"
-    sentinel = _get_json(s3, bucket, PRICE_CACHE_FRESHNESS_SENTINEL_KEY)
+    sentinel = get_json(s3, bucket, PRICE_CACHE_FRESHNESS_SENTINEL_KEY)
     latest = None
     ts_raw = sentinel.get("timestamp") if isinstance(sentinel, dict) else None
     if ts_raw:
@@ -533,7 +533,7 @@ def build_substrate_tile(
     #    rollup (config#1153 Batch E). Graded when the producer has run + the
     #    rollup is fresh; transparent N/A naming the producer otherwise.
     ds_src = f"s3://{bucket}/{DEPLOY_SUCCESS_KEY}"
-    ds_doc = _get_json(s3, bucket, DEPLOY_SUCCESS_KEY)
+    ds_doc = get_json(s3, bucket, DEPLOY_SUCCESS_KEY)
     ds_age_days = None
     if isinstance(ds_doc, dict):
         gen = ds_doc.get("generated_utc")
