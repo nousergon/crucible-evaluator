@@ -41,6 +41,7 @@ vendor/
 
 # Local docs / scratch
 CLAUDE.md
+AGENTS.md
 *-design-*.md
 *-design.md
 run.log
