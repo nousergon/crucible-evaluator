@@ -30,6 +30,7 @@ from krepis.dates import now_dual, resolve_trading_day
 from krepis.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
+from grading.experiment_record import build_experiment_record, write_experiment_record
 
 # Structured logging + flow-doctor. Passing a flow-doctor.yaml attaches a
 # FlowDoctorHandler at ERROR (off under pytest), so every log.error() routes
@@ -186,6 +187,31 @@ def handler(event: dict | None = None, context=None) -> dict:
         latest_key = written["latest_key"]
         dated_key = written["dated_key"]
 
+    # experiment_record.v1 (alpha-engine-config#3077 Phase C): a per-run index
+    # binding what ran to what it emitted, for the results renderer. Isolated,
+    # fail-SOFT best-effort — this is a NEW secondary-observability artifact
+    # riding on top of the report-card build; a bug in it must never turn a
+    # healthy report-card cycle into a failed SF state (the report card write
+    # above is the primary deliverable and is already fully persisted by the
+    # time this runs). Skipped entirely on a dry run — dry runs never persist
+    # a report card, so a record built from one would only ever describe a
+    # cycle that emitted nothing (an uninformative, permanently-"failed"
+    # record every Friday-PM Preflight Pipeline run).
+    experiment_record_key = None
+    if write:
+        try:
+            record = build_experiment_record(
+                bucket, run_date, card, report_card_key=dated_key or latest_key,
+            )
+            written_record = write_experiment_record(bucket, run_date, record)
+            experiment_record_key = written_record["dated_key"]
+        except Exception as exc:  # noqa: BLE001 — secondary artifact, never fatal
+            logger.warning(
+                "experiment_record emission failed for %s (report card already "
+                "persisted above; this does not fail the run): %s",
+                run_date, exc, exc_info=True,
+            )
+
     summary = {
         "status": "ok",
         "dry_run": dry_run,
@@ -198,6 +224,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "latest_key": latest_key,
         "snapshot": snapshot,
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),
+        "experiment_record_key": experiment_record_key,
     }
     logger.info(
         "Report Card v2 %s: overall=%s tiles=%s",
