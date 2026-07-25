@@ -82,6 +82,10 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # no contract/IAM change, just a pin bump.
     "grading/aggregate.py": 3,
     "grading/artifacts.py": 1,
+    # config#3077: experiment_record writes dated + latest JSON pointers
+    # (put_object ×2) under the "experiments" prefix — newly declared
+    # readwrite in the contract for this PR.
+    "grading/experiment_record.py": 2,
     # config#3058: freshness_preflight reads metrics.json/e2e_lift.json (via
     # get_object) and probes signals.json instance dates (via head_object) --
     # all under the already-granted "backtest"/"predictor"/"signals"/"trades"
