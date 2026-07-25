@@ -37,6 +37,7 @@
     "evaluator": "readwrite",
     "director": "readwrite",
     "_substrate": "readwrite",
-    "groom": "read"
+    "groom": "read",
+    "experiments": "readwrite"
   }
 }

@@ -83,6 +83,10 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "grading/aggregate.py": 3,
     # config#3104: grading/artifacts.py S3 access moved to nousergon_lib.artifact_resolution SSoT;
     # the contract pin for the library-side access sites lives in nousergon-lib, not here.
+    # config#3077: experiment_record writes dated + latest JSON pointers
+    # (put_object ×2) under the "experiments" prefix — newly declared
+    # readwrite in the contract for this PR.
+    "grading/experiment_record.py": 2,
     # config#3058: freshness_preflight reads metrics.json/e2e_lift.json (via
     # get_object) and probes signals.json instance dates (via head_object) --
     # all under the already-granted "backtest"/"predictor"/"signals"/"trades"

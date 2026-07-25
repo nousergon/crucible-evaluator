@@ -197,6 +197,61 @@ class TestHandler:
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
 
 
+class TestExperimentRecordWiring:
+    """alpha-engine-config#3077 Phase C: experiment_record.v1 rides alongside
+    the report card write, fail-SOFT — a bug in it must never fail the run."""
+
+    def test_writes_experiment_record_alongside_report_card(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["experiment_record_key"] == f"experiments/reference/records/{RUN_DATE}.json"
+        obj = s3.get_object(Bucket=BUCKET, Key=out["experiment_record_key"])
+        record = json.loads(obj["Body"].read())
+        assert record["schema_version"] == 1
+        assert record["experiment_id"] == "reference"
+        assert record["run_date"] == RUN_DATE
+        # _seed_eod only seeds the 5 hard-gated freshness artifacts; several
+        # other backtest artifacts are legitimately-optional-and-unseeded in
+        # this fixture (scanner_opt/cio_opt/sizing_ab/etc — see grading/
+        # artifacts.py's own module docstring), so this record is honestly
+        # "partial", not "complete".
+        assert record["status"] == "partial"
+        # latest.json pointer also refreshed.
+        latest = s3.get_object(Bucket=BUCKET, Key="experiments/reference/records/latest.json")
+        assert json.loads(latest["Body"].read()) == record
+
+    def test_no_write_skips_experiment_record_too(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False})
+        assert out["experiment_record_key"] is None
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="experiments/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_dry_run_skips_experiment_record(self, s3):
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["experiment_record_key"] is None
+        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix="experiments/")
+        assert listing.get("KeyCount", 0) == 0
+
+    def test_experiment_record_failure_does_not_fail_the_handler(self, s3, monkeypatch):
+        # A bug in the NEW secondary-artifact code path must never turn a
+        # healthy report-card cycle into a failed run — the report card
+        # write already succeeded by the time this runs.
+        _seed_eod(s3)
+
+        def _boom(*a, **k):
+            raise RuntimeError("synthetic experiment_record bug")
+
+        monkeypatch.setattr(H, "build_experiment_record", _boom)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["status"] == "ok"
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert out["experiment_record_key"] is None
+        # report card itself still round-trips fine.
+        s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])
+
+
 class TestCheckDeployDriftDispatch:
     """config#2348: action=check_deploy_drift short-circuits BEFORE the normal
     report-card build path — no S3/bucket resolution, no tile compute."""
