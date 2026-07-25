@@ -21,12 +21,24 @@ Fail-loud posture (``[[feedback_no_silent_fails]]``):
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 
 import boto3
-from botocore.exceptions import ClientError
+
+# SSoT: artifact resolution lives in nousergon_lib (config#1190).
+# These re-exports ensure the evaluator's consumer tiles resolve the SSoT
+# symbol, never a local fork — the identity contract test in
+# tests/test_artifacts.py asserts this.
+from nousergon_lib.artifact_resolution import (
+    DEFAULT_ARTIFACT_MAX_AGE_DAYS,
+    get_json,
+    get_json_windowed,
+)
+
+# Back-compat alias for grading.tiles.substrate which historically
+# imported the private ``_get_json`` name.
+_get_json = get_json
 
 logger = logging.getLogger(__name__)
 
@@ -96,81 +108,6 @@ class ArtifactReport:
         }
 
 
-def _get_json(s3, bucket: str, key: str) -> dict | None:
-    """Read one JSON object from S3.
-
-    Returns the parsed dict, or ``None`` if the key does not exist
-    (``NoSuchKey``). Raises on any other ClientError (real S3 problem) and on
-    malformed JSON.
-    """
-    try:
-        resp = s3.get_object(Bucket=bucket, Key=key)
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("NoSuchKey", "404"):
-            return None
-        # Auth / throttle / wrong-bucket / network — do NOT swallow.
-        logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
-        raise
-    body = resp["Body"].read()
-    return json.loads(body)
-
-
-# Resilience keystone (config#1190 — the "clean Saturday run" redefinition): the
-# report card must reflect whatever artifacts EXIST, accumulated across PARTIAL /
-# RETRIED / OFF-CYCLE pipeline runs — never require every artifact at a single
-# continuous run_date. A weekly artifact + slack for multi-day recovery → 10 days.
-DEFAULT_ARTIFACT_MAX_AGE_DAYS = 10
-
-
-def get_json_windowed(
-    s3,
-    bucket: str,
-    key_template: str,
-    run_date: str,
-    *,
-    max_age_days: int = DEFAULT_ARTIFACT_MAX_AGE_DAYS,
-):
-    """Resolve a dated artifact to the FRESHEST instance at/before ``run_date``
-    within ``max_age_days``, walking back one calendar day at a time.
-
-    Returns ``(doc, src_date, age_days, key)`` — or ``(None, None, None, None)``
-    if no instance exists in the window. ``key_template`` carries a ``{date}``
-    placeholder, e.g. ``"backtest/{date}/e2e_lift.json"``.
-
-    This is the consumer half of the artifact-resilience principle (ARCHITECTURE.md
-    §"Artifact resilience"): a producer that ran on a partial/earlier attempt this
-    week still grades, instead of the metric reading N/A because THIS run_date's
-    pipeline didn't reach that stage. The returned ``key`` (carrying the real
-    artifact date) is used as the metric ``source_path`` so provenance — and any
-    staleness — stays visible, never silently graded as "today". Generalizes the
-    behavioral-tile ``_latest_shadow_tripwire`` backward scan to every tile.
-    """
-    import datetime as _dt
-
-    try:
-        day = _dt.date.fromisoformat(run_date)
-    except (ValueError, TypeError):
-        # Non-ISO run_date — fall back to a single exact read at the literal value.
-        key = key_template.format(date=run_date)
-        doc = _get_json(s3, bucket, key)
-        return (doc, run_date, 0, key) if doc is not None else (None, None, None, None)
-    for delta in range(max_age_days + 1):
-        d = (day - _dt.timedelta(days=delta)).isoformat()
-        key = key_template.format(date=d)
-        try:
-            doc = _get_json(s3, bucket, key)
-        except (json.JSONDecodeError, ValueError) as e:
-            # A corrupt / empty / partially-written artifact (a crashed mid-write
-            # from a failed pipeline attempt) is NOT a usable instance — skip it
-            # and keep walking back to the last GOOD one. This is the resilience
-            # point: a half-written file from a non-continuous run must not crash
-            # the grader. A real S3 ClientError still propagates (_get_json raises).
-            logger.warning("Skipping corrupt artifact s3://%s/%s: %s", bucket, key, e)
-            continue
-        if doc is not None:
-            return doc, d, delta, key
-    return None, None, None, None
 
 
 def _read_signal_quality(s3, bucket: str, prefix: str) -> dict | None:
@@ -184,7 +121,7 @@ def _read_signal_quality(s3, bucket: str, prefix: str) -> dict | None:
     persisted, so the composite high-bucket sub-grade stays N/A until a
     standalone ``signal_quality.json`` is persisted (filed follow-up).
     """
-    metrics = _get_json(s3, bucket, f"{prefix}/metrics.json")
+    metrics = get_json(s3, bucket, f"{prefix}/metrics.json")
     if metrics is None:
         return None
     overall = {k: v for k, v in metrics.items() if k not in _METRICS_NON_OVERALL_KEYS}
@@ -221,7 +158,7 @@ def read_scorecard_inputs(
         )
 
     for param, filename in ARTIFACT_MAP.items():
-        data = _get_json(s3, bucket, f"{prefix}/{filename}")
+        data = get_json(s3, bucket, f"{prefix}/{filename}")
         if data is not None:
             inputs[param] = data
             report.read.append(filename)

@@ -81,7 +81,8 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # snapshot write -- same "evaluator" prefix, already granted readwrite;
     # no contract/IAM change, just a pin bump.
     "grading/aggregate.py": 3,
-    "grading/artifacts.py": 1,
+    # config#3104: grading/artifacts.py S3 access moved to nousergon_lib.artifact_resolution SSoT;
+    # the contract pin for the library-side access sites lives in nousergon-lib, not here.
     # config#3077: experiment_record writes dated + latest JSON pointers
     # (put_object ×2) under the "experiments" prefix — newly declared
     # readwrite in the contract for this PR.
