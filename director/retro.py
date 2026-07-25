@@ -35,11 +35,12 @@ from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
 logger = logging.getLogger(__name__)
 
-# Sonnet judge tier (config#1673) — env-overridable; the default is a
-# floating alias (no dated snapshot). Intentionally distinct from
-# `agent.DIRECTOR_MODEL` (Opus, plan generation) — do not import/reuse that
-# constant here; the whole point is judge != generator.
-RETRO_JUDGE_MODEL_DEFAULT = "claude-sonnet-4-6"
+# Retro judge model tier — uses the "high" group from LLM_MODEL_REGISTRY.yaml
+# (config#1673, migrated from claude-sonnet-4-6 direct Anthropic 2026-07-24).
+# Env-overridable; the default is the high group primary (floating alias).
+# Intentionally distinct from `agent.DIRECTOR_MODEL` (ultra group) — do not
+# import/reuse that constant here; the whole point is judge != generator.
+RETRO_JUDGE_MODEL_DEFAULT = "deepseek-v4-pro-max"
 
 _RETRO_JUDGE_SCHEMA_NAME = "RetroGrade"
 
@@ -112,24 +113,21 @@ class _KrepisStructuredJudge:
 
 
 def _default_llm() -> _KrepisStructuredJudge:
-    """Construct the real structured-output Sonnet judge client (lazy import).
+    """Construct the real structured-output judge client (lazy import).
 
-    Same SSM ``ANTHROPIC_API_KEY`` secret path as ``agent._default_llm`` —
-    kept here so the retro can be exercised independently — but routed
-    through ``krepis.llm.LLMClient`` (krepis>=0.9.0) bound to ``RetroGrade``,
-    not langchain's ``ChatAnthropic``. Both imports are lazy so tests + the
-    grading path never pull krepis' provider SDKs or hit SSM.
+    The OpenRouter key is fetched from SSM (``/alpha-engine/OPENROUTER_API_KEY``)
+    via ``krepis.secrets.get_secret``, routed through ``krepis.llm.LLMClient``
+    (krepis>=0.9.0) bound to ``RetroGrade``. Migrated from anthropic→openrouter
+    provider 2026-07-24. Both imports are lazy so tests + the grading path never
+    pull krepis' provider SDKs or hit SSM.
     """
     from krepis.llm import LLMClient
     from krepis.llm_config import ModelSpec
     from krepis.secrets import get_secret
 
     judge_model = _judge_model()
-    api_key = get_secret("ANTHROPIC_API_KEY")
-    # No `temperature` — matches agent._default_llm's note: current-generation
-    # Claude models reject sampling params. krepis.llm's anthropic transport
-    # never sets one, so there's nothing to strip here.
-    spec = ModelSpec(provider="anthropic", model=judge_model, max_tokens=2000)
+    api_key = get_secret("OPENROUTER_API_KEY")
+    spec = ModelSpec(provider="openrouter", model=judge_model, max_tokens=2000)
     client = LLMClient(spec, api_key=api_key)
     return _KrepisStructuredJudge(client, judge_model=judge_model)
 
