@@ -1,16 +1,18 @@
 """
-agent.py — the Director agent (Layer C): one structured Opus call over the
+agent.py — the Director agent (Layer C): one structured LLM call over the
 Report Card v2 → a DirectorWeeklyActionPlan.
 
-Not LangGraph — a single ``ChatAnthropic`` call with
-``with_structured_output(DirectorWeeklyActionPlan)``, wrapped in a small
+Not LangGraph — a single ``krepis.llm.LLMClient`` structured call routed
+through OpenRouter to the ultra-group primary (GLM 5.2), wrapped in a small
 rate-limit retry. The report card is condensed to a digest (the issues +
 trends), last week's plan is supplied as carry-over context, and the model
-emits the structured plan directly (tool-use + Pydantic — no freeform parsing).
+emits the structured plan directly (krepis structured-output + Pydantic — no
+freeform parsing).
 
-The LLM is injectable (``llm=``) so the build/validate + tests run without a key
-or langchain installed; ``_default_llm()`` lazily constructs the real client.
-Model: Opus (locked, director-plan §4.2).
+The LLM is injectable (``llm=``) so the build/validate + tests run without a
+key or krepis installed; ``_default_llm()`` lazily constructs the real client.
+Model: ultra group (LLM_MODEL_REGISTRY.yaml), primary = GLM 5.2 via OpenRouter.
+Migrated from claude-opus-4-8 direct Anthropic → OpenRouter 2026-07-24.
 """
 
 from __future__ import annotations
@@ -23,7 +25,8 @@ from director.schema import DirectorWeeklyActionPlan
 
 logger = logging.getLogger(__name__)
 
-DIRECTOR_MODEL = "claude-opus-4-8"
+DIRECTOR_MODEL = "glm-5.2"
+_DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
 _RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
 
@@ -39,28 +42,62 @@ def _load_system_prompt() -> str:
         return SYSTEM_PROMPT
 
 
-def _default_llm():
-    """Construct the real structured-output Opus client (lazy import).
+def _split_messages(messages: list) -> tuple[str, str]:
+    """``build_messages()``'s ``[("system", ...), ("human", ...)]`` shape ->
+    krepis.llm's flat ``(system, user_content)`` call surface."""
+    system = ""
+    human_parts: list[str] = []
+    for role, content in messages:
+        if role == "system":
+            system = content
+        else:
+            human_parts.append(content)
+    return system, "\n\n".join(human_parts)
 
-    The Anthropic key is fetched from SSM (``/alpha-engine/ANTHROPIC_API_KEY``)
-    via the lib's ``get_secret`` — the fleet's institutional secret path — so the
-    Director Lambda needs no ``ANTHROPIC_API_KEY`` env wiring (just the
-    ``ssm:GetParameter`` grant on the role). Passed as ``anthropic_api_key=``
-    (the ChatAnthropic kwarg, not ``api_key``). Both imports are lazy so tests +
-    the grading path never pull langchain or hit SSM.
+
+class _KrepisStructuredDirector:
+    """Adapts a ``krepis.llm.LLMClient`` to the ``.invoke(messages) ->
+    DirectorWeeklyActionPlan`` surface ``_invoke_with_retry`` expects."""
+
+    def __init__(self, client, *, director_model: str):
+        self._client = client
+        self._director_model = director_model
+
+    def invoke(self, messages: list) -> DirectorWeeklyActionPlan:
+        system, user_content = _split_messages(messages)
+        result = self._client.structured(
+            system=system,
+            user_content=user_content,
+            schema=DirectorWeeklyActionPlan,
+            schema_name=_DIRECTOR_SCHEMA_NAME,
+            max_tokens=8000,
+        )
+        plan: DirectorWeeklyActionPlan = result.parsed
+        plan.director_model = self._director_model
+        plan.resolved_model = result.model
+        return plan
+
+
+def _default_llm() -> _KrepisStructuredDirector:
+    """Construct the real structured-output Director client (lazy import).
+
+    The OpenRouter key is fetched from SSM (``/alpha-engine/OPENROUTER_API_KEY``)
+    via ``krepis.secrets.get_secret``, routed through ``krepis.llm.LLMClient``
+    bound to ``DirectorWeeklyActionPlan``. Uses the ultra group primary (GLM 5.2)
+    from LLM_MODEL_REGISTRY.yaml. Both imports are lazy so tests + the grading
+    path never pull krepis' provider SDKs or hit SSM.
+
+    Migrated from ChatAnthropic(claude-opus-4-8) → krepis.llm(glm-5.2 via
+    OpenRouter) 2026-07-24.
     """
+    from krepis.llm import LLMClient
+    from krepis.llm_config import ModelSpec
     from krepis.secrets import get_secret
-    from langchain_anthropic import ChatAnthropic  # lazy — not needed for tests
 
-    api_key = get_secret("ANTHROPIC_API_KEY")
-    # NB: no `temperature` — claude-opus-4-8 (the DIRECTOR_MODEL) removed the
-    # sampling params (`temperature`/`top_p`/`top_k`); passing any of them 400s
-    # ("`temperature` is deprecated for this model"). Determinism is steered via
-    # the prompt + structured output, not a temperature knob.
-    base = ChatAnthropic(
-        model=DIRECTOR_MODEL, max_tokens=8000, anthropic_api_key=api_key,
-    )
-    return base.with_structured_output(DirectorWeeklyActionPlan)
+    api_key = get_secret("OPENROUTER_API_KEY")
+    spec = ModelSpec(provider="openrouter", model=DIRECTOR_MODEL, max_tokens=8000)
+    client = LLMClient(spec, api_key=api_key)
+    return _KrepisStructuredDirector(client, director_model=DIRECTOR_MODEL)
 
 
 def _carryover_context(carryover: dict | None) -> str:
@@ -131,8 +168,9 @@ def build_action_plan(
     """Run the Director: report card → DirectorWeeklyActionPlan.
 
     ``llm`` is injectable (a structured-output runnable returning a
-    DirectorWeeklyActionPlan); defaults to the real Opus client. ``run_date``
-    overrides the plan's run_date (else taken from the card provenance).
+    DirectorWeeklyActionPlan); defaults to the real krepis.llm client using
+    the ultra group primary (GLM 5.2 via OpenRouter). ``run_date`` overrides
+    the plan's run_date (else taken from the card provenance).
     """
     llm = llm or _default_llm()
     messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
