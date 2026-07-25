@@ -452,14 +452,14 @@ class TestRetro:
 
     def test_judge_model_defaults_to_sonnet_and_respects_env_override(self, monkeypatch):
         """RETRO_JUDGE_MODEL is config, not code: env override wins; the
-        default is a Sonnet alias, deliberately NOT agent.DIRECTOR_MODEL
-        (Opus) — grading a plan with the model that wrote it is self-grading
-        bias."""
+        default is the high-group primary (DeepSeek V4 Pro Max), deliberately
+        NOT agent.DIRECTOR_MODEL (ultra-group GLM 5.2) — grading a plan with
+        the model that wrote it is self-grading bias."""
         from director.agent import DIRECTOR_MODEL
         from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _judge_model
 
         monkeypatch.delenv("RETRO_JUDGE_MODEL", raising=False)
-        assert _judge_model() == RETRO_JUDGE_MODEL_DEFAULT == "claude-sonnet-4-6"
+        assert _judge_model() == RETRO_JUDGE_MODEL_DEFAULT == "deepseek-v4-pro-max"
         assert _judge_model() != DIRECTOR_MODEL
 
         monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-5")
@@ -468,11 +468,11 @@ class TestRetro:
     def test_grade_prior_plan_injected_llm_never_touches_real_secrets(self, monkeypatch):
         """Test-hygiene guard (bit a previous integration): the llm= injection
         point must short-circuit _default_llm() entirely, so an ambient
-        ANTHROPIC_API_KEY sitting in the CI environment (as this repo's own
+        OPENROUTER_API_KEY sitting in the CI environment (as this repo's own
         runner may have) can never leak into a hermetic test path. Simulates
         the leak by setting a fake key AND making krepis.secrets.get_secret
         raise if it's ever called."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "leaked-ambient-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "leaked-ambient-key")
         import krepis.secrets as ks
 
         def _must_not_be_called(*a, **kw):
@@ -489,9 +489,9 @@ class TestRetro:
 
     def test_default_llm_routes_through_krepis_for_configured_judge_model(self, monkeypatch):
         """_default_llm() must build a krepis.llm.LLMClient (not langchain's
-        ChatAnthropic) targeting the anthropic provider + the configured
+        ChatAnthropic) targeting the OpenRouter provider + the configured
         judge alias — never agent.DIRECTOR_MODEL."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-4-6")
         import krepis.secrets as ks
         monkeypatch.setattr(ks, "get_secret", lambda name, **kw: "test-key")
@@ -500,7 +500,7 @@ class TestRetro:
         llm = _default_llm()
         assert isinstance(llm, _KrepisStructuredJudge)
         assert llm._judge_model == "claude-sonnet-4-6"
-        assert llm._client.spec.provider == "anthropic"
+        assert llm._client.spec.provider == "openrouter"
         assert llm._client.spec.model == "claude-sonnet-4-6"
 
     def test_krepis_judge_stamps_judge_model_and_resolved_model(self):
