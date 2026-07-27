@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
 
       - name: Build evaluator image
         run: |
@@ -118,5 +118,5 @@ jobs:
   notify-main-failure:
     needs: [test, docker-image-tests]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@62597e550c08c0b7a7fe0af490cb141e344061b3
     secrets: inherit
