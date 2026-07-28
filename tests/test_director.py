@@ -551,7 +551,12 @@ class TestRetro:
             return _FakeAnthropicClient()
 
         spec = ModelSpec(provider="anthropic", model=RETRO_JUDGE_MODEL_DEFAULT, max_tokens=2000)
-        client = LLMClient(spec, api_key="test-key", client_factory=_client_factory)
+        client = LLMClient(
+            spec,
+            api_key="test-key",
+            client_factory=_client_factory,
+            callsite_id="director-retro-judge",
+        )
         judge = _KrepisStructuredJudge(client, judge_model=RETRO_JUDGE_MODEL_DEFAULT)
 
         messages = build_messages(_plan().model_dump(), _CARD)
