@@ -128,7 +128,11 @@ def _default_llm() -> _KrepisStructuredJudge:
     judge_model = _judge_model()
     api_key = get_secret("OPENROUTER_API_KEY")
     spec = ModelSpec(provider="openrouter", model=judge_model, max_tokens=2000)
-    client = LLMClient(spec, api_key=api_key)
+    # callsite_id is REQUIRED since krepis 0.23 (krepis/llm.py::LLMClient.__init__,
+    # validated non-empty). It is the join key between this call's emitted cost
+    # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
+    # sync with that row's `id` (alpha-engine-config, id: director-retro-judge).
+    client = LLMClient(spec, api_key=api_key, callsite_id="director-retro-judge")
     return _KrepisStructuredJudge(client, judge_model=judge_model)
 
 
