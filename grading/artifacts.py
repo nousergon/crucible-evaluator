@@ -40,6 +40,90 @@ from nousergon_lib.artifact_resolution import (
 # imported the private ``_get_json`` name.
 _get_json = get_json
 
+# ---------------------------------------------------------------------------
+# Per-tile-family staleness thresholds (config#2885 — tile hardening).
+# ---------------------------------------------------------------------------
+# Each tile family declares the max acceptable age (in days) of its input
+# artifacts before routing dependent components to N/A with a staleness
+# reason. "Worker" families (backtester / research) tolerate the full
+# 10-day weekly-recovery window; "daily" families (executor) demand
+# fresher data. These are evaluated per-call-site against the ``age_days``
+# returned by ``get_json_windowed`` — the resolved age of the ACTUAL
+# instance the tile will grade, not the requested run_date.
+
+BACKTESTER_ARTIFACT_MAX_AGE_DAYS: int = 10      # weekly cadence, 10d recovery window
+EXECUTOR_ARTIFACT_MAX_AGE_DAYS: int = 3          # daily artifacts, 3d tolerance
+PREDICTOR_ARTIFACT_MAX_AGE_DAYS: int = 7         # weekly-ish, 7d tolerance
+RESEARCH_ARTIFACT_MAX_AGE_DAYS: int = 7          # weekly, 7d tolerance
+AGENT_ARTIFACT_MAX_AGE_DAYS: int = 10            # weekly agent producer
+BEHAVIORAL_ARTIFACT_MAX_AGE_DAYS: int = 10       # weekly behavioral producer
+SUBSTRATE_ARTIFACT_MAX_AGE_DAYS: int = 10        # weekly substrate producer
+
+
+def artifact_is_stale(age_days: int | None, max_age_days: int) -> bool:
+    """True when the artifact's resolved age exceeds the per-family max.
+
+    ``age_days`` comes from ``get_json_windowed``'s third return value —
+    the age of the actual instance the tile will grade. ``None`` means the
+    artifact resolved to the exact-requested key (no walk-back), so it is
+    never stale. A negative age (clock-skew / future-dated instance) is
+    treated as not-stale (it is a mislabel, not an age breach).
+    """
+    if age_days is None or age_days < 0:
+        return False
+    return age_days > max_age_days
+
+
+@dataclass
+class StalenessRecord:
+    """Per-artifact staleness provenance for one tile's input."""
+
+    artifact: str          # e.g. "grading.json"
+    age_days: int | None   # resolved age (None = walk-back didn't fire)
+    max_age_days: int      # per-family threshold checked
+
+
+class StalenessRegistry:
+    """Per-tile staleness tracker — each tile builder creates one and records
+    every ``get_json_windowed`` call's age so the tile dict and the report card
+    can surface a top-level ``degraded_staleness`` flag.
+
+    NOT thread-safe (single-threaded Lambda / CLI context).
+    """
+
+    def __init__(self) -> None:
+        self._records: list[StalenessRecord] = []
+
+    def record(self, artifact: str, age_days: int | None, max_age_days: int) -> None:
+        self._records.append(StalenessRecord(artifact, age_days, max_age_days))
+
+    @property
+    def any_stale(self) -> bool:
+        return any(
+            artifact_is_stale(r.age_days, r.max_age_days) for r in self._records
+        )
+
+    @property
+    def stale_count(self) -> int:
+        return sum(
+            1 for r in self._records
+            if artifact_is_stale(r.age_days, r.max_age_days)
+        )
+
+    @property
+    def max_age_days(self) -> float | None:
+        ages = [r.age_days for r in self._records if r.age_days is not None]
+        return max(ages) if ages else None
+
+    def summary(self) -> dict:
+        """Return a dict suitable for the tile's staleness section."""
+        return {
+            "stale_artifact_count": self.stale_count,
+            "max_artifact_age_days": self.max_age_days,
+            "any_stale": self.any_stale,
+        }
+
+
 logger = logging.getLogger(__name__)
 
 

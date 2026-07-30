@@ -166,6 +166,23 @@ def build_report_card(
         {name: t["status"] for name, t in tiles.items()}
     )
 
+    # config#2885: top-level degraded_staleness flag — true when ANY tile
+    # reports a stale artifact (detected by scanning tile components' na_detail
+    # for the "stale input" reason text each per-call-site staleness check
+    # produces). The Director agent's prompt MUST check this before treating
+    # the card as ground truth (advisory hardening — freshness_preflight.py
+    # already hard-fails the snapshot path on the core inputs, but per-tile
+    # staleness catches edge cases the preflight doesn't cover).
+    stale_tiles: list[str] = []
+    for name, t in tiles.items():
+        for c in (t.get("components") or []):
+            if isinstance(c, dict) and "stale input" in (c.get("na_detail") or ""):
+                stale_tiles.append(name)
+                break
+    scorecard["degraded_staleness"] = bool(stale_tiles)
+    if stale_tiles:
+        scorecard["stale_tiles"] = sorted(stale_tiles)
+
     scorecard["_provenance"] = {
         "run_date": run_date,
         "grader_source": GRADER_SOURCE,

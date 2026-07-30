@@ -45,7 +45,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import AGENT_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.tiles.groom import build_groom_components
@@ -89,8 +89,17 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """
     s3 = s3_client or boto3.client("s3")
     # Windowed resolution (config#1190): freshest within the trailing window.
-    aq, _, _, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
+    aq, _aq_date, aq_age, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
     aq_src = f"s3://{bucket}/{_aq_key}" if _aq_key else f"s3://{bucket}/backtest/{run_date}/agent_quality.json"
+    aq_stale = artifact_is_stale(aq_age, AGENT_ARTIFACT_MAX_AGE_DAYS)
+
+    def _stale_na(name: str) -> str:
+        return (
+            f"{name}: agent_quality.json is {aq_age}d old "
+            f"(> {AGENT_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, "
+            f"cannot grade confidently."
+        )
+
     components = []
 
     # 1. agent_validation_failure_rate (critical) — % of agent .invoke()s that
@@ -98,7 +107,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    the agents are emitting malformed structured output the graph has to
     #    repair or drop — a direct agent-quality regression the Director acts on.
     blk = _block(aq, "agent_validation_failure_rate")
-    if blk is not None:
+    if blk is not None and not aq_stale:
         components.append(build_metric(
             name="agent_validation_failure_rate", module=MODULE, metric_type="pct",
             criticality="critical", estimator="wilson_failure_rate",
@@ -115,13 +124,14 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             measurement_horizon="per_run",
             n_floor=50, target=0.02, red_line=0.10, higher_is_better=False,
             source_path=aq_src, input_present=False,
-            na_detail="agent_validation_failure_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=_stale_na("agent_validation_failure_rate") if aq_stale
+            else "agent_validation_failure_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     # 2. cost_per_signal (supporting) — total run LLM $ / finalized signal (lower
     #    better). Efficiency of the research spend per usable output.
     blk = _block(aq, "cost_per_signal")
-    if blk is not None:
+    if blk is not None and not aq_stale:
         components.append(build_metric(
             name="cost_per_signal", module=MODULE, metric_type="ratio", criticality="supporting",
             value=blk["value"], n_samples=blk.get("n"), n_floor=5,
@@ -133,14 +143,15 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="cost_per_signal", module=MODULE, metric_type="ratio", criticality="supporting",
             n_floor=5, target=1.0, red_line=5.0, higher_is_better=False,
             source_path=aq_src, input_present=False,
-            na_detail="cost_per_signal: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=_stale_na("cost_per_signal") if aq_stale
+            else "cost_per_signal: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     # 3. retry_storm_count (supporting) — # of agents that reached their per-type
     #    max_retries ceiling (lower better). A storm signals provider instability
     #    or a malformed-output loop burning budget.
     blk = _block(aq, "retry_storm_count")
-    if blk is not None:
+    if blk is not None and not aq_stale:
         components.append(build_metric(
             name="retry_storm_count", module=MODULE, metric_type="count", criticality="supporting",
             value=blk["value"], n_samples=blk.get("n"), n_floor=1,
@@ -152,14 +163,15 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="retry_storm_count", module=MODULE, metric_type="count", criticality="supporting",
             n_floor=1, target=0.0, red_line=5.0, higher_is_better=False,
             source_path=aq_src, input_present=False,
-            na_detail="retry_storm_count: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=_stale_na("retry_storm_count") if aq_stale
+            else "retry_storm_count: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     # 4. agent_latency_p95 (diagnostic) — per-agent-type p95 wall-clock (ms,
     #    lower better). A latency creep flags a slowing agent before it trips the
     #    Lambda ceiling.
     blk = _block(aq, "agent_latency_p95")
-    if blk is not None:
+    if blk is not None and not aq_stale:
         components.append(build_metric(
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
             value=blk["value"], n_samples=blk.get("n"), n_floor=1,
@@ -171,7 +183,8 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
             n_floor=1, target=15000.0, red_line=60000.0, higher_is_better=False,
             source_path=aq_src, input_present=False,
-            na_detail="agent_latency_p95: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=_stale_na("agent_latency_p95") if aq_stale
+            else "agent_latency_p95: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     # 5. judge_rubric_distribution (diagnostic) — modal-score concentration of
@@ -179,7 +192,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    concentration is rubric collapse: the judge gives the same grade to
     #    everything, so its signal is degenerate.
     blk = _block(aq, "judge_rubric_distribution")
-    if blk is not None:
+    if blk is not None and not aq_stale:
         components.append(build_metric(
             name="judge_rubric_distribution", module=MODULE, metric_type="ratio", criticality="diagnostic",
             value=blk["value"], n_samples=blk.get("n"), n_floor=10,
@@ -191,7 +204,8 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="judge_rubric_distribution", module=MODULE, metric_type="ratio", criticality="diagnostic",
             n_floor=10, target=0.40, red_line=0.70, higher_is_better=False,
             source_path=aq_src, input_present=False,
-            na_detail="judge_rubric_distribution: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=_stale_na("judge_rubric_distribution") if aq_stale
+            else "judge_rubric_distribution: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
     # 6. stance_source_provenance (diagnostic) — pick-provenance coverage; lands
