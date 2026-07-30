@@ -166,7 +166,11 @@ def numeric_grade(components: list[MetricRecord]) -> float | None:
     return sum(scores) / len(scores)
 
 
-def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.05) -> dict:
+def build_tile(
+    module: str, components: list[MetricRecord], *,
+    alpha: float = 0.05,
+    staleness: dict | None = None,
+) -> dict:
     """Assemble a tile summary from its components.
 
     Adds the RC v2 per-tile freshness stamps (config-I2556):
@@ -179,6 +183,12 @@ def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.
         each component's real ``source_path`` (see ``_ARTIFACT_DATE_RE`` above)
         — genuine per-tile attribution derived from data every tile builder
         already threads through ``build_metric``, not a guessed/global rollup.
+
+    ``staleness`` (config#2885): optional per-tile staleness summary from the
+    tile builder's ``grading.artifacts.StalenessRegistry.summary()``. When
+    provided, adds ``stale_artifact_count`` and ``max_artifact_age_days`` to
+    the tile dict so the report card's top-level ``degraded_staleness`` flag
+    can be derived.
     """
     from krepis.metrics import derive_letter
 
@@ -194,7 +204,7 @@ def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.
         if (m := _ARTIFACT_DATE_RE.search(c.get("source_path") or ""))
     })
 
-    return {
+    tile: dict = {
         "module": module,
         "status": status,
         "letter": derive_letter(status),
@@ -204,3 +214,8 @@ def build_tile(module: str, components: list[MetricRecord], *, alpha: float = 0.
         "source_artifact_dates": source_artifact_dates,
         "components": dumped,
     }
+    if staleness is not None:
+        tile["stale_artifact_count"] = staleness.get("stale_artifact_count", 0)
+        tile["max_artifact_age_days"] = staleness.get("max_artifact_age_days")
+        tile["any_stale"] = staleness.get("any_stale", False)
+    return tile

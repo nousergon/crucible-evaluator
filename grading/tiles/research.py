@@ -28,7 +28,7 @@ from botocore.exceptions import ClientError
 from nousergon_lib import contracts
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import RESEARCH_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -190,13 +190,14 @@ def build_research_tile(
     prefix = f"backtest/{run_date}"
     # Windowed resolution (config#1190): grade off the freshest artifact within the
     # trailing window so a partial/retried/off-cycle Saturday run still grades.
-    e2e, _, _, _e2e_key = get_json_windowed(s3, bucket, "backtest/{date}/e2e_lift.json", run_date)
-    score_cal, _, _, _score_key = get_json_windowed(s3, bucket, "backtest/{date}/score_calibration.json", run_date)
-    macro, _, _, _macro_key = get_json_windowed(s3, bucket, "backtest/{date}/macro_eval.json", run_date)
-    pcal, _, _, _pcal_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_calibration.json", run_date)
+    e2e, _e2e_date, e2e_age, _e2e_key = get_json_windowed(s3, bucket, "backtest/{date}/e2e_lift.json", run_date)
+    score_cal, _sc_date, sc_age, _score_key = get_json_windowed(s3, bucket, "backtest/{date}/score_calibration.json", run_date)
+    macro, _macro_date, macro_age, _macro_key = get_json_windowed(s3, bucket, "backtest/{date}/macro_eval.json", run_date)
+    pcal, _pcal_date, pcal_age, _pcal_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_calibration.json", run_date)
     e2e_src = f"s3://{bucket}/{_e2e_key}" if _e2e_key else f"s3://{bucket}/{prefix}/e2e_lift.json"
     components = []
 
+    e2e_stale = artifact_is_stale(e2e_age, RESEARCH_ARTIFACT_MAX_AGE_DAYS)
     e2e = e2e or {}
 
     # config#1580 / config-I2993: the six-team+CIO research orchestration was
@@ -702,7 +703,7 @@ def build_research_tile(
     #      reads — but grade the research-output-quality axis (judge pass-rate,
     #      pillar coverage, signal volume). Absent → precise N/A-MISSING-INPUT
     #      naming the producer, self-activating on the first agent_quality.json.
-    aq, _, _, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
+    aq, _aq_date, aq_age, _aq_key = get_json_windowed(s3, bucket, "backtest/{date}/agent_quality.json", run_date)
     aq_src = f"s3://{bucket}/{_aq_key}" if _aq_key else f"s3://{bucket}/{prefix}/agent_quality.json"
 
     def _aq_block(key: str) -> dict | None:
@@ -770,7 +771,7 @@ def build_research_tile(
     #        below grades a precise N/A-MISSING-INPUT and self-activates on the
     #        first artifact (same forward-compat contract as agent_quality).
     #        All alpha values in the artifact are decimal 21d log-alpha.
-    att, _, _, _att_key = get_json_windowed(
+    att, _att_date, att_age, _att_key = get_json_windowed(
         s3, bucket, "backtest/{date}/attractiveness_eval.json", run_date
     )
     att_src = f"s3://{bucket}/{_att_key}" if _att_key else f"s3://{bucket}/{prefix}/attractiveness_eval.json"

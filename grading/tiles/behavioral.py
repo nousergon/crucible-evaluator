@@ -36,7 +36,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import BEHAVIORAL_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -82,8 +82,17 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """Build the Behavioral tile from behavioral_anomaly.json + the tripwire."""
     s3 = s3_client or boto3.client("s3")
     # Windowed resolution (config#1190): freshest within the trailing window.
-    ba, _, _, _ba_key = get_json_windowed(s3, bucket, "backtest/{date}/behavioral_anomaly.json", run_date)
+    ba, _ba_date, ba_age, _ba_key = get_json_windowed(s3, bucket, "backtest/{date}/behavioral_anomaly.json", run_date)
     ba_src = f"s3://{bucket}/{_ba_key}" if _ba_key else f"s3://{bucket}/backtest/{run_date}/behavioral_anomaly.json"
+    ba_stale = artifact_is_stale(ba_age, BEHAVIORAL_ARTIFACT_MAX_AGE_DAYS)
+
+    def _stale_na(name: str) -> str:
+        return (
+            f"{name}: behavioral_anomaly.json is {ba_age}d old "
+            f"(> {BEHAVIORAL_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, "
+            f"cannot grade confidently."
+        )
+
     components = []
 
     def _sub(name: str) -> dict | None:
@@ -125,7 +134,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
 
     # 2. decision_reversal (supporting) — lower is better (target < red_line).
     rev = _sub("decision_reversal")
-    if rev:
+    if rev and not ba_stale:
         components.append(build_metric(
             name="decision_reversal", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="reversal_rate_rolling_window", measurement_horizon=f"{rev.get('window_days', 10)}d_window",
@@ -141,12 +150,12 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="decision_reversal", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="reversal_rate_rolling_window", measurement_horizon="10d_window",
             n_floor=10, target=0.10, red_line=0.30, source_path=ba_src, input_present=False,
-            na_detail=_na_detail("decision_reversal"),
+            na_detail=_stale_na("decision_reversal") if ba_stale else _na_detail("decision_reversal"),
         ))
 
     # 3. conviction_stability (diagnostic) — lower is better.
     conv = _sub("conviction_stability")
-    if conv:
+    if conv and not ba_stale:
         components.append(build_metric(
             name="conviction_stability", module=MODULE, metric_type="count", criticality="diagnostic",
             estimator="median_rolling_score_std", measurement_horizon=f"{conv.get('window_days', 90)}d_window",
@@ -162,12 +171,12 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="conviction_stability", module=MODULE, metric_type="count", criticality="diagnostic",
             estimator="median_rolling_score_std", measurement_horizon="90d_window",
             n_floor=5, target=5.0, red_line=15.0, source_path=ba_src, input_present=False,
-            na_detail=_na_detail("conviction_stability"),
+            na_detail=_stale_na("conviction_stability") if ba_stale else _na_detail("conviction_stability"),
         ))
 
     # 4. cost_adjusted_quality (supporting) — higher is better.
     cost = _sub("cost_adjusted_quality")
-    if cost:
+    if cost and not ba_stale:
         components.append(build_metric(
             name="cost_adjusted_quality", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="median_net_alpha_after_slippage", measurement_horizon="per_roundtrip",
@@ -184,12 +193,12 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="cost_adjusted_quality", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="median_net_alpha_after_slippage", measurement_horizon="per_roundtrip",
             n_floor=15, target=0.5, red_line=0.0, source_path=ba_src, input_present=False,
-            na_detail=_na_detail("cost_adjusted_quality"),
+            na_detail=_stale_na("cost_adjusted_quality") if ba_stale else _na_detail("cost_adjusted_quality"),
         ))
 
     # 5. portfolio_state_drift (diagnostic) — lower is better.
     drift = _sub("portfolio_state_drift")
-    if drift:
+    if drift and not ba_stale:
         components.append(build_metric(
             name="portfolio_state_drift", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="median_daily_l1_weight_drift", measurement_horizon="day_over_day",
@@ -205,7 +214,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="portfolio_state_drift", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="median_daily_l1_weight_drift", measurement_horizon="day_over_day",
             n_floor=10, target=0.05, red_line=0.20, source_path=ba_src, input_present=False,
-            na_detail=_na_detail("portfolio_state_drift"),
+            na_detail=_stale_na("portfolio_state_drift") if ba_stale else _na_detail("portfolio_state_drift"),
         ))
 
     return build_tile(MODULE, components)

@@ -47,7 +47,7 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib import contracts
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import BACKTESTER_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -196,9 +196,10 @@ def build_backtester_tile(
 
     # 1. evaluator_coverage (critical) — the anti-"insufficient data" meta-metric.
     # Windowed resolution (config#1190): freshest within the trailing window.
-    grading, _, _, _grading_key = get_json_windowed(s3, bucket, "backtest/{date}/grading.json", run_date)
+    grading, _grading_date, grading_age, _grading_key = get_json_windowed(s3, bucket, "backtest/{date}/grading.json", run_date)
     g_src = f"s3://{bucket}/{_grading_key}" if _grading_key else src("grading.json")
-    if grading:
+    grading_stale = artifact_is_stale(grading_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if grading and not grading_stale:
         cov, graded, total = _coverage(grading)
         components.append(build_metric(
             name="evaluator_coverage", module=MODULE, metric_type="pct", criticality="critical",
@@ -213,7 +214,11 @@ def build_backtester_tile(
             name="evaluator_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion", measurement_horizon="trailing_4w",
             n_floor=1, target=0.95, red_line=0.80, source_path=g_src, input_present=False,
-            na_detail="evaluator_coverage: grading.json absent this cycle.",
+            na_detail=(
+                f"evaluator_coverage: grading.json is {grading_age}d old "
+                f"(> {BACKTESTER_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, cannot grade confidently."
+                if grading_stale else "evaluator_coverage: grading.json absent this cycle."
+            ),
         ))
 
     # 2. grading_freshness (supporting) — hours since grading.json last written.
@@ -239,10 +244,11 @@ def build_backtester_tile(
             raise
 
     # 3. vectorized_vs_consolidated_parity (supporting) — sim-path agreement.
-    parity, _, _, _parity_key = get_json_windowed(s3, bucket, "backtest/{date}/parity_report.json", run_date)
+    parity, _parity_date, parity_age, _parity_key = get_json_windowed(s3, bucket, "backtest/{date}/parity_report.json", run_date)
     p_src = f"s3://{bucket}/{_parity_key}" if _parity_key else src("parity_report.json")
+    parity_stale = artifact_is_stale(parity_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
     ok_states = ("ok", "parity_ok", "clean", "match")
-    if parity and (parity.get("data_state") in ok_states):
+    if parity and (parity.get("data_state") in ok_states) and not parity_stale:
         diverged = bool(parity.get("trade_count_divergence")) or bool(parity.get("ticker_set_divergence"))
         components.append(build_metric(
             name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct", criticality="supporting",
@@ -262,9 +268,10 @@ def build_backtester_tile(
         ))
 
     # 4. fdr_surface_health (supporting) — count of BH-FDR-significant correlations.
-    attr, _, _, _attr_key = get_json_windowed(s3, bucket, "backtest/{date}/attribution.json", run_date)
+    attr, _attr_date, attr_age, _attr_key = get_json_windowed(s3, bucket, "backtest/{date}/attribution.json", run_date)
     a_src = f"s3://{bucket}/{_attr_key}" if _attr_key else src("attribution.json")
-    if attr and attr.get("status") == "ok":
+    attr_stale = artifact_is_stale(attr_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if attr and attr.get("status") == "ok" and not attr_stale:
         corr = attr.get("correlations") or {}
         n_sig = sum(
             1 for label in corr.values() if isinstance(label, dict)
@@ -327,7 +334,7 @@ def build_backtester_tile(
     #    value = number of unhealthy (RED+WATCH) loops, so the card sorts on it;
     #    the reason names every non-green loop with outcome + blocked_by slugs
     #    + consecutive weeks so the Director digest carries the specifics.
-    aa, _, _, _aa_key = get_json_windowed(s3, bucket, "config/apply_audit/{date}.json", run_date)
+    aa, _aa_date, aa_age, _aa_key = get_json_windowed(s3, bucket, "config/apply_audit/{date}.json", run_date)
     aa_src = f"s3://{bucket}/{_aa_key}" if _aa_key else f"s3://{bucket}/config/apply_audit/{run_date}.json"
     # config#1861: apply_audit is the lifted-unchanged v1 contract. Surface any
     # conformance drift against the canonical lib schema whenever an artifact is
@@ -335,7 +342,8 @@ def build_backtester_tile(
     # standing contract is to grade malformed/drifted artifacts as a specific
     # N/A / RED (see the loops-None and unrecognized-outcome paths below), never
     # to crash the whole backtester tile on a producer contract break.
-    if aa:
+    aa_stale = artifact_is_stale(aa_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if aa and not aa_stale:
         _aa_errs = contracts.conformance_errors("apply_audit", aa)
         if _aa_errs:
             logger.warning(
@@ -406,9 +414,10 @@ def build_backtester_tile(
     # anything? Graded on the WEAKEST-LINK adequacy ratio (min n/floor across
     # analyses) from the backtester producer. ratio>=1.0 → GREEN (well-powered),
     # 0.5<=ratio<1.0 → WATCH (building), <0.5 → RED (grades are under-powered noise).
-    ss, _, _, _ss_key = get_json_windowed(s3, bucket, "backtest/{date}/sample_size.json", run_date)
+    ss, _ss_date, ss_age, _ss_key = get_json_windowed(s3, bucket, "backtest/{date}/sample_size.json", run_date)
     ss_src = f"s3://{bucket}/{_ss_key}" if _ss_key else f"s3://{bucket}/{prefix}/sample_size.json"
-    if ss and ss.get("status") == "ok" and ss.get("adequacy_ratio") is not None:
+    ss_stale = artifact_is_stale(ss_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if ss and ss.get("status") == "ok" and ss.get("adequacy_ratio") is not None and not ss_stale:
         ratio = ss["adequacy_ratio"]
         weakest = ss.get("weakest_analysis")
         per = ss.get("per_analysis") or {}
@@ -442,9 +451,10 @@ def build_backtester_tile(
     # sized by DIRECTION only until the CI clears. Graded GREEN when
     # all_magnitude_certain, else WATCH (not RED — an under-powered CI is a data
     # state to wait out, not a regression to alarm on).
-    rr, _, _, _rr_key = get_json_windowed(s3, bucket, "backtest/{date}/risk_ratio_ci.json", run_date)
+    rr, _rr_date, rr_age, _rr_key = get_json_windowed(s3, bucket, "backtest/{date}/risk_ratio_ci.json", run_date)
     rr_src = f"s3://{bucket}/{_rr_key}" if _rr_key else f"s3://{bucket}/{prefix}/risk_ratio_ci.json"
-    if rr and rr.get("status") == "ok" and rr.get("all_magnitude_certain") is not None:
+    rr_stale = artifact_is_stale(rr_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if rr and rr.get("status") == "ok" and rr.get("all_magnitude_certain") is not None and not rr_stale:
         certain = bool(rr["all_magnitude_certain"])
         n = rr.get("n_samples")
         floor = rr.get("sample_floor")
@@ -474,9 +484,10 @@ def build_backtester_tile(
     # emits churn_ratio = max|Δweight| / guardrail_cap; <1.0 = within guardrails.
     # Lower is better: target 0.8 (well inside the cap → GREEN), red-line 1.0
     # (at/over the cap → the tuner is fighting its own guardrail → RED).
-    oc, _, _, _oc_key = get_json_windowed(s3, bucket, "backtest/{date}/optimizer_churn.json", run_date)
+    oc, _oc_date, oc_age, _oc_key = get_json_windowed(s3, bucket, "backtest/{date}/optimizer_churn.json", run_date)
     oc_src = f"s3://{bucket}/{_oc_key}" if _oc_key else f"s3://{bucket}/{prefix}/optimizer_churn.json"
-    if oc and oc.get("status") == "ok" and oc.get("churn_ratio") is not None:
+    oc_stale = artifact_is_stale(oc_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if oc and oc.get("status") == "ok" and oc.get("churn_ratio") is not None and not oc_stale:
         cr = float(oc["churn_ratio"])
         within = bool(oc.get("within_guardrails"))
         components.append(build_metric(
@@ -584,9 +595,10 @@ def build_backtester_tile(
     # weekly window; 1.0 = monotone/converging, 0.0 = fully oscillating. Higher
     # is better: target 0.8 (stable → GREEN), red-line 0.5 (half the steps
     # reverse → drifting → RED).
-    wf, _, _, _wf_key = get_json_windowed(s3, bucket, "backtest/{date}/walk_forward_stability.json", run_date)
+    wf, _wf_date, wf_age, _wf_key = get_json_windowed(s3, bucket, "backtest/{date}/walk_forward_stability.json", run_date)
     wf_src = f"s3://{bucket}/{_wf_key}" if _wf_key else f"s3://{bucket}/{prefix}/walk_forward_stability.json"
-    if wf and wf.get("status") == "ok" and wf.get("stability_ratio") is not None:
+    wf_stale = artifact_is_stale(wf_age, BACKTESTER_ARTIFACT_MAX_AGE_DAYS)
+    if wf and wf.get("status") == "ok" and wf.get("stability_ratio") is not None and not wf_stale:
         sr = float(wf["stability_ratio"])
         components.append(build_metric(
             name="walk_forward_stability", module=MODULE, metric_type="ratio", criticality="supporting",

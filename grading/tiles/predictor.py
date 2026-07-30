@@ -26,7 +26,7 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib.quant.stats.intervals import bootstrap_ci
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import PREDICTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -285,7 +285,7 @@ def build_predictor_tile(
     # backtest/{run_date}/veto_analysis.json (config#859 — was an unwired N/A).
     # 10d-horizon measurement (beat_spy_10d), hence supporting not critical.
     # Windowed resolution (config#1190): freshest within the trailing window.
-    va, _, _, _veto_key = (
+    va, _va_date, va_age, _veto_key = (
         get_json_windowed(s3, bucket, "backtest/{date}/veto_analysis.json", run_date)
         if run_date else (None, None, None, None)
     )
@@ -296,7 +296,8 @@ def build_predictor_tile(
         entries = [e for e in (va.get("thresholds") or []) if e.get("precision") is not None]
         if cur is not None and entries:
             va_match = min(entries, key=lambda e: abs((e.get("confidence") or 0) - cur))
-    if va_match is not None:
+    va_stale = artifact_is_stale(va_age, PREDICTOR_ARTIFACT_MAX_AGE_DAYS)
+    if va_match is not None and not va_stale:
         ci = va_match.get("precision_ci_95")
         ci_low = ci[0] if isinstance(ci, (list, tuple)) and len(ci) >= 2 else None
         ci_high = ci[1] if isinstance(ci, (list, tuple)) and len(ci) >= 2 else None
@@ -316,6 +317,9 @@ def build_predictor_tile(
     else:
         if run_date is None:
             na = "veto_gate_precision: run_date not provided to the predictor tile; cross-tile veto_analysis.json read skipped."
+        elif va_stale:
+            na = (f"veto_gate_precision: veto_analysis.json is {va_age}d old "
+                  f"(> {PREDICTOR_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, cannot grade confidently.")
         elif va is None:
             na = f"veto_gate_precision: veto_analysis.json absent in the trailing window ending {run_date}."
         else:
@@ -338,16 +342,20 @@ def build_predictor_tile(
     # the whole module RED — the report card's real gate is the leak-free
     # meta_l2_ic rank-IC above; this tile exists so a sub-baseline direction head
     # can never again go unnoticed.
-    cm, _, _, _cm_key = (
+    cm, _cm_date, cm_age, _cm_key = (
         get_json_windowed(s3, bucket, "backtest/{date}/confusion_matrix.json", run_date)
         if run_date else (None, None, None, None)
     )
     cm_src = f"s3://{bucket}/{_cm_key}" if _cm_key else latest_src
-    cm_ok = isinstance(cm, dict) and cm.get("status") == "ok" and isinstance(cm.get("per_class"), dict)
+    cm_stale = artifact_is_stale(cm_age, PREDICTOR_ARTIFACT_MAX_AGE_DAYS)
+    cm_ok = isinstance(cm, dict) and cm.get("status") == "ok" and isinstance(cm.get("per_class"), dict) and not cm_stale
 
     def _cm_na(metric_name: str) -> str:
         if run_date is None:
             return f"{metric_name}: run_date not provided to the predictor tile; cross-tile confusion_matrix.json read skipped."
+        if cm_stale:
+            return (f"{metric_name}: confusion_matrix.json is {cm_age}d old "
+                    f"(> {PREDICTOR_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, cannot grade confidently.")
         if cm is None:
             return f"{metric_name}: confusion_matrix.json absent in the trailing window ending {run_date}."
         return f"{metric_name}: confusion_matrix.json has no usable accuracy/per_class breakdown (status={cm.get('status')}) this cycle."
