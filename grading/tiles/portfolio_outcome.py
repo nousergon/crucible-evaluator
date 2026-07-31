@@ -59,12 +59,13 @@ _REGIME_MIN_BUCKETS = 2      # min qualifying regime buckets to decompose at all
 class EodPnlSeries:
     """Parsed daily series from eod_pnl.csv (returns as fractions, not pct)."""
 
-    def __init__(self, dates, nav, port, spy, alpha):
+    def __init__(self, dates, nav, port, spy, alpha, rows_dropped: int = 0):
         self.dates = dates
         self.nav = nav            # portfolio NAV level series
         self.port = port          # daily portfolio returns (fraction)
         self.spy = spy            # daily SPY returns (fraction)
         self.alpha = alpha        # daily active return port-spy (fraction)
+        self.rows_dropped = rows_dropped  # config#2885: silently-unparseable rows
 
     @property
     def n(self) -> int:
@@ -90,19 +91,27 @@ def read_eod_pnl(bucket: str, s3_client=None) -> EodPnlSeries | None:
     rows.sort(key=lambda r: r["date"])
 
     dates, nav, port, spy, alpha = [], [], [], [], []
+    rows_dropped = 0
     for r in rows:
         try:
             nav.append(float(r["portfolio_nav"]))
             p = float(r["daily_return_pct"]) / 100.0
             s = float(r["spy_return_pct"]) / 100.0
         except (TypeError, ValueError):
+            rows_dropped += 1
             continue
         dates.append(r["date"])
         port.append(p)
         spy.append(s)
         a = r.get("daily_alpha_pct")
         alpha.append(float(a) / 100.0 if a not in (None, "") else p - s)
-    return EodPnlSeries(dates, nav, port, spy, alpha)
+    if rows_dropped:
+        logger.warning(
+            "read_eod_pnl: %d row(s) dropped from eod_pnl.csv "
+            "(unparseable portfolio_nav or daily_return_pct)",
+            rows_dropped,
+        )
+    return EodPnlSeries(dates, nav, port, spy, alpha, rows_dropped=rows_dropped)
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +643,12 @@ def build_portfolio_outcome_tile(
     # 14. Alpha trend (diagnostic) — is daily alpha statistically improving?
     components.append(_build_alpha_trend([a * 100.0 for a in active], src))
 
-    return build_tile(MODULE, components)
+    tile = build_tile(MODULE, components)
+    # config#2885: surface silently-dropped CSV rows so the report card
+    # shows data-integrity issues (unparseable portfolio_nav/daily_return_pct).
+    if series is not None:
+        tile["rows_dropped"] = series.rows_dropped
+    return tile
 
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover
