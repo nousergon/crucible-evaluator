@@ -32,7 +32,7 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
-from grading.artifacts import get_json_windowed
+from grading.artifacts import EXECUTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 
@@ -57,20 +57,29 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     s3 = s3_client or boto3.client("s3")
     prefix = f"backtest/{run_date}"
     # Windowed resolution (config#1190): the freshest artifact within the trailing
-    # window, so a partial/retried/off-cycle run still grades.
-    trig, _, _, _trig_key = get_json_windowed(s3, bucket, "backtest/{date}/trigger_scorecard.json", run_date)
-    shadow, _, _, _shadow_key = get_json_windowed(s3, bucket, "backtest/{date}/shadow_book.json", run_date)
-    exits, _, _, _exits_key = get_json_windowed(s3, bucket, "backtest/{date}/exit_timing.json", run_date)
-    exc, _, _, _exc_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_excursion.json", run_date)
+    # window, so a partial/retried/off-cycle run still grades. Each artifact's
+    # resolved age is checked against EXECUTOR_ARTIFACT_MAX_AGE_DAYS (3d — daily
+    # artifacts; config#2885 tile hardening).
+    trig, _trig_date, trig_age, _trig_key = get_json_windowed(s3, bucket, "backtest/{date}/trigger_scorecard.json", run_date)
+    shadow, _shadow_date, shadow_age, _shadow_key = get_json_windowed(s3, bucket, "backtest/{date}/shadow_book.json", run_date)
+    exits, _exits_date, exits_age, _exits_key = get_json_windowed(s3, bucket, "backtest/{date}/exit_timing.json", run_date)
+    exc, _exc_date, exc_age, _exc_key = get_json_windowed(s3, bucket, "backtest/{date}/portfolio_excursion.json", run_date)
     # reconciliation_audit lives under trades/{date}/ (executor EOD producer),
     # NOT backtest/{date}/ — it is daily broker-vs-ledger state, config#859.
-    recon, _, _, _recon_key = get_json_windowed(s3, bucket, "trades/{date}/reconciliation_audit.json", run_date)
-    aent, _, _, _aent_key = get_json_windowed(s3, bucket, "backtest/{date}/action_entropy.json", run_date)
+    recon, _recon_date, recon_age, _recon_key = get_json_windowed(s3, bucket, "trades/{date}/reconciliation_audit.json", run_date)
+    aent, _aent_date, aent_age, _aent_key = get_json_windowed(s3, bucket, "backtest/{date}/action_entropy.json", run_date)
     _resolved = {
         "trigger_scorecard.json": _trig_key, "shadow_book.json": _shadow_key,
         "exit_timing.json": _exits_key, "portfolio_excursion.json": _exc_key,
         "action_entropy.json": _aent_key,
     }
+
+    def _stale_na(name: str, age_days: int | None) -> str:
+        return (
+            f"{name}: artifact is {age_days}d old "
+            f"(> {EXECUTOR_ARTIFACT_MAX_AGE_DAYS}d max for executor tile) — "
+            f"stale input, cannot grade confidently."
+        )
     components = []
 
     def src(name):
@@ -79,7 +88,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
 
     # 1. entry_triggers (critical) — win-rate vs SPY across timed entries (Wilson).
     ts_src = src("trigger_scorecard.json")
-    if trig and trig.get("status") == "ok":
+    trig_stale = artifact_is_stale(trig_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
+    if trig and trig.get("status") == "ok" and not trig_stale:
         summ = trig.get("summary") or {}
         wr = summ.get("win_rate_vs_spy")
         n = int(summ.get("total_entries") or 0)
@@ -103,20 +113,27 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                 name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
                 estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
                 n_floor=30, target=0.55, red_line=0.45, source_path=ts_src, input_present=False,
-                na_detail="entry_triggers: trigger_scorecard has no win-rate/entries this cycle.",
+                na_detail=(
+                    _stale_na("entry_triggers", trig_age) if trig_stale
+                    else "entry_triggers: trigger_scorecard has no win-rate/entries this cycle."
+                ),
             ))
     else:
         components.append(build_metric(
             name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
             estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
             n_floor=30, target=0.55, red_line=0.45, source_path=ts_src, input_present=False,
-            na_detail="entry_triggers: trigger_scorecard.json absent this cycle (OK-only persisted; lands on a Saturday run).",
+            na_detail=(
+                _stale_na("entry_triggers", trig_age) if trig_stale
+                else "entry_triggers: trigger_scorecard.json absent this cycle (OK-only persisted; lands on a Saturday run)."
+            ),
         ))
 
     # 2. risk_guard (critical) — precision of blocks (% blocked that were losers).
     sb_src = src("shadow_book.json")
+    shadow_stale = artifact_is_stale(shadow_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
     clf = (shadow or {}).get("classification") if shadow and shadow.get("status") == "ok" else None
-    if clf and clf.get("precision") is not None:
+    if clf and clf.get("precision") is not None and not shadow_stale:
         tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
         n_blk = tp + fp
         w = wilson_score_interval(tp, n_blk) if n_blk > 0 else {"status": "insufficient_data"}
@@ -135,7 +152,10 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="risk_guard", module=MODULE, metric_type="pct", criticality="critical",
             estimator="wilson_precision",
             n_floor=20, target=0.55, red_line=0.40, source_path=sb_src, input_present=False,
-            na_detail="risk_guard: shadow_book.json absent or has no classification this cycle (OK-only persisted).",
+            na_detail=(
+                _stale_na("risk_guard", shadow_age) if shadow_stale
+                else "risk_guard: shadow_book.json absent or has no classification this cycle (OK-only persisted)."
+            ),
         ))
 
     # 3. exit_rules (critical) — WINNER capture ratio (realized / max-favorable
@@ -147,7 +167,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    lever is entry quality, L4560). Pre-2026-06-07 artifacts without the
     #    winner-capture field fall back to the legacy mean.
     et_src = src("exit_timing.json")
-    if exits and exits.get("status") == "ok":
+    exits_stale = artifact_is_stale(exits_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
+    if exits and exits.get("status") == "ok" and not exits_stale:
         summ = exits.get("summary") or {}
         cap = summ.get("capture_winners_median")
         cap_label = "winner-capture-median"
@@ -171,12 +192,16 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="exit_rules", module=MODULE, metric_type="ratio", criticality="critical",
             estimator="winner_capture_median", measurement_horizon="per_hold",
             n_floor=20, target=0.70, red_line=0.40, source_path=et_src, input_present=False,
-            na_detail="exit_rules: exit_timing.json absent this cycle (OK-only persisted; lands on a Saturday run).",
+            na_detail=(
+                _stale_na("exit_rules", exits_age) if exits_stale
+                else "exit_rules: exit_timing.json absent this cycle (OK-only persisted; lands on a Saturday run)."
+            ),
         ))
 
     # 4. excursion (supporting) — MFE/MAE process quality.
     pe_src = src("portfolio_excursion.json")
-    if exc and exc.get("status") == "ok" and exc.get("mean_mfe_mae_ratio") is not None:
+    exc_stale = artifact_is_stale(exc_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
+    if exc and exc.get("status") == "ok" and exc.get("mean_mfe_mae_ratio") is not None and not exc_stale:
         components.append(build_metric(
             name="excursion", module=MODULE, metric_type="ratio", criticality="supporting",
             value=exc.get("mean_mfe_mae_ratio"), n_samples=exc.get("n"), n_floor=20,
@@ -187,7 +212,10 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="excursion", module=MODULE, metric_type="ratio", criticality="supporting",
             n_floor=20, target=1.5, red_line=0.8, source_path=pe_src, input_present=False,
-            na_detail="excursion: portfolio_excursion.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
+            na_detail=(
+                _stale_na("excursion", exc_age) if exc_stale
+                else "excursion: portfolio_excursion.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279)."
+            ),
         ))
 
     # 5. position_sizing (supporting) — accepted permanent honest-N/A
@@ -207,7 +235,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    diversity → GREEN), red-line 0.3 (collapsed → RED). `alarm` from the
     #    producer flags a collapse independent of the band.
     ae_src = src("action_entropy.json")
-    if aent and aent.get("status") == "ok" and aent.get("entropy_normalized") is not None:
+    aent_stale = artifact_is_stale(aent_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
+    if aent and aent.get("status") == "ok" and aent.get("entropy_normalized") is not None and not aent_stale:
         h_norm = float(aent["entropy_normalized"])
         mc = aent.get("most_common")
         mcf = aent.get("most_common_fraction")
@@ -225,8 +254,11 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="action_entropy", module=MODULE, metric_type="ratio", criticality="diagnostic",
             n_floor=20, target=0.7, red_line=0.3, source_path=ae_src, input_present=False,
-            na_detail=(f"action_entropy: no ok action_entropy.json in the trailing window ending {run_date} "
-                       f"(status={(aent or {}).get('status')!r}); no labelled decision stream this cycle (config#1151)."),
+            na_detail=(
+                _stale_na("action_entropy", aent_age) if aent_stale
+                else f"action_entropy: no ok action_entropy.json in the trailing window ending {run_date} "
+                     f"(status={(aent or {}).get('status')!r}); no labelled decision stream this cycle (config#1151)."
+            ),
         ))
 
     # 7. reconciliation_integrity (critical) — ledger-vs-IB position parity
@@ -238,7 +270,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    integrity breakdown.
     recon_src = (f"s3://{bucket}/{_recon_key}" if _recon_key
                  else f"s3://{bucket}/trades/{run_date}/reconciliation_audit.json")
-    if recon and recon.get("reconciliation_match_rate") is not None:
+    recon_stale = artifact_is_stale(recon_age, EXECUTOR_ARTIFACT_MAX_AGE_DAYS)
+    if recon and recon.get("reconciliation_match_rate") is not None and not recon_stale:
         mr = float(recon["reconciliation_match_rate"])
         n_pos = int(recon.get("n_positions") or 0)
         n_mis = int(recon.get("n_mismatched") or 0)
@@ -264,7 +297,8 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="reconciliation_match_rate", measurement_horizon="eod",
             n_floor=1, target=1.0, red_line=0.90, source_path=recon_src, input_present=False,
             na_detail=(
-                "reconciliation_integrity: reconciliation_audit.json absent this "
+                _stale_na("reconciliation_integrity", recon_age) if recon_stale
+                else "reconciliation_integrity: reconciliation_audit.json absent this "
                 "cycle (executor EOD producer, config#859) — runs after a daemon "
                 "shutdown / EOD reconcile."
             ),
