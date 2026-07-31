@@ -33,19 +33,37 @@ Returns a JSON-serializable dict; the SF's Choice state reads ``has_drift``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import urllib.request
 from pathlib import Path
 
 # Re-imported as a module-level attribute (not called via a fully-qualified
 # path) so `patch.object(deploy_drift, "_fetch_origin_main_sha", ...)` keeps
 # working in tests — mirrors crucible-predictor/inference/deploy_drift.py's
 # own re-export comment.
-from nousergon_lib.preflight import _fetch_origin_main_sha  # noqa: F401
+from nousergon_lib.preflight import _fetch_origin_main_sha, _safe_urlopen
 
 log = logging.getLogger(__name__)
 
 _EVALUATOR_REPO = "nousergon/crucible-evaluator"
+
+# Path patterns that trigger a deploy (mirrors .github/workflows/deploy.yml
+# ``push.paths``). When a commit advances main but no changed file matches
+# these patterns, the drift gate must not flag it — the deploy pipeline
+# correctly skipped it, and the Lambda image is current for all code that
+# affects the deployed artifact.
+# (config#3710: PR #153 added .github/workflows/gate-label-guard.yml — not a
+# deploy-relevant path — which exposed this gap in the preflight gate.)
+_DEPLOY_PATH_PATTERNS = [
+    "grading/",
+    "director/",
+    "requirements",
+    "Dockerfile",
+    "infrastructure/deploy.sh",
+    ".github/workflows/deploy.yml",
+]
 
 # Lambda image convention (matches nousergon_lib.preflight._DEFAULT_GIT_SHA_FILE
 # and crucible-predictor's Dockerfile `RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt`).
@@ -82,6 +100,48 @@ def _shas_match(deployed: str | None, upstream: str | None) -> bool:
     return upstream.startswith(deployed) or deployed.startswith(upstream)
 
 
+def _has_deploy_relevant_changes(
+    repo: str, base: str, head: str, timeout: float = 5.0,
+) -> bool:
+    """Check whether any deploy-relevant files changed between *base* and *head*.
+
+    Uses the GitHub compare-commits API (same pattern as
+    ``nousergon_lib.preflight._is_ancestor``). Returns ``True`` if at least
+    one changed file matches ``_DEPLOY_PATH_PATTERNS``. Returns ``True``
+    (fail-closed) on any API error — a network blip must not silently pass a
+    possibly-real drift.
+    """
+    # Inlined f-string (not a formatted variable) — same S310 rationale as
+    # _fetch_origin_main_sha / _is_ancestor in nousergon_lib.preflight: keeps
+    # the https:// scheme provably hardcoded at the call site.
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    try:
+        with _safe_urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning(
+            "Deploy-drift: GitHub compare API unreachable (%s) — cannot "
+            "check deploy-relevant paths, treating mismatch as drift", exc,
+        )
+        return True  # fail-closed
+
+    files = payload.get("files", [])
+    if not files:
+        # API reports no files changed (force-push or empty merge).
+        # If SHAs differ but compare reports no files, be conservative.
+        return True
+
+    for f in files:
+        filename = f.get("filename", "")
+        for pattern in _DEPLOY_PATH_PATTERNS:
+            if filename.startswith(pattern):
+                return True
+    return False
+
+
 def check_deploy_drift(
     *,
     function_name: str,
@@ -116,7 +176,17 @@ def check_deploy_drift(
     elif not upstream_available:
         reason = "github_unreachable"
     elif has_drift:
-        reason = "sha_mismatch"
+        # Before flagging drift, check whether any deploy-relevant files
+        # actually changed between the baked SHA and upstream HEAD. The
+        # deploy workflow's path filter (deploy.yml push.paths) skips
+        # redeploys for CI/docs/config-only changes — the drift gate
+        # must mirror that filter so it doesn't false-positive on a
+        # commit that the deploy pipeline correctly ignored.
+        if not _has_deploy_relevant_changes(repo, baked, upstream, timeout=timeout):
+            has_drift = False
+            reason = "sha_mismatch_non_deploy_paths"
+        else:
+            reason = "sha_mismatch"
     else:
         reason = "in_sync"
 

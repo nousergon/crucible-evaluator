@@ -7,10 +7,9 @@ uses for the identical re-import)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 import grading.deploy_drift as dd
 
@@ -146,6 +145,176 @@ def test_repo_and_branch_are_threaded_through(tmp_path: Path):
     mock_fetch.assert_called_once_with("nousergon/crucible-evaluator", branch="main", timeout=5.0)
     assert result["repo"] == "nousergon/crucible-evaluator"
     assert result["branch"] == "main"
+
+
+# ── _has_deploy_relevant_changes ─────────────────────────────────────────────
+
+
+def _mock_urlopen_with_files(files):
+    """Return a fake urlopen context-manager whose response body carries the
+    given ``files`` list inside a compare-API-shaped JSON payload."""
+
+    class _FakeResponse:
+        @staticmethod
+        def read():
+            return json.dumps({"files": files}).encode()
+
+    class _FakeCtx:
+        def __enter__(self):
+            return _FakeResponse()
+
+        def __exit__(self, *args):
+            pass
+
+    return _FakeCtx()
+
+
+def test_has_deploy_relevant_changes_true_on_grading_file():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "grading/handler.py"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_true_on_director_file():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "director/handler.py"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_true_on_requirements():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "requirements.txt"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_true_on_dockerfile():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "Dockerfile"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_true_on_deploy_sh():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "infrastructure/deploy.sh"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_true_on_deploy_yml():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": ".github/workflows/deploy.yml"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_false_on_ci_only_change():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": ".github/workflows/gate-label-guard.yml"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is False
+
+
+def test_has_deploy_relevant_changes_false_on_docs_change():
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [{"filename": "README.md"}],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is False
+
+
+def test_has_deploy_relevant_changes_true_on_mixed_changes():
+    # One deploy-relevant file among several non-relevant ones → True
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
+        [
+            {"filename": ".github/workflows/gate-label-guard.yml"},
+            {"filename": "grading/handler.py"},
+            {"filename": "README.md"},
+        ],
+    )):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_fail_closed_on_api_error():
+    # API unreachable → fail-closed (treat as drift)
+    with patch.object(dd, "_safe_urlopen", side_effect=OSError("timeout")):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_fail_closed_on_empty_files():
+    # Compare API returned no files (force-push / empty merge) → conservative
+    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files([])):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_fail_closed_on_json_error():
+    with (
+        patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files([])),
+        patch.object(json, "loads", side_effect=json.JSONDecodeError("bad json", "", 0)),
+    ):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+# ── check_deploy_drift + path-aware gate ───────────────────────────────────
+
+def test_drift_with_non_deploy_paths_is_not_drift(tmp_path: Path):
+    """When main is ahead but only non-deploy paths changed, has_drift must be False."""
+    stamp = tmp_path / "GIT_SHA.txt"
+    stamp.write_text(SHA_A)
+    with (
+        patch.object(dd, "_fetch_origin_main_sha", return_value=SHA_B),
+        patch.object(dd, "_has_deploy_relevant_changes", return_value=False),
+    ):
+        result = dd.check_deploy_drift(
+            function_name="alpha-engine-evaluator", sha_file=stamp,
+        )
+    assert result["has_drift"] is False
+    assert result["reason"] == "sha_mismatch_non_deploy_paths"
+    assert result["baked_sha"] == SHA_A
+    assert result["upstream_sha"] == SHA_B
+
+
+def test_drift_with_deploy_paths_remains_drift(tmp_path: Path):
+    """When main is ahead AND deploy-relevant paths changed, has_drift must stay True."""
+    stamp = tmp_path / "GIT_SHA.txt"
+    stamp.write_text(SHA_A)
+    with (
+        patch.object(dd, "_fetch_origin_main_sha", return_value=SHA_B),
+        patch.object(dd, "_has_deploy_relevant_changes", return_value=True),
+    ):
+        result = dd.check_deploy_drift(
+            function_name="alpha-engine-evaluator", sha_file=stamp,
+        )
+    assert result["has_drift"] is True
+    assert result["reason"] == "sha_mismatch"
+    assert result["baked_sha"] == SHA_A
+    assert result["upstream_sha"] == SHA_B
 
 
 # ── _resolve_function_name ───────────────────────────────────────────────────
