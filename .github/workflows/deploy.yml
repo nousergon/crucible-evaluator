@@ -6,9 +6,14 @@ on:
     paths:
       # Only rebuild + redeploy when code/infra that actually lands in the
       # Docker image changes. Docs, tests, CI, and IAM/example files do not.
-      # (Unlike alpha-engine-predictor, the evaluator has no Lambda-SHA drift
-      # probe in the weekday pipeline, so path-filtering is safe — a non-image
-      # PR won't reform deploy-drift.)
+      # WARNING: the Saturday pipeline (ne-weekly-freshness-pipeline) DOES
+      # check evaluator + director deploy-drift via EvaluatorDeployDriftGate
+      # and EvaluatorDirectorDeployDriftGate (config#2348, 2026-07-13). A
+      # CI-only push to main that doesn't match this paths filter WILL cause
+      # the next Saturday run to fail on sha_mismatch — the Lambdas are still
+      # stamped with the prior deploy SHA while main HEAD advanced. Remedy:
+      # after merging a CI-only PR, trigger a manual deploy via
+      # workflow_dispatch (the Actions UI tab) to re-stamp the Lambdas.
       - 'grading/**'
       - 'director/**'
       - 'requirements*.txt'
