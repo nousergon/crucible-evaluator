@@ -117,3 +117,4 @@ jobs:
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@62597e550c08c0b7a7fe0af490cb141e344061b3
     secrets: inherit
+# no-op workflow scope probe
