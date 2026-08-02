@@ -36,7 +36,18 @@ pandas~=3.0
 # config#1694: notify_on_category required flow-doctor >=0.8; krepis flow_doctor
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
 # is >=0.10.3 — the extra alone resolves flow-doctor 0.8.x.
-krepis[flow_doctor]>=0.24.1
+# config#6050 (2026-08-01): the [openai] extra is LOAD-BEARING, not optional.
+# director/agent.py migrated direct-Anthropic -> OpenRouter on 2026-07-24
+# (DIRECTOR_MODEL='glm-5.2', routed through krepis.llm.LLMClient), and
+# krepis's own pyproject states: `krepis[openai]` for OpenAI / OpenRouter /
+# any OpenAI-compatible endpoint. The extra was never added, so every
+# Director invocation since has died at import with
+# `ModuleNotFoundError: No module named 'openai'` — surfaced live on
+# watch-rerun-2026-08-01-4 (SF event 858, director/agent.py:182).
+# Declared via the krepis extra rather than a bare `openai>=1.40` line so
+# the version stays krepis's to own — the same single-source rule the
+# nousergon-lib layer above learned the hard way (2026-07-11 drift).
+krepis[flow_doctor,openai]>=0.24.1
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
