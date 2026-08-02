@@ -455,27 +455,12 @@ class TestRetro:
         default is the high-group primary (DeepSeek V4 Pro Max), deliberately
         NOT agent.DIRECTOR_MODEL (ultra-group GLM 5.2) — grading a plan with
         the model that wrote it is self-grading bias."""
-        from director.agent import DIRECTOR_GROUP
+        from director.agent import DIRECTOR_MODEL
         from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _judge_model
 
         monkeypatch.delenv("RETRO_JUDGE_MODEL", raising=False)
         assert _judge_model() == RETRO_JUDGE_MODEL_DEFAULT == "deepseek-v4-pro-max"
-
-        # The Director now addresses the `ultra` GROUP rather than pinning a
-        # model, so judge != generator can no longer be asserted against a
-        # single constant — the served model depends on which chain entry is
-        # healthy. What IS still assertable: the judge is not the group itself,
-        # and the two are configured independently.
-        assert DIRECTOR_GROUP == "ultra"
-        assert _judge_model() != DIRECTOR_GROUP
-
-        # KNOWN GAP, tracked as alpha-engine-config-I6052 and deliberately NOT
-        # asserted here: `deepseek-v4-pro-max` is BOTH this judge default (the
-        # `high` primary) and `ultra`'s LAST fallback. If ultra exhausts its
-        # first three entries the plan is graded by the model that wrote it.
-        # Enforcing that needs the SERVED model at call time, which this unit
-        # test has no access to — asserting a weaker proxy here would make the
-        # invariant look enforced when it is not.
+        assert _judge_model() != DIRECTOR_MODEL
 
         monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-5")
         assert _judge_model() == "claude-sonnet-5"

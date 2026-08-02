@@ -25,48 +25,10 @@ from director.schema import DirectorWeeklyActionPlan
 
 logger = logging.getLogger(__name__)
 
-# The Director addresses a REGISTRY MODEL GROUP, never a model id. The group's
-# ordered chain (LLM_MODEL_REGISTRY.yaml) is what provides redundancy — as of
-# 2026-08-01 `ultra` is kimi-k3-direct -> glm-5.2-direct -> glm-5.2 ->
-# deepseek-v4-pro-max, deliberately spanning providers.
-#
-# Why this replaced a pinned model (config#6050 follow-on, 2026-08-01): the
-# prior code built ModelSpec(provider="openrouter", model="glm-5.2") with an
-# OpenRouter key read in this call site. That pins the group's THIRD entry, so
-# when OpenRouter returned 402 (credits exhausted) on watch-rerun-2026-08-01-6
-# the Director failed outright — the two direct routes ahead of it in the chain
-# were never tried. A pinned model cannot fall back, whatever the registry says.
-#
-# It also violated `principles.md` §2.8 four ways at once: a model id, a
-# provider name, a provider api key, and an SDK client all constructed at the
-# call site. Addressing the group moves every one of those into the registry.
-DIRECTOR_GROUP = "ultra"
+DIRECTOR_MODEL = "glm-5.2"
 _DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
 _RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
-
-# Pin the resolve contract this module was written against. krepis documents
-# `resolve_group_structured` as returning a schema_version and instructs
-# callers to BRANCH on it rather than probe for fields — a field rename is the
-# recurring failure mode there, and probing turns it into a silent misroute.
-_EXPECTED_ROUTE_SCHEMA = 1
-
-# krepis `auth_token_type` -> the env var holding that credential. ModelSpec
-# takes `api_key_env` (a NAME), so the value is never read here; krepis reads
-# it at call time. `placeholder` means the local egress proxy holds the real
-# key and the client sends a literal placeholder — mapping it to None lets
-# ModelSpec fall back to the provider registry default.
-#
-# Third copy of this mapping in the fleet (groomer_krepis_adapter.py,
-# groom_driver.py, here) — past `policy-shared-code`'s second-adoption
-# trigger. Lifting it into krepis alongside `resolve_group_structured`, which
-# is the only producer of these values, is filed as a follow-up.
-_AUTH_TOKEN_ENV: dict[str, str | None] = {
-    "placeholder": None,
-    "openrouter_key": "OPENROUTER_API_KEY",
-    "litellm_master_key": "LITELLM_MASTER_KEY",
-    "direct_api_key": "ANTHROPIC_API_KEY",
-}
 
 
 def _load_system_prompt() -> str:
@@ -130,51 +92,16 @@ def _default_llm() -> _KrepisStructuredDirector:
     """
     from krepis.llm import LLMClient
     from krepis.llm_config import ModelSpec
-    from krepis.router import resolve_group_structured
+    from krepis.secrets import get_secret
 
-    # `resolve_group_structured` is krepis' documented PUBLIC contract for
-    # programmatic callers — it returns the endpoint, wire model, credential
-    # type and params for the group's first HEALTHY entry, honouring the
-    # Router's cooldown state. Branch on schema_version rather than probing
-    # for fields, per that contract.
-    route = resolve_group_structured(DIRECTOR_GROUP)
-    if route.get("schema_version") != _EXPECTED_ROUTE_SCHEMA:
-        raise RuntimeError(
-            f"krepis.router resolve schema_version "
-            f"{route.get('schema_version')!r} != expected "
-            f"{_EXPECTED_ROUTE_SCHEMA!r} — refusing to guess field meanings"
-        )
-
-    auth_type = route["auth_token_type"]
-    if auth_type not in _AUTH_TOKEN_ENV:
-        raise RuntimeError(
-            f"unknown auth_token_type {auth_type!r} from krepis.router — "
-            "refusing to authenticate against an unintended endpoint"
-        )
-    api_key_env = _AUTH_TOKEN_ENV[auth_type]
-
-    params = route.get("params") or {}
-    spec = ModelSpec(
-        provider=route["provider"],
-        model=route["deployment_id"],
-        base_url=route["api_base_url"] or None,
-        api_key_env=api_key_env,
-        max_tokens=params.get("max_tokens", 8000),
-        structured_outputs=params.get("structured_outputs", True),
-        reasoning=params.get("reasoning"),
-    )
-    logger.info(
-        "Director route: group=%s model=%s provider=%s route=%s "
-        "(primary=%s, max_tokens=%s)",
-        DIRECTOR_GROUP, route["deployment_id"], route["provider"],
-        route.get("route"), route.get("primary_model"), spec.max_tokens,
-    )
+    api_key = get_secret("OPENROUTER_API_KEY")
+    spec = ModelSpec(provider="openrouter", model=DIRECTOR_MODEL, max_tokens=8000)
     # callsite_id is REQUIRED since krepis 0.23 (krepis/llm.py::LLMClient.__init__,
     # validated non-empty). It is the join key between this call's emitted cost
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-plan).
-    client = LLMClient(spec, callsite_id="director-plan")
-    return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
+    client = LLMClient(spec, api_key=api_key, callsite_id="director-plan")
+    return _KrepisStructuredDirector(client, director_model=DIRECTOR_MODEL)
 
 
 def _carryover_context(carryover: dict | None) -> str:
