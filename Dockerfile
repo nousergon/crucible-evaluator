@@ -35,6 +35,12 @@ RUN NOUSERGON_LIB_LINE="$(grep '^nousergon-lib' requirements.txt)" && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
 
+# config-I4799: the Lambda Python 3.12 base image ships boto3 1.34.x which may
+# predate the appconfigdata service (boto3>=1.34.99). krepis 0.26.0's AppConfig
+# registry resolution needs it for the Director's LLM_MODEL_REGISTRY lookup.
+# Force-upgrade so appconfigdata client is available.
+RUN pip install --no-cache-dir -U "boto3>=1.36" "botocore>=1.36"
+
 # Application code (Layer B grading + Layer C director skeleton).
 COPY grading/ ${LAMBDA_TASK_ROOT}/grading/
 COPY director/ ${LAMBDA_TASK_ROOT}/director/
