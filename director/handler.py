@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 
 import boto3
 
@@ -369,6 +370,44 @@ def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
     return summary
 
 
+def _ensure_registry(bucket: str, s3) -> None:
+    """Download LLM_MODEL_REGISTRY.yaml from S3 to /tmp and point krepis at it.
+
+    The Director runs in a public-repo Lambda without ``private-docs/`` on disk,
+    and AppConfig resolution (krepis 0.26.0 Tier 2) depends on a boto3 version
+    with the ``appconfigdata`` client.  Rather than debugging that in CI-deploy
+    loops, the registry is uploaded to S3 (``director/LLM_MODEL_REGISTRY.yaml``)
+    and downloaded here — the fastest, most reliable path.  Sets
+    ``LLM_MODEL_REGISTRY_PATH`` so krepis finds it at Tier 1 (env var override).
+
+    Idempotent: skips if the file already exists or the env var is already set.
+    **Best-effort** — a missing or unreachable registry produces a WARNING, never
+    raises.  The downstream ``_default_llm()`` → ``resolve_group_structured()``
+    call will fail with its own ``FileNotFoundError`` if the registry is truly
+    absent, which is a clearer error than wrapping S3 failures here.
+    """
+    import os as _os
+
+    if _os.environ.get("LLM_MODEL_REGISTRY_PATH"):
+        return  # already set — nothing to do
+
+    dest = "/tmp/LLM_MODEL_REGISTRY.yaml"
+    if not Path(dest).exists():
+        from botocore.exceptions import ClientError
+        try:
+            s3.download_file(bucket, "director/LLM_MODEL_REGISTRY.yaml", dest)
+        except ClientError as exc:
+            logger.warning(
+                "Director: cannot download LLM_MODEL_REGISTRY.yaml from "
+                "s3://%s/director/ — %s. krepis will fail with its own error "
+                "if the registry is truly absent.",
+                bucket, exc,
+            )
+            return
+    _os.environ["LLM_MODEL_REGISTRY_PATH"] = dest
+    logger.info("Director registry cached from s3://%s/director/", bucket)
+
+
 def handler(event: dict | None = None, context=None) -> dict:
     """Build + persist the weekly Director action plan (flag-gated).
 
@@ -393,6 +432,14 @@ def handler(event: dict | None = None, context=None) -> dict:
     run_date = _resolve_run_date(event)
     dry_run = bool(event.get("dry_run", False))
     s3 = boto3.client("s3")
+
+    # Ensure the model registry is resolvable before any Director LLM call.
+    # This Lambda runs in a public repo without private-docs/ on disk, and
+    # AppConfig resolution (krepis 0.26.0 Tier 2) depends on the appconfigdata
+    # boto3 client which may not be available.  The registry lives at
+    # s3://<bucket>/director/LLM_MODEL_REGISTRY.yaml — downloaded to /tmp and
+    # wired via LLM_MODEL_REGISTRY_PATH for krepis Tier 1 (env var override).
+    _ensure_registry(bucket, s3)
 
     card = _load_report_card(s3, bucket, run_date)
 
