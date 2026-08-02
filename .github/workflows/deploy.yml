@@ -42,20 +42,8 @@ jobs:
       - name: Checkout evaluator repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
-      # deploy.sh stages LLM_MODEL_REGISTRY.yaml from nousergon/alpha-engine-config
-      # into the Docker build context so krepis.router.resolve_group_structured()
-      # can resolve the Director's model group. This is a public repo without
-      # private-docs/ on disk — the file comes from the private config repo.
-      # Mirrors crucible-predictor's config-staging pattern.
-      # Fine-grained PAT with read-only Contents access on alpha-engine-config
-      # is stored as ALPHA_ENGINE_CONFIG_TOKEN.
-      - name: Checkout alpha-engine-config
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-        with:
-          repository: nousergon/alpha-engine-config
-          path: alpha-engine-config
-          token: ${{ secrets.ALPHA_ENGINE_CONFIG_TOKEN }}
-
+      # LLM_MODEL_REGISTRY.yaml is downloaded from S3 at Lambda startup by
+      # director/handler.py's _ensure_registry() — no build-time staging needed.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4
 
@@ -97,11 +85,6 @@ jobs:
       # alias. It PRESERVES any operator-set DIRECTOR_ENABLED — the auto-deploy
       # never resets the flag.
       - name: Build image + deploy both Lambdas
-        env:
-          # deploy.sh defaults CONFIG_REPO_DIR to $(dirname $PWD)/
-          # alpha-engine-config — exactly where the checkout step above
-          # placed it.
-          CONFIG_REPO_DIR: ${{ github.workspace }}/alpha-engine-config
         run: bash infrastructure/deploy.sh
 
       - name: Report deployed versions

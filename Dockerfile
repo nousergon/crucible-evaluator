@@ -49,21 +49,13 @@ COPY director/ ${LAMBDA_TASK_ROOT}/director/
 # Ships in the Lambda task root (the handlers locate it via LAMBDA_TASK_ROOT).
 COPY flow-doctor.yaml ${LAMBDA_TASK_ROOT}/
 
-# LLM_MODEL_REGISTRY.yaml — staged from alpha-engine-config by deploy.sh.
-# This is a public repo (no private-docs/ on disk); the deploy workflow clones
-# alpha-engine-config and stages the registry into the build context so
-# krepis.router can resolve model groups via the filesystem lookup path
-# (private-docs/LLM_MODEL_REGISTRY.yaml relative to cwd). The AppConfig path
-# (KREPIS_APPCONFIG_APPLICATION) is also set as a future enabler but the
-# filesystem path is what works TODAY — AppConfig requires the application +
-# config profile to exist in AWS (not yet provisioned).
-COPY LLM_MODEL_REGISTRY.yaml ${LAMBDA_TASK_ROOT}/private-docs/
-
 # Lambda entrypoint: the grading-layer producer. Builds the Report Card v2 and
 # writes evaluator/{date}/report_card.json. (The Director, Part II, will add its
 # own handler to the same image.)
 #
-# config-I4799: AppConfig registry resolution for the Director Lambda —
-# set as a future enabler (the filesystem path above is what works today).
+# LLM_MODEL_REGISTRY.yaml is downloaded from S3 at Lambda startup by
+# director/handler.py's _ensure_registry() rather than baked into the image.
+# config-I4799: AppConfig env var is also set as a future enabler — once
+# the AppConfig application is provisioned, the S3 download becomes redundant.
 ENV KREPIS_APPCONFIG_APPLICATION=alpha-engine
 CMD ["grading.handler.handler"]
