@@ -22,6 +22,7 @@ Migrated from claude-opus-4-8 direct Anthropic → OpenRouter 2026-07-24, then
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from director.report_card_digest import summarize_report_card
@@ -187,7 +188,18 @@ def _default_llm() -> _KrepisStructuredDirector:
     # validated non-empty). It is the join key between this call's emitted cost
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-plan).
-    client = LLMClient(spec, callsite_id="director-plan")
+    #
+    # config-I6056: if the env var the route expects is not set (common in
+    # Lambda, where the key lives in SSM not env), read it from SSM and pass
+    # as api_key= to LLMClient.  The old OpenRouter-pin path did exactly this.
+    api_kwargs = {}
+    if api_key_env is not None and not os.environ.get(api_key_env):
+        from krepis.secrets import get_secret
+        ssm_key = api_key_env  # e.g. "LITELLM_MASTER_KEY"
+        secret = get_secret(ssm_key)
+        if secret:
+            api_kwargs["api_key"] = secret
+    client = LLMClient(spec, callsite_id="director-plan", **api_kwargs)
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
 
 
