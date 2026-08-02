@@ -53,7 +53,7 @@ _RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
 # `resolve_group_structured` as returning a schema_version and instructs
 # callers to BRANCH on it rather than probe for fields — a field rename is the
 # recurring failure mode there, and probing turns it into a silent misroute.
-_EXPECTED_ROUTE_SCHEMA = 1
+_EXPECTED_ROUTE_SCHEMA = 2
 
 # krepis `auth_token_type` -> the env var holding that credential. ModelSpec
 # takes `api_key_env` (a NAME), so the value is never read here; krepis reads
