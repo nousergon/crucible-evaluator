@@ -79,7 +79,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install krepis (runner-side canary CLI)
-        run: pip install "$(grep '^krepis\[flow_doctor\]' requirements.txt)"
+        run: pip install "$(grep '^krepis\[' requirements.txt)"
 
       # deploy.sh builds the single ECR image and deploys BOTH the grading
       # Lambda (alpha-engine-evaluator) and the Director Lambda
