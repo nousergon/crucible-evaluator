@@ -31,7 +31,7 @@ COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN NOUSERGON_LIB_LINE="$(grep '^nousergon-lib' requirements.txt)" && \
     test -n "${NOUSERGON_LIB_LINE}" && \
     pip install --no-cache-dir "${NOUSERGON_LIB_LINE}" && \
-    grep -vE "^#|^$|^pytest|^pytest-cov|^moto|^python-dotenv|^boto3|^botocore|^s3transfer|^nousergon-lib" requirements.txt > /tmp/req-lambda.txt && \
+    grep -vE "^#|^$|^pytest|^pytest-cov|^moto|^python-dotenv|^nousergon-lib" requirements.txt > /tmp/req-lambda.txt && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
 
@@ -46,4 +46,9 @@ COPY flow-doctor.yaml ${LAMBDA_TASK_ROOT}/
 # Lambda entrypoint: the grading-layer producer. Builds the Report Card v2 and
 # writes evaluator/{date}/report_card.json. (The Director, Part II, will add its
 # own handler to the same image.)
+#
+# config-I4799: AppConfig registry resolution for the Director Lambda (this is a
+# public repo — no private-docs/ on disk; krepis 0.26.0's AppConfig path resolves
+# LLM_MODEL_REGISTRY.yaml from AWS AppConfig instead).
+ENV KREPIS_APPCONFIG_APPLICATION=alpha-engine
 CMD ["grading.handler.handler"]
