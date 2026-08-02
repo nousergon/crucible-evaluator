@@ -30,8 +30,8 @@ pandas~=3.0
 # importable in the deploy environment — this floor makes it a hard dep.
 # Bumped to >=0.9.0 (config#1673): director/retro.py's Phase-G retro judge
 # now calls `krepis.llm` (the provider-agnostic LLMClient/ModelSpec adapter),
-# introduced in krepis 0.9.0 — LOAD-BEARING for the retro's Sonnet judge call
-# (judge != generator; the Opus plan-generation call in director/agent.py is
+# introduced in krepis 0.9.0 — LOAD-BEARING for the retro's judge call
+# (judge != generator; the plan-generation call in director/agent.py is
 # untouched and stays on langchain-anthropic below).
 # config#1694: notify_on_category required flow-doctor >=0.8; krepis flow_doctor
 # extra capped <0.7 until v0.10.3 (krepis#14). Direct pin removed once floor
@@ -47,19 +47,28 @@ pandas~=3.0
 # Declared via the krepis extra rather than a bare `openai>=1.40` line so
 # the version stays krepis's to own — the same single-source rule the
 # nousergon-lib layer above learned the hard way (2026-07-11 drift).
-krepis[flow_doctor,openai]>=0.24.1
+#
+# 2026-08-02: floor raised from >=0.24.1 to >=0.26.0 — 0.26.0 adds
+# AppConfig-based registry resolution (resolve_group_structured can now
+# read the LLM_MODEL_REGISTRY from AppConfig when KREPIS_APPCONFIG_APPLICATION
+# is set), which is load-bearing for this Lambda (public repo, no
+# private-docs/ on disk). The Director now addresses the "ultra" GROUP
+# rather than pinning a model id.
+krepis[flow_doctor,openai]>=0.26.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
 nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.3
 
-# Director (Layer C) — single structured Opus call for PLAN GENERATION
-# (director/agent.py, DIRECTOR_MODEL, locked to Opus). langchain-anthropic
-# provides ChatAnthropic + with_structured_output; only needed when
+# Director (Layer C) — single structured LLM call for PLAN GENERATION
+# (director/agent.py, DIRECTOR_GROUP="ultra", resolved through
+# krepis.router.resolve_group_structured). langchain-anthropic provides
+# ChatAnthropic + with_structured_output; only needed when
 # DIRECTOR_ENABLED is on (imported lazily, so the test suite + the grading
 # path don't require it). The Phase-G retro JUDGE call (director/retro.py)
-# is a separate model tier (Sonnet) routed through krepis.llm instead —
+# is a separate model tier (high group) routed through krepis.llm instead —
 # see the krepis>=0.9.0 bump above.
+langchain-anthropic~=1.5
 langchain-anthropic~=1.5
 
 # Dev / testing

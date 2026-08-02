@@ -10,16 +10,16 @@ pattern (mirrors research ``evals/judge.py`` ``RubricEvalLLMOutput``).
 The LLM is injectable (``llm=``) so build/validate + tests run without a key or
 krepis' provider SDKs; ``_default_llm()`` lazily constructs the real client.
 
-**Judge tier: Sonnet, deliberately NOT the Director's Opus.** Grading a plan
-with the same model that generated it is self-grading bias (config#1673,
-judge != generator) — see ``agent.py``'s ``DIRECTOR_MODEL`` (Opus, locked for
-plan generation, untouched here). The judge call is routed through
+**Judge tier: the ``high`` group, deliberately NOT the Director's ``ultra``.**
+Grading a plan with the same model that generated it is self-grading bias
+(config#1673, judge != generator) — see ``agent.py``'s ``DIRECTOR_GROUP``.
+(This paragraph said "Sonnet" / "Opus" until 2026-08-01; both were stale from
+the 2026-07-24 migration off direct Anthropic.) The judge call is routed through
 ``krepis.llm``'s provider-agnostic adapter (krepis>=0.9.0) rather than
 langchain's ``ChatAnthropic`` — a separate call surface from
 ``agent._default_llm``. The model is config, not code: ``RETRO_JUDGE_MODEL``
-env var, default ``"claude-sonnet-4-6"``. That default is a floating alias
-with no dated snapshot — the API resolves it to a live snapshot per call, and
-both the alias (``judge_model``) and the API-resolved model (``resolved_model``)
+env var, default ``"deepseek-v4-pro-max"`` (the high group primary). Both the
+model alias (``judge_model``) and the API-resolved model (``resolved_model``)
 are stamped onto the persisted ``RetroGrade`` (``extra="allow"``) so the
 dashboard/audit trail can see exactly what ran.
 """
@@ -38,8 +38,13 @@ logger = logging.getLogger(__name__)
 # Retro judge model tier — uses the "high" group from LLM_MODEL_REGISTRY.yaml
 # (config#1673, migrated from claude-sonnet-4-6 direct Anthropic 2026-07-24).
 # Env-overridable; the default is the high group primary (floating alias).
-# Intentionally distinct from `agent.DIRECTOR_MODEL` (ultra group) — do not
-# import/reuse that constant here; the whole point is judge != generator.
+# Intentionally a DIFFERENT group from `agent.DIRECTOR_GROUP` ("ultra") — do
+# not import/reuse it here; the whole point is judge != generator.
+#
+# CAVEAT (alpha-engine-config-I6052): distinct GROUPS no longer guarantee
+# distinct MODELS. `deepseek-v4-pro-max` is both this default (high's primary)
+# and ultra's LAST fallback, so a fully-degraded ultra chain serves the judge's
+# own model. Nothing enforces the invariant at call time yet.
 RETRO_JUDGE_MODEL_DEFAULT = "deepseek-v4-pro-max"
 
 _RETRO_JUDGE_SCHEMA_NAME = "RetroGrade"
