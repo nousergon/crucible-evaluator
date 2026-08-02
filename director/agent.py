@@ -152,7 +152,7 @@ def _default_llm() -> _KrepisStructuredDirector:
     # type and params for the group's first HEALTHY entry, honouring the
     # Router's cooldown state. Branch on schema_version rather than probing
     # for fields, per that contract.
-    route = resolve_group_structured(DIRECTOR_GROUP)
+    route = resolve_group_structured(DIRECTOR_GROUP, exclude_route="litellm_proxy")
     if route.get("schema_version") != _EXPECTED_ROUTE_SCHEMA:
         raise RuntimeError(
             f"krepis.router resolve schema_version "
