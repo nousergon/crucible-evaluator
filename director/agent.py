@@ -168,12 +168,24 @@ def _default_llm() -> _KrepisStructuredDirector:
         )
     api_key_env = _AUTH_TOKEN_ENV[auth_type]
 
+    # Resolve the API key.  In Lambda the key lives in SSM (not env), so
+    # read it from SSM via the same get_secret() call the old OpenRouter-pin
+    # code used.  api_key= is passed directly to LLMClient — the ModelSpec
+    # does NOT carry api_key_env here, because LLMClient would try to read
+    # the env var (empty in Lambda) and fail before consulting api_key=.
+    from krepis.secrets import get_secret
+    api_key = get_secret(api_key_env) if api_key_env else None
+    if not api_key:
+        raise RuntimeError(
+            f"Director: no API key for auth_token_type {auth_type!r} "
+            f"(env {api_key_env!r} is empty and get_secret returned nothing)"
+        )
+
     params = route.get("params") or {}
     spec = ModelSpec(
         provider=route["provider"],
         model=route["deployment_id"],
         base_url=route["api_base_url"] or None,
-        api_key_env=api_key_env,
         max_tokens=params.get("max_tokens", 8000),
         structured_outputs=params.get("structured_outputs", True),
         reasoning=params.get("reasoning"),
@@ -184,22 +196,7 @@ def _default_llm() -> _KrepisStructuredDirector:
         DIRECTOR_GROUP, route["deployment_id"], route["provider"],
         route.get("route"), route.get("primary_model"), spec.max_tokens,
     )
-    # callsite_id is REQUIRED since krepis 0.23 (krepis/llm.py::LLMClient.__init__,
-    # validated non-empty). It is the join key between this call's emitted cost
-    # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
-    # sync with that row's `id` (alpha-engine-config, id: director-plan).
-    #
-    # config-I6056: if the env var the route expects is not set (common in
-    # Lambda, where the key lives in SSM not env), read it from SSM and pass
-    # as api_key= to LLMClient.  The old OpenRouter-pin path did exactly this.
-    api_kwargs = {}
-    if api_key_env is not None and not os.environ.get(api_key_env):
-        from krepis.secrets import get_secret
-        ssm_key = api_key_env  # e.g. "LITELLM_MASTER_KEY"
-        secret = get_secret(ssm_key)
-        if secret:
-            api_kwargs["api_key"] = secret
-    client = LLMClient(spec, callsite_id="director-plan", **api_kwargs)
+    client = LLMClient(spec, api_key=api_key, callsite_id="director-plan")
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
 
 
