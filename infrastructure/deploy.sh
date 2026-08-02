@@ -30,6 +30,33 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 GIT_SHA="${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 echo "  Stamping image with GIT_SHA=${GIT_SHA}"
 
+# ── Stage LLM_MODEL_REGISTRY.yaml from alpha-engine-config ───────────────────
+# krepis 0.26.0's router.resolve_group_structured() needs the model registry
+# to map the "ultra" group to a provider/model chain. This is a public repo
+# (no private-docs/ on disk), so the deploy workflow clones alpha-engine-config
+# and sets CONFIG_REPO_DIR. The file is staged into the Docker build context
+# and the Dockerfile copies it to /var/task/private-docs/ where krepis's
+# filesystem walk finds it. The AppConfig path (KREPIS_APPCONFIG_APPLICATION)
+# requires the application + config profile to exist in AWS (not yet provisioned
+# as of 2026-08-02); this filesystem path works TODAY.
+# Mirrors crucible-predictor/infrastructure/deploy.sh's config-staging pattern.
+CONFIG_REPO_DIR="${CONFIG_REPO_DIR:-$(dirname "$PWD")/alpha-engine-config}"
+SRC="$CONFIG_REPO_DIR/private-docs/LLM_MODEL_REGISTRY.yaml"
+
+if [ -f "$SRC" ]; then
+  echo "Staging LLM_MODEL_REGISTRY.yaml from $SRC"
+  cp "$SRC" LLM_MODEL_REGISTRY.yaml
+elif [ -f "LLM_MODEL_REGISTRY.yaml" ]; then
+  echo "Using existing LLM_MODEL_REGISTRY.yaml (local dev / CI placeholder)"
+else
+  echo "ERROR: LLM_MODEL_REGISTRY.yaml not found — tried:"
+  echo "  $SRC (config repo sibling)"
+  echo "  LLM_MODEL_REGISTRY.yaml (local dev / CI placeholder)"
+  echo "Hint: clone nousergon/alpha-engine-config as a sibling directory,"
+  echo "      or set CONFIG_REPO_DIR=/path/to/alpha-engine-config"
+  exit 1
+fi
+
 echo "=== Building $FUNCTION image (linux/amd64) ==="
 docker build --platform linux/amd64 --provenance=false \
   --build-arg "GIT_SHA=${GIT_SHA}" \

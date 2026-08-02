@@ -85,6 +85,21 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
+      # The Dockerfile COPYs LLM_MODEL_REGISTRY.yaml into the image. The real
+      # file is staged from alpha-engine-config by deploy.sh during production
+      # deploys. This CI job has no access to the private config repo, so we
+      # create a minimal placeholder — the image builds, and the test suite
+      # exercises only the grading layer (the Director's LLM path is lazy and
+      # never reached in these tests).
+      - name: Create placeholder LLM_MODEL_REGISTRY.yaml (CI-only)
+        run: |
+          cat > LLM_MODEL_REGISTRY.yaml << 'YAMLEOF'
+          schema_version: 1
+          model_groups:
+            ultra: []
+          models: {}
+          YAMLEOF
+
       - name: Build evaluator image
         run: |
           docker build --platform linux/amd64 --provenance=false \
