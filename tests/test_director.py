@@ -780,3 +780,74 @@ class TestDirectorRouteDegradationIsAlerted:
                 emitted["value"] = MetricData[0]["Value"]
         boto3.client = lambda _n: _CW()
         monkeypatch.setitem(sys.modules, "boto3", boto3)
+
+
+class TestDirectorCredentialResolution:
+    """config-I6056 / model-router-policy R20 — fail closed, loudly.
+
+    Supersedes crucible-evaluator-PR169, which resolved the credential
+    unconditionally and would therefore have raised on a `placeholder` route
+    (egress_proxy entries carry no key of their own — the proxy holds it).
+    That never bit in the Lambda, where only the litellm_proxy route can
+    serve, but it would have broken every direct route from `laptop`.
+    """
+
+    def _patch_krepis(self, monkeypatch, *, auth_token_type, secret):
+        import sys, types
+        from director import agent as A
+
+        captured = {}
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_structured = lambda group, **kw: {
+            "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+            "provider": "litellm", "deployment_id": "ultra",
+            "api_base_url": "http://172.31.73.124:8980",
+            "auth_token_type": auth_token_type,
+            "registry_id": "r", "primary_registry_id": "r",
+            "route": "litellm_proxy", "exec_context": "lambda_vpc",
+            "params": {}, "skipped_entries": [],
+        }
+        krepis_llm = types.ModuleType("krepis.llm")
+
+        def _client(spec, **kw):
+            captured.update(kw)
+            return object()
+        krepis_llm.LLMClient = _client
+        krepis_cfg = types.ModuleType("krepis.llm_config")
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+        krepis_cfg.ModelSpec = _Spec
+        krepis_secrets = types.ModuleType("krepis.secrets")
+        krepis_secrets.get_secret = lambda name, **kw: secret
+        pkg = types.ModuleType("krepis")
+        for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
+                          ("krepis.llm", krepis_llm),
+                          ("krepis.llm_config", krepis_cfg),
+                          ("krepis.secrets", krepis_secrets)):
+            monkeypatch.setitem(sys.modules, name, mod)
+        monkeypatch.setattr(A, "_warn_on_degraded_route", lambda r: None)
+        return A, captured
+
+    def test_placeholder_route_resolves_no_credential(self, monkeypatch):
+        """The egress proxy holds the real key. Demanding one here would break
+        every direct route reachable from `laptop`."""
+        A, captured = self._patch_krepis(
+            monkeypatch, auth_token_type="placeholder", secret=None)
+        A._default_llm()
+        assert "api_key" not in captured
+
+    def test_named_credential_is_passed_through(self, monkeypatch):
+        A, captured = self._patch_krepis(
+            monkeypatch, auth_token_type="litellm_master_key", secret="sk-x")
+        A._default_llm()
+        assert captured["api_key"] == "sk-x"
+
+    def test_unresolvable_named_credential_raises(self, monkeypatch):
+        """It used to fall through with no key; the 401 that followed read as
+        a provider fault rather than a missing credential."""
+        A, _ = self._patch_krepis(
+            monkeypatch, auth_token_type="litellm_master_key", secret=None)
+        with pytest.raises(RuntimeError, match="no credential for auth_token_type"):
+            A._default_llm()

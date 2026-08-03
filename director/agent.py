@@ -292,16 +292,33 @@ def _default_llm() -> _KrepisStructuredDirector:
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-plan).
     #
-    # config-I6056: if the env var the route expects is not set (common in
-    # Lambda, where the key lives in SSM not env), read it from SSM and pass
-    # as api_key= to LLMClient.  The old OpenRouter-pin path did exactly this.
+    # config-I6056: the credential this route needs is named by the registry,
+    # not chosen here. In Lambda it lives in SSM rather than the environment,
+    # so it is resolved through krepis' own SSM-with-env-fallback lookup.
+    #
+    # `auth_token_type == "placeholder"` maps to api_key_env=None and means
+    # the egress proxy holds the real key — there is NOTHING to resolve, and
+    # treating that as a missing credential would break every direct route
+    # from a context that can reach one. The two cases are distinguished
+    # rather than collapsed.
+    #
+    # Where a credential IS named and cannot be resolved, this RAISES.  It
+    # previously fell through with no key and surfaced as a 401 from the
+    # provider — an auth failure that looks like a provider problem
+    # (model-router-policy R20: fail closed, loudly).
     api_kwargs = {}
-    if api_key_env is not None and not os.environ.get(api_key_env):
+    if api_key_env is not None:
         from krepis.secrets import get_secret
-        ssm_key = api_key_env  # e.g. "LITELLM_MASTER_KEY"
-        secret = get_secret(ssm_key)
-        if secret:
-            api_kwargs["api_key"] = secret
+
+        secret = get_secret(api_key_env, required=False)
+        if not secret:
+            raise RuntimeError(
+                f"Director: no credential for auth_token_type {auth_type!r} — "
+                f"{api_key_env!r} is absent from the environment and from SSM. "
+                "Refusing to call the endpoint unauthenticated: the resulting "
+                "401 would read as a provider fault rather than a missing key."
+            )
+        api_kwargs["api_key"] = secret
     client = LLMClient(spec, callsite_id="director-plan", **api_kwargs)
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
 
