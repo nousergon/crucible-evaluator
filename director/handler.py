@@ -408,6 +408,44 @@ def _ensure_registry(bucket: str, s3) -> None:
     logger.info("Director registry cached from s3://%s/director/", bucket)
 
 
+def _ensure_litellm_credential() -> None:
+    """Ensure LITELLM_MASTER_KEY is available as an env var for the krepis router.
+
+    The krepis router resolves the LiteLLM proxy route's credential in order:
+    env → secrets.env → SSM.  Setting the env var short-circuits krepis'
+    resolution at the first step so the router does not itself need
+    ``ssm:GetParameter`` on ``/alpha-engine/LITELLM_MASTER_KEY`` — the Lambda's
+    own IAM grant gates the read instead, which is the same grant the Lambda
+    already exercises for ``ANTHROPIC_API_KEY`` and other ``/alpha-engine/*``
+    parameters at runtime.
+
+    **Idempotent** — skips if ``LITELLM_MASTER_KEY`` is already in the
+    environment (operator-set on the function config).
+
+    **Best-effort** — a missing or unreachable parameter produces a WARNING,
+    never raises.  The downstream ``resolve_group_structured()`` call will fail
+    with its own ``ValueError`` if the credential is truly absent, which is a
+    clearer error than wrapping SSM failures here.
+    """
+    if os.environ.get("LITELLM_MASTER_KEY"):
+        return  # already set — nothing to do
+
+    try:
+        ssm = boto3.client("ssm")
+        resp = ssm.get_parameter(
+            Name="/alpha-engine/LITELLM_MASTER_KEY",
+            WithDecryption=True,
+        )
+        os.environ["LITELLM_MASTER_KEY"] = resp["Parameter"]["Value"]
+        logger.info("Director: LITELLM_MASTER_KEY set from SSM")
+    except Exception as exc:
+        logger.warning(
+            "Director: cannot read /alpha-engine/LITELLM_MASTER_KEY from SSM — "
+            "%s. krepis will fail with its own error if the key is truly absent.",
+            exc,
+        )
+
+
 def handler(event: dict | None = None, context=None) -> dict:
     """Build + persist the weekly Director action plan (flag-gated).
 
@@ -440,6 +478,16 @@ def handler(event: dict | None = None, context=None) -> dict:
     # s3://<bucket>/director/LLM_MODEL_REGISTRY.yaml — downloaded to /tmp and
     # wired via LLM_MODEL_REGISTRY_PATH for krepis Tier 1 (env var override).
     _ensure_registry(bucket, s3)
+
+    # Ensure the LiteLLM proxy master key is resolvable as an env var before
+    # any krepis router call.  krepis resolves the credential for the
+    # synthesised litellm_proxy route at route-validation time (env →
+    # secrets.env → SSM), and setting it here short-circuits the router's own
+    # SSM lookup.  The Lambda's SSM grant is the same one it already exercises
+    # for ANTHROPIC_API_KEY and other /alpha-engine/* parameters at runtime —
+    # this call just moves the read to startup so the router never needs its
+    # own grant.
+    _ensure_litellm_credential()
 
     card = _load_report_card(s3, bucket, run_date)
 
