@@ -874,3 +874,79 @@ class TestDirectorCredentialResolution:
             monkeypatch, auth_token_type="litellm_master_key", secret=None)
         with pytest.raises(RuntimeError, match="no credential for auth_token_type"):
             A._default_llm()
+
+
+class TestDirectorRoutesThroughTheProxyNoExceptions:
+    """From a Lambda the Director routes through the LiteLLM proxy or it does not run.
+
+    Brian, 2026-08-03: "director should be using the krepis router, ultra
+    complexity. no exceptions."
+
+    The reason this is a RUNTIME guard and not only a CI assertion: every time
+    this has failed in production, the code was correct and the artifact it read
+    was not. `exclude_route="litellm_proxy"` in this module; then a hand-published
+    S3 registry copy with no `reachable_from`, which krepis read as universal
+    reachability; then a krepis health probe that spoke plain HTTP at the
+    router's TLS edge and declared it unreachable. Each produced the same
+    symptom — a paid `ultra` call to openrouter.ai, DLP-unscanned, logging a
+    healthy route (alpha-engine-config-I6183, model-router-policy R26).
+    """
+
+    @staticmethod
+    def _route(route_name, **over):
+        base = {
+            "schema_version": 2,
+            "route": route_name,
+            "provider": "openrouter" if route_name == "openrouter" else "litellm",
+            "deployment_id": "z-ai/glm-5.2" if route_name == "openrouter" else "ultra",
+            "api_base_url": ("https://openrouter.ai/api" if route_name == "openrouter"
+                             else "https://router.nousergon.ai:8443"),
+            "auth_token_type": ("openrouter_key" if route_name == "openrouter"
+                                else "litellm_master_key"),
+            "params": {"max_tokens": 16384},
+            "skipped_entries": [],
+        }
+        base.update(over)
+        return base
+
+    def test_openrouter_from_a_lambda_raises(self):
+        from director import agent as A
+        with pytest.raises(RuntimeError) as exc:
+            A._assert_routed_through_the_proxy(self._route("openrouter"))
+        msg = str(exc.value)
+        # The message has to be diagnosable on its own: which route, and enough
+        # to tell "stale registry" from "resolver skipped the proxy".
+        assert "openrouter" in msg
+        assert "litellm_proxy" in msg
+        assert "openrouter.ai" in msg
+
+    def test_egress_proxy_from_a_lambda_also_raises(self):
+        """Not an openrouter-specific block — 127.0.0.1:8990 does not exist here."""
+        from director import agent as A
+        with pytest.raises(RuntimeError):
+            A._assert_routed_through_the_proxy(
+                self._route("egress_proxy", api_base_url="http://127.0.0.1:8990"))
+
+    def test_litellm_proxy_from_a_lambda_passes(self):
+        from director import agent as A
+        A._assert_routed_through_the_proxy(self._route("litellm_proxy"))
+
+    def test_a_direct_route_is_legitimate_off_lambda(self, monkeypatch):
+        """On the laptop or the box the egress proxy is on loopback (R27d)."""
+        from director import agent as A
+        monkeypatch.setattr(A, "DIRECTOR_EXEC_CONTEXT", "laptop")
+        A._assert_routed_through_the_proxy(self._route("openrouter"))
+
+    def test_the_guard_is_wired_into_default_llm(self, monkeypatch):
+        """The load-bearing case: assert the SHIPPED path, not the helper.
+
+        A guard that exists and is never called is the failure mode this whole
+        arc is made of.
+        """
+        from director import agent as A
+        import krepis.router as kr
+        monkeypatch.setattr(
+            kr, "resolve_group_structured",
+            lambda *a, **kw: TestDirectorRoutesThroughTheProxyNoExceptions._route("openrouter"))
+        with pytest.raises(RuntimeError, match="litellm_proxy"):
+            A._default_llm()

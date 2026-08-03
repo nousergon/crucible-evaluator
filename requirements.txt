@@ -64,7 +64,29 @@ pandas~=3.0
 # all. Below this version the Director cannot express which execution context
 # it runs in, and the resolver falls back to serving openrouter.ai direct
 # (alpha-engine-config-I6183).
-krepis[flow_doctor,openai]>=0.27.0
+#
+# 2026-08-03: raised again to >=0.30.0, and this floor is the ONLY thing that
+# makes the Director actually route through the proxy. Three defects, each of
+# which independently sent the weekly `ultra` call to openrouter.ai
+# DLP-unscanned while logging a healthy route:
+#
+#   0.29.0  an undeclared `reachable_from` was read as reachable from EVERY
+#           context, so a stale registry copy silently re-enabled the direct
+#           route; and `exclude_route` — the argument that let this Lambda skip
+#           the proxy entirely — is gone rather than deprecated.
+#   0.29.0  the master-key SSM lookup shelled out to `aws --profile
+#           ne-laptop-daemon`, which cannot work in a Lambda for three separate
+#           reasons, all swallowed. It now uses boto3.
+#   0.30.0  the health probe was `HTTPConnection` unconditionally, so against
+#           the router's TLS edge (router.nousergon.ai:8443, added
+#           alpha-engine-config-I6194) the handshake failed and the proxy was
+#           reported "not reachable" — at the same minute that URL was serving
+#           23 models. Resolution then fell through to openrouter.
+#
+# Below 0.30.0 the Director resolves openrouter no matter what the registry,
+# the edge or the credential say. A floor, not a pin, because krepis is ours
+# and forward versions are the tested path.
+krepis[flow_doctor,openai]>=0.30.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
