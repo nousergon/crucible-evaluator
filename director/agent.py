@@ -11,13 +11,20 @@ carry-over context, and the model emits the structured plan directly (krepis
 structured-output + Pydantic — no freeform parsing).
 
 **Where it runs decides what it can reach.** This Lambda declares
-``exec_context="lambda_vpc"`` and krepis filters the chain by the registry's
+``exec_context="lambda"`` and krepis filters the chain by the registry's
 ``reachable_from`` (model-router-policy R28/R29). No registry entry declares
-``lambda_vpc``, so the LiteLLM proxy is the only path from here — and an
-unreachable proxy is an **outage**, not a licence to reach a public endpoint.
-That is the whole fix for alpha-engine-config-I6183, where this module passed
+``lambda``, so the router is the only path from here — and an unreachable
+router is an **outage**, not a licence to reach a public endpoint. That is the
+whole fix for alpha-engine-config-I6183, where this module passed
 ``exclude_route="litellm_proxy"`` and quietly served ``glm-5.2`` at
 openrouter.ai, DLP-unscanned, while logging a healthy-looking route.
+
+The context names where this runs, **not how it is attached**, and the
+distinction is load-bearing: §3.4a R27a forbids reaching the router by network
+position, so an unreachable router is fixed on the router side
+(alpha-engine-config-I6194) and never by attaching this function to the
+router's VPC — which is what caused a 2h20m fleet-wide SSM outage on
+2026-08-03 (nous-ergon-ops-I417).
 
 The LLM is injectable (``llm=``) so the build/validate + tests run without a
 key or krepis installed; ``_default_llm()`` lazily constructs the real client.
@@ -31,6 +38,7 @@ Migrated from claude-opus-4-8 direct Anthropic → OpenRouter 2026-07-24, then
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -62,15 +70,28 @@ DIRECTOR_GROUP = "ultra"
 # so this is the whole of what the Director says about routing — and the
 # reason it can no longer end up on a public endpoint by accident.
 #
-# `lambda_vpc` is not decorative: no registry entry declares itself reachable
-# from it, so the LiteLLM proxy is the only path and an unreachable proxy is
-# an OUTAGE here, not a degraded mode (model-router-policy §5). That is the
-# posture llm-egress-proxy-policy's Lambda row requires.
+# `lambda` names WHERE THIS RUNS, not how it is attached. It says nothing
+# about a VPC, and it must not: model-router-policy §3.4a R27a is categorical
+# that reaching the router may not depend on host, VPC, subnet, security group
+# or private IP, and that if making a consumer work requires changing the
+# consumer's network attachment, the ROUTER is mis-exposed.
+#
+# That rule was written because of this Lambda. On 2026-08-03 the available
+# answer to "the Director cannot reach the router" was to attach it to the
+# router's VPC; the SSM endpoint that then had to be created to restore its
+# egress carried a VPC-wide private-DNS override behind a security group that
+# blocked the VPC, and the whole fleet lost SSM for 2h20m (nous-ergon-ops-I417).
+#
+# What the declaration buys: no registry entry is reachable from `lambda`, so
+# krepis can only resolve the router route or fail closed. An unreachable
+# router is an OUTAGE here, never a licence to reach a public endpoint
+# (model-router-policy §5). The remedy when it is unreachable is on the router
+# side — one TLS-terminated authenticated exposure, alpha-engine-config-I6194.
 #
 # Overridable by env so a local dry-run can resolve against laptop
 # reachability without editing code; the Lambda sets nothing and gets the
 # correct default.
-DIRECTOR_EXEC_CONTEXT = os.environ.get("KREPIS_EXEC_CONTEXT", "lambda_vpc")
+DIRECTOR_EXEC_CONTEXT = os.environ.get("KREPIS_EXEC_CONTEXT", "lambda")
 
 _DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
@@ -117,10 +138,17 @@ def _warn_on_degraded_route(route: dict) -> None:
     indistinguishable from a dead emitter, and `principles.md` §2.7 is that
     *no data* is never rendered as green.
 
-    Never raises. A telemetry failure must not take down the weekly plan —
-    but it is logged as an exception rather than swallowed, because a metric
-    that silently stops emitting is the failure this function exists to
-    prevent, one level up.
+    Emitted as a **CloudWatch Embedded Metric Format** log line, not a
+    ``PutMetricData`` call. This Lambda is VPC-attached to a subnet with no
+    internet route, so a boto3 CloudWatch call would hang until its timeout
+    on every single run and then be swallowed — a metric that is *structurally
+    incapable* of emitting, which is precisely the dead emitter this function
+    exists to rule out. Log delivery is service-side and needs no egress from
+    the ENI, so EMF works from here and costs nothing. It also removes the
+    ~$7.30/mo `monitoring` interface endpoint the alternative would require
+    for one weekly data point.
+
+    Never raises. A telemetry failure must not take down the weekly plan.
     """
     skipped = route.get("skipped_entries") or []
     primary = route.get("primary_registry_id") or route.get("primary_model")
@@ -139,17 +167,22 @@ def _warn_on_degraded_route(route: dict) -> None:
         )
 
     try:
-        import boto3
-
-        boto3.client("cloudwatch").put_metric_data(
-            Namespace="AlphaEngine/Director",
-            MetricData=[{
-                "MetricName": "DirectorRouteFallback",
-                "Value": 1.0 if degraded else 0.0,
-                "Unit": "Count",
-                "Dimensions": [{"Name": "Group", "Value": DIRECTOR_GROUP}],
-            }],
-        )
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "AlphaEngine/Director",
+                    "Dimensions": [["Group"]],
+                    "Metrics": [{"Name": "DirectorRouteFallback", "Unit": "Count"}],
+                }],
+            },
+            "Group": DIRECTOR_GROUP,
+            "DirectorRouteFallback": 1 if degraded else 0,
+            "served": served,
+            "primary": primary,
+            "route": route.get("route"),
+            "exec_context": route.get("exec_context"),
+        }))
     except Exception:
         logger.exception(
             "Director: failed to emit DirectorRouteFallback — the fallback "

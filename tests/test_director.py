@@ -655,9 +655,22 @@ class TestDirectorExecutionContext:
             f"via {offenders} — that is a routing table held at layer 5"
         )
 
-    def test_declares_lambda_vpc_by_default(self):
+    def test_declares_lambda_by_default(self):
         from director import agent as A
-        assert A.DIRECTOR_EXEC_CONTEXT == "lambda_vpc"
+        assert A.DIRECTOR_EXEC_CONTEXT == "lambda"
+
+    def test_context_names_no_network_attachment(self):
+        """§3.4a R27a — reaching the router may not depend on network
+        position, so the context this module declares must not assert one.
+        `lambda_vpc` was the original value in this arc, and a name asserting
+        an attachment is what makes "attach the consumer" read as the fix for
+        an unreachable router — the reasoning behind nous-ergon-ops-I417."""
+        from director import agent as A
+        assert not any(t in A.DIRECTOR_EXEC_CONTEXT
+                       for t in ("vpc", "subnet", "sg", "peering")), (
+            f"{A.DIRECTOR_EXEC_CONTEXT!r} names a network attachment, not a "
+            "place code runs"
+        )
 
     def test_resolution_passes_context_and_openai_wire(self, monkeypatch):
         """`wire=openai` matters: this call site builds a krepis LLMClient on
@@ -678,7 +691,7 @@ class TestDirectorExecutionContext:
                 "auth_token_type": "litellm_master_key",
                 "registry_id": "litellm:group:ultra",
                 "primary_registry_id": "litellm:group:ultra",
-                "route": "litellm_proxy", "exec_context": "lambda_vpc",
+                "route": "litellm_proxy", "exec_context": "lambda",
                 "params": {}, "skipped_entries": [],
             }
 
@@ -704,7 +717,7 @@ class TestDirectorExecutionContext:
         A._default_llm()
 
         assert seen["group"] == "ultra"
-        assert seen["exec_context"] == "lambda_vpc"
+        assert seen["exec_context"] == "lambda"
         assert seen["wire"] == "openai"
         assert "exclude_route" not in seen
 
@@ -719,67 +732,77 @@ class TestDirectorRouteDegradationIsAlerted:
             "registry_id": "kimi-k3-direct",
             "primary_registry_id": "kimi-k3-direct",
             "route": "litellm_proxy",
-            "exec_context": "lambda_vpc",
+            "exec_context": "lambda",
             "skipped_entries": [],
         }
         r.update(over)
         return r
 
-    def test_healthy_route_emits_metric_value_zero(self, monkeypatch):
+    @staticmethod
+    def _emf(capsys):
+        """The EMF line is the metric. Parse it back out of stdout."""
+        import json as _json
+        for line in capsys.readouterr().out.splitlines():
+            line = line.strip()
+            if line.startswith("{") and "_aws" in line:
+                return _json.loads(line)
+        return None
+
+    def test_healthy_route_emits_metric_value_zero(self, capsys):
         """A metric that only appears on failure is indistinguishable from a
         dead emitter (principles.md §2.7)."""
         from director import agent as A
-        emitted = {}
-        monkeypatch.setattr(A, "_cw_put", lambda v: emitted.setdefault("v", v),
-                            raising=False)
-        self._patch_boto(monkeypatch, emitted)
         A._warn_on_degraded_route(self._route())
-        assert emitted["value"] == 0.0
+        emf = self._emf(capsys)
+        assert emf is not None, "no EMF line emitted on the healthy path"
+        assert emf["DirectorRouteFallback"] == 0
 
-    def test_fallback_emits_one_and_warns(self, monkeypatch, caplog):
+    def test_fallback_emits_one_and_warns(self, capsys, caplog):
         from director import agent as A
-        emitted = {}
-        self._patch_boto(monkeypatch, emitted)
         route = self._route(
             registry_id="glm-5.2",
             skipped_entries=[{"registry_id": "kimi-k3-direct",
-                              "reason": "Not reachable from execution context 'lambda_vpc'"}],
+                              "reason": "Not reachable from execution context 'lambda'"}],
         )
         with caplog.at_level("WARNING"):
             A._warn_on_degraded_route(route)
-        assert emitted["value"] == 1.0
+        emf = self._emf(capsys)
+        assert emf["DirectorRouteFallback"] == 1
+        assert emf["served"] == "glm-5.2"
         assert "DEGRADED" in caplog.text
         assert "kimi-k3-direct" in caplog.text
-        assert "lambda_vpc" in caplog.text
+        assert "lambda" in caplog.text
 
-    def test_telemetry_failure_does_not_break_the_run(self, monkeypatch, caplog):
-        """A blind alarm is bad; a weekly plan that does not run because
-        CloudWatch was unavailable is worse. Logged as an exception, not
-        swallowed."""
+    def test_emf_carries_the_metric_directive(self, capsys):
+        """Without the `_aws` block CloudWatch treats the line as plain log
+        text and no metric is ever created — a silent dead emitter with a
+        healthy-looking log."""
         from director import agent as A
+        A._warn_on_degraded_route(self._route())
+        emf = self._emf(capsys)
+        directive = emf["_aws"]["CloudWatchMetrics"][0]
+        assert directive["Namespace"] == "AlphaEngine/Director"
+        assert directive["Dimensions"] == [["Group"]]
+        assert {"Name": "DirectorRouteFallback", "Unit": "Count"} in directive["Metrics"]
+        assert emf["Group"] == "ultra"
+
+    def test_emits_no_network_call(self, monkeypatch, capsys):
+        """The Lambda is VPC-attached with no internet route, so a boto3
+        CloudWatch call would hang until timeout on EVERY run and then be
+        swallowed. Importing boto3 here at all is the regression."""
         import sys, types
-        boto3 = types.ModuleType("boto3")
+        from director import agent as A
 
-        def _client(_name):
-            raise RuntimeError("no creds")
-        boto3.client = _client
-        monkeypatch.setitem(sys.modules, "boto3", boto3)
-        with caplog.at_level("ERROR"):
-            A._warn_on_degraded_route(self._route())
-        assert "alarm is blind" in caplog.text
+        exploding = types.ModuleType("boto3")
 
-    @staticmethod
-    def _patch_boto(monkeypatch, emitted):
-        import sys, types
-        boto3 = types.ModuleType("boto3")
-
-        class _CW:
-            def put_metric_data(self, Namespace, MetricData):
-                emitted["namespace"] = Namespace
-                emitted["name"] = MetricData[0]["MetricName"]
-                emitted["value"] = MetricData[0]["Value"]
-        boto3.client = lambda _n: _CW()
-        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        def _boom(*a, **k):
+            raise AssertionError(
+                "_warn_on_degraded_route made a boto3 call; EMF must need none"
+            )
+        exploding.client = _boom
+        monkeypatch.setitem(sys.modules, "boto3", exploding)
+        A._warn_on_degraded_route(self._route())
+        assert self._emf(capsys)["DirectorRouteFallback"] == 0
 
 
 class TestDirectorCredentialResolution:
@@ -804,7 +827,7 @@ class TestDirectorCredentialResolution:
             "api_base_url": "http://172.31.73.124:8980",
             "auth_token_type": auth_token_type,
             "registry_id": "r", "primary_registry_id": "r",
-            "route": "litellm_proxy", "exec_context": "lambda_vpc",
+            "route": "litellm_proxy", "exec_context": "lambda",
             "params": {}, "skipped_entries": [],
         }
         krepis_llm = types.ModuleType("krepis.llm")

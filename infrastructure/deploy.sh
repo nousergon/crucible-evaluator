@@ -125,10 +125,38 @@ if aws lambda get-function --function-name "$DIRECTOR_FUNCTION" --region "$REGIO
   aws lambda update-function-code --function-name "$DIRECTOR_FUNCTION" \
     --image-uri "$IMAGE_URI" --region "$REGION" --query 'LastUpdateStatus' --output text
   aws lambda wait function-updated --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
-  # NOTE: preserve any operator-set DIRECTOR_ENABLED — do NOT reset the env here.
+  # Flow-doctor config, resolved HERE rather than at runtime.
+  #
+  # The Director Lambda is VPC-attached to a subnet with no internet route and
+  # there is no SSM interface endpoint, so `flow-doctor`'s SSM lookup times out
+  # at cold start and the import chain dies with
+  # `ConfigError: Unresolved environment variable(s): EMAIL_SENDER` — which is
+  # what alpha-engine-config-I6171 was diagnosing as a networking fault.
+  #
+  # These two values are non-secret configuration, and flow-doctor's OWN
+  # contract names the process environment as its primary mechanism (README
+  # § credential resolution: "the process environment" first). SSM stays the
+  # source of truth; the deploy — which runs with internet — reads it and bakes
+  # the result in. That removes a runtime dependency AND the ~$7.30/mo SSM
+  # interface endpoint the alternative would need, for a weekly function.
+  #
+  # Merged into the EXISTING env, never overwritten: DIRECTOR_ENABLED is
+  # operator-set and a blind --environment write would silently switch the
+  # Director off.
+  echo "=== Director env: merge flow-doctor config from SSM ==="
+  EMAIL_SENDER_VAL=$(aws ssm get-parameter --name /alpha-engine/EMAIL_SENDER \
+    --with-decryption --region "$REGION" --query 'Parameter.Value' --output text)
+  EMAIL_RECIPIENTS_VAL=$(aws ssm get-parameter --name /alpha-engine/EMAIL_RECIPIENTS \
+    --with-decryption --region "$REGION" --query 'Parameter.Value' --output text)
+  DIRECTOR_ENV=$(aws lambda get-function-configuration \
+    --function-name "$DIRECTOR_FUNCTION" --region "$REGION" \
+    --query 'Environment.Variables' --output json \
+    | jq -c --arg s "$EMAIL_SENDER_VAL" --arg r "$EMAIL_RECIPIENTS_VAL" \
+        '(. // {}) + {EMAIL_SENDER: $s, EMAIL_RECIPIENTS: $r}')
   aws lambda update-function-configuration --function-name "$DIRECTOR_FUNCTION" \
     --image-config "Command=$DIRECTOR_CMD" \
     --timeout "$TIMEOUT" --memory-size "$MEMORY" \
+    --environment "{\"Variables\":${DIRECTOR_ENV}}" \
     --region "$REGION" --query 'LastUpdateStatus' --output text
   aws lambda wait function-updated --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
 else
