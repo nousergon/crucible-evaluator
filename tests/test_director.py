@@ -615,3 +615,262 @@ class TestRetro:
         trend = json.loads(s3.get_object(Bucket=BUCKET, Key="director/retro_trend.json")["Body"].read())
         assert trend["grades"][0]["judge_model"] == "claude-sonnet-4-6"
         assert trend["grades"][0]["resolved_model"] == "claude-sonnet-4-6-20260115"
+
+
+# ── execution-context routing (model-router-policy R28/R29) ──────────────
+#
+# alpha-engine-config-I6183: this module passed
+# `exclude_route="litellm_proxy"` and resolution fell through to `glm-5.2` at
+# openrouter.ai, DLP-unscanned, while `Director route:` logged a healthy
+# route. Nothing failed when the proxy path was never restored — which is
+# what made it a shortcut that produced a passing result.
+
+class TestDirectorExecutionContext:
+    def test_no_resolve_call_narrows_the_chain(self):
+        """The consumer declares WHERE it runs and nothing else about routing
+        (model-router-policy §2 layer 5). An exclusion argument is a routing
+        table held at layer 5, whatever the mechanism.
+
+        Asserted over the AST rather than the source text: prose in a
+        docstring explaining why the argument was removed must not fail the
+        test, and a grep-shaped check would either do that or be defeated by
+        reformatting.
+        """
+        import ast
+        import inspect
+        from director import agent as A
+
+        tree = ast.parse(inspect.getsource(A))
+        offenders = [
+            kw.arg
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            == "resolve_group_structured"
+            for kw in node.keywords
+            if kw.arg in {"exclude_route", "exclude_provider"}
+        ]
+        assert not offenders, (
+            f"director/agent.py narrows the fallback chain at the call site "
+            f"via {offenders} — that is a routing table held at layer 5"
+        )
+
+    def test_declares_lambda_by_default(self):
+        from director import agent as A
+        assert A.DIRECTOR_EXEC_CONTEXT == "lambda"
+
+    def test_context_names_no_network_attachment(self):
+        """§3.4a R27a — reaching the router may not depend on network
+        position, so the context this module declares must not assert one.
+        `lambda_vpc` was the original value in this arc, and a name asserting
+        an attachment is what makes "attach the consumer" read as the fix for
+        an unreachable router — the reasoning behind nous-ergon-ops-I417."""
+        from director import agent as A
+        assert not any(t in A.DIRECTOR_EXEC_CONTEXT
+                       for t in ("vpc", "subnet", "sg", "peering")), (
+            f"{A.DIRECTOR_EXEC_CONTEXT!r} names a network attachment, not a "
+            "place code runs"
+        )
+
+    def test_resolution_passes_context_and_openai_wire(self, monkeypatch):
+        """`wire=openai` matters: this call site builds a krepis LLMClient on
+        the openai transport, and the resolver's default is the Claude CLI's
+        Anthropic wire. Without it a DeepSeek egress fallback would hand this
+        module an 8971 URL its transport cannot speak."""
+        from director import agent as A
+
+        seen = {}
+
+        def _fake_resolve(group, **kw):
+            seen["group"] = group
+            seen.update(kw)
+            return {
+                "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+                "provider": "litellm", "deployment_id": "ultra",
+                "api_base_url": "http://172.31.73.124:8980",
+                "auth_token_type": "litellm_master_key",
+                "registry_id": "litellm:group:ultra",
+                "primary_registry_id": "litellm:group:ultra",
+                "route": "litellm_proxy", "exec_context": "lambda",
+                "params": {}, "skipped_entries": [],
+            }
+
+        import sys, types
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_structured = _fake_resolve
+        krepis_llm = types.ModuleType("krepis.llm")
+        krepis_llm.LLMClient = lambda spec, **kw: object()
+        krepis_cfg = types.ModuleType("krepis.llm_config")
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+        krepis_cfg.ModelSpec = _Spec
+        pkg = types.ModuleType("krepis")
+        for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
+                          ("krepis.llm", krepis_llm),
+                          ("krepis.llm_config", krepis_cfg)):
+            monkeypatch.setitem(sys.modules, name, mod)
+        monkeypatch.setattr(A, "_warn_on_degraded_route", lambda r: None)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key")
+
+        A._default_llm()
+
+        assert seen["group"] == "ultra"
+        assert seen["exec_context"] == "lambda"
+        assert seen["wire"] == "openai"
+        assert "exclude_route" not in seen
+
+
+class TestDirectorRouteDegradationIsAlerted:
+    """alpha-engine-config-I6185 — krepis returns skipped_entries and
+    primary_registry_id; this module discarded both, so a third-fallback route
+    logged identically to the primary."""
+
+    def _route(self, **over):
+        r = {
+            "registry_id": "kimi-k3-direct",
+            "primary_registry_id": "kimi-k3-direct",
+            "route": "litellm_proxy",
+            "exec_context": "lambda",
+            "skipped_entries": [],
+        }
+        r.update(over)
+        return r
+
+    @staticmethod
+    def _emf(capsys):
+        """The EMF line is the metric. Parse it back out of stdout."""
+        import json as _json
+        for line in capsys.readouterr().out.splitlines():
+            line = line.strip()
+            if line.startswith("{") and "_aws" in line:
+                return _json.loads(line)
+        return None
+
+    def test_healthy_route_emits_metric_value_zero(self, capsys):
+        """A metric that only appears on failure is indistinguishable from a
+        dead emitter (principles.md §2.7)."""
+        from director import agent as A
+        A._warn_on_degraded_route(self._route())
+        emf = self._emf(capsys)
+        assert emf is not None, "no EMF line emitted on the healthy path"
+        assert emf["DirectorRouteFallback"] == 0
+
+    def test_fallback_emits_one_and_warns(self, capsys, caplog):
+        from director import agent as A
+        route = self._route(
+            registry_id="glm-5.2",
+            skipped_entries=[{"registry_id": "kimi-k3-direct",
+                              "reason": "Not reachable from execution context 'lambda'"}],
+        )
+        with caplog.at_level("WARNING"):
+            A._warn_on_degraded_route(route)
+        emf = self._emf(capsys)
+        assert emf["DirectorRouteFallback"] == 1
+        assert emf["served"] == "glm-5.2"
+        assert "DEGRADED" in caplog.text
+        assert "kimi-k3-direct" in caplog.text
+        assert "lambda" in caplog.text
+
+    def test_emf_carries_the_metric_directive(self, capsys):
+        """Without the `_aws` block CloudWatch treats the line as plain log
+        text and no metric is ever created — a silent dead emitter with a
+        healthy-looking log."""
+        from director import agent as A
+        A._warn_on_degraded_route(self._route())
+        emf = self._emf(capsys)
+        directive = emf["_aws"]["CloudWatchMetrics"][0]
+        assert directive["Namespace"] == "AlphaEngine/Director"
+        assert directive["Dimensions"] == [["Group"]]
+        assert {"Name": "DirectorRouteFallback", "Unit": "Count"} in directive["Metrics"]
+        assert emf["Group"] == "ultra"
+
+    def test_emits_no_network_call(self, monkeypatch, capsys):
+        """The Lambda is VPC-attached with no internet route, so a boto3
+        CloudWatch call would hang until timeout on EVERY run and then be
+        swallowed. Importing boto3 here at all is the regression."""
+        import sys, types
+        from director import agent as A
+
+        exploding = types.ModuleType("boto3")
+
+        def _boom(*a, **k):
+            raise AssertionError(
+                "_warn_on_degraded_route made a boto3 call; EMF must need none"
+            )
+        exploding.client = _boom
+        monkeypatch.setitem(sys.modules, "boto3", exploding)
+        A._warn_on_degraded_route(self._route())
+        assert self._emf(capsys)["DirectorRouteFallback"] == 0
+
+
+class TestDirectorCredentialResolution:
+    """config-I6056 / model-router-policy R20 — fail closed, loudly.
+
+    Supersedes crucible-evaluator-PR169, which resolved the credential
+    unconditionally and would therefore have raised on a `placeholder` route
+    (egress_proxy entries carry no key of their own — the proxy holds it).
+    That never bit in the Lambda, where only the litellm_proxy route can
+    serve, but it would have broken every direct route from `laptop`.
+    """
+
+    def _patch_krepis(self, monkeypatch, *, auth_token_type, secret):
+        import sys, types
+        from director import agent as A
+
+        captured = {}
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_structured = lambda group, **kw: {
+            "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+            "provider": "litellm", "deployment_id": "ultra",
+            "api_base_url": "http://172.31.73.124:8980",
+            "auth_token_type": auth_token_type,
+            "registry_id": "r", "primary_registry_id": "r",
+            "route": "litellm_proxy", "exec_context": "lambda",
+            "params": {}, "skipped_entries": [],
+        }
+        krepis_llm = types.ModuleType("krepis.llm")
+
+        def _client(spec, **kw):
+            captured.update(kw)
+            return object()
+        krepis_llm.LLMClient = _client
+        krepis_cfg = types.ModuleType("krepis.llm_config")
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+        krepis_cfg.ModelSpec = _Spec
+        krepis_secrets = types.ModuleType("krepis.secrets")
+        krepis_secrets.get_secret = lambda name, **kw: secret
+        pkg = types.ModuleType("krepis")
+        for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
+                          ("krepis.llm", krepis_llm),
+                          ("krepis.llm_config", krepis_cfg),
+                          ("krepis.secrets", krepis_secrets)):
+            monkeypatch.setitem(sys.modules, name, mod)
+        monkeypatch.setattr(A, "_warn_on_degraded_route", lambda r: None)
+        return A, captured
+
+    def test_placeholder_route_resolves_no_credential(self, monkeypatch):
+        """The egress proxy holds the real key. Demanding one here would break
+        every direct route reachable from `laptop`."""
+        A, captured = self._patch_krepis(
+            monkeypatch, auth_token_type="placeholder", secret=None)
+        A._default_llm()
+        assert "api_key" not in captured
+
+    def test_named_credential_is_passed_through(self, monkeypatch):
+        A, captured = self._patch_krepis(
+            monkeypatch, auth_token_type="litellm_master_key", secret="sk-x")
+        A._default_llm()
+        assert captured["api_key"] == "sk-x"
+
+    def test_unresolvable_named_credential_raises(self, monkeypatch):
+        """It used to fall through with no key; the 401 that followed read as
+        a provider fault rather than a missing credential."""
+        A, _ = self._patch_krepis(
+            monkeypatch, auth_token_type="litellm_master_key", secret=None)
+        with pytest.raises(RuntimeError, match="no credential for auth_token_type"):
+            A._default_llm()
