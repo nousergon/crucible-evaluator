@@ -123,6 +123,58 @@ _AUTH_TOKEN_ENV: dict[str, str | None] = {
 }
 
 
+def _assert_routed_through_the_proxy(route: dict) -> None:
+    """From a Lambda the Director routes through the LiteLLM proxy. No exceptions.
+
+    This is a guard against a **corrupted input**, not a routing decision, and
+    the distinction is what keeps it on the right side of `model-router-policy`
+    §2's layer-5 rule. The Director does not choose a route here; it refuses one
+    that cannot be conformant. Which entries are reachable from `lambda` remains
+    entirely the registry's statement about itself (R28/R29).
+
+    It exists because that input has been wrong, in production, more than once,
+    and every time the symptom was identical: a paid `ultra` call to
+    openrouter.ai, DLP-unscanned, logging a healthy route (R26,
+    alpha-engine-config-I6183).
+
+    - `exclude_route="litellm_proxy"` was passed by this module to make the
+      Lambda succeed while the network path to the proxy was down. It worked,
+      and nothing failed for the weeks the proxy path stayed broken.
+    - The registry the Lambda reads is an S3 copy that was published by hand.
+      It lagged the repo, carried no `reachable_from`, and krepis read the
+      omission as universal reachability.
+    - krepis' health probe spoke plain HTTP at the router's TLS edge, called it
+      unreachable, and fell through — while that URL was serving 23 models.
+
+    A CI test cannot catch any of those: the code was correct in all three, and
+    the artifact it consumed at runtime was not. So the assertion has to run
+    where the artifact is read.
+
+    Raising loses the week's advisory action plan. That is the intended trade
+    (R20): the Director is advisory and its stage is non-fatal, while an
+    unscanned egress is a policy breach that bills real money and reports
+    success.
+    """
+    if DIRECTOR_EXEC_CONTEXT != "lambda":
+        # On a laptop or the dashboard box a direct provider route is legitimate
+        # — the egress proxy is on loopback there and R27d permits it.
+        return
+    actual = route.get("route")
+    if actual != "litellm_proxy":
+        raise RuntimeError(
+            f"Director resolved route={actual!r} from exec_context="
+            f"{DIRECTOR_EXEC_CONTEXT!r}. The only conformant route from a "
+            f"Lambda is 'litellm_proxy' (model-router-policy R26): no direct "
+            f"provider endpoint is reachable from here, so this resolution "
+            f"came from a registry copy that is stale or wrong, or from a "
+            f"resolver that skipped the proxy. Refusing to make a paid, "
+            f"DLP-unscanned call. Resolved: model={route.get('deployment_id')!r} "
+            f"provider={route.get('provider')!r} "
+            f"api_base_url={route.get('api_base_url')!r}; "
+            f"skipped={route.get('skipped_entries')!r}"
+        )
+
+
 def _warn_on_degraded_route(route: dict) -> None:
     """Alert when the group's declared primary is not what will serve.
 
@@ -288,6 +340,7 @@ def _default_llm() -> _KrepisStructuredDirector:
         exec_context=DIRECTOR_EXEC_CONTEXT,
         wire="openai",
     )
+    _assert_routed_through_the_proxy(route)
     _warn_on_degraded_route(route)
     if route.get("schema_version") != _EXPECTED_ROUTE_SCHEMA:
         raise RuntimeError(
