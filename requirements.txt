@@ -54,7 +54,17 @@ pandas~=3.0
 # is set), which is load-bearing for this Lambda (public repo, no
 # private-docs/ on disk). The Director now addresses the "ultra" GROUP
 # rather than pinning a model id.
-krepis[flow_doctor,openai]>=0.26.0
+#
+# 2026-08-02: floor raised to >=0.27.0 — LOAD-BEARING, not a courtesy bump.
+# 0.27.0 adds the `exec_context` and `wire` parameters to
+# resolve_group_structured (model-router-policy R28/R29). Against 0.26.x both
+# are unexpected keyword arguments and director/agent.py::_default_llm raises
+# TypeError at the first Director call of the week — which is a LOUD failure
+# and the correct one, but the floor is what keeps it from being installed at
+# all. Below this version the Director cannot express which execution context
+# it runs in, and the resolver falls back to serving openrouter.ai direct
+# (alpha-engine-config-I6183).
+krepis[flow_doctor,openai]>=0.27.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).

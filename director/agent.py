@@ -4,17 +4,27 @@ Report Card v2 → a DirectorWeeklyActionPlan.
 
 Not LangGraph — a single ``krepis.llm.LLMClient`` structured call routed
 through ``krepis.router.resolve_group_structured("ultra")`` to the ultra
-group's first healthy entry (kimi-k3-direct → glm-5.2-direct → glm-5.2 →
-deepseek-v4-pro-max), wrapped in a small rate-limit retry. The report card is
+group's first entry that is both **reachable from this execution context**
+and healthy, wrapped in a small rate-limit retry. The report card is
 condensed to a digest (the issues + trends), last week's plan is supplied as
 carry-over context, and the model emits the structured plan directly (krepis
 structured-output + Pydantic — no freeform parsing).
 
+**Where it runs decides what it can reach.** This Lambda declares
+``exec_context="lambda_vpc"`` and krepis filters the chain by the registry's
+``reachable_from`` (model-router-policy R28/R29). No registry entry declares
+``lambda_vpc``, so the LiteLLM proxy is the only path from here — and an
+unreachable proxy is an **outage**, not a licence to reach a public endpoint.
+That is the whole fix for alpha-engine-config-I6183, where this module passed
+``exclude_route="litellm_proxy"`` and quietly served ``glm-5.2`` at
+openrouter.ai, DLP-unscanned, while logging a healthy-looking route.
+
 The LLM is injectable (``llm=``) so the build/validate + tests run without a
 key or krepis installed; ``_default_llm()`` lazily constructs the real client.
-The registry reaches this Lambda via krepis 0.26.0's AppConfig path —
-``KREPIS_APPCONFIG_APPLICATION=alpha-engine`` makes the class→model mapping
-resolvable from a public repo without ``private-docs/`` on disk.
+The registry reaches this Lambda by S3 download at handler startup
+(``handler.py::_ensure_registry``), which sets ``LLM_MODEL_REGISTRY_PATH`` —
+krepis Tier 1. An AppConfig path is also wired and permanently shadowed by
+it; removing the dead one is alpha-engine-config-I6187.
 Migrated from claude-opus-4-8 direct Anthropic → OpenRouter 2026-07-24, then
 → krepis.router.resolve_group_structured("ultra") 2026-08-02.
 """
@@ -46,6 +56,22 @@ logger = logging.getLogger(__name__)
 # provider name, a provider api key, and an SDK client all constructed at the
 # call site. Addressing the group moves every one of those into the registry.
 DIRECTOR_GROUP = "ultra"
+
+# Where this module runs, declared rather than inferred (model-router-policy
+# R29). krepis filters the fallback chain by the registry's `reachable_from`,
+# so this is the whole of what the Director says about routing — and the
+# reason it can no longer end up on a public endpoint by accident.
+#
+# `lambda_vpc` is not decorative: no registry entry declares itself reachable
+# from it, so the LiteLLM proxy is the only path and an unreachable proxy is
+# an OUTAGE here, not a degraded mode (model-router-policy §5). That is the
+# posture llm-egress-proxy-policy's Lambda row requires.
+#
+# Overridable by env so a local dry-run can resolve against laptop
+# reachability without editing code; the Lambda sets nothing and gets the
+# correct default.
+DIRECTOR_EXEC_CONTEXT = os.environ.get("KREPIS_EXEC_CONTEXT", "lambda_vpc")
+
 _DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
 _RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
@@ -74,6 +100,61 @@ _AUTH_TOKEN_ENV: dict[str, str | None] = {
     "litellm_master_key": "LITELLM_MASTER_KEY",
     "direct_api_key": "ANTHROPIC_API_KEY",
 }
+
+
+def _warn_on_degraded_route(route: dict) -> None:
+    """Alert when the group's declared primary is not what will serve.
+
+    ``model-router-policy`` R12 is explicit that serving from a fallback is an
+    *alert*, not a log line. krepis already returns everything needed —
+    ``primary_registry_id`` and a ``skipped_entries`` list with a reason per
+    entry — and this module used to throw all of it away, logging one INFO
+    line that read identically whether the primary served or the third
+    fallback did (alpha-engine-config-I6185).
+
+    Emits ``DirectorRouteFallback`` on **every** run: 1 on degradation, **0 on
+    the healthy path**. A metric that only appears when something is wrong is
+    indistinguishable from a dead emitter, and `principles.md` §2.7 is that
+    *no data* is never rendered as green.
+
+    Never raises. A telemetry failure must not take down the weekly plan —
+    but it is logged as an exception rather than swallowed, because a metric
+    that silently stops emitting is the failure this function exists to
+    prevent, one level up.
+    """
+    skipped = route.get("skipped_entries") or []
+    primary = route.get("primary_registry_id") or route.get("primary_model")
+    served = route.get("registry_id")
+    degraded = bool(skipped) or (primary is not None and served != primary)
+
+    if degraded:
+        logger.warning(
+            "Director route DEGRADED: group=%s primary=%s served=%s route=%s "
+            "context=%s — skipped: %s",
+            DIRECTOR_GROUP, primary, served, route.get("route"),
+            route.get("exec_context"),
+            "; ".join(
+                f"{s.get('registry_id')}: {s.get('reason')}" for s in skipped
+            ) or "(none recorded)",
+        )
+
+    try:
+        import boto3
+
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="AlphaEngine/Director",
+            MetricData=[{
+                "MetricName": "DirectorRouteFallback",
+                "Value": 1.0 if degraded else 0.0,
+                "Unit": "Count",
+                "Dimensions": [{"Name": "Group", "Value": DIRECTOR_GROUP}],
+            }],
+        )
+    except Exception:
+        logger.exception(
+            "Director: failed to emit DirectorRouteFallback — the fallback "
+            "alarm is blind for this run"
+        )
 
 
 def _load_system_prompt() -> str:
@@ -130,14 +211,14 @@ def _default_llm() -> _KrepisStructuredDirector:
     ``krepis.router.resolve_group_structured()`` — krepis' documented public
     contract for programmatic callers — and builds the ``ModelSpec`` from the
     returned route: provider, deployment_id, api_base_url, and the credential
-    NAME implied by auth_token_type. The registry (on disk or from AppConfig)
-    decides model, endpoint and auth; this module decides only which capability
-    tier it wants.
+    NAME implied by auth_token_type. The registry decides model, endpoint and
+    auth; this module decides only which capability tier it wants and **where
+    it is running**.
 
-    The registry is resolved via krepis 0.26.0's AppConfig path when
-    ``KREPIS_APPCONFIG_APPLICATION`` is set (this Lambda runs in a public repo
-    without ``private-docs/`` on disk). Both imports are lazy so tests +
-    the grading path never pull krepis' provider SDKs or hit SSM.
+    The registry is downloaded from S3 by ``handler.py::_ensure_registry``,
+    which sets ``LLM_MODEL_REGISTRY_PATH`` — krepis Tier 1 (this Lambda runs
+    in a public repo without ``private-docs/`` on disk). Both imports are lazy
+    so tests + the grading path never pull krepis' provider SDKs or hit SSM.
 
     Migrated from ChatAnthropic(claude-opus-4-8) → krepis.llm(glm-5.2 via
     OpenRouter) 2026-07-24, then → krepis.router.resolve_group_structured
@@ -152,7 +233,29 @@ def _default_llm() -> _KrepisStructuredDirector:
     # type and params for the group's first HEALTHY entry, honouring the
     # Router's cooldown state. Branch on schema_version rather than probing
     # for fields, per that contract.
-    route = resolve_group_structured(DIRECTOR_GROUP, exclude_route="litellm_proxy")
+    # `exec_context` is the ONLY thing this module says about routing, and it
+    # is a statement about where it is running, not about which routes it
+    # wants (model-router-policy §2 layer 5, R29).
+    #
+    # It replaces `exclude_route="litellm_proxy"`, which was a routing table
+    # held at the consumer. That argument was added to make the Lambda succeed
+    # while the VPC path to the proxy was down, and it worked: resolution fell
+    # through to `glm-5.2` at openrouter.ai, DLP-unscanned, logging a healthy
+    # route the whole time (alpha-engine-config-I6183). Nothing failed when
+    # the proxy path was never restored, which is what made it a shortcut
+    # rather than a fix.
+    #
+    # `wire=openai` because this call site builds a krepis LLMClient on the
+    # openai transport. The resolver previously always returned the Claude
+    # CLI's Anthropic-wire endpoint, so a fallback to a DeepSeek egress route
+    # would have handed this module an 8971 URL its transport cannot speak —
+    # latent only because the chain never reached that entry here.
+    route = resolve_group_structured(
+        DIRECTOR_GROUP,
+        exec_context=DIRECTOR_EXEC_CONTEXT,
+        wire="openai",
+    )
+    _warn_on_degraded_route(route)
     if route.get("schema_version") != _EXPECTED_ROUTE_SCHEMA:
         raise RuntimeError(
             f"krepis.router resolve schema_version "

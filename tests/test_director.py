@@ -615,3 +615,168 @@ class TestRetro:
         trend = json.loads(s3.get_object(Bucket=BUCKET, Key="director/retro_trend.json")["Body"].read())
         assert trend["grades"][0]["judge_model"] == "claude-sonnet-4-6"
         assert trend["grades"][0]["resolved_model"] == "claude-sonnet-4-6-20260115"
+
+
+# ── execution-context routing (model-router-policy R28/R29) ──────────────
+#
+# alpha-engine-config-I6183: this module passed
+# `exclude_route="litellm_proxy"` and resolution fell through to `glm-5.2` at
+# openrouter.ai, DLP-unscanned, while `Director route:` logged a healthy
+# route. Nothing failed when the proxy path was never restored — which is
+# what made it a shortcut that produced a passing result.
+
+class TestDirectorExecutionContext:
+    def test_no_resolve_call_narrows_the_chain(self):
+        """The consumer declares WHERE it runs and nothing else about routing
+        (model-router-policy §2 layer 5). An exclusion argument is a routing
+        table held at layer 5, whatever the mechanism.
+
+        Asserted over the AST rather than the source text: prose in a
+        docstring explaining why the argument was removed must not fail the
+        test, and a grep-shaped check would either do that or be defeated by
+        reformatting.
+        """
+        import ast
+        import inspect
+        from director import agent as A
+
+        tree = ast.parse(inspect.getsource(A))
+        offenders = [
+            kw.arg
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            == "resolve_group_structured"
+            for kw in node.keywords
+            if kw.arg in {"exclude_route", "exclude_provider"}
+        ]
+        assert not offenders, (
+            f"director/agent.py narrows the fallback chain at the call site "
+            f"via {offenders} — that is a routing table held at layer 5"
+        )
+
+    def test_declares_lambda_vpc_by_default(self):
+        from director import agent as A
+        assert A.DIRECTOR_EXEC_CONTEXT == "lambda_vpc"
+
+    def test_resolution_passes_context_and_openai_wire(self, monkeypatch):
+        """`wire=openai` matters: this call site builds a krepis LLMClient on
+        the openai transport, and the resolver's default is the Claude CLI's
+        Anthropic wire. Without it a DeepSeek egress fallback would hand this
+        module an 8971 URL its transport cannot speak."""
+        from director import agent as A
+
+        seen = {}
+
+        def _fake_resolve(group, **kw):
+            seen["group"] = group
+            seen.update(kw)
+            return {
+                "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+                "provider": "litellm", "deployment_id": "ultra",
+                "api_base_url": "http://172.31.73.124:8980",
+                "auth_token_type": "litellm_master_key",
+                "registry_id": "litellm:group:ultra",
+                "primary_registry_id": "litellm:group:ultra",
+                "route": "litellm_proxy", "exec_context": "lambda_vpc",
+                "params": {}, "skipped_entries": [],
+            }
+
+        import sys, types
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_structured = _fake_resolve
+        krepis_llm = types.ModuleType("krepis.llm")
+        krepis_llm.LLMClient = lambda spec, **kw: object()
+        krepis_cfg = types.ModuleType("krepis.llm_config")
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+        krepis_cfg.ModelSpec = _Spec
+        pkg = types.ModuleType("krepis")
+        for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
+                          ("krepis.llm", krepis_llm),
+                          ("krepis.llm_config", krepis_cfg)):
+            monkeypatch.setitem(sys.modules, name, mod)
+        monkeypatch.setattr(A, "_warn_on_degraded_route", lambda r: None)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key")
+
+        A._default_llm()
+
+        assert seen["group"] == "ultra"
+        assert seen["exec_context"] == "lambda_vpc"
+        assert seen["wire"] == "openai"
+        assert "exclude_route" not in seen
+
+
+class TestDirectorRouteDegradationIsAlerted:
+    """alpha-engine-config-I6185 — krepis returns skipped_entries and
+    primary_registry_id; this module discarded both, so a third-fallback route
+    logged identically to the primary."""
+
+    def _route(self, **over):
+        r = {
+            "registry_id": "kimi-k3-direct",
+            "primary_registry_id": "kimi-k3-direct",
+            "route": "litellm_proxy",
+            "exec_context": "lambda_vpc",
+            "skipped_entries": [],
+        }
+        r.update(over)
+        return r
+
+    def test_healthy_route_emits_metric_value_zero(self, monkeypatch):
+        """A metric that only appears on failure is indistinguishable from a
+        dead emitter (principles.md §2.7)."""
+        from director import agent as A
+        emitted = {}
+        monkeypatch.setattr(A, "_cw_put", lambda v: emitted.setdefault("v", v),
+                            raising=False)
+        self._patch_boto(monkeypatch, emitted)
+        A._warn_on_degraded_route(self._route())
+        assert emitted["value"] == 0.0
+
+    def test_fallback_emits_one_and_warns(self, monkeypatch, caplog):
+        from director import agent as A
+        emitted = {}
+        self._patch_boto(monkeypatch, emitted)
+        route = self._route(
+            registry_id="glm-5.2",
+            skipped_entries=[{"registry_id": "kimi-k3-direct",
+                              "reason": "Not reachable from execution context 'lambda_vpc'"}],
+        )
+        with caplog.at_level("WARNING"):
+            A._warn_on_degraded_route(route)
+        assert emitted["value"] == 1.0
+        assert "DEGRADED" in caplog.text
+        assert "kimi-k3-direct" in caplog.text
+        assert "lambda_vpc" in caplog.text
+
+    def test_telemetry_failure_does_not_break_the_run(self, monkeypatch, caplog):
+        """A blind alarm is bad; a weekly plan that does not run because
+        CloudWatch was unavailable is worse. Logged as an exception, not
+        swallowed."""
+        from director import agent as A
+        import sys, types
+        boto3 = types.ModuleType("boto3")
+
+        def _client(_name):
+            raise RuntimeError("no creds")
+        boto3.client = _client
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
+        with caplog.at_level("ERROR"):
+            A._warn_on_degraded_route(self._route())
+        assert "alarm is blind" in caplog.text
+
+    @staticmethod
+    def _patch_boto(monkeypatch, emitted):
+        import sys, types
+        boto3 = types.ModuleType("boto3")
+
+        class _CW:
+            def put_metric_data(self, Namespace, MetricData):
+                emitted["namespace"] = Namespace
+                emitted["name"] = MetricData[0]["MetricName"]
+                emitted["value"] = MetricData[0]["Value"]
+        boto3.client = lambda _n: _CW()
+        monkeypatch.setitem(sys.modules, "boto3", boto3)
