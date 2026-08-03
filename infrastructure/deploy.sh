@@ -125,38 +125,39 @@ if aws lambda get-function --function-name "$DIRECTOR_FUNCTION" --region "$REGIO
   aws lambda update-function-code --function-name "$DIRECTOR_FUNCTION" \
     --image-uri "$IMAGE_URI" --region "$REGION" --query 'LastUpdateStatus' --output text
   aws lambda wait function-updated --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
-  # Flow-doctor config, resolved HERE rather than at runtime.
+  # NO --environment here, deliberately.
   #
-  # The Director Lambda is VPC-attached to a subnet with no internet route and
-  # there is no SSM interface endpoint, so `flow-doctor`'s SSM lookup times out
-  # at cold start and the import chain dies with
-  # `ConfigError: Unresolved environment variable(s): EMAIL_SENDER` — which is
-  # what alpha-engine-config-I6171 was diagnosing as a networking fault.
+  # This step used to read /alpha-engine/EMAIL_SENDER and
+  # /alpha-engine/EMAIL_RECIPIENTS from SSM and bake them into the Director's
+  # env. That existed for one reason, stated in its own comment: the Director
+  # Lambda was VPC-attached to a subnet with no internet route and no SSM
+  # interface endpoint, so flow-doctor's runtime SSM lookup timed out at cold
+  # start.
   #
-  # These two values are non-secret configuration, and flow-doctor's OWN
-  # contract names the process environment as its primary mechanism (README
-  # § credential resolution: "the process environment" first). SSM stays the
-  # source of truth; the deploy — which runs with internet — reads it and bakes
-  # the result in. That removes a runtime dependency AND the ~$7.30/mo SSM
-  # interface endpoint the alternative would need, for a weekly function.
+  # That premise is void. The Lambda was DETACHED from the VPC on 2026-08-02
+  # (`nous-ergon-ops-I417`; model-router-policy §3.4a R27a now forbids
+  # re-attaching it), so it reaches SSM over the Lambda-managed network like
+  # every other un-attached function. Measured 2026-08-03: a dry-run invoke
+  # returns `status: dry_run` with EMAIL_SENDER and EMAIL_RECIPIENTS ABSENT
+  # from the function's environment — flow-doctor resolved both from SSM at
+  # runtime. SSM is the source of truth and is read as such.
   #
-  # Merged into the EXISTING env, never overwritten: DIRECTOR_ENABLED is
-  # operator-set and a blind --environment write would silently switch the
-  # Director off.
-  echo "=== Director env: merge flow-doctor config from SSM ==="
-  EMAIL_SENDER_VAL=$(aws ssm get-parameter --name /alpha-engine/EMAIL_SENDER \
-    --with-decryption --region "$REGION" --query 'Parameter.Value' --output text)
-  EMAIL_RECIPIENTS_VAL=$(aws ssm get-parameter --name /alpha-engine/EMAIL_RECIPIENTS \
-    --with-decryption --region "$REGION" --query 'Parameter.Value' --output text)
-  DIRECTOR_ENV=$(aws lambda get-function-configuration \
-    --function-name "$DIRECTOR_FUNCTION" --region "$REGION" \
-    --query 'Environment.Variables' --output json \
-    | jq -c --arg s "$EMAIL_SENDER_VAL" --arg r "$EMAIL_RECIPIENTS_VAL" \
-        '(. // {}) + {EMAIL_SENDER: $s, EMAIL_RECIPIENTS: $r}')
+  # Removing the bake also removes the reason `github-actions-lambda-deploy`
+  # would need `ssm:GetParameter`. It does not have it, so this step failed
+  # with AccessDenied on 2026-08-03 (run 30829310846) AFTER the grading
+  # Lambda's alias had already been promoted — leaving the Director's :live
+  # alias stranded on v104, three commits behind main, still carrying the
+  # `exclude_route="litellm_proxy"` shortcut that egresses to openrouter.ai
+  # DLP-unscanned (`alpha-engine-config-I6183`). A deploy role that must read
+  # config to deploy is authority we do not need to grant.
+  #
+  # Omitting --environment leaves the live env untouched, which is what the
+  # old code went out of its way to achieve by merging: DIRECTOR_ENABLED and
+  # KREPIS_LITELLM_PROXY_URL are operator-set and a blind --environment write
+  # would silently switch the Director off.
   aws lambda update-function-configuration --function-name "$DIRECTOR_FUNCTION" \
     --image-config "Command=$DIRECTOR_CMD" \
     --timeout "$TIMEOUT" --memory-size "$MEMORY" \
-    --environment "{\"Variables\":${DIRECTOR_ENV}}" \
     --region "$REGION" --query 'LastUpdateStatus' --output text
   aws lambda wait function-updated --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
 else
