@@ -191,21 +191,46 @@ def _warn_on_degraded_route(route: dict) -> None:
     *no data* is never rendered as green.
 
     Emitted as a **CloudWatch Embedded Metric Format** log line, not a
-    ``PutMetricData`` call. This Lambda is VPC-attached to a subnet with no
-    internet route, so a boto3 CloudWatch call would hang until its timeout
-    on every single run and then be swallowed — a metric that is *structurally
-    incapable* of emitting, which is precisely the dead emitter this function
-    exists to rule out. Log delivery is service-side and needs no egress from
-    the ENI, so EMF works from here and costs nothing. It also removes the
-    ~$7.30/mo `monitoring` interface endpoint the alternative would require
-    for one weekly data point.
+    ``PutMetricData`` call. Log delivery is service-side, costs nothing, and
+    needs no `monitoring` interface endpoint (~$7.30/mo) for one weekly data
+    point.
+
+    (Corrected 2026-08-03: this docstring used to justify EMF by the Lambda
+    being "VPC-attached to a subnet with no internet route". It was detached
+    from the VPC on 2026-08-02 and `model-router-policy` §3.4a R27a now forbids
+    re-attaching it, so that reason is void. EMF remains the right choice on
+    the cost argument alone — but a stale reason in a comment is how the next
+    reader concludes the constraint still applies.)
 
     Never raises. A telemetry failure must not take down the weekly plan.
     """
     skipped = route.get("skipped_entries") or []
     primary = route.get("primary_registry_id") or route.get("primary_model")
     served = route.get("registry_id")
-    degraded = bool(skipped) or (primary is not None and served != primary)
+
+    # On the proxy path `registry_id` is a GROUP HANDLE — `litellm:group:ultra`
+    # — not an entry id, so it can never equal `primary_registry_id`
+    # (`kimi-k3-direct`). Comparing them is a category error, and it fired on
+    # the very first healthy run through the router: every invocation logged
+    # DEGRADED and pinned DirectorRouteFallback at 1.
+    #
+    # That is worse than no metric. A fallback alarm that is always on is
+    # indistinguishable from one that is stuck, and it trains the reader to
+    # ignore the week it means something — the same failure mode as a metric
+    # that never emits, arrived at from the other direction.
+    #
+    # The consumer genuinely cannot know which entry served through the proxy:
+    # LiteLLM walks the fallback chain internally and the resolution contract
+    # reports the group, by design. So on this route the only degradation
+    # signal the consumer HAS is `skipped_entries` — entries the resolver
+    # itself refused before handing over. Which is the honest answer, not a
+    # weakened one: R12's "serving from a fallback is an alert" is owed by the
+    # layer that knows, and for the proxy path that is the router's own
+    # telemetry (R21), not this module.
+    if route.get("route") == "litellm_proxy":
+        degraded = bool(skipped)
+    else:
+        degraded = bool(skipped) or (primary is not None and served != primary)
 
     if degraded:
         logger.warning(

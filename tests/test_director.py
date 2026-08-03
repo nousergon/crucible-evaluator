@@ -950,3 +950,71 @@ class TestDirectorRoutesThroughTheProxyNoExceptions:
             lambda *a, **kw: TestDirectorRoutesThroughTheProxyNoExceptions._route("openrouter"))
         with pytest.raises(RuntimeError, match="litellm_proxy"):
             A._default_llm()
+
+
+class TestDegradedRouteIsNotAlwaysTrueOnTheProxyPath:
+    """A fallback alarm that is always on is as useless as one that never fires.
+
+    On the proxy path krepis returns `registry_id = "litellm:group:ultra"` — a
+    GROUP HANDLE — while `primary_registry_id` is an entry id like
+    `kimi-k3-direct`. The old comparison could never match, so the very first
+    healthy run through the router (2026-08-03 23:15:45Z, live) logged
+    `Director route DEGRADED` and emitted `DirectorRouteFallback=1`:
+
+        Director route DEGRADED: group=ultra primary=kimi-k3-direct
+        served=litellm:group:ultra route=litellm_proxy — skipped: (none recorded)
+
+    The consumer cannot know which entry served through the proxy; LiteLLM
+    walks the chain internally. `skipped_entries` — what the resolver itself
+    refused — is the only degradation signal this layer legitimately has.
+    """
+
+    @staticmethod
+    def _proxy_route(**over):
+        base = {
+            "route": "litellm_proxy",
+            "registry_id": "litellm:group:ultra",
+            "primary_registry_id": "kimi-k3-direct",
+            "primary_model": "kimi-k3",
+            "exec_context": "lambda",
+            "skipped_entries": [],
+        }
+        base.update(over)
+        return base
+
+    def test_healthy_proxy_route_is_not_degraded(self, capsys, caplog):
+        from director import agent as A
+        with caplog.at_level("WARNING"):
+            A._warn_on_degraded_route(self._proxy_route())
+        assert "DEGRADED" not in caplog.text
+        emitted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert emitted["DirectorRouteFallback"] == 0, (
+            "a healthy proxy route emitted the fallback metric — the alarm is "
+            "pinned on and cannot signal the week it matters"
+        )
+
+    def test_proxy_route_with_skipped_entries_is_still_degraded(self, capsys, caplog):
+        """The signal that survives: entries the resolver itself refused."""
+        from director import agent as A
+        with caplog.at_level("WARNING"):
+            A._warn_on_degraded_route(self._proxy_route(
+                skipped_entries=[{"registry_id": "kimi-k3-direct",
+                                  "reason": "not reachable from 'lambda'"}]))
+        assert "DEGRADED" in caplog.text
+        emitted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert emitted["DirectorRouteFallback"] == 1
+
+    def test_direct_route_still_compares_served_against_primary(self, capsys, caplog):
+        """Off the proxy path the comparison is meaningful and must not regress."""
+        from director import agent as A
+        with caplog.at_level("WARNING"):
+            A._warn_on_degraded_route({
+                "route": "openrouter",
+                "registry_id": "glm-5.2",
+                "primary_registry_id": "kimi-k3-direct",
+                "exec_context": "laptop",
+                "skipped_entries": [],
+            })
+        assert "DEGRADED" in caplog.text
+        emitted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert emitted["DirectorRouteFallback"] == 1
