@@ -287,12 +287,29 @@ class _KrepisStructuredDirector:
 
     def invoke(self, messages: list) -> DirectorWeeklyActionPlan:
         system, user_content = _split_messages(messages)
+        # No `max_tokens=` here. It carried a literal 8000 until 2026-08-04,
+        # which SHADOWED the registry: `LLMClient.structured` takes the
+        # caller's value when one is given and `spec.max_tokens` otherwise, so
+        # the row's budget never reached the wire. GLM-5.2 is a reasoning model
+        # and max_tokens bounds reasoning + content TOGETHER — the whole 8000
+        # went to the reasoning trace and the completion came back with
+        # `content: ''`, twice, fully billed (alpha-engine-config-I6396).
+        #
+        # It also defeated the remediation: raising the row to 65536
+        # (alpha-engine-config-PR6390) changed nothing, because this line was
+        # what the request actually carried, and the route log below printed
+        # `spec.max_tokens` — the registry's value, not the one being sent.
+        #
+        # The budget is a registry-owned parameter (model-router-policy §2:
+        # the registry decides model, endpoint, auth and params; the call site
+        # decides only its capability tier and where it runs). Restating one
+        # here is the layer-5 duplication `resolve_group_spec` was adopted to
+        # end.
         result = self._client.structured(
             system=system,
             user_content=user_content,
             schema=DirectorWeeklyActionPlan,
             schema_name=_DIRECTOR_SCHEMA_NAME,
-            max_tokens=8000,
         )
         plan: DirectorWeeklyActionPlan = result.parsed
         plan.director_model = self._director_model

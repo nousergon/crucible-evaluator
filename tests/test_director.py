@@ -1140,3 +1140,82 @@ class TestDirectorNeverUsesTheInProcessRouter:
             "route — rebuilding it re-derives the provider and reselects the "
             "in-process router."
         )
+
+
+class TestDirectorDoesNotShadowTheRegistryBudget:
+    """`max_tokens` is a registry-owned parameter. A literal here silently wins.
+
+    `krepis.llm.LLMClient.structured` resolves the budget as
+    `max_tokens if max_tokens is not None else self.spec.max_tokens`, so a
+    caller-supplied literal takes precedence over the registry row — with no
+    warning, and no trace in any log the Lambda emits.
+
+    Live 2026-08-04 (alpha-engine-config-I6396): this module passed
+    `max_tokens=8000`. GLM-5.2 is a reasoning model and `max_tokens` bounds
+    reasoning + content TOGETHER, so the entire budget went to the reasoning
+    trace and both attempts returned `content: ''` after ~100s each, fully
+    billed. nginx logged those responses at 30,689 and 30,710 bytes — the
+    reasoning trace, not an empty body.
+
+    It also made the remediation inert: raising the registry row 16384 → 65536
+    (alpha-engine-config-PR6390) changed nothing, because this literal was what
+    the request carried, while the route log printed `spec.max_tokens` — the
+    registry's value, which was never sent. Three diagnostic cycles were spent
+    on hypotheses that assumed the logged number was the wire number.
+    """
+
+    def test_the_structured_call_passes_no_max_tokens(self):
+        from director.agent import _KrepisStructuredDirector
+        from director.schema import DirectorWeeklyActionPlan
+
+        seen = {}
+
+        class _Client:
+            def structured(self, **kwargs):
+                seen.update(kwargs)
+
+                class _R:
+                    parsed = DirectorWeeklyActionPlan(
+                        run_date="2026-07-31",
+                        system_summary="s",
+                        top_risks=[],
+                        action_items=[],
+                    )
+                    model = "z-ai/glm-5.2"
+
+                return _R()
+
+        _KrepisStructuredDirector(
+            _Client(), director_model="ultra"
+        ).invoke([("system", "sys"), ("human", "body")])
+
+        assert "max_tokens" not in seen, (
+            f"the Director passes max_tokens={seen['max_tokens']!r} to krepis, "
+            "shadowing the registry row's budget. The registry decides the "
+            "budget (model-router-policy §2); this call site decides only its "
+            "capability tier and where it runs."
+        )
+
+    def test_no_literal_max_tokens_anywhere_in_the_module(self):
+        """AST, not grep — the docstrings above explain the history in prose.
+
+        Guards the CLASS, not the one call: any krepis call surface in this
+        module that restates a registry parameter reintroduces the same
+        silent shadowing.
+        """
+        import ast
+        import inspect
+        from director import agent as A
+
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(inspect.getsource(A)))
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "max_tokens" and isinstance(kw.value, ast.Constant)
+        ]
+        assert not offenders, (
+            f"director/agent.py passes a literal max_tokens at line(s) "
+            f"{offenders}. The registry owns the budget; a literal here wins "
+            "over it silently and makes any registry-side change inert."
+        )
