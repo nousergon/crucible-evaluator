@@ -97,30 +97,16 @@ _DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
 _RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
 
-# Pin the resolve contract this module was written against. krepis documents
-# `resolve_group_structured` as returning a schema_version and instructs
-# callers to BRANCH on it rather than probe for fields — a field rename is the
-# recurring failure mode there, and probing turns it into a silent misroute.
-# Bumped 2026-08-02: krepis 0.26.1 resolve_group_structured returns
-# schema_version 2 (the route dict gained `params` + `reasoning` keys).
-_EXPECTED_ROUTE_SCHEMA = 2
-
-# krepis `auth_token_type` -> the env var holding that credential. ModelSpec
-# takes `api_key_env` (a NAME), so the value is never read here; krepis reads
-# it at call time. `placeholder` means the local egress proxy holds the real
-# key and the client sends a literal placeholder — mapping it to None lets
-# ModelSpec fall back to the provider registry default.
+# The `auth_token_type` -> credential-name mapping used to live here, as the
+# THIRD copy in the fleet (groomer_krepis_adapter.py, groom_driver.py, here) —
+# its own comment said so and named the lift as a follow-up. krepis 0.31.1 owns
+# it (`router._AUTH_TOKEN_SECRET`, applied inside `resolve_group_spec`), so the
+# copy is deleted rather than maintained. A consumer that re-derives a
+# credential name is holding a routing fact at layer 5.
 #
-# Third copy of this mapping in the fleet (groomer_krepis_adapter.py,
-# groom_driver.py, here) — past `policy-shared-code`'s second-adoption
-# trigger. Lifting it into krepis alongside `resolve_group_structured`, which
-# is the only producer of these values, is filed as a follow-up.
-_AUTH_TOKEN_ENV: dict[str, str | None] = {
-    "placeholder": None,
-    "openrouter_key": "OPENROUTER_API_KEY",
-    "litellm_master_key": "LITELLM_MASTER_KEY",
-    "direct_api_key": "ANTHROPIC_API_KEY",
-}
+# `_EXPECTED_ROUTE_SCHEMA` went the same way: `resolve_group_spec` branches on
+# the schema version and refuses rather than guessing. Two places asserting the
+# same contract is how they drift.
 
 
 def _assert_routed_through_the_proxy(route: dict) -> None:
@@ -335,77 +321,61 @@ def _default_llm() -> _KrepisStructuredDirector:
     ("ultra") 2026-08-02.
     """
     from krepis.llm import LLMClient
-    from krepis.llm_config import ModelSpec
-    from krepis.router import resolve_group_structured
+    from krepis.router import resolve_group_spec
 
-    # `resolve_group_structured` is krepis' documented PUBLIC contract for
-    # programmatic callers — it returns the endpoint, wire model, credential
-    # type and params for the group's first HEALTHY entry, honouring the
-    # Router's cooldown state. Branch on schema_version rather than probing
-    # for fields, per that contract.
+    # `resolve_group_spec` is krepis' supported way to go from "I want the
+    # ultra tier, and I am running in a Lambda" to a client. It returns a
+    # ready ModelSpec plus the route it came from.
+    #
+    # This module used to hand-build the ModelSpec from
+    # `resolve_group_structured`, and that reconstruction was the bug. The
+    # resolver reports `provider: "litellm"` for the proxy route, and
+    # `llm_config.PROVIDER_REGISTRY` binds that name to TRANSPORT_LITELLM —
+    # `get_router()`, an **in-process LiteLLM Router** built from the registry
+    # that calls each provider DIRECTLY from this Lambda, reading
+    # OPENROUTER_API_KEY out of the environment as it goes.
+    #
+    # Measured 2026-08-04, on the first REAL invoke after the edge went live:
+    # `ModuleNotFoundError: No module named 'litellm'`. Adding that package
+    # would have made the Director "work" while egressing straight to
+    # openrouter.ai, unscanned, bypassing the authenticated edge and every
+    # per-consumer control on it — the exact shortcut this arc exists to end.
+    # krepis 0.31.1 maps the proxy route to a plain OpenAI transport against
+    # the edge URL, which is what the proxy actually speaks.
+    #
+    # A dry run cannot catch this: it stops before `.invoke()`. Only a real
+    # completion reaches the transport.
+    #
     # `exec_context` is the ONLY thing this module says about routing, and it
     # is a statement about where it is running, not about which routes it
-    # wants (model-router-policy §2 layer 5, R29).
-    #
-    # It replaces `exclude_route="litellm_proxy"`, which was a routing table
-    # held at the consumer. That argument was added to make the Lambda succeed
-    # while the VPC path to the proxy was down, and it worked: resolution fell
-    # through to `glm-5.2` at openrouter.ai, DLP-unscanned, logging a healthy
-    # route the whole time (alpha-engine-config-I6183). Nothing failed when
-    # the proxy path was never restored, which is what made it a shortcut
-    # rather than a fix.
-    #
-    # `wire=openai` because this call site builds a krepis LLMClient on the
-    # openai transport. The resolver previously always returned the Claude
-    # CLI's Anthropic-wire endpoint, so a fallback to a DeepSeek egress route
-    # would have handed this module an 8971 URL its transport cannot speak —
-    # latent only because the chain never reached that entry here.
-    route = resolve_group_structured(
+    # wants (model-router-policy §2 layer 5, R29). `wire=openai` because this
+    # call site speaks the OpenAI wire format.
+    spec, route = resolve_group_spec(
         DIRECTOR_GROUP,
         exec_context=DIRECTOR_EXEC_CONTEXT,
         wire="openai",
     )
     _assert_routed_through_the_proxy(route)
     _warn_on_degraded_route(route)
-    if route.get("schema_version") != _EXPECTED_ROUTE_SCHEMA:
-        raise RuntimeError(
-            f"krepis.router resolve schema_version "
-            f"{route.get('schema_version')!r} != expected "
-            f"{_EXPECTED_ROUTE_SCHEMA!r} — refusing to guess field meanings"
-        )
 
+    # The schema and auth-token checks that used to live here are inside
+    # `resolve_group_spec`, which refuses rather than guesses on both counts.
+    # Keeping local copies would be the same layer-5 duplication the
+    # ModelSpec reconstruction was.
+    api_key_env = spec.api_key_env
     auth_type = route["auth_token_type"]
-    if auth_type not in _AUTH_TOKEN_ENV:
-        raise RuntimeError(
-            f"unknown auth_token_type {auth_type!r} from krepis.router — "
-            "refusing to authenticate against an unintended endpoint"
-        )
-    api_key_env = _AUTH_TOKEN_ENV[auth_type]
 
-    params = route.get("params") or {}
-    spec = ModelSpec(
-        provider=route["provider"],
-        model=route["deployment_id"],
-        base_url=route["api_base_url"] or None,
-        api_key_env=api_key_env,
-        max_tokens=params.get("max_tokens", 8000),
-        structured_outputs=params.get("structured_outputs", True),
-        reasoning=params.get("reasoning"),
-    )
     logger.info(
         "Director route: group=%s model=%s provider=%s route=%s "
-        "(primary=%s, max_tokens=%s)",
-        DIRECTOR_GROUP, route["deployment_id"], route["provider"],
+        "(primary=%s, max_tokens=%s, transport=%s)",
+        DIRECTOR_GROUP, route["deployment_id"], spec.provider,
         route.get("route"), route.get("primary_model"), spec.max_tokens,
+        spec.transport,
     )
     # callsite_id is REQUIRED since krepis 0.23 (krepis/llm.py::LLMClient.__init__,
     # validated non-empty). It is the join key between this call's emitted cost
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-plan).
-    #
-    # config-I6056: the credential this route needs is named by the registry,
-    # not chosen here. In Lambda it lives in SSM rather than the environment,
-    # so it is resolved through krepis' own SSM-with-env-fallback lookup.
     #
     # `auth_token_type == "placeholder"` maps to api_key_env=None and means
     # the egress proxy holds the real key — there is NOTHING to resolve, and
@@ -413,7 +383,7 @@ def _default_llm() -> _KrepisStructuredDirector:
     # from a context that can reach one. The two cases are distinguished
     # rather than collapsed.
     #
-    # Where a credential IS named and cannot be resolved, this RAISES.  It
+    # Where a credential IS named and cannot be resolved, this RAISES. It
     # previously fell through with no key and surfaced as a 401 from the
     # provider — an auth failure that looks like a provider problem
     # (model-router-policy R20: fail closed, loudly).

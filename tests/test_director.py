@@ -681,30 +681,38 @@ class TestDirectorExecutionContext:
 
         seen = {}
 
+        import sys, types
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
         def _fake_resolve(group, **kw):
             seen["group"] = group
             seen.update(kw)
-            return {
-                "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+            spec = _Spec(
+                provider="litellm_proxy", model="ultra",
+                base_url="https://router.nousergon.ai:8443",
+                api_key_env="LITELLM_MASTER_KEY", max_tokens=16384,
+                structured_outputs=True, reasoning=None, transport="openai",
+            )
+            route = {
+                "schema_version": 2,
                 "provider": "litellm", "deployment_id": "ultra",
-                "api_base_url": "http://172.31.73.124:8980",
+                "api_base_url": "https://router.nousergon.ai:8443",
                 "auth_token_type": "litellm_master_key",
                 "registry_id": "litellm:group:ultra",
                 "primary_registry_id": "litellm:group:ultra",
                 "route": "litellm_proxy", "exec_context": "lambda",
                 "params": {}, "skipped_entries": [],
             }
+            return spec, route
 
-        import sys, types
         krepis_router = types.ModuleType("krepis.router")
-        krepis_router.resolve_group_structured = _fake_resolve
+        krepis_router.resolve_group_spec = _fake_resolve
         krepis_llm = types.ModuleType("krepis.llm")
         krepis_llm.LLMClient = lambda spec, **kw: object()
         krepis_cfg = types.ModuleType("krepis.llm_config")
-
-        class _Spec:
-            def __init__(self, **kw):
-                self.__dict__.update(kw)
         krepis_cfg.ModelSpec = _Spec
         pkg = types.ModuleType("krepis")
         for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
@@ -820,16 +828,33 @@ class TestDirectorCredentialResolution:
         from director import agent as A
 
         captured = {}
-        krepis_router = types.ModuleType("krepis.router")
-        krepis_router.resolve_group_structured = lambda group, **kw: {
-            "schema_version": A._EXPECTED_ROUTE_SCHEMA,
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        # krepis 0.31.1 owns the auth_token_type -> credential-name mapping and
+        # applies it inside resolve_group_spec, so the spec arrives with
+        # api_key_env already decided. `placeholder` means the egress proxy
+        # holds the real key and there is nothing for the consumer to resolve.
+        _spec = _Spec(
+            provider="litellm_proxy", model="ultra",
+            base_url="https://router.nousergon.ai:8443",
+            api_key_env=None if auth_token_type == "placeholder" else "LITELLM_MASTER_KEY",
+            max_tokens=16384, structured_outputs=True, reasoning=None,
+            transport="openai",
+        )
+        _route = {
+            "schema_version": 2,
             "provider": "litellm", "deployment_id": "ultra",
-            "api_base_url": "http://172.31.73.124:8980",
+            "api_base_url": "https://router.nousergon.ai:8443",
             "auth_token_type": auth_token_type,
             "registry_id": "r", "primary_registry_id": "r",
             "route": "litellm_proxy", "exec_context": "lambda",
             "params": {}, "skipped_entries": [],
         }
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_spec = lambda group, **kw: (_spec, _route)
         krepis_llm = types.ModuleType("krepis.llm")
 
         def _client(spec, **kw):
@@ -837,10 +862,6 @@ class TestDirectorCredentialResolution:
             return object()
         krepis_llm.LLMClient = _client
         krepis_cfg = types.ModuleType("krepis.llm_config")
-
-        class _Spec:
-            def __init__(self, **kw):
-                self.__dict__.update(kw)
         krepis_cfg.ModelSpec = _Spec
         krepis_secrets = types.ModuleType("krepis.secrets")
         krepis_secrets.get_secret = lambda name, **kw: secret
@@ -1018,3 +1039,104 @@ class TestDegradedRouteIsNotAlwaysTrueOnTheProxyPath:
         assert "DEGRADED" in caplog.text
         emitted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert emitted["DirectorRouteFallback"] == 1
+
+
+class TestDirectorNeverUsesTheInProcessRouter:
+    """The proxy route is an HTTP endpoint, not an in-process LiteLLM Router.
+
+    `resolve_group_structured` reports `provider: "litellm"` for the proxy
+    route, and `krepis.llm_config.PROVIDER_REGISTRY` binds that name to
+    TRANSPORT_LITELLM — `get_router()`, an in-process Router built from the
+    registry that calls each provider DIRECTLY from this Lambda, reading
+    OPENROUTER_API_KEY out of the environment as it goes.
+
+    Found 2026-08-04 on the FIRST REAL invoke after the authenticated edge went
+    live: `ModuleNotFoundError: No module named 'litellm'`. The tempting fix —
+    add the package — would have made the Director "work" while egressing
+    straight to openrouter.ai, unscanned, bypassing the edge and every
+    per-consumer control on it.
+
+    A dry run cannot catch it. `_dry_run_probe` stops before `.invoke()`, so
+    the transport is never exercised; the probe was green throughout.
+    """
+
+    def test_the_spec_transport_is_never_the_in_process_router(self, monkeypatch):
+        import sys, types
+        from director import agent as A
+
+        built = {}
+
+        class _Spec:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        spec = _Spec(
+            provider="litellm_proxy", model="ultra",
+            base_url="https://router.nousergon.ai:8443",
+            api_key_env="LITELLM_MASTER_KEY", max_tokens=16384,
+            structured_outputs=True, reasoning=None, transport="openai",
+        )
+        route = {
+            "schema_version": 2, "provider": "litellm", "deployment_id": "ultra",
+            "api_base_url": "https://router.nousergon.ai:8443",
+            "auth_token_type": "litellm_master_key",
+            "registry_id": "r", "primary_registry_id": "r",
+            "route": "litellm_proxy", "exec_context": "lambda",
+            "params": {}, "skipped_entries": [],
+        }
+
+        krepis_router = types.ModuleType("krepis.router")
+        krepis_router.resolve_group_spec = lambda group, **kw: (spec, route)
+        krepis_llm = types.ModuleType("krepis.llm")
+
+        def _client(s, **kw):
+            built["spec"] = s
+            return object()
+        krepis_llm.LLMClient = _client
+        krepis_cfg = types.ModuleType("krepis.llm_config")
+        krepis_cfg.ModelSpec = _Spec
+        krepis_secrets = types.ModuleType("krepis.secrets")
+        krepis_secrets.get_secret = lambda name, **kw: "test-key"
+        pkg = types.ModuleType("krepis")
+        for name, mod in (("krepis", pkg), ("krepis.router", krepis_router),
+                          ("krepis.llm", krepis_llm),
+                          ("krepis.llm_config", krepis_cfg),
+                          ("krepis.secrets", krepis_secrets)):
+            monkeypatch.setitem(sys.modules, name, mod)
+        monkeypatch.setattr(A, "_warn_on_degraded_route", lambda r: None)
+
+        A._default_llm()
+
+        assert built["spec"].transport != "litellm", (
+            "the Director's ModelSpec resolves to TRANSPORT_LITELLM — the "
+            "IN-PROCESS LiteLLM Router, which calls providers directly from "
+            "this Lambda and bypasses the authenticated edge entirely"
+        )
+        assert built["spec"].base_url, (
+            "the proxy route must carry an explicit base_url; without one the "
+            "OpenAI transport has no edge to address"
+        )
+
+    def test_agent_does_not_rebuild_the_spec_itself(self):
+        """Consume the contract; do not reconstruct it (layer-5 rule).
+
+        Hand-building a ModelSpec from the route dict is what re-derived
+        `provider="litellm"` and selected the in-process router. AST, not grep,
+        so the docstrings explaining the history do not fail the test.
+        """
+        import ast
+        import inspect
+        from director import agent as A
+
+        tree = ast.parse(inspect.getsource(A))
+        offenders = [
+            node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == "ModelSpec"
+        ]
+        assert not offenders, (
+            f"director/agent.py constructs a ModelSpec at line(s) {offenders}. "
+            "krepis' resolve_group_spec returns one already adapted to the "
+            "route — rebuilding it re-derives the provider and reselects the "
+            "in-process router."
+        )
