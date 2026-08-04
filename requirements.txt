@@ -86,7 +86,17 @@ pandas~=3.0
 # Below 0.30.0 the Director resolves openrouter no matter what the registry,
 # the edge or the credential say. A floor, not a pin, because krepis is ours
 # and forward versions are the tested path.
-krepis[flow_doctor,openai]>=0.30.0
+#
+# 2026-08-04: raised to >=0.31.1. `resolve_group_spec` (0.31.0) returns a ready
+# ModelSpec instead of leaving the consumer to build one, and 0.31.1 is what
+# maps the proxy route to a plain OpenAI transport against the edge URL. Below
+# it, `provider: "litellm"` binds to TRANSPORT_LITELLM — an IN-PROCESS LiteLLM
+# Router that calls each provider directly from this Lambda, reading
+# OPENROUTER_API_KEY from the environment. That is unscanned egress bypassing
+# the authenticated edge entirely, and it surfaced only on the first REAL
+# invoke as `ModuleNotFoundError: No module named 'litellm'` — a dry run stops
+# before .invoke() and cannot reach it.
+krepis[flow_doctor,openai]>=0.31.1
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
