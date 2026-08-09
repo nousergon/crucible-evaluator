@@ -417,7 +417,22 @@ def _default_llm() -> _KrepisStructuredDirector:
                 "401 would read as a provider fault rather than a missing key."
             )
         api_kwargs["api_key"] = secret
-    client = LLMClient(spec, callsite_id="director-plan", **api_kwargs)
+    # timeout/max_retries are sized for the ultra group's single-call latency,
+    # not left at the krepis defaults (180s / 3): the plan call's measured
+    # Duration 2026-06-01→08-03 is p90 ≈ 85s, p99 ≈ 285s, and the 2026-08-08
+    # Saturday run died exactly this way — the 180s default aborted a healthy
+    # in-flight call, the SDK retried, and the second attempt hit the Lambda's
+    # 300s wall (config#6050). 340s keeps the deadline client-owned: the router
+    # edge's proxy_read_timeout is 360s, so the client, not the edge, times out
+    # first and the failure is attributable. One retry bounds the worst case to
+    # 2×340s inside the Lambda's 900s budget (infrastructure/deploy.sh).
+    client = LLMClient(
+        spec,
+        callsite_id="director-plan",
+        timeout=340.0,
+        max_retries=1,
+        **api_kwargs,
+    )
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
 
 

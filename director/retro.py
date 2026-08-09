@@ -137,7 +137,19 @@ def _default_llm() -> _KrepisStructuredJudge:
     # validated non-empty). It is the join key between this call's emitted cost
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-retro-judge).
-    client = LLMClient(spec, api_key=api_key, callsite_id="director-retro-judge")
+    # timeout/max_retries bound the judge's share of the single Director
+    # invoke: the plan call may legitimately use up to 2×340s (agent.py), so
+    # the judge is capped at 2×120s to keep the whole invoke inside the
+    # Lambda's 900s budget (config#6050). The judge's 2k-token grade is a much
+    # smaller call than the plan; 120s is generous against its observed
+    # latency.
+    client = LLMClient(
+        spec,
+        api_key=api_key,
+        callsite_id="director-retro-judge",
+        timeout=120.0,
+        max_retries=1,
+    )
     return _KrepisStructuredJudge(client, judge_model=judge_model)
 
 
