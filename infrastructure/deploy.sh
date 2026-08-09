@@ -13,6 +13,13 @@ FUNCTION="alpha-engine-evaluator"
 HANDLER_CMD='["grading.handler.handler"]'
 REGION="${AWS_REGION:-us-east-1}"
 TIMEOUT=300
+# The Director Lambda gets its own budget: one invoke carries the ultra-group
+# plan call (client timeout 340s × 2 attempts, director/agent.py) plus the
+# retro judge (120s × 2, director/retro.py) plus S3/registry overhead. 300s
+# killed the 2026-08-08 Saturday run mid-flight (config#6050); 900 is the
+# platform max and the stated new baseline, sized to the call chain above —
+# not an accommodation of an unexplained regression (sf-pipeline-policy §4).
+DIRECTOR_TIMEOUT=900
 MEMORY=1024
 NO_CANARY=false
 [[ "${1:-}" == "--no-canary" ]] && NO_CANARY=true
@@ -157,14 +164,14 @@ if aws lambda get-function --function-name "$DIRECTOR_FUNCTION" --region "$REGIO
   # would silently switch the Director off.
   aws lambda update-function-configuration --function-name "$DIRECTOR_FUNCTION" \
     --image-config "Command=$DIRECTOR_CMD" \
-    --timeout "$TIMEOUT" --memory-size "$MEMORY" \
+    --timeout "$DIRECTOR_TIMEOUT" --memory-size "$MEMORY" \
     --region "$REGION" --query 'LastUpdateStatus' --output text
   aws lambda wait function-updated --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
 else
   aws lambda create-function --function-name "$DIRECTOR_FUNCTION" \
     --package-type Image --code "ImageUri=$IMAGE_URI" \
     --image-config "Command=$DIRECTOR_CMD" \
-    --role "$ROLE_ARN" --timeout "$TIMEOUT" --memory-size "$MEMORY" \
+    --role "$ROLE_ARN" --timeout "$DIRECTOR_TIMEOUT" --memory-size "$MEMORY" \
     --environment "Variables={EVALUATOR_BUCKET=alpha-engine-research}" \
     --region "$REGION" --query 'FunctionArn' --output text
   aws lambda wait function-active --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
