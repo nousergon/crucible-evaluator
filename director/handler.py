@@ -282,19 +282,25 @@ def _persist_retro(s3, bucket: str, run_date: str, grade) -> str:
     return retro_key
 
 
-def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict) -> dict:
+def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict, budget=None) -> dict:
     """Phase-G retro — judge LAST week's plan against THIS week's card. Best-effort:
     the plan (primary deliverable) is already persisted, so a retro failure must
     not fail the Director run. Records the failure via WARN + a summary field
     (no silent swallow — [[feedback_no_silent_fails]]: secondary observability
-    hung off a primary path that records the failure)."""
+    hung off a primary path that records the failure).
+
+    config#6904: the retro runs LAST and is the call most likely to find the
+    invocation already late. ``BudgetExhausted`` is reported as its own skip
+    reason rather than an error — declining a grade we cannot finish is the
+    correct outcome, and it is materially different from a judge that failed."""
+    from director.budget import BudgetExhausted
     from director.retro import grade_prior_plan
 
     prior = _load_prior_plan(s3, bucket, run_date)
     if prior is None:
         return {"retro": "skipped", "retro_reason": "no prior plan (first cycle)"}
     try:
-        grade = grade_prior_plan(prior, card)
+        grade = grade_prior_plan(prior, card, budget=budget)
         retro_key = _persist_retro(s3, bucket, run_date, grade)
         return {
             "retro": "ok",
@@ -304,6 +310,9 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict) -> dict:
             "retro_calibration": grade.calibration,
             "retro_actionability": grade.actionability,
         }
+    except BudgetExhausted as e:
+        logger.warning("Director retro skipped — out of invocation budget: %s", e)
+        return {"retro": "skipped", "retro_reason": f"invocation budget exhausted: {e}"}
     except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
         logger.warning("Director retro failed (plan already written, non-fatal): %s", e)
         return {"retro": "error", "retro_error": str(e)}
@@ -466,6 +475,13 @@ def handler(event: dict | None = None, context=None) -> dict:
         logger.info("Director disabled (DIRECTOR_ENABLED off) — no-op.")
         return {"status": "disabled", "reason": "DIRECTOR_ENABLED is off"}
 
+    # config#6904: every LLM call in this invocation is quoted against the time
+    # actually left, not against a static literal whose sum (2×340 + 2×120 =
+    # 920s) exceeds the function's own 900s ceiling. Outside Lambda there is no
+    # context and the budget is unbounded, so the static ceilings apply as before.
+    from director.budget import InvocationBudget
+    budget = InvocationBudget.from_context(context)
+
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
     run_date = _resolve_run_date(event)
     dry_run = bool(event.get("dry_run", False))
@@ -526,7 +542,8 @@ def handler(event: dict | None = None, context=None) -> dict:
         backlog_digest = _fetch_backlog_digest_best_effort(gh_token)
         resolved_digest = _fetch_resolved_digest_best_effort(gh_token, run_date)
     plan = build_action_plan(card, run_date=run_date, carryover=ledger,
-                             roadmap_digest=backlog_digest, resolved_digest=resolved_digest)
+                             roadmap_digest=backlog_digest, resolved_digest=resolved_digest,
+                             budget=budget)
 
     plan_key = f"director/{run_date}/action_plan.json"
     s3.put_object(
@@ -564,7 +581,7 @@ def handler(event: dict | None = None, context=None) -> dict:
     # week's card (the realized-outcome feedback the in-call SelfGrade can't give).
     # Best-effort: the plan above is the primary deliverable and is already
     # persisted; a retro failure is recorded, never fatal.
-    retro_summary = _run_retro_best_effort(s3, bucket, run_date, card)
+    retro_summary = _run_retro_best_effort(s3, bucket, run_date, card, budget=budget)
 
     # Phase H output half: file the weekly proposals as area:director-proposals
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.

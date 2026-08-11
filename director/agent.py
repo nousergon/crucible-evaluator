@@ -43,6 +43,7 @@ import logging
 import os
 import time
 
+from director.budget import UNBOUNDED
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan
 
@@ -64,6 +65,13 @@ logger = logging.getLogger(__name__)
 # provider name, a provider api key, and an SDK client all constructed at the
 # call site. Addressing the group moves every one of those into the registry.
 DIRECTOR_GROUP = "ultra"
+
+# Per-attempt ceiling for the plan call (config#6050): under the router edge's
+# 360s proxy_read_timeout, so the client owns the deadline and the failure is
+# attributable. config#6904 made it a ceiling rather than the budget — see
+# director/budget.py and the invariant test in
+# tests/test_director_invocation_budget.py.
+DIRECTOR_PLAN_CEILING_S = 340.0
 
 # Where this module runs, declared rather than inferred (model-router-policy
 # R29). krepis filters the fallback chain by the registry's `reachable_from`,
@@ -317,7 +325,7 @@ class _KrepisStructuredDirector:
         return plan
 
 
-def _default_llm() -> _KrepisStructuredDirector:
+def _default_llm(budget=None) -> _KrepisStructuredDirector:
     """Construct the real structured-output Director client (lazy import).
 
     Resolves ``DIRECTOR_GROUP`` ("ultra") through
@@ -424,12 +432,21 @@ def _default_llm() -> _KrepisStructuredDirector:
     # in-flight call, the SDK retried, and the second attempt hit the Lambda's
     # 300s wall (config#6050). 340s keeps the deadline client-owned: the router
     # edge's proxy_read_timeout is 360s, so the client, not the edge, times out
-    # first and the failure is attributable. One retry bounds the worst case to
-    # 2×340s inside the Lambda's 900s budget (infrastructure/deploy.sh).
+    # first and the failure is attributable.
+    #
+    # config#6904: 340 is now a CEILING, not the budget. The old comment here
+    # claimed one retry "bounds the worst case to 2×340s inside the Lambda's
+    # 900s budget" — but the Phase-G retro judge adds 2×120s in the same
+    # invocation, so the worst case is 920s against a 900s function timeout,
+    # before a single S3 write. The quote below derives the per-attempt budget
+    # from the time actually remaining, so a late invocation declines the call
+    # (raising BudgetExhausted, which the caller records) instead of starting
+    # one the wall will kill mid-flight with no artifact and no cause.
+    plan_budget = budget or UNBOUNDED
     client = LLMClient(
         spec,
         callsite_id="director-plan",
-        timeout=340.0,
+        timeout=plan_budget.quote("director-plan", DIRECTOR_PLAN_CEILING_S, attempts=2),
         max_retries=1,
         **api_kwargs,
     )
@@ -500,6 +517,7 @@ def build_action_plan(
     roadmap_digest: str | None = None,
     resolved_digest: str | None = None,
     llm=None,
+    budget=None,
 ) -> DirectorWeeklyActionPlan:
     """Run the Director: report card → DirectorWeeklyActionPlan.
 
@@ -508,8 +526,13 @@ def build_action_plan(
     through ``krepis.router.resolve_group_structured("ultra")`` — the registry
     decides model, endpoint and auth. ``run_date`` overrides the plan's
     run_date (else taken from the card provenance).
+
+    ``budget`` is an ``InvocationBudget`` (config#6904): the plan call's
+    per-attempt timeout is the smaller of its static ceiling and what the
+    invocation can still afford. Omitted (or ``None``) means unbounded, which
+    is the behaviour outside Lambda.
     """
-    llm = llm or _default_llm()
+    llm = llm or _default_llm(budget)
     messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
                               resolved_digest=resolved_digest)
     plan = _invoke_with_retry(llm, messages)
