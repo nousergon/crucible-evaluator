@@ -123,3 +123,39 @@ class BudgetExhausted(RuntimeError):
 
 #: Unbounded budget — the default for callers with no Lambda context.
 UNBOUNDED = InvocationBudget()
+
+
+#: Time each best-effort tail step is assumed to need, in seconds (config#6915).
+#: These are affordability floors, not deadlines: a step is skipped when the
+#: invocation cannot fund it, so an over-estimate costs a skipped advisory step
+#: and an under-estimate risks the kill this module exists to prevent. Sized
+#: from healthy 2026-07 invocations with headroom, and deliberately generous.
+STEP_ESTIMATE_S = {
+    "backlog_digest": 60.0,
+    "resolved_digest": 60.0,
+    "loop_verification": 120.0,
+    "digest_email": 30.0,
+    "issue_filing": 90.0,
+    "deploy_rollup": 60.0,
+}
+
+
+def skip_if_unaffordable(budget, step: str, *, estimate: float | None = None) -> str | None:
+    """Return a human-readable skip reason, or ``None`` when the step can run.
+
+    A single check for a WHOLE batch — never per item. A partially-executed
+    batch is worse than a skipped one for the two steps that mutate GitHub
+    state (issue filing, loop verification): a kill mid-loop leaves issues
+    filed or reopened with no record of where it stopped.
+    """
+    if budget is None:
+        return None
+    need = STEP_ESTIMATE_S.get(step) if estimate is None else estimate
+    if need is None:
+        raise KeyError(f"no budget estimate registered for step {step!r}")
+    if budget.can_afford(need):
+        return None
+    return (
+        f"invocation budget exhausted: {step} needs ~{need:.0f}s, "
+        f"{budget.remaining():.0f}s left after the write reserve"
+    )

@@ -33,6 +33,7 @@ from pathlib import Path
 import boto3
 
 from director.agent import build_action_plan
+from director.budget import skip_if_unaffordable
 from director.carryover import load_ledger, merge_plan_into_ledger, write_ledger
 from director.issue_filer import (
     DEFAULT_REPO,
@@ -116,36 +117,74 @@ def _director_github_token() -> str | None:
         return None
 
 
-def _fetch_backlog_digest_best_effort(token: str) -> str | None:
+def _budgeted_gh_request(budget):
+    """`_gh_request` with a per-request timeout capped by the invocation budget.
+
+    config#6915: the digest fetches page through the GitHub API, so the step
+    estimate bounds the STEP while this bounds each REQUEST — without it a
+    single unresponsive call could still consume the whole step's share (and,
+    for the two pre-plan digests, the plan call's share after it). Never
+    exceeds the module default; only ever shortens it.
+    """
+    from director.roadmap_pr import DEFAULT_GH_TIMEOUT_S, _gh_request
+
+    if budget is None or not getattr(budget, "bounded", False):
+        return _gh_request
+
+    def _request(method, url, token, body=None, *, timeout=DEFAULT_GH_TIMEOUT_S):
+        # A quarter of what is left: enough for a page, never the whole budget.
+        capped = min(timeout, max(1.0, budget.remaining() / 4.0))
+        return _gh_request(method, url, token, body, timeout=capped)
+
+    return _request
+
+
+def _fetch_backlog_digest_best_effort(token: str, budget=None) -> str | None:
     """Phase H input half: read the live OPEN issue backlog and condense to a
     digest so the director won't re-propose tracked work. Repointed from the
     ROADMAP digest now that the backlog lives in GitHub Issues (config#978).
     Best-effort — a fetch failure just means the LLM runs without the dedup
-    context (the slug-skip at file time is the second line of defense)."""
+    context (the slug-skip at file time is the second line of defense).
+
+    config#6915: this runs BEFORE the plan call, so an unbounded fetch here
+    shortens the budget the plan is then quoted against — degrading the primary
+    deliverable, not just this step. Skipped whole when unaffordable, and each
+    HTTP request is capped independently."""
+    reason = skip_if_unaffordable(budget, "backlog_digest")
+    if reason:
+        logger.warning("Director: backlog digest skipped — %s", reason)
+        return None
     try:
-        digest = open_issues_digest(DEFAULT_REPO, token)
+        digest = open_issues_digest(DEFAULT_REPO, token, gh_request=_budgeted_gh_request(budget))
         return digest or None
     except Exception as e:  # noqa: BLE001
         logger.warning("Director: backlog digest fetch failed (%s); proceeding without digest.", e)
         return None
 
 
-def _fetch_resolved_digest_best_effort(token: str, run_date: str) -> str | None:
+def _fetch_resolved_digest_best_effort(token: str, run_date: str, budget=None) -> str | None:
     """Phase H input half (companion to the open-backlog digest): the
     director-proposals CLOSED in the last ~8 weeks, so the LLM won't re-litigate
     a just-resolved concern under a fresh slug (config#1164 follow-up). The open
     digest only carries OPEN issues and the file-time skip only catches the EXACT
     slug — this closes the semantically-similar-new-slug gap. Best-effort: a
-    fetch failure or unparseable run_date just drops the extra dedup context."""
+    fetch failure or unparseable run_date just drops the extra dedup context.
+    Budget-guarded for the same reason as the open-backlog digest (config#6915)."""
+    reason = skip_if_unaffordable(budget, "resolved_digest")
+    if reason:
+        logger.warning("Director: resolved-proposals digest skipped — %s", reason)
+        return None
     try:
-        digest = recently_closed_proposals_digest(DEFAULT_REPO, token, run_date=run_date)
+        digest = recently_closed_proposals_digest(
+            DEFAULT_REPO, token, run_date=run_date, gh_request=_budgeted_gh_request(budget)
+        )
         return digest or None
     except Exception as e:  # noqa: BLE001
         logger.warning("Director: resolved-proposals digest fetch failed (%s); proceeding without it.", e)
         return None
 
 
-def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
+def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None) -> dict:
     """Phase H output half: file the weekly proposals as ``area:director-proposals``
     GitHub issues (Brian triages). Best-effort + fail-loud — the plan is already
     persisted, so a missing token or a GitHub error is WARN-logged AND recorded
@@ -162,6 +201,13 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
             _GH_PARAM_HINT,
         )
         return {"director_issues": "skipped", "director_issues_reason": "no token configured"}
+    # config#6915: checked ONCE for the whole batch. file_director_issues loops
+    # over the plan's items, and a kill mid-loop leaves issues filed with no
+    # record of where it stopped — a partial mutation is worse than none.
+    reason = skip_if_unaffordable(budget, "issue_filing")
+    if reason:
+        logger.warning("Director: issue filing skipped — %s", reason)
+        return {"director_issues": "skipped", "director_issues_reason": reason}
     try:
         res = file_director_issues(plan, run_date, token=token)
         return {
@@ -174,7 +220,7 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None) -> dict:
         return {"director_issues": "error", "director_issues_error": str(e)}
 
 
-def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None) -> dict:
+def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget=None) -> dict:
     """Phase H+ (config#3145): close the Director loop. Runs BEFORE this
     week's ledger write so any correction it makes (backfilled issue
     numbers, a sticky ``escalated`` flag) persists in the same write —
@@ -184,6 +230,14 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None) -> dic
     GitHub is unreachable this week."""
     if not token:
         return {"director_loop": "skipped", "director_loop_reason": "no GH token"}
+    # config#6915: one check for the whole pass. backfill_issue_numbers and
+    # verify_and_correct both MUTATE (reopen an issue, set a sticky escalated
+    # flag) while iterating; being killed partway leaves GitHub and the ledger
+    # disagreeing about what this run did.
+    reason = skip_if_unaffordable(budget, "loop_verification")
+    if reason:
+        logger.warning("Director: loop verification skipped — %s", reason)
+        return {"director_loop": "skipped", "director_loop_reason": reason}
     try:
         items = ledger.get("items") or []
         n_backfilled = backfill_issue_numbers(items, repo=DEFAULT_REPO, token=token)
@@ -318,7 +372,7 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict, budget=No
         return {"retro": "error", "retro_error": str(e)}
 
 
-def _run_deploy_success_best_effort(s3, bucket: str, token: str | None) -> dict:
+def _run_deploy_success_best_effort(s3, bucket: str, token: str | None, budget=None) -> dict:
     """Produce the substrate tile's deploy_success_rate rollup (config#1153 Batch E).
 
     The evaluator's grading Lambda holds no GitHub token, so the deploy health of
@@ -329,6 +383,10 @@ def _run_deploy_success_best_effort(s3, bucket: str, token: str | None) -> dict:
     ([[feedback_no_silent_fails]])."""
     if not token:
         return {"deploy_success": "skipped", "deploy_success_reason": "no GH token"}
+    reason = skip_if_unaffordable(budget, "deploy_rollup")
+    if reason:
+        logger.warning("Director: deploy_success producer skipped — %s", reason)
+        return {"deploy_success": "skipped", "deploy_success_reason": reason}
     try:
         from grading.producers.deploy_success import run as run_deploy_success
         res = run_deploy_success(s3, bucket, token)
@@ -539,8 +597,8 @@ def handler(event: dict | None = None, context=None) -> dict:
     backlog_digest = event.get("roadmap_digest")
     resolved_digest = None
     if backlog_digest is None and gh_token and _issue_filing_enabled():
-        backlog_digest = _fetch_backlog_digest_best_effort(gh_token)
-        resolved_digest = _fetch_resolved_digest_best_effort(gh_token, run_date)
+        backlog_digest = _fetch_backlog_digest_best_effort(gh_token, budget=budget)
+        resolved_digest = _fetch_resolved_digest_best_effort(gh_token, run_date, budget=budget)
     plan = build_action_plan(card, run_date=run_date, carryover=ledger,
                              roadmap_digest=backlog_digest, resolved_digest=resolved_digest,
                              budget=budget)
@@ -559,7 +617,7 @@ def handler(event: dict | None = None, context=None) -> dict:
     # BEFORE the ledger write so its in-place corrections (backfilled
     # issue_number, sticky escalated flag) land in this week's persisted
     # ledger.
-    loop_summary = _verify_loop_best_effort(merged, card, gh_token)
+    loop_summary = _verify_loop_best_effort(merged, card, gh_token, budget=budget)
 
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
@@ -571,9 +629,13 @@ def handler(event: dict | None = None, context=None) -> dict:
     # GMAIL_APP_PASSWORD from SSM (the role's parameter/alpha-engine/* grant),
     # so until those are set the lib logs "Email not configured" and skips.
     email_sent = False
+    email_skip = skip_if_unaffordable(budget, "digest_email")
+    if email_skip:
+        logger.warning("Director: digest email skipped — %s", email_skip)
     try:
-        from director.emailer import send_director_digest
-        email_sent = send_director_digest(plan, run_date, loop_summary=loop_summary)
+        if not email_skip:
+            from director.emailer import send_director_digest
+            email_sent = send_director_digest(plan, run_date, loop_summary=loop_summary)
     except Exception:  # noqa: BLE001 — the email must never break the Director
         logger.warning("Director: digest email failed (non-fatal)", exc_info=True)
 
@@ -585,13 +647,13 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     # Phase H output half: file the weekly proposals as area:director-proposals
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
-    issues_summary = _file_issues_best_effort(plan, run_date, gh_token)
+    issues_summary = _file_issues_best_effort(plan, run_date, gh_token, budget=budget)
 
     # Substrate producer: the deploy-health rollup the substrate tile reads
     # (config#1153 Batch E). The Director is the one weekly component holding both
     # a GH token and the research bucket, so it doubles as the GH-API→S3 producer
     # for deploy_success_rate. Best-effort — never breaks the plan.
-    deploy_summary = _run_deploy_success_best_effort(s3, bucket, gh_token)
+    deploy_summary = _run_deploy_success_best_effort(s3, bucket, gh_token, budget=budget)
 
     summary = {
         "status": "ok",
