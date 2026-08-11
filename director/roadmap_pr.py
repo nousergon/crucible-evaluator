@@ -218,9 +218,27 @@ def roadmap_digest(roadmap_text: str, *, max_chars: int = 12000) -> str:
 # --------------------------------------------------------------------------- #
 # GitHub REST (fine-grained PAT, stdlib urllib — no new pip dep)
 # --------------------------------------------------------------------------- #
-def _gh_request(method: str, url: str, token: str, body: dict | None = None) -> tuple[int, dict]:
+#: Per-request ceiling for a GitHub call (config#6915). ``urlopen`` with no
+#: timeout inherits the global socket default, which is ``None`` — an
+#: unresponsive api.github.com would hang the whole Director invocation until
+#: the Lambda's own wall killed it, writing nothing and logging no cause. Every
+#: call this module makes is a small REST read or write; 20s is generous.
+DEFAULT_GH_TIMEOUT_S = 20.0
+
+
+def _gh_request(
+    method: str,
+    url: str,
+    token: str,
+    body: dict | None = None,
+    *,
+    timeout: float = DEFAULT_GH_TIMEOUT_S,
+) -> tuple[int, dict]:
     """Minimal GitHub REST call. Raises urllib HTTPError only for unexpected
-    statuses the callers don't handle; returns (status, parsed_json) otherwise."""
+    statuses the callers don't handle; returns (status, parsed_json) otherwise.
+
+    ``timeout`` bounds a single request. Callers running inside a metered
+    invocation pass a budget-derived value (config#6915)."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Bearer {token}")
@@ -230,7 +248,7 @@ def _gh_request(method: str, url: str, token: str, body: dict | None = None) -> 
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req) as resp:  # noqa: S310 - fixed api.github.com host
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed api.github.com host
             return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as e:
         payload = e.read().decode("utf-8") if e.fp else ""
