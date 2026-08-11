@@ -35,6 +35,22 @@ from director.budget import (
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _DEPLOY = _REPO / "infrastructure" / "deploy.sh"
 
+# The `docker-image-tests` job mounts only tests/ into the shipped image, which
+# deliberately does not carry infrastructure/ (see .github/workflows/ci.yml —
+# it already --ignores the other deploy.sh-reading suites for the same reason).
+# The two assertions below are repo-shape assertions, not package assertions, so
+# they are binding in the `test` job that runs against a full checkout and
+# inapplicable inside the image. Everything else in this file exercises the
+# image's own packages and must keep running there.
+_repo_only = pytest.mark.skipif(
+    not _DEPLOY.exists(),
+    reason=(
+        "infrastructure/deploy.sh is not present — running inside the shipped "
+        "image, where this repo-shape assertion does not apply. It is enforced "
+        "by the repo-checkout `test` job."
+    ),
+)
+
 
 def _deploy_director_timeout() -> int:
     """The function timeout the deploy script actually sets."""
@@ -65,6 +81,7 @@ class _Context:
 # The invariant the comment used to assert and nothing enforced
 # ---------------------------------------------------------------------------
 
+@_repo_only
 def test_each_ceiling_is_individually_affordable():
     """One retried call must fit the function timeout on its own."""
     from director.agent import DIRECTOR_PLAN_CEILING_S
@@ -84,6 +101,7 @@ def test_each_ceiling_is_individually_affordable():
         )
 
 
+@_repo_only
 def test_the_ceilings_do_not_fit_together_which_is_why_the_budget_exists():
     """Documents the measured overrun this change addresses.
 
