@@ -30,10 +30,15 @@ import logging
 import os
 
 from director.agent import _invoke_with_retry
+from director.budget import UNBOUNDED
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
 logger = logging.getLogger(__name__)
+
+# Per-attempt ceiling for the retro judge (config#6050); a ceiling rather than
+# the budget since config#6904 — see director/budget.py.
+RETRO_JUDGE_CEILING_S = 120.0
 
 # Retro judge model tier — uses the "high" group from LLM_MODEL_REGISTRY.yaml
 # (config#1673, migrated from claude-sonnet-4-6 direct Anthropic 2026-07-24).
@@ -117,7 +122,7 @@ class _KrepisStructuredJudge:
         return grade
 
 
-def _default_llm() -> _KrepisStructuredJudge:
+def _default_llm(budget=None) -> _KrepisStructuredJudge:
     """Construct the real structured-output judge client (lazy import).
 
     The OpenRouter key is fetched from SSM (``/alpha-engine/OPENROUTER_API_KEY``)
@@ -138,16 +143,24 @@ def _default_llm() -> _KrepisStructuredJudge:
     # row and its LLM_CALLSITE_REGISTRY.yaml entry, so the literal must stay in
     # sync with that row's `id` (alpha-engine-config, id: director-retro-judge).
     # timeout/max_retries bound the judge's share of the single Director
-    # invoke: the plan call may legitimately use up to 2×340s (agent.py), so
-    # the judge is capped at 2×120s to keep the whole invoke inside the
-    # Lambda's 900s budget (config#6050). The judge's 2k-token grade is a much
-    # smaller call than the plan; 120s is generous against its observed
-    # latency.
+    # invoke. The judge's 2k-token grade is a much smaller call than the plan;
+    # 120s is generous against its observed latency.
+    #
+    # config#6904: the old note here claimed 2×340s (plan) plus 2×120s (judge)
+    # kept "the whole invoke inside the Lambda's 900s budget" — that is 920s
+    # against a 900s ceiling, before any S3 write, and it was never enforced by
+    # anything but this comment. 120 is now a CEILING; the quote below derives
+    # the per-attempt budget from the time actually left. The retro is
+    # explicitly best-effort and runs AFTER the plan is persisted, so declining
+    # it on an exhausted budget costs a grade, never the primary deliverable.
+    judge_budget = budget or UNBOUNDED
     client = LLMClient(
         spec,
         api_key=api_key,
         callsite_id="director-retro-judge",
-        timeout=120.0,
+        timeout=judge_budget.quote(
+            "director-retro-judge", RETRO_JUDGE_CEILING_S, attempts=2
+        ),
         max_retries=1,
     )
     return _KrepisStructuredJudge(client, judge_model=judge_model)
@@ -194,13 +207,14 @@ def grade_prior_plan(
     current_card: dict,
     *,
     llm=None,
+    budget=None,
 ) -> RetroGrade:
     """Judge the prior week's plan against the current Report Card → RetroGrade.
 
     ``llm`` is injectable (a structured-output runnable returning a RetroGrade);
     defaults to the real Sonnet judge.
     """
-    llm = llm or _default_llm()
+    llm = llm or _default_llm(budget)
     messages = build_messages(prior_plan, current_card)
     grade = _invoke_with_retry(llm, messages)
     # Stamp the prior run_date from the plan if the model didn't echo it.
