@@ -362,45 +362,79 @@ def backtester_attestation_key(run_date: str) -> str:
     return f"backtest/{run_date}/attestation.json"
 
 
-def read_backtester_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
-    """Read ``backtest/{run_date}/attestation.json`` and normalize it.
+def evaluator_stage_attestation_key(run_date: str) -> str:
+    """The Evaluator STAGE's verdict — distinct from this Lambda's own battery.
+
+    ``run_evaluator_attestation`` above attests the quant primitives *this image*
+    computes the card's risk-adjusted tiles from. This key is the verdict of the
+    ``EvaluatorDiagnostics``/``EvaluatorOptimize`` SF stages, which run
+    ``crucible-backtester evaluate.py`` on a spot box: the ranking metrics (IC,
+    hit rate, calibration) it grades on, plus whether it was permitted to promote
+    ``config/executor_params.json`` and ``config/producer_champion.json`` this
+    cycle. Two different pieces of arithmetic on two different substrates; the
+    card needs both.
+    """
+    return f"backtest/{run_date}/evaluator_attestation.json"
+
+
+def _read_verdict_artifact(
+    bucket: str,
+    key: str,
+    run_date: str,
+    label: str,
+    s3_client=None,
+) -> dict:
+    """Read a §2.3a verdict artifact and normalize it. Never raises.
 
     Every failure path — absent object, unreadable body, unparseable JSON, an
     unrecognised verdict string, a body stamped with a DIFFERENT ``run_date`` —
-    resolves to ``UNKNOWN`` with a reason. §2.3a rule 2.
+    resolves to ``UNKNOWN`` with a reason (rule 2).
 
     The run_date check is rule 1 made concrete: a verdict from an earlier cycle
     says nothing about this cycle's numbers, and inheriting it is exactly how a
     stale pass gets granted by default.
+
+    ``as_of`` carries the object's S3 ``LastModified`` so every surface can
+    render *when* the verdict was established alongside *what* it said — a
+    verdict with no timestamp cannot read as stale, which is the failure mode
+    one layer up from reading absence as green.
     """
-    key = backtester_attestation_key(run_date)
     source_path = f"s3://{bucket}/{key}"
-    base = {"source_path": source_path, "run_date": run_date}
+    base = {"source_path": source_path, "run_date": run_date, "as_of": None}
     s3 = s3_client or boto3.client("s3")
     try:
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj["Body"].read()
+        last_modified = obj.get("LastModified")
+        if last_modified is not None:
+            base["as_of"] = last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
-        reason = (f"backtester attestation absent at {source_path} — the producer never ran "
+        reason = (f"{label} attestation absent at {source_path} — the producer never ran "
                   "this cycle." if code in ("NoSuchKey", "404")
-                  else f"backtester attestation unreadable ({code}).")
+                  else f"{label} attestation unreadable ({code}).")
         logger.warning("attestation: %s", reason)
         return {**base, "verdict": UNKNOWN, "reason": reason}
     except Exception as exc:  # noqa: BLE001 — see CONTRACT: never raises
-        reason = f"backtester attestation read failed ({type(exc).__name__}: {exc})."
+        reason = f"{label} attestation read failed ({type(exc).__name__}: {exc})."
         logger.error("attestation: %s", reason)
         return {**base, "verdict": UNKNOWN, "reason": reason}
 
     try:
         doc = json.loads(body)
     except Exception as exc:  # noqa: BLE001
-        reason = f"backtester attestation body is not JSON ({type(exc).__name__})."
+        reason = f"{label} attestation body is not JSON ({type(exc).__name__})."
+        logger.error("attestation: %s", reason)
+        return {**base, "verdict": UNKNOWN, "reason": reason}
+
+    if not isinstance(doc, dict):
+        reason = f"{label} attestation body is not a JSON object."
         logger.error("attestation: %s", reason)
         return {**base, "verdict": UNKNOWN, "reason": reason}
 
     stamped = doc.get("run_date")
     if stamped != run_date:
-        reason = (f"backtester attestation carries run_date {stamped!r}, not {run_date!r} — "
+        reason = (f"{label} attestation carries run_date {stamped!r}, not {run_date!r} — "
                   "a verdict from another cycle is not inherited.")
         logger.warning("attestation: %s", reason)
         return {**base, "verdict": UNKNOWN, "reason": reason,
@@ -416,45 +450,117 @@ def read_backtester_attestation(bucket: str, run_date: str, s3_client=None) -> d
         "n_errored": doc.get("n_errored"),
         "engine": doc.get("engine"),
     }
+    # The Evaluator stage's artifact nests its own battery under `own`; surface
+    # the counts and the promotion decision so the card can say what was
+    # withheld, not merely that something was.
+    own = doc.get("own")
+    if isinstance(own, dict):
+        result["n_checks"] = own.get("n_checks")
+        result["n_failed"] = own.get("n_failed")
+        result["n_errored"] = own.get("n_errored")
+        result["engine"] = own.get("engine")
+    if "promotion_withheld" in doc:
+        result["promotion_withheld"] = bool(doc.get("promotion_withheld"))
+
     if verdict == UNKNOWN:
         result["reason"] = (
-            f"backtester attestation verdict {doc.get('verdict')!r} is not one of "
+            f"{label} attestation verdict {doc.get('verdict')!r} is not one of "
             f"{sorted(_VALID_VERDICTS)} — treated as UNKNOWN, never as a pass."
         )
     elif verdict == FAIL:
-        failed = [c.get("name") for c in (doc.get("checks") or []) if c.get("passed") is False]
+        checks = (own or doc).get("checks") or []
+        failed = [c.get("name") for c in checks if c.get("passed") is False]
         result["reason"] = (
-            f"backtester attestation FAILED on {doc.get('n_failed')} known-answer "
+            f"{label} attestation FAILED on {result.get('n_failed')} known-answer "
             f"check(s){': ' + ', '.join(str(f) for f in failed) if failed else ''}. "
-            "This cycle's backtest numbers are NOT trustworthy."
+            f"This cycle's {label} numbers are NOT trustworthy."
         )
     else:
         result["reason"] = (
-            f"backtester attestation PASS ({doc.get('n_checks')} known-answer checks)."
+            f"{label} attestation PASS ({result.get('n_checks')} known-answer checks)."
+        )
+    if result.get("promotion_withheld"):
+        result["reason"] += (
+            " Config and champion promotion were WITHHELD this cycle — the live "
+            "executor is still on last cycle's parameters."
         )
     return result
+
+
+def read_backtester_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
+    """Read the simulation engine's verdict at ``backtest/{run_date}/attestation.json``."""
+    return _read_verdict_artifact(
+        bucket, backtester_attestation_key(run_date), run_date, "backtester",
+        s3_client=s3_client,
+    )
+
+
+def read_evaluator_stage_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
+    """Read the Evaluator stage's verdict at ``backtest/{run_date}/evaluator_attestation.json``."""
+    return _read_verdict_artifact(
+        bucket, evaluator_stage_attestation_key(run_date), run_date, "evaluator stage",
+        s3_client=s3_client,
+    )
 
 
 def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
     """The combined block the Report Card carries at ``report_card["attestation"]``.
 
-    Never raises; the worst half wins.
+    Three halves, because three distinct pieces of arithmetic stand between the
+    raw data and a number on this card, on three substrates that version
+    independently:
+
+    ``evaluator``
+        this image's quant primitives (Sharpe, Sortino, drawdown, CVaR, the
+        cumulative log-alpha headline) — attested in-process on every build.
+    ``backtester``
+        the simulation engine's fills, fees, NAV marking and classification
+        counts — attested on the spot box that produced the week's numbers.
+    ``evaluator_stage``
+        the ranking metrics the Evaluator stage grades and promotes on — IC,
+        hit rate, calibration — attested on the spot box that ran it, together
+        with whether promotion was permitted this cycle.
+
+    Never raises; the worst half wins. Any half UNKNOWN withholds the guarantee,
+    because a card whose numbers are only two-thirds attested is not a verified
+    card — §2.3a rule 2 admits no partial pass.
     """
     evaluator = run_evaluator_attestation()
     backtester = read_backtester_attestation(bucket, run_date, s3_client=s3_client)
-    verdict = _worst(evaluator["verdict"], backtester["verdict"])
+    evaluator_stage = read_evaluator_stage_attestation(bucket, run_date, s3_client=s3_client)
+    verdict = _worst(evaluator["verdict"], backtester["verdict"], evaluator_stage["verdict"])
+    withheld = [
+        f"{name}={half['verdict']}"
+        for name, half in (
+            ("evaluator", evaluator),
+            ("backtester", backtester),
+            ("evaluator_stage", evaluator_stage),
+        )
+        if half["verdict"] != PASS
+    ]
+    reasons = " ".join(
+        half.get("reason", "")
+        for half in (backtester, evaluator_stage)
+        if half["verdict"] != PASS
+    ).strip()
     block = {
         "schema": SCHEMA,
         "run_date": run_date,
         "verdict": verdict,
+        "as_of": {
+            "backtester": backtester.get("as_of"),
+            "evaluator_stage": evaluator_stage.get("as_of"),
+        },
         "evaluator": evaluator,
         "backtester": backtester,
+        "evaluator_stage": evaluator_stage,
+        "promotion_withheld": bool(evaluator_stage.get("promotion_withheld")),
         "reason": (
-            "Both halves attested — the deployed quant primitives and the backtest "
-            "engine each agreed with their hand-derived known answers."
+            "All three halves attested — the deployed quant primitives, the backtest "
+            "engine, and the Evaluator stage's ranking metrics each agreed with their "
+            "hand-derived known answers."
             if verdict == PASS else
-            f"Correctness guarantee WITHHELD: evaluator={evaluator['verdict']}, "
-            f"backtester={backtester['verdict']}. {backtester.get('reason', '')}".strip()
+            f"Correctness guarantee WITHHELD: {', '.join(withheld)}. {reasons}".strip()
         ),
     }
     if verdict != PASS:

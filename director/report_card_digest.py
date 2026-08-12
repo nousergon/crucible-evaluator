@@ -89,19 +89,43 @@ def summarize_report_card(card: dict) -> str:
     # verdict-does-not-propagate defect one axis over.
     att = card.get("attestation") or {}
     verdict = att.get("verdict")
+    # `as_of` rides with the state so a verdict reads STALE rather than green:
+    # "PASS" with a timestamp from a previous cycle is a different fact from
+    # "PASS" established minutes ago, and a state rendered without its timestamp
+    # cannot express the difference.
+    as_of = att.get("as_of") or {}
+    stamps = ", ".join(
+        f"{k} as-of {v or 'never'}" for k, v in sorted(as_of.items())
+    )
+    stamp_suffix = f" [{stamps}]" if stamps else ""
     if verdict == "PASS":
-        out.append("CORRECTNESS ATTESTATION: PASS — the deployed backtest engine and "
-                   "the evaluator's quant primitives both agreed with their known answers.")
+        out.append(
+            "CORRECTNESS ATTESTATION: PASS — the deployed backtest engine, the "
+            "Evaluator stage's ranking metrics, and the evaluator's own quant "
+            "primitives all agreed with their known answers." + stamp_suffix
+        )
     elif verdict:
         out.append(
             f"⚠ CORRECTNESS ATTESTATION: {verdict} — {att.get('reason', '')} "
             "The numbers below are NOT established as correct: do not assert a "
             "metric moved, and do not prescribe an action premised on its level."
+            + stamp_suffix
         )
     else:
         out.append(
             "⚠ CORRECTNESS ATTESTATION: UNKNOWN — this card carries no attestation "
             "block. Treat every number below as unverified."
+        )
+    if att.get("promotion_withheld"):
+        # A withheld promotion is a fact about the LIVE system, not about the
+        # card: the executor is still running last cycle's parameters. The
+        # Director prescribes actions premised on the current config, so it must
+        # not be able to read past this.
+        out.append(
+            "⚠ PROMOTION WITHHELD: the Evaluator stage ran under a forced freeze "
+            "this cycle — config/executor_params.json and config/producer_champion.json "
+            "were NOT updated. The live executor is on the PREVIOUS cycle's "
+            "parameters; do not describe any config change as having taken effect."
         )
     if card.get("degraded_staleness"):
         out.append("⚠ DEGRADED (staleness): stale tiles — "

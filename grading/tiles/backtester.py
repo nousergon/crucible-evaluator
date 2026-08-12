@@ -49,7 +49,7 @@ from nousergon_lib import contracts
 
 from grading import attestation as attestation_module
 from grading.artifacts import BACKTESTER_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
-from grading.attestation import read_backtester_attestation
+from grading.attestation import read_backtester_attestation, read_evaluator_stage_attestation
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -261,6 +261,59 @@ def build_backtester_tile(
             n_floor=1, target=1.0, red_line=1.0, source_path=a_src, input_present=False,
             na_detail=(
                 "numeric_attestation: " + att.get("reason", "verdict UNKNOWN")
+                + " Per sf-pipeline-policy §2.3a the correctness guarantee is WITHHELD "
+                "this cycle — absence is never a pass."
+            ),
+        ))
+
+    # 1c. evaluator_stage_attestation (CRITICAL) — sf-pipeline-policy §2.3a.
+    #
+    # 1b grades the simulation ENGINE. This grades the stage that consumes it:
+    # crucible-backtester's evaluate.py, run by the EvaluatorDiagnostics /
+    # EvaluatorOptimize SF states, which computes the ranking metrics (IC, hit
+    # rate, calibration) the Research and Predictor tiles are built from and
+    # writes config/executor_params.json + config/producer_champion.json — the two
+    # artifacts the live executor reads.
+    #
+    # It lives on this tile rather than Research because both verdicts describe
+    # arithmetic performed on the same spot substrate, under the same
+    # backtest/{date}/ prefix, by the same repo — keeping them adjacent is what
+    # makes a divergence between them diagnosable at a glance ("the engine is
+    # fine, the ranking layer moved" is a different investigation from the
+    # reverse). The card-level block and the Director digest carry the combined
+    # state for every other reader.
+    #
+    # Same shape as 1b: never windowed, never inherited, N/A-MISSING-INPUT on
+    # UNKNOWN, RED on FAIL.
+    stage_att = read_evaluator_stage_attestation(bucket, run_date, s3_client=s3)
+    s_src = stage_att["source_path"]
+    if stage_att["verdict"] == attestation_module.PASS:
+        components.append(build_metric(
+            name="evaluator_stage_attestation", module=MODULE, metric_type="pct",
+            criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            value=1.0, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
+            target=1.0, red_line=1.0, source_path=s_src, status="GREEN",
+            reason=stage_att["reason"],
+        ))
+    elif stage_att["verdict"] == attestation_module.FAIL:
+        components.append(build_metric(
+            name="evaluator_stage_attestation", module=MODULE, metric_type="pct",
+            criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            value=0.0, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
+            target=1.0, red_line=1.0, source_path=s_src, status="RED",
+            reason=stage_att["reason"],
+        ))
+    else:
+        components.append(build_metric(
+            name="evaluator_stage_attestation", module=MODULE, metric_type="pct",
+            criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            n_floor=1, target=1.0, red_line=1.0, source_path=s_src, input_present=False,
+            na_detail=(
+                "evaluator_stage_attestation: "
+                + stage_att.get("reason", "verdict UNKNOWN")
                 + " Per sf-pipeline-policy §2.3a the correctness guarantee is WITHHELD "
                 "this cycle — absence is never a pass."
             ),
