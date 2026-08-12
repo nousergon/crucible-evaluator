@@ -157,18 +157,30 @@ def check_deploy_drift(
     module has no AWS calls of its own; it only reads the local stamp file
     baked into whichever Lambda invokes it.
 
-    Degraded modes (``has_drift=False`` with a diagnostic ``reason``):
-    stamp file missing/unknown (legacy image, or local/non-Lambda invoke),
-    or GitHub unreachable. Never block on a probe-side failure — this
-    mirrors the fail-open posture of every existing SF preflight gate
-    (LibPinDriftCheck, PipelineContractCheck) documented in
-    ``nousergon-data/infrastructure/step_function.json``.
+    Degraded modes: stamp file missing/unknown (legacy image, or
+    local/non-Lambda invoke) is a CONFIRMED, already-measured non-drift
+    state — ``has_drift=False`` is a real verdict there (nothing to
+    compare). GitHub unreachable is different: a real stamp exists but
+    could not be checked, so ``has_drift`` is OMITTED entirely (not set to
+    ``False``) — alpha-engine-config-I7048. This mirrors the fail-open
+    posture of every existing SF preflight gate (LibPinDriftCheck,
+    PipelineContractCheck, documented in
+    ``nousergon-data/infrastructure/step_function.json``): the SF's
+    ``EvaluatorDeployDriftGate``/``EvaluatorDirectorDeployDriftGate``
+    Choice states are already IsPresent-guarded to route an absent
+    ``has_drift`` to the visible ``EvaluatorGateDegraded`` path rather than
+    the silent-pass Default — they simply never received that shape before.
+    Never hard-blocks on a probe-side failure either way.
     """
     baked = _read_baked_git_sha(sha_file)
     upstream = _fetch_origin_main_sha(repo, branch=branch, timeout=timeout)
 
     stamp_present = baked is not None
     upstream_available = upstream is not None
+    # UNMEASURED only when a real stamp exists but upstream could not be
+    # fetched — a missing stamp is its own confirmed non-drift state
+    # (nothing to compare) and must NOT be conflated with "couldn't check".
+    drift_unmeasured = stamp_present and not upstream_available
     has_drift = stamp_present and upstream_available and not _shas_match(baked, upstream)
 
     if not stamp_present:
@@ -197,15 +209,18 @@ def check_deploy_drift(
         "baked_sha": baked,
         "stamp_present": stamp_present,
         "upstream_sha": upstream,
-        "has_drift": has_drift,
         "reason": reason,
     }
+    # alpha-engine-config-I7048: has_drift is OMITTED (not False) when
+    # drift_unmeasured — see the module/function docstrings.
+    if not drift_unmeasured:
+        result["has_drift"] = has_drift
     log.info(
         "Deploy-drift check (%s): baked=%s upstream=%s has_drift=%s reason=%s",
         function_name,
         (baked or "missing")[:12],
         (upstream or "unavailable")[:12],
-        has_drift,
+        "unmeasured" if drift_unmeasured else has_drift,
         reason,
     )
     return result
