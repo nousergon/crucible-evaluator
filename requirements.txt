@@ -96,7 +96,7 @@ pandas~=3.0
 # the authenticated edge entirely, and it surfaced only on the first REAL
 # invoke as `ModuleNotFoundError: No module named 'litellm'` — a dry run stops
 # before .invoke() and cannot reach it.
-krepis[flow_doctor,openai]>=0.40.0
+krepis[flow-doctor,openai]>=0.40.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
