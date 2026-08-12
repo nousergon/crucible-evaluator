@@ -114,6 +114,10 @@ def test_short_prefix_stamp_still_matches(tmp_path: Path):
 
 def test_missing_stamp_file_is_no_drift_not_hard_fail(tmp_path: Path):
     # Legacy/local image without the GIT_SHA stamp — fail-open, not fail-loud.
+    # alpha-engine-config-I7048: a MISSING stamp is a confirmed,
+    # already-measured non-drift state (nothing to compare) — distinct from
+    # an unmeasured GitHub outage — so has_drift stays a definite, present
+    # False here.
     stamp = tmp_path / "does_not_exist.txt"
     with patch.object(dd, "_fetch_origin_main_sha", return_value=SHA_A):
         result = dd.check_deploy_drift(function_name="alpha-engine-evaluator", sha_file=stamp)
@@ -123,11 +127,18 @@ def test_missing_stamp_file_is_no_drift_not_hard_fail(tmp_path: Path):
 
 
 def test_github_outage_is_no_drift(tmp_path: Path):
+    # alpha-engine-config-I7048: a real stamp exists but upstream could not
+    # be fetched — genuinely UNMEASURED, not "confirmed no drift". This
+    # test previously pinned the bug it now guards against: has_drift must
+    # be OMITTED (not a present False) so the SF's IsPresent-guarded
+    # EvaluatorDeployDriftGate/EvaluatorDirectorDeployDriftGate Choice
+    # states actually route to the visible EvaluatorGateDegraded path on a
+    # GitHub outage instead of silently reporting a clean deploy.
     stamp = tmp_path / "GIT_SHA.txt"
     stamp.write_text(SHA_A)
     with patch.object(dd, "_fetch_origin_main_sha", return_value=None):
         result = dd.check_deploy_drift(function_name="alpha-engine-evaluator", sha_file=stamp)
-    assert result["has_drift"] is False
+    assert "has_drift" not in result
     assert result["reason"] == "github_unreachable"
     assert result["upstream_sha"] is None
 
