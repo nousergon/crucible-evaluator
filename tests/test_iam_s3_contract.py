@@ -81,9 +81,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # snapshot write -- same "evaluator" prefix, already granted readwrite;
     # no contract/IAM change, just a pin bump.
     "grading/aggregate.py": 3,
-    # §2.3a runtime attestation: one get_object reading
-    # backtest/{run_date}/attestation.json — the "backtest" prefix is already
-    # declared `read` in the contract, so no contract/IAM change, just the pin.
+    # §2.3a runtime attestation: one get_object call site, shared by
+    # `_read_verdict_artifact` across TWO keys — backtest/{run_date}/attestation.json
+    # (the simulation engine's verdict) and backtest/{run_date}/evaluator_attestation.json
+    # (the Evaluator stage's). The count stays 1 because the second key reuses the
+    # same reader, not because nothing was added; both live under the "backtest"
+    # prefix, already declared `read` in the contract, so no contract/IAM change.
     "grading/attestation.py": 1,
     # config#3104: grading/artifacts.py S3 access moved to nousergon_lib.artifact_resolution SSoT;
     # the contract pin for the library-side access sites lives in nousergon-lib, not here.

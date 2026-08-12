@@ -12,9 +12,13 @@ would shift every risk-adjusted tile on the card, plausibly and invisibly. The
 battery pins each primitive to a closed-form expectation written out from its
 definition, computed here with `math` alone — never by calling the code under test.
 
-**Consumer** — the backtester emits its own verdict at
-`backtest/{run_date}/attestation.json`. The card must carry that verdict, and a
-missing artifact must propagate as UNKNOWN, never as a pass.
+**Consumer** — two upstream stages emit their own verdicts under
+`backtest/{run_date}/`: the simulation engine at `attestation.json`, and the
+Evaluator stage (the one that grades the ranking metrics and promotes
+`config/executor_params.json` + `config/producer_champion.json`) at
+`evaluator_attestation.json`. The card must carry both, with their `as_of`
+stamps, and a missing artifact must propagate as UNKNOWN, never as a pass —
+including when the other two halves passed.
 """
 from __future__ import annotations
 
@@ -45,6 +49,45 @@ def _put_backtester_attestation(s3, body: dict, run_date: str = RUN_DATE):
         Key=f"backtest/{run_date}/attestation.json",
         Body=json.dumps(body).encode(),
     )
+
+
+def _put_evaluator_stage_attestation(s3, body: dict, run_date: str = RUN_DATE):
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"backtest/{run_date}/evaluator_attestation.json",
+        Body=json.dumps(body).encode(),
+    )
+
+
+def _stage_body(verdict: str = "PASS", run_date: str = RUN_DATE, **extra):
+    """A minimal `evaluator_attestation-1.0.0` body as the producer emits it."""
+    body = {
+        "schema": "evaluator_attestation-1.0.0",
+        "component": "evaluator",
+        "run_date": run_date,
+        "verdict": verdict,
+        "promotion_withheld": verdict != "PASS",
+        "own": {
+            "schema": "evaluator_attestation-1.0.0", "component": "evaluator",
+            "status": "ok", "verdict": verdict, "n_checks": 11, "n_failed": 0,
+            "n_errored": 0, "checks": [], "engine": {"python": "3.11.9"},
+        },
+        "upstream": {
+            "component": "backtester", "verdict": verdict, "reason": "verdict read",
+            "as_of": "2026-08-08T06:13:29Z",
+            "key": f"backtest/{run_date}/attestation.json",
+        },
+    }
+    body.update(extra)
+    return body
+
+
+def _put_both_passing(s3, run_date: str = RUN_DATE):
+    _put_backtester_attestation(s3, {
+        "schema": "backtest_attestation-1.0.0", "run_date": run_date,
+        "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0,
+    }, run_date=run_date)
+    _put_evaluator_stage_attestation(s3, _stage_body(run_date=run_date), run_date=run_date)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -201,15 +244,69 @@ class TestBacktesterVerdictConsumption:
 
 
 class TestCombinedVerdict:
-    def test_pass_requires_both_halves(self, s3):
+    def test_pass_requires_all_three_halves(self, s3):
+        _put_both_passing(s3)
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] == attestation.PASS
+        assert block["evaluator"]["verdict"] == attestation.PASS
+        assert block["backtester"]["verdict"] == attestation.PASS
+        assert block["evaluator_stage"]["verdict"] == attestation.PASS
+
+    def test_a_missing_evaluator_stage_verdict_degrades_the_card(self, s3):
+        # The engine attested; the stage that grades and PROMOTES off its numbers
+        # did not. Two of three halves is not a verified card.
         _put_backtester_attestation(s3, {
             "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
             "status": "ok", "verdict": "PASS",
         })
         block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
-        assert block["verdict"] == attestation.PASS
-        assert block["evaluator"]["verdict"] == attestation.PASS
-        assert block["backtester"]["verdict"] == attestation.PASS
+        assert block["verdict"] == attestation.UNKNOWN
+        assert block["evaluator_stage"]["verdict"] == attestation.UNKNOWN
+        assert "absent" in block["evaluator_stage"]["reason"]
+
+    def test_a_failing_evaluator_stage_outranks_a_passing_engine(self, s3):
+        _put_backtester_attestation(s3, {
+            "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+            "status": "ok", "verdict": "PASS",
+        })
+        _put_evaluator_stage_attestation(s3, _stage_body(verdict="FAIL"))
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] == attestation.FAIL
+
+    def test_stage_verdict_from_another_cycle_is_not_inherited(self, s3):
+        _put_backtester_attestation(s3, {
+            "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+            "status": "ok", "verdict": "PASS",
+        })
+        # A PASS body written under THIS cycle's key but stamped with last week's
+        # run_date — S3 will serve it happily.
+        _put_evaluator_stage_attestation(s3, _stage_body(run_date="2026-08-08"))
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] == attestation.UNKNOWN
+        assert "another cycle" in block["evaluator_stage"]["reason"]
+
+    def test_promotion_withheld_surfaces_on_the_block(self, s3):
+        _put_backtester_attestation(s3, {
+            "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+            "status": "ok", "verdict": "PASS",
+        })
+        _put_evaluator_stage_attestation(s3, _stage_body(verdict="UNKNOWN"))
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["promotion_withheld"] is True
+        assert "WITHHELD" in block["evaluator_stage"]["reason"]
+
+    def test_as_of_is_carried_per_half(self, s3):
+        _put_both_passing(s3)
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        # A state with no timestamp cannot read as stale — §2.3a rule 3's
+        # surface requirement is state AND as-of.
+        assert block["as_of"]["backtester"] is not None
+        assert block["as_of"]["evaluator_stage"] is not None
+
+    def test_as_of_is_none_when_the_verdict_is_absent(self, s3):
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["as_of"]["backtester"] is None
+        assert block["as_of"]["evaluator_stage"] is None
 
     def test_a_missing_backtester_verdict_degrades_the_card(self, s3):
         block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
@@ -333,10 +430,7 @@ class TestReportCardCarriesTheVerdict:
     def test_degraded_flag_clears_only_on_a_full_pass(self, s3, monkeypatch):
         import grading.aggregate as aggregate
 
-        _put_backtester_attestation(s3, {
-            "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
-            "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0,
-        })
+        _put_both_passing(s3)
         monkeypatch.setattr(aggregate, "assert_input_freshness", lambda *a, **k: {})
         monkeypatch.setattr(aggregate, "read_scorecard_inputs",
                             lambda *a, **k: ({}, _StubReport()))
@@ -410,3 +504,154 @@ class TestProducerConsumerContract:
 class _StubReport:
     def as_dict(self):
         return {"n_read": 0, "n_missing": 0}
+
+
+class TestEvaluatorStageProducerConsumerContract:
+    """M0 contract discipline — the consumer half of
+    `crucible-backtester contracts/evaluator_attestation.schema.json`.
+
+    The producer half (a real `build_stage_attestation()` body validated against
+    that schema) lives in that repo; this half pins the fields THIS consumer
+    reads, so a producer-side rename cannot silently degrade every card to
+    UNKNOWN without a test here going red first.
+    """
+
+    #: A body copied from the producer's emitted shape.
+    PRODUCER_BODY = {
+        "schema": "evaluator_attestation-1.0.0",
+        "component": "evaluator",
+        "run_date": RUN_DATE,
+        "verdict": "PASS",
+        "promotion_withheld": False,
+        "own": {
+            "schema": "evaluator_attestation-1.0.0",
+            "component": "evaluator",
+            "run_date": RUN_DATE,
+            "status": "ok",
+            "verdict": "PASS",
+            "checks": [
+                {"name": "ic_single_adjacent_transposition",
+                 "description": "rho = 1 - 6*sum(d^2)/(n(n^2-1)) = 4493/4495",
+                 "expected": 0.9995550611790879, "observed": 0.9995550611790878,
+                 "abs_error": 1.1102230246251565e-16, "rtol": 1e-9, "atol": 1e-12,
+                 "passed": True},
+            ],
+            "n_checks": 11,
+            "n_failed": 0,
+            "n_errored": 0,
+            "engine": {"python": "3.11.9", "numpy": "2.4.6", "pandas": "2.2.3"},
+            "wall_clock_seconds": 0.31,
+        },
+        "upstream": {
+            "component": "backtester",
+            "verdict": "PASS",
+            "reason": "verdict read",
+            "as_of": "2026-08-08T06:13:29Z",
+            "key": f"backtest/{RUN_DATE}/attestation.json",
+        },
+    }
+
+    #: Exactly the fields this consumer reads.
+    CONSUMED_FIELDS = ("schema", "run_date", "verdict", "promotion_withheld", "own")
+
+    def test_consumes_a_verbatim_producer_body(self, s3):
+        _put_evaluator_stage_attestation(s3, self.PRODUCER_BODY)
+        block = attestation.read_evaluator_stage_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] == attestation.PASS
+        assert block["n_checks"] == 11
+        assert block["n_failed"] == 0
+        assert block["engine"]["python"] == "3.11.9"
+        assert block["promotion_withheld"] is False
+
+    @pytest.mark.parametrize("field", CONSUMED_FIELDS)
+    def test_each_consumed_field_can_go_missing_without_an_exception(self, s3, field):
+        body = {k: v for k, v in self.PRODUCER_BODY.items() if k != field}
+        _put_evaluator_stage_attestation(s3, body)
+        block = attestation.read_evaluator_stage_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] in (attestation.PASS, attestation.UNKNOWN)
+        if field in ("run_date", "verdict"):
+            assert block["verdict"] == attestation.UNKNOWN
+
+    def test_named_failing_checks_reach_the_reason(self, s3):
+        body = json.loads(json.dumps(self.PRODUCER_BODY))
+        body["verdict"] = "FAIL"
+        body["own"]["verdict"] = "FAIL"
+        body["own"]["n_failed"] = 1
+        body["own"]["checks"][0]["passed"] = False
+        _put_evaluator_stage_attestation(s3, body)
+        block = attestation.read_evaluator_stage_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["verdict"] == attestation.FAIL
+        assert "ic_single_adjacent_transposition" in block["reason"]
+
+
+class TestBacktesterTileCarriesTheStageVerdict:
+    """The tile component must be CRITICAL and must never default to GREEN."""
+
+    def _component(self, s3, monkeypatch):
+        import grading.tiles.backtester as tile_mod
+
+        tile = tile_mod.build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        by_name = {c["name"]: c for c in tile["components"]}
+        return by_name["evaluator_stage_attestation"]
+
+    def test_absent_verdict_is_not_green(self, s3, monkeypatch):
+        comp = self._component(s3, monkeypatch)
+        assert comp["criticality"] == "critical"
+        assert comp["status"] == "N/A-MISSING-INPUT"
+        assert comp["value"] is None
+        assert "absence is never a pass" in comp["status_reason"]
+
+    def test_pass_is_green(self, s3, monkeypatch):
+        _put_evaluator_stage_attestation(s3, _stage_body())
+        comp = self._component(s3, monkeypatch)
+        assert comp["status"] == "GREEN"
+        assert comp["value"] == 1.0
+
+    def test_fail_is_red(self, s3, monkeypatch):
+        _put_evaluator_stage_attestation(s3, _stage_body(verdict="FAIL"))
+        comp = self._component(s3, monkeypatch)
+        assert comp["status"] == "RED"
+        assert comp["value"] == 0.0
+
+
+class TestDirectorDigestCarriesTheState:
+    def _digest(self, card):
+        from director.report_card_digest import summarize_report_card
+
+        return summarize_report_card(card)
+
+    def test_absent_attestation_block_warns(self):
+        text = self._digest({"tiles": {}, "tiles_overall_status": "GREEN"})
+        assert "CORRECTNESS ATTESTATION: UNKNOWN" in text
+
+    def test_as_of_is_rendered_beside_the_state(self):
+        text = self._digest({
+            "tiles": {}, "tiles_overall_status": "GREEN",
+            "attestation": {
+                "verdict": "PASS", "reason": "ok",
+                "as_of": {"backtester": "2026-08-08T06:13:29Z",
+                          "evaluator_stage": "2026-08-08T06:14:02Z"},
+            },
+        })
+        assert "2026-08-08T06:13:29Z" in text
+        assert "2026-08-08T06:14:02Z" in text
+
+    def test_a_never_written_half_renders_as_never_not_as_blank(self):
+        text = self._digest({
+            "tiles": {}, "tiles_overall_status": "GREEN",
+            "attestation": {
+                "verdict": "UNKNOWN", "reason": "absent",
+                "as_of": {"backtester": "2026-08-08T06:13:29Z",
+                          "evaluator_stage": None},
+            },
+        })
+        assert "evaluator_stage as-of never" in text
+
+    def test_withheld_promotion_is_stated_in_terms_of_the_live_system(self):
+        text = self._digest({
+            "tiles": {}, "tiles_overall_status": "GREEN",
+            "attestation": {"verdict": "UNKNOWN", "reason": "absent",
+                            "promotion_withheld": True},
+        })
+        assert "PROMOTION WITHHELD" in text
+        assert "PREVIOUS cycle's" in text
