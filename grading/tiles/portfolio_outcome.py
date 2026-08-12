@@ -72,6 +72,25 @@ class EodPnlSeries:
         return len(self.port)
 
 
+def cumulative_log_alpha(port, spy) -> float:
+    """Cumulative log-domain alpha vs SPY: Σ (log(1+r_p) − log(1+r_spy)).
+
+    Extracted from ``build_portfolio_outcome_tile`` so the runtime attestation
+    (``grading/attestation.py``) can pin the ``alpha_vs_spy`` headline to a
+    closed-form expectation — a metric computed only inside a 400-line tile
+    builder cannot be attested without standing up its whole input surface.
+
+    Days where either leg would take the log of a non-positive quantity (a −100%
+    or worse daily return) are skipped rather than producing ``-inf``; that guard
+    is part of the definition and is attested with it.
+    """
+    return sum(
+        math.log1p(p) - math.log1p(s)
+        for p, s in zip(port, spy)
+        if (1 + p) > 0 and (1 + s) > 0
+    )
+
+
 def read_eod_pnl(bucket: str, s3_client=None) -> EodPnlSeries | None:
     """Read + parse eod_pnl.csv from S3. None if absent (NoSuchKey); raises on
     any other S3 error (fail-loud per no_silent_fails)."""
@@ -507,11 +526,7 @@ def build_portfolio_outcome_tile(
     ))
 
     # 4. Alpha vs SPY (critical) — cumulative log-alpha since inception.
-    log_alpha = sum(
-        math.log1p(p) - math.log1p(s)
-        for p, s in zip(port, series.spy)
-        if (1 + p) > 0 and (1 + s) > 0
-    )
+    log_alpha = cumulative_log_alpha(port, series.spy)
     components.append(build_metric(
         name="alpha_vs_spy", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="cumulative_log_alpha", measurement_horizon="since_inception",

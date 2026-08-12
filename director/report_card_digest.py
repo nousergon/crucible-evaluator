@@ -75,7 +75,38 @@ def summarize_report_card(card: dict) -> str:
     overall = card.get("tiles_overall_status", "N/A")
     tiles = card.get("tiles", {}) or {}
 
-    out = [f"# Report Card v2 — run_date {run_date}", f"OVERALL: {overall}", ""]
+    out = [f"# Report Card v2 — run_date {run_date}", f"OVERALL: {overall}"]
+
+    # sf-pipeline-policy §2.3a rule 3 — every surface presenting the run's numbers
+    # carries the correctness-verdict state. The Director acts on these numbers
+    # (files issues, grades its own prior plan), so it depends on them being
+    # uncontaminated and must see when that was not established. Rendered BEFORE
+    # the tiles so it cannot be read past.
+    #
+    # `degraded_staleness` is surfaced here too: aggregate.py has documented since
+    # config#2885 that "the Director agent's prompt MUST check this before treating
+    # the card as ground truth", but the flag never reached the digest — the same
+    # verdict-does-not-propagate defect one axis over.
+    att = card.get("attestation") or {}
+    verdict = att.get("verdict")
+    if verdict == "PASS":
+        out.append("CORRECTNESS ATTESTATION: PASS — the deployed backtest engine and "
+                   "the evaluator's quant primitives both agreed with their known answers.")
+    elif verdict:
+        out.append(
+            f"⚠ CORRECTNESS ATTESTATION: {verdict} — {att.get('reason', '')} "
+            "The numbers below are NOT established as correct: do not assert a "
+            "metric moved, and do not prescribe an action premised on its level."
+        )
+    else:
+        out.append(
+            "⚠ CORRECTNESS ATTESTATION: UNKNOWN — this card carries no attestation "
+            "block. Treat every number below as unverified."
+        )
+    if card.get("degraded_staleness"):
+        out.append("⚠ DEGRADED (staleness): stale tiles — "
+                   + ", ".join(card.get("stale_tiles") or []))
+    out.append("")
 
     for key in TILE_ORDER:
         tile = tiles.get(key)

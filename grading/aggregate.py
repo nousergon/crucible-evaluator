@@ -30,6 +30,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
+from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
@@ -182,6 +183,22 @@ def build_report_card(
     scorecard["degraded_staleness"] = bool(stale_tiles)
     if stale_tiles:
         scorecard["stale_tiles"] = sorted(stale_tiles)
+
+    # sf-pipeline-policy §2.3a — the run's CORRECTNESS VERDICT, distinct from the
+    # freshness gate above. Freshness answers "are the inputs current"; this
+    # answers "is the arithmetic that produced them still right". Both halves are
+    # known-answer batteries run at RUNTIME on the deployed wheels: the
+    # evaluator's own quant primitives here, and the backtest engine's verdict
+    # read from backtest/{run_date}/attestation.json.
+    #
+    # A missing verdict propagates as UNKNOWN, never as a pass (rule 2), and every
+    # surface presenting the run's numbers carries the state (rule 3): the card
+    # here, the Backtester tile's `numeric_attestation` critical component, and the
+    # Director digest. Never raises — a dead verdict stage must not kill the card,
+    # and must equally not let it render as verified.
+    attestation = build_run_attestation(bucket, run_date, s3_client=s3_client)
+    scorecard["attestation"] = attestation
+    scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])
 
     scorecard["_provenance"] = {
         "run_date": run_date,

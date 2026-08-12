@@ -47,7 +47,9 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib import contracts
 
+from grading import attestation as attestation_module
 from grading.artifacts import BACKTESTER_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
+from grading.attestation import read_backtester_attestation
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -218,6 +220,49 @@ def build_backtester_tile(
                 f"evaluator_coverage: grading.json is {grading_age}d old "
                 f"(> {BACKTESTER_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, cannot grade confidently."
                 if grading_stale else "evaluator_coverage: grading.json absent this cycle."
+            ),
+        ))
+
+    # 1b. numeric_attestation (CRITICAL) — sf-pipeline-policy §2.3a.
+    #
+    # The backtester runs a known-answer battery through its production simulation
+    # path, in-process, on every cycle, and emits the verdict at
+    # backtest/{date}/attestation.json. Every other component on this tile grades
+    # the backtester's feedback-loop integrity; this one grades whether its
+    # ARITHMETIC is still right on the wheels the spot instance actually resolved.
+    #
+    # Deliberately NOT windowed like the artifacts above: a verdict from an
+    # earlier cycle says nothing about this cycle's numbers (rule 1), so a missing
+    # artifact is N/A-MISSING-INPUT — never GREEN, never inherited. RED on FAIL:
+    # a disagreeing known-answer check means the week's backtest numbers, and the
+    # config the optimizer derived from them, cannot be trusted.
+    att = read_backtester_attestation(bucket, run_date, s3_client=s3)
+    a_src = att["source_path"]
+    if att["verdict"] == attestation_module.PASS:
+        components.append(build_metric(
+            name="numeric_attestation", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            value=1.0, n_samples=att.get("n_checks") or 1, n_floor=1,
+            target=1.0, red_line=1.0, source_path=a_src, status="GREEN",
+            reason=att["reason"],
+        ))
+    elif att["verdict"] == attestation_module.FAIL:
+        components.append(build_metric(
+            name="numeric_attestation", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            value=0.0, n_samples=att.get("n_checks") or 1, n_floor=1,
+            target=1.0, red_line=1.0, source_path=a_src, status="RED",
+            reason=att["reason"],
+        ))
+    else:
+        components.append(build_metric(
+            name="numeric_attestation", module=MODULE, metric_type="pct", criticality="critical",
+            estimator="known_answer_battery", measurement_horizon="this_cycle",
+            n_floor=1, target=1.0, red_line=1.0, source_path=a_src, input_present=False,
+            na_detail=(
+                "numeric_attestation: " + att.get("reason", "verdict UNKNOWN")
+                + " Per sf-pipeline-policy §2.3a the correctness guarantee is WITHHELD "
+                "this cycle — absence is never a pass."
             ),
         ))
 
