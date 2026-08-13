@@ -1,0 +1,282 @@
+"""Tests for `grading/self_test.py` — the published known-answer self-test.
+
+Three layers, and the last two are the load-bearing ones:
+
+1. **The battery agrees on THIS runner.** Every case passes here too, so a CI
+   failure and an in-Lambda failure mean the same thing and can be compared.
+2. **The expectations are re-derived here, independently.** Each closed form is
+   recomputed in the test from the metric's definition. If the module's own
+   arithmetic were ever quietly changed to match the implementation, this layer
+   is what notices.
+3. **The runner's outcome taxonomy holds.** Disagreed => FAIL, could-not-run =>
+   UNKNOWN, over-budget => FAIL (Brian ruling 2026-08-13). This is the part that
+   decides whether a harness fault gets reported as a correctness regression.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+
+import pytest
+
+from grading import self_test as st
+
+
+# ── layer 1: the real battery ───────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def body():
+    return st.run_self_test(run_date="2026-08-15")
+
+
+def test_every_case_passes_on_this_runner(body):
+    failures = [c for c in body["cases"] if c["verdict"] != st.PASS]
+    assert not failures, json.dumps(failures, indent=2, default=str)
+    assert body["verdict"] == st.PASS
+    assert body["n_cases"] == len(st.build_cases())
+
+
+def test_the_five_named_metrics_are_all_covered(body):
+    """Sharpe, Sortino, Calmar, CVaR(95) and max drawdown — the five asked for.
+
+    A case silently dropped in a refactor is a coverage regression nothing else
+    would notice: the artifact would still say PASS, on fewer questions.
+    """
+    names = {c["case"] for c in body["cases"]}
+    assert {
+        "sharpe_closed_form",
+        "sortino_closed_form",
+        "calmar_closed_form",
+        "cvar_95_closed_form",
+        "max_drawdown_closed_form",
+    } <= names
+
+
+def test_every_closed_form_case_asserts_to_1e_9(body):
+    for case in body["cases"]:
+        if case["case"].endswith("_closed_form"):
+            assert case["tolerance"] == 1e-9
+            assert case["abs_error"] <= 1e-9
+
+
+# ── layer 2: the expectations, re-derived from first principles ─────────────
+
+_UP, _DOWN, _N_UP, _N_DOWN = 0.01, -0.01, 60, 40
+_N = _N_UP + _N_DOWN
+_MEAN = (_N_UP * _UP + _N_DOWN * _DOWN) / _N
+
+
+def test_expected_sharpe_is_the_definition():
+    variance = (_N_UP * (_UP - _MEAN) ** 2 + _N_DOWN * (_DOWN - _MEAN) ** 2) / (_N - 1)
+    assert st._expected_sharpe() == pytest.approx(
+        _MEAN / math.sqrt(variance) * math.sqrt(252), rel=0, abs=1e-15)
+
+
+def test_expected_sortino_uses_the_full_N_denominator():
+    """The load-bearing convention: RMS of min(0, r) over ALL N, not over the
+    negatives. The wrong denominator differs by sqrt(100/40) = 1.58x, so this
+    assertion is what stops the expectation drifting to match a changed lib."""
+    dd_over_n = math.sqrt(_N_DOWN * _DOWN**2 / _N)
+    dd_over_negatives = math.sqrt(_N_DOWN * _DOWN**2 / _N_DOWN)
+    assert st._expected_sortino() == pytest.approx(
+        _MEAN / dd_over_n * math.sqrt(252), rel=0, abs=1e-15)
+    assert st._expected_sortino() != pytest.approx(
+        _MEAN / dd_over_negatives * math.sqrt(252), rel=1e-6)
+
+
+def test_expected_max_drawdown_is_the_peak_to_trough_ratio():
+    assert st._expected_max_drawdown() == pytest.approx(0.99**40 - 1, rel=0, abs=1e-15)
+
+
+def test_expected_calmar_is_annualised_return_over_abs_drawdown():
+    growth = 1.01**59 * 0.99**40
+    expected = (growth ** (252 / 100) - 1.0) / abs(0.99**40 - 1)
+    assert st._expected_calmar() == pytest.approx(expected, rel=0, abs=1e-15)
+
+
+def test_expected_cvar_is_the_tail_mean_on_the_return_scale():
+    assert st._expected_cvar_95() == -0.01
+
+
+def test_the_frozen_fixture_is_the_series_the_expectations_assume():
+    """A fixture drifting away from the derivation silently makes every closed
+    form a coincidence. Asserted against the rendered CSV, not the constants."""
+    text = st._eod_pnl_csv(st._returns())
+    rows = text.strip().splitlines()
+    assert rows[0] == "date,portfolio_nav,daily_return_pct,spy_return_pct"
+    body_rows = rows[1:]
+    assert len(body_rows) == _N
+    ups = [r for r in body_rows if r.split(",")[2] == repr(1.0)]
+    downs = [r for r in body_rows if r.split(",")[2] == repr(-1.0)]
+    assert len(ups) == _N_UP and len(downs) == _N_DOWN
+    # Percent, not fraction — the tile divides by 100, so the fixture must
+    # exercise that conversion rather than bypass it.
+    assert body_rows[0].split(",")[2] == repr(1.0)
+
+
+# ── layer 3: the artifact and the taxonomy ──────────────────────────────────
+
+def test_artifact_carries_the_provenance_header(body):
+    """The library versions ARE the deliverable — this is an instrument check."""
+    assert body["schema"] == "evaluator_self_test-1.0.0"
+    assert body["component"] == "evaluator"
+    assert body["run_date"] == "2026-08-15"
+    assert body["python"]
+    assert "code_sha" in body
+    for dist in ("nousergon-lib", "numpy", "pandas"):
+        assert body["libraries"][dist], f"{dist} version is empty"
+
+
+def test_every_case_row_carries_the_full_shape(body):
+    for case in body["cases"]:
+        assert set(case) >= {
+            "case", "description", "inputs", "expected", "actual",
+            "abs_error", "tolerance", "verdict",
+        }
+        assert case["inputs"], f"{case['case']} publishes no inputs to re-derive from"
+        assert case["verdict"] in (st.PASS, st.FAIL, st.UNKNOWN)
+
+
+def test_artifact_is_strict_json(body):
+    """``allow_nan=False`` RAISES on a non-finite float anywhere in the body."""
+    text = json.dumps(body, allow_nan=False, default=str)
+    assert json.loads(text)["verdict"] == body["verdict"]
+
+
+def test_battery_is_cheap_enough_to_run_every_cycle(body):
+    assert body["wall_clock_seconds"] < 30.0
+
+
+def _case(name="c", expected=1.0, compute=lambda: 1.0, tolerance=0.0):
+    return st.Case(name=name, description="d", inputs={"k": 1},
+                   expected=expected, compute=compute, tolerance=tolerance)
+
+
+def test_disagreement_is_FAIL_not_UNKNOWN():
+    out = st.run_self_test(case_provider=lambda: [_case(expected=1.0, compute=lambda: 2.0)])
+    assert out["cases"][0]["verdict"] == st.FAIL
+    assert out["verdict"] == st.FAIL
+
+
+def test_a_case_that_could_not_run_is_UNKNOWN_not_FAIL():
+    def _boom():
+        raise RuntimeError("import blew up")
+
+    out = st.run_self_test(case_provider=lambda: [_case(compute=_boom)])
+    assert out["cases"][0]["verdict"] == st.UNKNOWN
+    assert out["verdict"] == st.UNKNOWN
+
+
+def test_a_timeout_is_FAIL_never_UNKNOWN():
+    """Brian ruling 2026-08-13.
+
+    Asserted on the raised exception rather than on elapsed wall-clock, so the
+    branch is exercised deterministically — a timing-based version of this test
+    is only as trustworthy as the process's clock, and this suite has already
+    had a test leak a no-op ``time.sleep`` across files.
+    """
+    def _too_slow():
+        raise st._CaseTimeout("case exceeded its budget")
+
+    out = st.run_self_test(case_provider=lambda: [_case(compute=_too_slow)])
+    assert out["cases"][0]["verdict"] == st.FAIL
+    assert out["cases"][0]["timed_out"] is True
+    assert out["verdict"] == st.FAIL
+
+
+def test_an_over_budget_call_really_does_raise_case_timeout():
+    """The other half: the budget mechanism itself fires on a real overrun.
+
+    Busy-waits on ``time.monotonic`` rather than sleeping, so it holds whether
+    or not a SIGALRM budget could be installed and regardless of what any other
+    test did to ``time.sleep``.
+    """
+    import time as _time
+
+    def _busy():
+        deadline = _time.monotonic() + 0.5
+        while _time.monotonic() < deadline:
+            pass
+        return 1.0
+
+    with pytest.raises(st._CaseTimeout):
+        st._call_with_timeout(_busy, 0.1)
+
+
+def test_a_battery_that_could_not_be_built_is_UNKNOWN_and_does_not_raise():
+    def _boom():
+        raise ImportError("no lib")
+
+    out = st.run_self_test(case_provider=_boom)
+    assert out["verdict"] == st.UNKNOWN
+    assert out["status"] == "error"
+
+
+def test_an_empty_battery_is_UNKNOWN_never_PASS():
+    assert st.run_self_test(case_provider=lambda: [])["verdict"] == st.UNKNOWN
+
+
+def test_fail_beats_unknown_in_the_overall_verdict():
+    def _boom():
+        raise RuntimeError("x")
+
+    out = st.run_self_test(case_provider=lambda: [
+        _case(name="a", expected=1.0, compute=lambda: 2.0),
+        _case(name="b", compute=_boom),
+    ])
+    assert out["verdict"] == st.FAIL
+
+
+def test_verdict_is_pass_only_on_the_literal_PASS():
+    assert st.verdict_is_pass("PASS")
+    for other in (None, "", "ok", "pass", "UNKNOWN", "FAIL", True):
+        assert not st.verdict_is_pass(other)
+
+
+def test_missing_distribution_is_recorded_explicitly_never_omitted():
+    resolved = st.resolved_library_versions(("nousergon-lib", "definitely-not-a-package"))
+    assert resolved["definitely-not-a-package"] == "<not installed>"
+
+
+def test_self_test_key_is_the_declared_artifact_path():
+    assert st.self_test_key("2026-08-15") == "evaluator/2026-08-15/self_test.json"
+
+
+def test_frozen_s3_serves_only_the_fixture_and_never_reaches_the_network():
+    from botocore.exceptions import ClientError
+
+    from grading.tiles.portfolio_outcome import EOD_PNL_KEY
+
+    fake = st._FrozenS3("x", EOD_PNL_KEY)
+    assert fake.get_object(Bucket="b", Key=EOD_PNL_KEY)["Body"].read() == b"x"
+    with pytest.raises(ClientError):
+        fake.get_object(Bucket="b", Key="signals/2024-01-01/signals.json")
+
+
+def test_write_self_test_puts_the_declared_key():
+    written = {}
+
+    class _S3:
+        def put_object(self, **kw):
+            written.update(kw)
+
+    key = st.write_self_test("bkt", "2026-08-15", {"verdict": "PASS"}, s3_client=_S3())
+    assert key == "evaluator/2026-08-15/self_test.json"
+    assert written["Bucket"] == "bkt"
+    assert json.loads(written["Body"])["verdict"] == "PASS"
+
+
+# ── wiring: the handler runs it, publishes it, and reports the verdict ──────
+
+def test_handler_wires_the_self_test():
+    """String-level wiring assertion: without these the artifact silently stops
+    being published and nothing fails."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "grading" / "handler.py").read_text()
+    assert "from grading.self_test import run_self_test, verdict_is_pass, write_self_test" in source
+    assert "self_test = run_self_test(run_date=run_date)" in source
+    assert "write_self_test(bucket, run_date, self_test)" in source
+    assert '"self_test_verdict": self_test.get("verdict")' in source
+    assert '"degraded_self_test": not self_test_pass' in source
