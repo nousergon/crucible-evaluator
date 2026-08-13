@@ -78,12 +78,21 @@ def test_resolved_digest_skips_and_makes_no_request(monkeypatch):
     assert tripwire.calls == 0
 
 
+#: An attested cycle. The §2.3a verdict gate is default-deny (config-I7039), so
+#: a budget test that omitted it would pass for the wrong reason.
+_ATTESTED = {"verdict": "PASS", "present": True, "as_of": {}}
+
+
 def test_issue_filing_skips_whole_batch_and_files_nothing(monkeypatch):
     tripwire = _Tripwire()
     monkeypatch.setattr(H, "file_director_issues", tripwire)
     monkeypatch.setattr(H, "_issue_filing_enabled", lambda: True)
 
-    out = H._file_issues_best_effort(object(), "2026-08-10", "tok", budget=_starved())
+    # config-I7039: the §2.3a gate is checked BEFORE the budget, so this test
+    # must declare an attested cycle or it would measure the verdict gate
+    # instead of the budget guard it is named for.
+    out = H._file_issues_best_effort(object(), "2026-08-10", "tok", budget=_starved(),
+                                     verdict_block=_ATTESTED)
 
     assert out["director_issues"] == "skipped"
     assert "budget" in out["director_issues_reason"]
@@ -96,7 +105,8 @@ def test_loop_verification_skips_whole_pass_and_mutates_nothing(monkeypatch):
     monkeypatch.setattr(H, "verify_and_correct", tripwire)
     ledger = {"items": [{"id": "a", "status": "open"}]}
 
-    out = H._verify_loop_best_effort(ledger, {}, "tok", budget=_starved())
+    out = H._verify_loop_best_effort(ledger, {}, "tok", budget=_starved(),
+                                     verdict_block=_ATTESTED)
 
     assert out["director_loop"] == "skipped"
     assert "budget" in out["director_loop_reason"]
