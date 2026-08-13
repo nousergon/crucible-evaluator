@@ -82,12 +82,32 @@ def _stage_body(verdict: str = "PASS", run_date: str = RUN_DATE, **extra):
     return body
 
 
+def _put_contamination(s3, body=None, run_date: str = RUN_DATE):
+    """config#7199 — the look-ahead-contamination verdict half."""
+    import json as _json
+    doc = body if body is not None else {
+        "schema": "pit_parity-1.0.0", "run_date": run_date, "status": "ok",
+        "verdict": "PASS", "verdict_reason": "PASS.",
+        "coverage": {"coverage_fraction": 1.0, "budget_stopped": False,
+                     "complete": True, "measured": True},
+        "materiality": {"material": False},
+    }
+    s3.put_object(
+        Bucket=BUCKET, Key=f"backtest/{run_date}/pit_parity.json",
+        Body=_json.dumps(doc).encode(),
+    )
+
+
 def _put_both_passing(s3, run_date: str = RUN_DATE):
+    """All FOUR halves passing (config#7199 added the contamination half; the
+    name predates it and is kept so every existing call site still means "the
+    fully-attested case")."""
     _put_backtester_attestation(s3, {
         "schema": "backtest_attestation-1.0.0", "run_date": run_date,
         "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0,
     }, run_date=run_date)
     _put_evaluator_stage_attestation(s3, _stage_body(run_date=run_date), run_date=run_date)
+    _put_contamination(s3, run_date=run_date)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -244,13 +264,32 @@ class TestBacktesterVerdictConsumption:
 
 
 class TestCombinedVerdict:
-    def test_pass_requires_all_three_halves(self, s3):
+    def test_pass_requires_all_four_halves(self, s3):
         _put_both_passing(s3)
         block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
         assert block["verdict"] == attestation.PASS
         assert block["evaluator"]["verdict"] == attestation.PASS
         assert block["backtester"]["verdict"] == attestation.PASS
         assert block["evaluator_stage"]["verdict"] == attestation.PASS
+        assert block["contamination"]["verdict"] == attestation.PASS
+        # config#7199 — the two claims stay two.
+        assert block["arithmetic_verdict"] == attestation.PASS
+        assert block["contamination_verdict"] == attestation.PASS
+
+    def test_three_clean_arithmetic_halves_do_not_carry_a_missing_contamination_half(self, s3):
+        """The 2026-08-07 configuration. Every arithmetic half attests, the
+        contamination check never answered, and the card must NOT read verified
+        — that is the whole of config#7199."""
+        _put_backtester_attestation(s3, {
+            "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+            "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0,
+        }, run_date=RUN_DATE)
+        _put_evaluator_stage_attestation(s3, _stage_body(run_date=RUN_DATE),
+                                         run_date=RUN_DATE)
+        block = attestation.build_run_attestation(BUCKET, RUN_DATE, s3_client=s3)
+        assert block["arithmetic_verdict"] == attestation.PASS
+        assert block["contamination_verdict"] == attestation.UNKNOWN
+        assert block["verdict"] == attestation.UNKNOWN
 
     def test_a_missing_evaluator_stage_verdict_degrades_the_card(self, s3):
         # The engine attested; the stage that grades and PROMOTES off its numbers
