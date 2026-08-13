@@ -64,7 +64,7 @@ from typing import Any
 # a second copy of `verdict == "PASS"` is a second place the "missing reads as
 # pass" bug can be reintroduced (`policy-shared-code` — same repo, so the fix
 # is an import, not a lift).
-from grading.attestation import FAIL, PASS, UNKNOWN, verdict_is_pass
+from grading.attestation import FAIL, PARTIAL, PASS, UNKNOWN, verdict_is_pass
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 #: emitted body is stamped ``report_card_attestation-1.0.0``.
 ATTESTATION_KEY = "attestation"
 
-_VALID_VERDICTS = frozenset({PASS, FAIL, UNKNOWN})
+_VALID_VERDICTS = frozenset({PASS, FAIL, PARTIAL, UNKNOWN})
 
 #: The Director actions gated on the verdict. Each creates state that OUTLIVES
 #: this cycle in a system other than this one, which is the test for membership
@@ -139,7 +139,22 @@ def read_card_verdict(card: Any) -> dict:
         "run_date": block.get("run_date"),
         "promotion_withheld": bool(block.get("promotion_withheld")),
     }
-    for half in ("evaluator", "backtester", "evaluator_stage"):
+    # config#7199: `contamination` joins the arithmetic halves. It is surfaced
+    # here as its own field, not folded into the combined verdict alone, because
+    # the digest sentence "the numbers are right" and the sentence "the numbers
+    # could not have seen the future" are different assurances to a reader.
+    result["arithmetic_verdict"] = (
+        block.get("arithmetic_verdict")
+        if block.get("arithmetic_verdict") in _VALID_VERDICTS else UNKNOWN
+    )
+    result["contamination_verdict"] = (
+        block.get("contamination_verdict")
+        if block.get("contamination_verdict") in _VALID_VERDICTS else UNKNOWN
+    )
+    result["contamination_coverage_fraction"] = block.get(
+        "contamination_coverage_fraction"
+    )
+    for half in ("evaluator", "backtester", "evaluator_stage", "contamination"):
         h = block.get(half)
         if isinstance(h, dict):
             result[f"{half}_verdict"] = (

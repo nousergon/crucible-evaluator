@@ -94,6 +94,14 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # (put_object ×2) under the "experiments" prefix — newly declared
     # readwrite in the contract for this PR.
     "grading/experiment_record.py": 2,
+    # config#7238: the published known-answer self-test writes one artifact,
+    # evaluator/{run_date}/self_test.json, via a single put_object in
+    # `write_self_test` — under the "evaluator" prefix, already declared
+    # readwrite above for the report card, so no contract or IAM change. The
+    # battery itself touches S3 not at all: it drives the production tile over
+    # an in-memory `_FrozenS3` that serves one frozen fixture and raises
+    # NoSuchKey for every other key.
+    "grading/self_test.py": 1,
     # config#3058: freshness_preflight reads metrics.json/e2e_lift.json (via
     # get_object) and probes signals.json instance dates (via head_object) --
     # all under the already-granted "backtest"/"predictor"/"signals"/"trades"
