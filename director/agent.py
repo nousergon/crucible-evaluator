@@ -103,7 +103,47 @@ DIRECTOR_EXEC_CONTEXT = os.environ.get("KREPIS_EXEC_CONTEXT", "lambda")
 
 _DIRECTOR_SCHEMA_NAME = "DirectorWeeklyActionPlan"
 _MAX_RETRIES = 3
-_RETRYABLE = ("overloaded", "rate", "429", "529", "timeout", "connection")
+
+# `openai.APITimeoutError` stringifies as **"Request timed out."** — which
+# matches neither "timeout" nor "connection". Measured 2026-08-13. So until
+# this line, the one failure mode the whole timeout chain exists to bound was
+# the one failure mode this loop did not retry; the retry that rescued the
+# 2026-08-09 run came from the SDK's own `max_retries`, which config#7126
+# removes (see `_CLIENT_MAX_RETRIES`). Retrying it here is therefore not new
+# behaviour — it is the same retry, moved to the only loop that can see the
+# invocation deadline.
+_RETRYABLE = (
+    "overloaded", "rate", "429", "529", "timeout", "timed out", "connection",
+)
+
+# ── The attempt multiplier (config#7126) ─────────────────────────────────────
+#
+# A single `llm.invoke()` used to be able to make FOUR timeout-bounded model
+# calls, and nothing in this module said so:
+#
+#   * `LLMClient(max_retries=1)`         → 2 transport attempts per model call
+#   * `client.structured()`              → `attempts=2` by DEFAULT (krepis'
+#                                          body-level corrective retry, which
+#                                          this call site never passed)
+#   ⇒ 2 × 2 = 4 × the per-attempt timeout, per invoke.
+#
+# `_invoke_with_retry` then wrapped that in up to 3 more, for a worst case of
+# 12 × 340s = 4080s inside a function whose timeout **cannot be raised**: 900s
+# is AWS Lambda's service maximum, not a number we chose.
+#
+# Meanwhile `budget.quote(..., attempts=2)` funded TWO. The budget module was
+# doing exactly what it was written to do and was quoting against an attempt
+# count that was wrong by 2× at the client and 6× overall — which is why
+# raising the ceiling from 300s to 900s moved the cliff instead of removing it,
+# the precise outcome `director/budget.py`'s docstring warns about.
+#
+# The fix is not a bigger number anywhere. It is **one retry loop instead of
+# three**, and it is the one that can see the deadline. Both inner loops are
+# collapsed to a single attempt each, so one `invoke()` is exactly one
+# timeout-bounded model call, and `_invoke_with_retry` — which now consults the
+# budget before every retry — owns the count.
+_CLIENT_MAX_RETRIES = 0
+_STRUCTURED_ATTEMPTS = 1
 
 # The `auth_token_type` -> credential-name mapping used to live here, as the
 # THIRD copy in the fleet (groomer_krepis_adapter.py, groom_driver.py, here) —
@@ -289,6 +329,13 @@ class _KrepisStructuredDirector:
     """Adapts a ``krepis.llm.LLMClient`` to the ``.invoke(messages) ->
     DirectorWeeklyActionPlan`` surface ``_invoke_with_retry`` expects."""
 
+    #: Wall-clock one ``invoke()`` may consume, for the budget gate in
+    #: ``_invoke_with_retry``. Deliberately the STATIC ceiling rather than the
+    #: (possibly shorter) quoted timeout: a retry is funded only when the
+    #: invocation could afford a full-ceiling attempt, so an already-late run
+    #: declines instead of buying one more chance to be killed at the wall.
+    attempt_cost_s = DIRECTOR_PLAN_CEILING_S
+
     def __init__(self, client, *, director_model: str):
         self._client = client
         self._director_model = director_model
@@ -318,6 +365,9 @@ class _KrepisStructuredDirector:
             user_content=user_content,
             schema=DirectorWeeklyActionPlan,
             schema_name=_DIRECTOR_SCHEMA_NAME,
+            # Explicit, not krepis' default of 2 — see `_STRUCTURED_ATTEMPTS`.
+            # Inheriting the default silently doubled every quoted budget.
+            attempts=_STRUCTURED_ATTEMPTS,
         )
         plan: DirectorWeeklyActionPlan = result.parsed
         plan.director_model = self._director_model
@@ -434,6 +484,36 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
     # edge's proxy_read_timeout is 360s, so the client, not the edge, times out
     # first and the failure is attributable.
     #
+    # Where 340 comes from — the derivation, which until config#7126 was
+    # asserted and never written down. Note the p90/p99 quoted above are
+    # CENSORED statistics: 3 of 14 observed runs were killed at a ceiling, so
+    # those percentiles report the wall back to the reader rather than the
+    # model's requirement. Five UNCENSORED plan calls, measured 2026-08-13
+    # against this same router edge with the same registry max_tokens and a
+    # Lambda-shaped prompt (11,212 prompt tokens, both backlog digests
+    # included), every one returning `finish_reason: stop`:
+    #
+    #     170.1s · 183.0s · 194.9s · 199.5s · 228.0s
+    #     draw 18.2k-23.3k completion tokens at 99-109 tok/s
+    #
+    # Plus one full `build_action_plan()` through this exact code path at
+    # krepis 0.56.0 — 212.7s, 25 action items, resolved=glm-5.2 — which also
+    # clears the served-model guard that failed the 2026-08-09 run
+    # (alpha-engine-config-I6543).
+    #
+    # 340s = 1.49 × the slowest uncensored call — `sf-pipeline-policy.md` §4's
+    # "observed p95 × 1.5" shape, now computed over samples that were allowed
+    # to finish.
+    #
+    # It also cannot simply be raised, for a reason outside this repo: the
+    # router edge's `proxy_read_timeout` is 360s, so any ceiling at or above it
+    # hands the deadline to the EDGE and the failure stops being attributable
+    # to this call site. 340 < 360 keeps the client owning it.
+    #
+    # `max_retries=0` is not a loss of resilience — the retry moved to
+    # `_invoke_with_retry`, the only loop that can see the invocation deadline.
+    # See `_CLIENT_MAX_RETRIES`.
+    #
     # config#6904: 340 is now a CEILING, not the budget. The old comment here
     # claimed one retry "bounds the worst case to 2×340s inside the Lambda's
     # 900s budget" — but the Phase-G retro judge adds 2×120s in the same
@@ -447,7 +527,7 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
         spec,
         callsite_id="director-plan",
         timeout=plan_budget.quote("director-plan", DIRECTOR_PLAN_CEILING_S, attempts=2),
-        max_retries=1,
+        max_retries=_CLIENT_MAX_RETRIES,
         **api_kwargs,
     )
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
@@ -492,7 +572,31 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
     return [("system", _load_system_prompt()), ("human", "\n".join(human))]
 
 
-def _invoke_with_retry(llm, messages) -> DirectorWeeklyActionPlan:
+def _invoke_with_retry(llm, messages, *, budget=None):
+    """Retry transient LLM failures — but only while the invocation can pay.
+
+    This is the fleet's single retry loop for both Director LLM calls (the plan
+    here, the Phase-G judge in ``director/retro.py``), and since config#7126 it
+    is the ONLY one: ``_CLIENT_MAX_RETRIES`` and ``_STRUCTURED_ATTEMPTS``
+    collapse krepis' transport and body-level loops to one attempt each, so one
+    ``llm.invoke()`` is exactly one timeout-bounded model call. That matters
+    because retry loops **multiply**, and only this one can see the deadline.
+
+    ``budget`` is an ``InvocationBudget``. Before every retry the loop requires
+    the invocation to still afford a full attempt plus its backoff; when it
+    cannot, the last error is raised **immediately** rather than after starting
+    a call the function timeout will kill mid-flight. That distinction is the
+    whole point: a Lambda killed at the wall writes no artifact and logs no
+    cause, which is what made the 2026-08-08 failure — and the three silent
+    weeks after it — invisible. An error raised here reaches the SF state as a
+    named error with a message.
+
+    The attempt's cost is read off the llm adapter's ``attempt_cost_s``.
+    Adapters that do not declare one (every injected test double) are treated
+    as unbounded, so the retry behaviour outside Lambda is unchanged.
+    """
+    budget = budget or UNBOUNDED
+    cost = getattr(llm, "attempt_cost_s", None)
     last = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
@@ -500,12 +604,21 @@ def _invoke_with_retry(llm, messages) -> DirectorWeeklyActionPlan:
         except Exception as e:  # noqa: BLE001 — classify + retry transient, raise the rest
             last = e
             msg = str(e).lower()
-            if attempt < _MAX_RETRIES and any(t in msg for t in _RETRYABLE):
-                delay = min(2 ** attempt, 30)
-                logger.warning("Director LLM transient error (attempt %d): %s — retrying in %ss", attempt, e, delay)
-                time.sleep(delay)
-                continue
-            raise
+            if attempt >= _MAX_RETRIES or not any(t in msg for t in _RETRYABLE):
+                raise
+            delay = min(2 ** attempt, 30)
+            if cost is not None and not budget.can_afford(cost + delay):
+                logger.error(
+                    "Director LLM transient error (attempt %d): %s — NOT retrying: "
+                    "another attempt needs ~%.0fs (%.0fs ceiling + %.0fs backoff) "
+                    "and only %.0fs remain after the write reserve. Raising now so "
+                    "the failure carries a cause, instead of starting a call the "
+                    "function timeout would kill mid-flight.",
+                    attempt, e, cost + delay, cost, delay, budget.remaining(),
+                )
+                raise
+            logger.warning("Director LLM transient error (attempt %d): %s — retrying in %ss", attempt, e, delay)
+            time.sleep(delay)
     raise RuntimeError(f"Director LLM failed after {_MAX_RETRIES} attempts") from last
 
 
@@ -535,7 +648,7 @@ def build_action_plan(
     llm = llm or _default_llm(budget)
     messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
                               resolved_digest=resolved_digest)
-    plan = _invoke_with_retry(llm, messages)
+    plan = _invoke_with_retry(llm, messages, budget=budget)
     # Stamp the run_date from the card if the model didn't echo one.
     rd = run_date or (report_card.get("_provenance", {}) or {}).get("run_date")
     if rd and not plan.run_date:

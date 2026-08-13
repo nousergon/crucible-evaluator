@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import os
 
-from director.agent import _invoke_with_retry
+from director.agent import _CLIENT_MAX_RETRIES, _STRUCTURED_ATTEMPTS, _invoke_with_retry
 from director.budget import UNBOUNDED
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
@@ -100,6 +100,11 @@ class _KrepisStructuredJudge:
     ``llm`` the retro invokes.
     """
 
+    #: Wall-clock one ``invoke()`` may consume — see
+    #: ``director.agent._KrepisStructuredDirector.attempt_cost_s``. The judge
+    #: shares `_invoke_with_retry`, so it shares the budget gate.
+    attempt_cost_s = RETRO_JUDGE_CEILING_S
+
     def __init__(self, client, *, judge_model: str):
         self._client = client
         self._judge_model = judge_model
@@ -111,6 +116,11 @@ class _KrepisStructuredJudge:
             user_content=user_content,
             schema=RetroGrade,
             schema_name=_RETRO_JUDGE_SCHEMA_NAME,
+            # Explicit, not krepis' default of 2 — see
+            # `director.agent._STRUCTURED_ATTEMPTS`. The retro runs LAST, on
+            # whatever budget the plan left, so an inherited hidden doubling
+            # lands here first.
+            attempts=_STRUCTURED_ATTEMPTS,
         )
         grade: RetroGrade = result.parsed
         # judge_model = the logical alias configured for this call (no dated
@@ -161,7 +171,7 @@ def _default_llm(budget=None) -> _KrepisStructuredJudge:
         timeout=judge_budget.quote(
             "director-retro-judge", RETRO_JUDGE_CEILING_S, attempts=2
         ),
-        max_retries=1,
+        max_retries=_CLIENT_MAX_RETRIES,
     )
     return _KrepisStructuredJudge(client, judge_model=judge_model)
 
@@ -216,7 +226,7 @@ def grade_prior_plan(
     """
     llm = llm or _default_llm(budget)
     messages = build_messages(prior_plan, current_card)
-    grade = _invoke_with_retry(llm, messages)
+    grade = _invoke_with_retry(llm, messages, budget=budget)
     # Stamp the prior run_date from the plan if the model didn't echo it.
     rd = prior_plan.get("run_date")
     if rd and not grade.prior_run_date:
