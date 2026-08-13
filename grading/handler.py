@@ -197,7 +197,7 @@ def handler(event: dict | None = None, context=None) -> dict:
             self_test.get("n_errored", 0), self_test.get("libraries"),
         )
 
-    card = build_report_card(bucket, run_date)
+    card = build_report_card(bucket, run_date, self_test=self_test)
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}

@@ -280,3 +280,28 @@ def test_handler_wires_the_self_test():
     assert "write_self_test(bucket, run_date, self_test)" in source
     assert '"self_test_verdict": self_test.get("verdict")' in source
     assert '"degraded_self_test": not self_test_pass' in source
+    assert "build_report_card(bucket, run_date, self_test=self_test)" in source
+
+
+class TestReportCardCarriesTheVerdict:
+    """§2.3a rule 3 — every surface presenting the run's results carries the
+    verdict state. The card is the surface Brian and the Director read off."""
+
+    def test_aggregate_sets_both_keys_and_falls_back_rather_than_dropping_them(self):
+        """A caller that forgets to thread the verdict must not silently produce
+        a card with nothing to declare — that is indistinguishable from a card
+        nobody checked."""
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[1] / "grading" / "aggregate.py").read_text()
+        assert 'scorecard["self_test"] = self_test_body' in source
+        assert ('scorecard["degraded_self_test"] = '
+                'not self_test_is_pass(self_test_body.get("verdict"))') in source
+        assert "self_test if self_test is not None else run_self_test(run_date)" in source
+
+    @pytest.mark.parametrize("verdict,expected_degraded", [
+        ("PASS", False), ("FAIL", True), ("UNKNOWN", True), (None, True), ("ok", True),
+    ])
+    def test_degraded_flag_is_derived_so_it_can_never_disagree(self, verdict, expected_degraded):
+        """An absent or unrecognised verdict reads as degraded, never as a pass."""
+        assert (not st.verdict_is_pass(verdict)) is expected_degraded

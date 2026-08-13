@@ -129,6 +129,13 @@ class TestHandler:
         assert out["degraded_self_test"] is (out["self_test_verdict"] != "PASS")
         assert out["self_test_key"] == f"evaluator/{RUN_DATE}/self_test.json"
 
+        # sf-pipeline-policy §2.3a rule 3: the CARD carries the verdict too —
+        # the surface that presents the run's numbers must say whether the
+        # arithmetic behind them was checked.
+        card = json.loads(s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])["Body"].read())
+        assert card["self_test"]["verdict"] == out["self_test_verdict"]
+        assert card["degraded_self_test"] is out["degraded_self_test"]
+
         body = json.loads(s3.get_object(Bucket=BUCKET, Key=out["self_test_key"])["Body"].read())
         assert body["schema"] == "evaluator_self_test-1.0.0"
         assert body["run_date"] == RUN_DATE

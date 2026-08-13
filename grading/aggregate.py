@@ -34,6 +34,8 @@ from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
+from grading.self_test import run_self_test
+from grading.self_test import verdict_is_pass as self_test_is_pass
 from grading.module_agg import overall_status
 from nousergon_lib.quant.stats.trial_accumulator import read_cumulative_trial_count
 from grading.tiles.agent import build_agent_tile
@@ -76,6 +78,7 @@ def build_report_card(
     bucket: str,
     run_date: str,
     s3_client=None,
+    self_test: dict | None = None,
 ) -> dict:
     """Read artifacts → grade → attach provenance. Pure of writes.
 
@@ -199,6 +202,28 @@ def build_report_card(
     attestation = build_run_attestation(bucket, run_date, s3_client=s3_client)
     scorecard["attestation"] = attestation
     scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])
+
+    # The published known-answer SELF-TEST (Brian, 2026-08-13; config#7238). Same
+    # clause, second surface: §2.3a rule 3 — every surface presenting the run's
+    # results carries the verdict state. The attestation above is the terse
+    # machine verdict; this carries the EVIDENCE behind it — every case's inputs,
+    # hand-derived expectation, observation, error and tolerance, plus the
+    # importlib.metadata version of every quant distribution actually loaded into
+    # this image. Full body at evaluator/{run_date}/self_test.json.
+    #
+    # `self_test` is threaded in by `grading/handler.py`, which runs the battery
+    # BEFORE this build so the answer to "can this image's arithmetic be trusted"
+    # does not depend on the card build succeeding. It falls back to running the
+    # battery here so a caller that forgets cannot silently drop the verdict —
+    # `run_self_test` never raises, and a missing one would otherwise read as a
+    # card with nothing to declare rather than a card nobody checked.
+    #
+    # `degraded_self_test` is DERIVED from the verdict rather than set
+    # independently, so the two can never disagree and an absent or unrecognised
+    # verdict reads as degraded — never as a pass.
+    self_test_body = self_test if self_test is not None else run_self_test(run_date)
+    scorecard["self_test"] = self_test_body
+    scorecard["degraded_self_test"] = not self_test_is_pass(self_test_body.get("verdict"))
     # config#7199 — the contamination claim, flagged SEPARATELY from the
     # arithmetic one. "Did we compute this right" and "could the input have seen
     # the future" are two questions; a single degraded flag answers neither
