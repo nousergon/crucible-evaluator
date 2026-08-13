@@ -43,6 +43,14 @@ from director.issue_filer import (
 )
 from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
+from director.verdict import (
+    actions_withheld,
+    log_verdict,
+    read_card_verdict,
+    stamp_plan_artifact,
+    withheld_reason,
+    withheld_summary,
+)
 from grading.handler import _resolve_run_date
 from krepis.logging import setup_logging
 
@@ -184,14 +192,25 @@ def _fetch_resolved_digest_best_effort(token: str, run_date: str, budget=None) -
         return None
 
 
-def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None) -> dict:
+def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None,
+                             verdict_block: dict | None = None) -> dict:
     """Phase H output half: file the weekly proposals as ``area:director-proposals``
     GitHub issues (Brian triages). Best-effort + fail-loud — the plan is already
     persisted, so a missing token or a GitHub error is WARN-logged AND recorded
     in the returned summary (no silent swallow — [[feedback_no_silent_fails]]: a
     secondary write hung off a primary path that records the failure). NEVER
     fatal: the advisory channel must not break the run that produced the real
-    trading artifacts."""
+    trading artifacts.
+
+    §2.3a gate FIRST, before the enable flag and the budget: filing issues is
+    how this cycle's numbers become durable tracked work in another system, and
+    an issue filed off unverified arithmetic outlives every signal that said so.
+    The check lives here rather than at the call site so a future second caller
+    inherits the gate instead of having to remember it (config-I7039)."""
+    if actions_withheld(verdict_block or {}):
+        reason = withheld_reason(verdict_block or {})
+        logger.error("Director: issue filing WITHHELD — %s", reason)
+        return {"director_issues": "withheld", "director_issues_reason": reason}
     if not _issue_filing_enabled():
         return {"director_issues": "disabled"}
     if not token:
@@ -220,14 +239,26 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None
         return {"director_issues": "error", "director_issues_error": str(e)}
 
 
-def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget=None) -> dict:
+def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget=None,
+                             verdict_block: dict | None = None) -> dict:
     """Phase H+ (config#3145): close the Director loop. Runs BEFORE this
     week's ledger write so any correction it makes (backfilled issue
     numbers, a sticky ``escalated`` flag) persists in the same write —
     reopen-if-unrecovered and carryover-escalation both mutate ``ledger``'s
     items in place. Best-effort + fail-loud (WARN + recorded, never fatal):
     the plan + ledger are the primary deliverables and must ship even if
-    GitHub is unreachable this week."""
+    GitHub is unreachable this week.
+
+    §2.3a gate FIRST (config-I7039). This pass REOPENS issues whose cited metric
+    it judges unrecovered and ESCALATES carried-over items to Brian's Decision
+    Queue — both decided by comparing the ledger against ``card``'s numbers. If
+    those numbers are not established correct, a reopen is an accusation with no
+    evidence and an escalation puts a reserved matter in front of Brian on the
+    strength of arithmetic nothing checked."""
+    if actions_withheld(verdict_block or {}):
+        reason = withheld_reason(verdict_block or {})
+        logger.error("Director: loop verification WITHHELD — %s", reason)
+        return {"director_loop": "withheld", "director_loop_reason": reason}
     if not token:
         return {"director_loop": "skipped", "director_loop_reason": "no GH token"}
     # config#6915: one check for the whole pass. backfill_issue_numbers and
@@ -585,6 +616,14 @@ def handler(event: dict | None = None, context=None) -> dict:
             "state must run before the Director."
         )
 
+    # ── §2.3a: read the run's correctness verdict BEFORE acting on its numbers.
+    # The card is the surface every number below is derived from; `attestation`
+    # is the only field on it that says whether those numbers can be trusted.
+    # Absent, unreadable or unrecognised all resolve to UNKNOWN and withhold —
+    # never to a pass (config-I7039).
+    verdict_block = read_card_verdict(card)
+    log_verdict(verdict_block, run_date)
+
     ledger = load_ledger(bucket, s3_client=s3)
 
     # Phase H token — shared by the backlog digest read (in) and issue filing (out).
@@ -606,7 +645,9 @@ def handler(event: dict | None = None, context=None) -> dict:
     plan_key = f"director/{run_date}/action_plan.json"
     s3.put_object(
         Bucket=bucket, Key=plan_key,
-        Body=plan.model_dump_json(indent=2).encode("utf-8"),
+        # §2.3a rule 3 — the plan artifact is the body the console Director page
+        # renders, so it carries the verdict alongside the numbers it advises on.
+        Body=stamp_plan_artifact(plan, verdict_block),
         ContentType="application/json",
     )
     merged = merge_plan_into_ledger(ledger, plan, run_date)
@@ -617,7 +658,8 @@ def handler(event: dict | None = None, context=None) -> dict:
     # BEFORE the ledger write so its in-place corrections (backfilled
     # issue_number, sticky escalated flag) land in this week's persisted
     # ledger.
-    loop_summary = _verify_loop_best_effort(merged, card, gh_token, budget=budget)
+    loop_summary = _verify_loop_best_effort(merged, card, gh_token, budget=budget,
+                                            verdict_block=verdict_block)
 
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 
@@ -635,7 +677,11 @@ def handler(event: dict | None = None, context=None) -> dict:
     try:
         if not email_skip:
             from director.emailer import send_director_digest
-            email_sent = send_director_digest(plan, run_date, loop_summary=loop_summary)
+            # §2.3a rule 3 — the digest is the surface Brian actually reads the
+            # week's numbers off; it leads with the verdict or it is asserting a
+            # guarantee nobody established.
+            email_sent = send_director_digest(plan, run_date, loop_summary=loop_summary,
+                                              verdict_block=verdict_block)
     except Exception:  # noqa: BLE001 — the email must never break the Director
         logger.warning("Director: digest email failed (non-fatal)", exc_info=True)
 
@@ -647,7 +693,8 @@ def handler(event: dict | None = None, context=None) -> dict:
 
     # Phase H output half: file the weekly proposals as area:director-proposals
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
-    issues_summary = _file_issues_best_effort(plan, run_date, gh_token, budget=budget)
+    issues_summary = _file_issues_best_effort(plan, run_date, gh_token, budget=budget,
+                                              verdict_block=verdict_block)
 
     # Substrate producer: the deploy-health rollup the substrate tile reads
     # (config#1153 Batch E). The Director is the one weekly component holding both
@@ -664,6 +711,10 @@ def handler(event: dict | None = None, context=None) -> dict:
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
         "digest_email": "sent" if email_sent else "not_sent",
+        # §2.3a — the withholding is visible in the SF execution output, not only
+        # in the artifact. A stage that quietly did less than usual and returned
+        # `status: ok` is the same blindness one layer up.
+        **withheld_summary(verdict_block),
         **retro_summary,
         **loop_summary,
         **issues_summary,
