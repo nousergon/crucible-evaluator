@@ -997,6 +997,115 @@ def build_research_tile(
                        + " Validates (does not steer) the judge rubric layer; feeds no gate."),
         ))
 
+    # 14. scanner_basket_return (CRITICAL, alpha-engine-config-I7213) — the
+    #     number Brian asked directly for: "population (~900 stocks) vs the
+    #     scanner attractiveness top 20 over a specific window". Replaces the
+    #     classification-metric framing (precision/recall on a beat_spy
+    #     binary) — a retrieval metric that discards magnitude — which fit the
+    #     retired pass/fail tech_score GATE but does not fit a RANKED top-N
+    #     feed. Value = excess_vs_population for the top-20, sector_balanced=
+    #     True cohort (I7213's named variant); the raw (unbalanced) cohort is
+    #     reported alongside in status_reason because a 20-name basket carries
+    #     several times the idiosyncratic variance of the ~900-name
+    #     population and a sector-concentrated selector can look skilled in
+    #     any favourable tape — measured precedent: the retired arm's
+    #     scanner_lift.lift_21d_log was +0.402pp raw vs -0.079pp sector-
+    #     neutral, i.e. the entire apparent edge there was a sector bet.
+    #
+    #     Thresholds (set here, not copied): target=0.0025 (25bp mean 21d
+    #     excess-over-population). Chosen conservatively below the measured
+    #     top-60 counterfactual mean alpha (+1.155%, market-relative) and well
+    #     below live-gate's measured +2.731% headline, because
+    #     excess_vs_population is a NEW, unmeasured, strictly harder bar — it
+    #     is alpha relative to the PIT population mean on top of the alpha
+    #     frame already being SPY-relative, so a smaller edge than either
+    #     prior number is expected even from a working selector. red_line=0.0:
+    #     a top-20 pick that does not beat the population it was drawn from
+    #     adds nothing over holding the universe — a floor derived directly
+    #     from what the metric measures, not borrowed from another component.
+    #
+    #     Producer (crucible-backtester attractiveness_eval.py, paired PR)
+    #     adds n=20/40 cohorts plus excess_vs_population / excess_t /
+    #     excess_p / excess_ci95 / population_mean_alpha / holding_rule to
+    #     counterfactual.top_n. Until it lands (or if any of those fields is
+    #     absent from an n=20 row), this grades a precise N/A-MISSING-INPUT
+    #     naming the missing field and self-activates on first emission —
+    #     same forward-compat contract as the other attractiveness_eval-
+    #     sourced components above.
+    def _cf_row(n, sector_balanced):
+        for e in top_n_all:
+            if isinstance(e, dict) and e.get("n") == n and bool(e.get("sector_balanced")) is sector_balanced:
+                return e
+        return None
+
+    top_n_all = cf.get("top_n") or []
+    sb20 = _cf_row(20, True)
+    raw20 = _cf_row(20, False)
+    holding_rule = cf.get("holding_rule")
+    sb_excess = sb20.get("excess_vs_population") if sb20 else None
+    sb_pop = sb20.get("population_mean_alpha") if sb20 else None
+
+    _missing_field = None
+    if att_ok:
+        if sb20 is None:
+            _missing_field = "top_n row for n=20, sector_balanced=True"
+        elif sb_excess is None:
+            _missing_field = "excess_vs_population"
+        elif sb_pop is None:
+            _missing_field = "population_mean_alpha"
+        elif holding_rule is None:
+            _missing_field = "holding_rule"
+
+    if att_ok and _missing_field is None:
+        raw_s = (
+            f"raw (unbalanced) top-20: excess_vs_population={raw20.get('excess_vs_population'):+.4f} "
+            f"(t={_fmt_p(raw20.get('excess_t'))}, p={_fmt_p(raw20.get('excess_p'))})"
+            if raw20 and raw20.get("excess_vs_population") is not None
+            else "raw (unbalanced) top-20: not available this cycle"
+        )
+        n_cyc = sb20.get("n_cycles")
+        sb_p = sb20.get("excess_p")
+        insig = sb_p is None or sb_p >= 0.10 or (n_cyc or 0) < 8
+        ci = sb20.get("excess_ci95") or [None, None]
+        ci_low = ci[0] if isinstance(ci, list) and len(ci) == 2 else None
+        ci_high = ci[1] if isinstance(ci, list) and len(ci) == 2 else None
+        components.append(build_metric(
+            name="scanner_basket_return", module=MODULE, metric_type="log_return",
+            criticality="critical",
+            estimator="date_clustered_mean_excess_vs_pit_population", measurement_horizon=att_hz,
+            reliability="low" if insig else "high", arm=_LIVE_ARM_SCANNER,
+            value=sb_excess, n_samples=n_cyc, n_floor=8, target=0.0025, red_line=0.0,
+            ci_low=ci_low, ci_high=ci_high, source_path=att_src,
+            status="WATCH" if insig else None,
+            reason=(f"scanner_basket_return: top-20 sector-balanced attractiveness basket "
+                    f"vs PIT population ({sb_pop:+.4f} mean {att_hz} alpha) = {sb_excess:+.4f} "
+                    f"excess (t={_fmt_p(sb20.get('excess_t'))}, p={_fmt_p(sb_p)}, N={n_cyc} "
+                    f"cycles). {raw_s}. Holding rule: {holding_rule}. Direct top-20-basket-"
+                    f"vs-population read Brian asked for (alpha-engine-config-I7213); "
+                    f"replaces the classification-metric framing for a ranked feed. "
+                    f"[arm: {_LIVE_ARM_SCANNER}] "
+                    + ("Not yet significant — WATCH, accumulating." if insig
+                       else ("basket beats the population" if sb_excess > 0
+                             else "basket does not beat the population"))),
+        ))
+    else:
+        components.append(build_metric(
+            name="scanner_basket_return", module=MODULE, metric_type="log_return",
+            criticality="critical",
+            estimator="date_clustered_mean_excess_vs_pit_population", measurement_horizon=att_hz,
+            n_floor=8, target=0.0025, red_line=0.0, source_path=att_src, input_present=False,
+            arm=_LIVE_ARM_SCANNER,
+            na_detail=(f"scanner_basket_return: "
+                       + (_ATT_MISSING if not att_ok else
+                          f"attractiveness_eval.json present but missing "
+                          f"{_missing_field!r} — the top-20 basket-vs-population cohort "
+                          f"and its excess-vs-population fields land via the "
+                          f"alpha-engine-config-I7213 backtester producer PR, deploying in "
+                          f"parallel with this consumer, self-activates on first emission.")
+                       + f" Direct top-20-basket-vs-population read Brian asked for. "
+                       f"[arm: {_LIVE_ARM_SCANNER}]"),
+        ))
+
     return build_tile(MODULE, components)
 
 
