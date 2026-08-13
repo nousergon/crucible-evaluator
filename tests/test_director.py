@@ -397,6 +397,152 @@ class TestHandler:
         assert out["status"] == "disabled"
 
 
+# ── Stage-output coverage (config-I7214, the ruled rescope) ──────────────────
+#
+# The single shared implementation is `nousergon_lib.stage_coverage`, landing
+# in a separate nousergon-lib wave — NOT YET at this repo's pinned tag. These
+# tests inject a fake module into sys.modules so the call sites can be
+# exercised without that pin bump; `TestStageCoverageImportDegrades` below
+# separately proves the REAL (current, pin-predates-module) degrade path.
+
+def _install_fake_stage_coverage(monkeypatch, calls=None):
+    """Inject a stand-in `nousergon_lib.stage_coverage` module so the handler's
+    `from nousergon_lib.stage_coverage import assert_stage_coverage` resolves
+    to a controllable fake (Python's import system checks sys.modules before
+    any finder/loader lookup, so this needs no real submodule on disk)."""
+    import types
+    calls = calls if calls is not None else []
+    fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+
+    def _fake_assert_stage_coverage(stage, *, run_date, window_start):
+        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+        return {"stage": stage, "status": "COVERED", "run_date": run_date}
+
+    fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
+    monkeypatch.setitem(__import__("sys").modules, "nousergon_lib.stage_coverage", fake_mod)
+    return calls
+
+
+class TestStageCoverageDirector:
+    """(director Lambda, work dispatch) — the Director SF stage. Covers all
+    three internal branches (disabled / dry_run / enabled-real) since they
+    all map to the SAME SF Task, never hardcoding a stage name."""
+
+    def test_disabled_branch_verdict_lands_with_correct_stage_name(self, s3, monkeypatch):
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        calls = _install_fake_stage_coverage(monkeypatch)
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "disabled"
+        assert out["stage_coverage"] == {"stage": "Director", "status": "COVERED", "run_date": RUN_DATE}
+        assert [c["stage"] for c in calls] == ["Director"]
+
+    def test_dry_run_branch_verdict_lands_with_correct_stage_name(self, s3, monkeypatch):
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        import director.agent as A
+        monkeypatch.setattr(A, "_default_llm", lambda: object())
+        calls = _install_fake_stage_coverage(monkeypatch)
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
+        assert out["status"] == "dry_run"
+        assert out["stage_coverage"]["stage"] == "Director"
+        assert [c["stage"] for c in calls] == ["Director"]
+
+    def test_enabled_real_branch_verdict_lands_with_correct_stage_name(self, s3, monkeypatch):
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        calls = _install_fake_stage_coverage(monkeypatch)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["stage_coverage"] == {"stage": "Director", "status": "COVERED", "run_date": RUN_DATE}
+        assert [c["stage"] for c in calls] == ["Director"]
+
+
+class TestStageCoverageEvaluatorDirectorDeployDriftCheck:
+    """(director Lambda, check_deploy_drift dispatch) — the
+    EvaluatorDirectorDeployDriftCheck SF stage. An infrastructure/gate stage:
+    declares no durable artifact, but must still record that it declared
+    nothing rather than being silently un-considered."""
+
+    def test_verdict_lands_under_stage_coverage_with_correct_stage_name(self, monkeypatch):
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        calls = _install_fake_stage_coverage(monkeypatch)
+
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+
+        assert out["stage_coverage"]["stage"] == "EvaluatorDirectorDeployDriftCheck"
+        assert [c["stage"] for c in calls] == ["EvaluatorDirectorDeployDriftCheck"]
+        # never confused with the real work stage this Lambda also backs.
+        assert out["stage_coverage"]["stage"] != "Director"
+
+
+class TestStageCoverageImportDegrades:
+    """Observe mode cannot break the stage it observes: a ModuleNotFoundError
+    from the lib (the pin here predates the module) must never change the
+    handler's own outcome — logged loud, never silent, no `stage_coverage`
+    key on the payload."""
+
+    def test_director_outcome_unchanged_when_module_absent(self, s3, monkeypatch):
+        import sys
+        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "disabled"
+        assert "stage_coverage" not in out
+
+    def test_deploy_drift_check_outcome_unchanged_when_module_absent(self, monkeypatch):
+        import sys
+        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        from director import handler as H
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+        assert out["has_drift"] is False
+        assert "stage_coverage" not in out
+
+
+class TestStageCoverageNeverEnablesEnforcement:
+    """OBSERVE MODE ONLY (config-I7214): no shipped call site may pass an
+    enforcement-enabling argument. `assert_stage_coverage` takes exactly
+    (stage, run_date, window_start) from every Director call site — any
+    extra kwarg would be how an enforcement flag could sneak in."""
+
+    def test_call_sites_pass_only_the_observe_mode_signature(self, s3, monkeypatch):
+        import sys
+        import types
+        seen_kwargs = []
+
+        def _capture(stage, **kwargs):
+            seen_kwargs.append(set(kwargs))
+            return {"stage": stage, "status": "COVERED"}
+
+        fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+        fake_mod.assert_stage_coverage = _capture
+        monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        H.handler({"date": RUN_DATE, "bucket": BUCKET})
+
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        H.handler({"action": "check_deploy_drift"}, context=None)
+
+        assert seen_kwargs
+        for kwargs in seen_kwargs:
+            assert kwargs == {"run_date", "window_start"}
+
+
 def _retro() -> "object":
     from director.schema import RetroGrade
     return RetroGrade(prior_run_date="2026-05-23", grounding=80, calibration=55,
