@@ -156,10 +156,52 @@ class TestBuildReportCard:
         with pytest.raises(MissingInputArtifactError):
             build_report_card(BUCKET, RUN_DATE, s3_client=s3)
 
-    def test_full_artifacts_produce_ok_status(self, s3):
+    def _seed_verdicts(self, s3):
+        """config#7199 — the four correctness verdicts a card needs before it
+        may present itself as a complete build. The evaluator's own battery runs
+        in-process; the other three are S3 artifacts."""
+        import json as _json
+        for key, body in (
+            (f"backtest/{RUN_DATE}/attestation.json", {
+                "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+                "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0}),
+            (f"backtest/{RUN_DATE}/evaluator_attestation.json", {
+                "schema": "evaluator_stage_attestation-1.0.0", "run_date": RUN_DATE,
+                "status": "ok", "verdict": "PASS",
+                "own": {"n_checks": 3, "n_failed": 0, "n_errored": 0},
+                "promotion_withheld": False}),
+            (f"backtest/{RUN_DATE}/pit_parity.json", {
+                "schema": "pit_parity-1.0.0", "run_date": RUN_DATE, "status": "ok",
+                "verdict": "PASS", "verdict_reason": "PASS.",
+                "coverage": {"coverage_fraction": 1.0, "budget_stopped": False,
+                             "complete": True, "measured": True},
+                "materiality": {"material": False}}),
+        ):
+            s3.put_object(Bucket=BUCKET, Key=key, Body=_json.dumps(body).encode())
+
+    def test_full_artifacts_with_no_correctness_verdicts_are_not_ok(self, s3):
+        """config#7199. Every graded input present, and NOTHING attested that the
+        arithmetic behind them is right or that they are free of look-ahead
+        contamination. On 2026-08-07 that combination produced `status: "ok"`,
+        grade 55.7 — a card asserting a guarantee nobody established."""
         _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert card["status"] == "partial"
+        assert "correctness verdict UNKNOWN" in card["status_reason"]
+        assert card["degraded_attestation"] is True
+        assert card["degraded_contamination"] is True
+        # Grading itself is unaffected — withholding the guarantee is not the
+        # same as failing the card (sf-pipeline-policy §2.3a).
+        assert card["overall"]["grade"] is not None
+
+    def test_full_artifacts_produce_ok_status(self, s3):
+        _seed_full(s3)
+        self._seed_verdicts(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         assert card["status"] == "ok"
+        assert card["degraded_attestation"] is False
+        assert card["degraded_contamination"] is False
+        assert card["contamination_verdict"] == "PASS"
         assert card["overall"]["grade"] is not None
         assert card["research"]["grade"] is not None
         assert card["predictor"]["grade"] is not None

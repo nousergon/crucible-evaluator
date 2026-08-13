@@ -102,7 +102,7 @@ class TestCorrectnessBlock:
         assert card["attestation"]["schema"] == "report_card_attestation-1.0.0"
 
     def test_verdict_is_in_the_closed_vocabulary(self, card):
-        assert card["attestation"]["verdict"] in {"PASS", "FAIL", "UNKNOWN"}
+        assert card["attestation"]["verdict"] in {"PASS", "FAIL", "PARTIAL", "UNKNOWN"}
 
     def test_absent_upstream_verdicts_yield_unknown_not_pass(self, card):
         # Neither `backtest/{date}/attestation.json` nor its evaluator-stage
@@ -116,4 +116,4 @@ class TestCorrectnessBlock:
         # stale, and the key's absence would be indistinguishable from a
         # consumer that forgot to look.
         as_of = card["attestation"]["as_of"]
-        assert set(as_of) == {"backtester", "evaluator_stage"}
+        assert set(as_of) == {"backtester", "evaluator_stage", "contamination"}

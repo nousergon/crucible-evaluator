@@ -29,11 +29,27 @@ had passed*.
 WHAT IT PRODUCES
 ----------------
 ``build_run_attestation()`` returns the block the card carries at
-``report_card["attestation"]``, combining both halves. The combined verdict is the
-worst of the two: any ``FAIL`` → ``FAIL``; otherwise any ``UNKNOWN`` → ``UNKNOWN``;
-only both ``PASS`` → ``PASS``. §2.3a rule 2 — a missing verdict propagates as
-``UNKNOWN``, never as a pass, and the report card, the Director digest and the
-console all render the state rather than assuming it.
+``report_card["attestation"]``, combining the halves. The combined verdict is the
+worst: any ``FAIL`` → ``FAIL``; otherwise any ``UNKNOWN`` → ``UNKNOWN``; otherwise
+any ``PARTIAL`` → ``PARTIAL``; only all ``PASS`` → ``PASS``. §2.3a rule 2 — a
+missing verdict propagates as ``UNKNOWN``, never as a pass, and the report card,
+the Director digest and the console all render the state rather than assuming it.
+
+3. **Look-ahead contamination (config#7199).** The three halves above all answer
+   *"did we compute this correctly?"* — none of them answers *"was the input
+   allowed to see the future?"*. That is a different claim and, for a number
+   shown outside the firm, the load-bearing one: an arithmetic error produces a
+   wrong number, look-ahead contamination produces a **spectacular** number that
+   is entirely fake, and it is the failure mode a backtest cannot self-diagnose
+   because the results look better rather than worse. The backtester's
+   ``PitParityCompare`` stage emits that verdict at
+   ``backtest/{run_date}/pit_parity.json``; this module is its consumer, and the
+   block renders ``arithmetic_verdict`` and ``contamination_verdict`` as two
+   fields because a reader asks about them as two questions.
+
+   Measured motivation: on 2026-08-07 that check timed out after 2700s, its
+   artifact read ``status: failed``, nothing consumed it, and the card was
+   written ``status: "ok"`` with grade 55.7.
 
 CONTRACT
 --------
@@ -66,8 +82,13 @@ BACKTESTER_ATTESTATION_SCHEMA_PREFIX = "backtest_attestation-"
 PASS = "PASS"
 FAIL = "FAIL"
 UNKNOWN = "UNKNOWN"
+#: config#7199 — a check that answered honestly over a strict SUBSET of what it
+#: was asked to cover. Distinct from UNKNOWN (no answer at all) because the
+#: diagnosis and the remedy differ: PARTIAL means the budget bound, UNKNOWN
+#: means the stage died. Both withhold the guarantee; neither is a pass.
+PARTIAL = "PARTIAL"
 
-_VALID_VERDICTS = frozenset({PASS, FAIL, UNKNOWN})
+_VALID_VERDICTS = frozenset({PASS, FAIL, PARTIAL, UNKNOWN})
 
 _TRADING_DAYS = 252
 _RTOL = 1e-12
@@ -115,10 +136,20 @@ def _normalize_verdict(raw) -> str:
 
 
 def _worst(*verdicts: str) -> str:
+    """Worst-of over the closed vocabulary: FAIL > UNKNOWN > PARTIAL > PASS.
+
+    PARTIAL sits ABOVE UNKNOWN because it carries real, if incomplete,
+    evidence, and UNKNOWN carries none — so a combined verdict of PARTIAL tells
+    a reader something a combined UNKNOWN does not. Neither is a pass:
+    :func:`verdict_is_pass` tests for ``PASS`` alone, so no ordering choice here
+    can grant the guarantee by accident.
+    """
     if any(v == FAIL for v in verdicts):
         return FAIL
-    if any(v != PASS for v in verdicts):
+    if any(v == UNKNOWN or v not in _VALID_VERDICTS for v in verdicts):
         return UNKNOWN
+    if any(v == PARTIAL for v in verdicts):
+        return PARTIAL
     return PASS
 
 
@@ -383,6 +414,7 @@ def _read_verdict_artifact(
     run_date: str,
     label: str,
     s3_client=None,
+    enrich: "Callable[[dict, dict], dict] | None" = None,
 ) -> dict:
     """Read a §2.3a verdict artifact and normalize it. Never raises.
 
@@ -441,6 +473,14 @@ def _read_verdict_artifact(
                 "stamped_run_date": stamped}
 
     verdict = _normalize_verdict(doc.get("verdict"))
+    if enrich is not None:
+        # A verdict artifact whose body is not a known-answer battery (the
+        # contamination report) supplies its own summary fields and its own
+        # reason. The read, the run_date-stamp rule and the UNKNOWN-on-anything
+        # posture above are identical, so they are shared rather than copied —
+        # a second copy of "absence is never a pass" is a second place it can
+        # be got wrong.
+        return enrich({**base, "verdict": verdict}, doc)
     result = {
         **base,
         "verdict": verdict,
@@ -503,6 +543,69 @@ def read_evaluator_stage_attestation(bucket: str, run_date: str, s3_client=None)
     )
 
 
+def contamination_key(run_date: str) -> str:
+    """The look-ahead-contamination verdict at ``backtest/{run_date}/pit_parity.json``.
+
+    Written by ``crucible-backtester analysis/pit_stats_artifact.py::
+    run_compare_and_publish`` (the ``PitParityCompare`` SF stage), which reads
+    both pit_parity passes and emits ``verdict`` over the same closed
+    vocabulary this module normalizes onto.
+    """
+    return f"backtest/{run_date}/pit_parity.json"
+
+
+def _enrich_contamination(result: dict, doc: dict) -> dict:
+    """Turn a pit_parity report into a contamination half of the attestation.
+
+    The producer already computed the verdict and its reason — this does not
+    re-derive them, it surfaces them plus the coverage fraction, which is the
+    number that makes a ``PARTIAL`` actionable ("clean over 62% of the window"
+    rather than a bare "incomplete").
+    """
+    coverage = doc.get("coverage") if isinstance(doc.get("coverage"), dict) else {}
+    fraction = coverage.get("coverage_fraction")
+    try:
+        fraction = None if fraction is None else float(fraction)
+    except (TypeError, ValueError):
+        fraction = None
+    result.update({
+        "schema": doc.get("schema"),
+        "status": doc.get("status"),
+        "coverage_fraction": fraction,
+        "budget_stopped": bool(coverage.get("budget_stopped", False)),
+        "covered_through": coverage.get("covered_through"),
+        "material": (doc.get("materiality") or {}).get("material"),
+    })
+    producer_reason = doc.get("verdict_reason")
+    if result["verdict"] == UNKNOWN and not producer_reason:
+        # Includes every pit_parity.json written BEFORE config#7199 — those
+        # carry no `verdict` key at all, and the absence of the field is
+        # exactly the condition §2.3a rule 2 governs.
+        producer_reason = (
+            f"contamination report at s3://{result['source_path'].split('s3://')[-1]} "
+            f"carries verdict {doc.get('verdict')!r}, which is not one of "
+            f"{sorted(_VALID_VERDICTS)} — treated as UNKNOWN, never as a pass."
+        ) if "source_path" in result else (
+            "contamination verdict absent or unrecognised — treated as UNKNOWN."
+        )
+    result["reason"] = producer_reason or "contamination verdict PASS."
+    return result
+
+
+def read_contamination_verdict(bucket: str, run_date: str, s3_client=None) -> dict:
+    """Read the look-ahead-contamination verdict. Never raises.
+
+    Absent, unparseable, stamped with another cycle's ``run_date``, or carrying
+    a verdict outside the closed vocabulary all resolve to ``UNKNOWN`` — the
+    same posture as the arithmetic halves, and for the same reason: a
+    contamination check that did not answer must not read as one that passed.
+    """
+    return _read_verdict_artifact(
+        bucket, contamination_key(run_date), run_date, "contamination",
+        s3_client=s3_client, enrich=_enrich_contamination,
+    )
+
+
 def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
     """The combined block the Report Card carries at ``report_card["attestation"]``.
 
@@ -521,44 +624,77 @@ def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
         hit rate, calibration — attested on the spot box that ran it, together
         with whether promotion was permitted this cycle.
 
+    ``contamination``
+        config#7199 — the look-ahead-contamination verdict from
+        ``backtest/{run_date}/pit_parity.json``: whether the point-in-time
+        replay of the same window differs materially from the look-ahead one.
+
+    **The last of those is a DIFFERENT CLAIM from the first three, and the block
+    renders it as one.** Arithmetic-correct answers "did we compute this
+    right"; contamination-free answers "was the input allowed to see the
+    future". An arithmetic error produces a wrong number and is embarrassing;
+    look-ahead contamination produces a spectacular number that is entirely
+    fake, and it is the first thing a competent external reader tests for. So
+    the block carries ``arithmetic_verdict`` and ``contamination_verdict``
+    separately as well as the combined ``verdict``, because a reader asks about
+    them separately and a single boolean cannot answer both.
+
     Never raises; the worst half wins. Any half UNKNOWN withholds the guarantee,
-    because a card whose numbers are only two-thirds attested is not a verified
-    card — §2.3a rule 2 admits no partial pass.
+    because a card whose numbers are only three-quarters attested is not a
+    verified card — §2.3a rule 2 admits no partial pass.
     """
     evaluator = run_evaluator_attestation()
     backtester = read_backtester_attestation(bucket, run_date, s3_client=s3_client)
     evaluator_stage = read_evaluator_stage_attestation(bucket, run_date, s3_client=s3_client)
-    verdict = _worst(evaluator["verdict"], backtester["verdict"], evaluator_stage["verdict"])
+    contamination = read_contamination_verdict(bucket, run_date, s3_client=s3_client)
+
+    arithmetic_verdict = _worst(
+        evaluator["verdict"], backtester["verdict"], evaluator_stage["verdict"],
+    )
+    contamination_verdict = contamination["verdict"]
+    verdict = _worst(arithmetic_verdict, contamination_verdict)
+
     withheld = [
         f"{name}={half['verdict']}"
         for name, half in (
             ("evaluator", evaluator),
             ("backtester", backtester),
             ("evaluator_stage", evaluator_stage),
+            ("contamination", contamination),
         )
         if half["verdict"] != PASS
     ]
     reasons = " ".join(
         half.get("reason", "")
-        for half in (backtester, evaluator_stage)
+        for half in (backtester, evaluator_stage, contamination)
         if half["verdict"] != PASS
     ).strip()
     block = {
         "schema": SCHEMA,
         "run_date": run_date,
         "verdict": verdict,
+        # Two claims, surfaced as two. Do not collapse these into `verdict`
+        # alone — an external reader asks "are the numbers right?" and "could
+        # they have seen the future?" as separate questions, and only the
+        # second is answerable by the contamination half.
+        "arithmetic_verdict": arithmetic_verdict,
+        "contamination_verdict": contamination_verdict,
+        "contamination_coverage_fraction": contamination.get("coverage_fraction"),
         "as_of": {
             "backtester": backtester.get("as_of"),
             "evaluator_stage": evaluator_stage.get("as_of"),
+            "contamination": contamination.get("as_of"),
         },
         "evaluator": evaluator,
         "backtester": backtester,
         "evaluator_stage": evaluator_stage,
+        "contamination": contamination,
         "promotion_withheld": bool(evaluator_stage.get("promotion_withheld")),
         "reason": (
-            "All three halves attested — the deployed quant primitives, the backtest "
+            "All four halves attested — the deployed quant primitives, the backtest "
             "engine, and the Evaluator stage's ranking metrics each agreed with their "
-            "hand-derived known answers."
+            "hand-derived known answers, and the point-in-time replay found no "
+            "material look-ahead contamination over the full window."
             if verdict == PASS else
             f"Correctness guarantee WITHHELD: {', '.join(withheld)}. {reasons}".strip()
         ),
