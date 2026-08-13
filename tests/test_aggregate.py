@@ -156,10 +156,109 @@ class TestBuildReportCard:
         with pytest.raises(MissingInputArtifactError):
             build_report_card(BUCKET, RUN_DATE, s3_client=s3)
 
-    def test_full_artifacts_produce_ok_status(self, s3):
+    def _seed_verdicts(self, s3):
+        """config#7199 — the four correctness verdicts a card needs before it
+        may present itself as a complete build. The evaluator's own battery runs
+        in-process; the other three are S3 artifacts."""
+        import json as _json
+        for key, body in (
+            (f"backtest/{RUN_DATE}/attestation.json", {
+                "schema": "backtest_attestation-1.0.0", "run_date": RUN_DATE,
+                "status": "ok", "verdict": "PASS", "n_checks": 5, "n_failed": 0}),
+            (f"backtest/{RUN_DATE}/evaluator_attestation.json", {
+                "schema": "evaluator_stage_attestation-1.0.0", "run_date": RUN_DATE,
+                "status": "ok", "verdict": "PASS",
+                "own": {"n_checks": 3, "n_failed": 0, "n_errored": 0},
+                "promotion_withheld": False}),
+            (f"backtest/{RUN_DATE}/pit_parity.json", {
+                "schema": "pit_parity-1.0.0", "run_date": RUN_DATE, "status": "ok",
+                "verdict": "PASS", "verdict_reason": "PASS.",
+                "coverage": {"coverage_fraction": 1.0, "budget_stopped": False,
+                             "complete": True, "measured": True},
+                "materiality": {"material": False}}),
+        ):
+            s3.put_object(Bucket=BUCKET, Key=key, Body=_json.dumps(body).encode())
+
+    def test_full_artifacts_with_no_correctness_verdicts_are_not_ok(self, s3):
+        """config#7199. Every graded input present, and NOTHING attested that the
+        arithmetic behind them is right or that they are free of look-ahead
+        contamination. On 2026-08-07 that combination produced `status: "ok"`,
+        grade 55.7 — a card asserting a guarantee nobody established."""
         _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert card["status"] == "partial"
+        assert "correctness verdict UNKNOWN" in card["status_reason"]
+        assert card["degraded_attestation"] is True
+        assert card["degraded_contamination"] is True
+        # Grading itself is unaffected — withholding the guarantee is not the
+        # same as failing the card (sf-pipeline-policy §2.3a).
+        assert card["overall"]["grade"] is not None
+
+    @pytest.mark.parametrize(
+        "contamination,expected_verdict",
+        [
+            # The literal 2026-08-07 artifact: the walk-forward pass hit its
+            # 2700s wall, so the report carries no verdict field at all.
+            ({"schema": "pit_parity-1.0.0", "run_date": RUN_DATE,
+              "status": "failed", "error_class": "RuntimeError",
+              "error_msg": "pit_parity walkforward pass timed out after 2700s: ...",
+              "observational": True}, "UNKNOWN"),
+            # Material look-ahead contamination actually FOUND.
+            ({"schema": "pit_parity-1.1.0", "run_date": RUN_DATE,
+              "status": "failed", "verdict": "FAIL",
+              "verdict_reason": "MATERIAL look-ahead delta on log_cum_return.",
+              "coverage": {"coverage_fraction": 1.0},
+              "materiality": {"material": True}}, "FAIL"),
+            # Answered honestly over a subset — real evidence, but not a pass.
+            ({"schema": "pit_parity-1.1.0", "run_date": RUN_DATE,
+              "status": "ok", "verdict": "PARTIAL",
+              "verdict_reason": "PARTIAL: clean over 62.0% of the window.",
+              "coverage": {"coverage_fraction": 0.62, "budget_stopped": True},
+              "materiality": {"material": False}}, "PARTIAL"),
+        ],
+        ids=["timed_out_2026_08_07", "material_contamination", "partial_coverage"],
+    )
+    def test_a_failed_contamination_check_cannot_coexist_with_an_ok_card(
+        self, s3, contamination, expected_verdict,
+    ):
+        """config#7199, the headline. THREE CLEAN ARITHMETIC HALVES and a
+        contamination check that failed, timed out, or only partly answered —
+        the card must not present itself as `ok`. This is the assertion that
+        would have caught 2026-08-07, where every arithmetic input was fine and
+        the only unanswered question was the load-bearing one.
+
+        Parameterised across all three non-PASS shapes because a guard that only
+        catches ABSENCE would still let a FAIL through, and a FAIL is the case
+        where contamination was actually detected.
+        """
+        import json as _json
+        _seed_full(s3)
+        self._seed_verdicts(s3)
+        s3.put_object(
+            Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/pit_parity.json",
+            Body=_json.dumps(contamination).encode(),
+        )
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert card["contamination_verdict"] == expected_verdict
+        assert card["degraded_contamination"] is True
+        assert card["status"] != "ok"
+        assert card["status"] == "partial"
+        # The arithmetic half is untouched and still says so — two claims, two
+        # fields. Collapsing them would make this indistinguishable from a
+        # broken Sharpe.
+        assert card["attestation"]["arithmetic_verdict"] == "PASS"
+        # And the card is still GRADED. Withholding the guarantee is not the
+        # same as failing the pipeline (sf-pipeline-policy §2.3a).
+        assert card["overall"]["grade"] is not None
+
+    def test_full_artifacts_produce_ok_status(self, s3):
+        _seed_full(s3)
+        self._seed_verdicts(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
         assert card["status"] == "ok"
+        assert card["degraded_attestation"] is False
+        assert card["degraded_contamination"] is False
+        assert card["contamination_verdict"] == "PASS"
         assert card["overall"]["grade"] is not None
         assert card["research"]["grade"] is not None
         assert card["predictor"]["grade"] is not None

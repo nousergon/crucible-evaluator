@@ -199,6 +199,30 @@ def build_report_card(
     attestation = build_run_attestation(bucket, run_date, s3_client=s3_client)
     scorecard["attestation"] = attestation
     scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])
+    # config#7199 — the contamination claim, flagged SEPARATELY from the
+    # arithmetic one. "Did we compute this right" and "could the input have seen
+    # the future" are two questions; a single degraded flag answers neither
+    # specifically, and the second is the one an external reader asks first.
+    scorecard["degraded_contamination"] = not verdict_is_pass(
+        attestation.get("contamination_verdict")
+    )
+    scorecard["contamination_verdict"] = attestation.get("contamination_verdict")
+
+    # A card whose correctness verdict did not come back cannot present itself
+    # as a complete build. On 2026-08-07 the contamination check timed out and
+    # the card was still written status "ok", degraded_staleness false, grade
+    # 55.7 — nothing distinguished a non-answer from a pass. `partial` is the
+    # existing vocabulary for "this card is not fully established" (the
+    # report_card schema enum is exactly ok | partial | insufficient_data), so
+    # this reuses it rather than minting a fourth value no consumer handles.
+    # `insufficient_data` is never upgraded — a card that could not be graded at
+    # all stays that way.
+    if scorecard.get("status") == "ok" and scorecard["degraded_attestation"]:
+        scorecard["status"] = "partial"
+        scorecard["status_reason"] = (
+            f"correctness verdict {attestation['verdict']} — "
+            f"{attestation.get('reason', '')}"
+        )
 
     # The frozen write-contract's version stamp
     # (nousergon_lib/contracts/report_card.schema.json, `schema_version` const 1).
