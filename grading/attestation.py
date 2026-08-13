@@ -577,7 +577,15 @@ def _enrich_contamination(result: dict, doc: dict) -> dict:
         "material": (doc.get("materiality") or {}).get("material"),
     })
     producer_reason = doc.get("verdict_reason")
-    if result["verdict"] == UNKNOWN and not producer_reason:
+    # Only when the raw field was genuinely OUTSIDE the vocabulary. An artifact
+    # that says `verdict: "UNKNOWN"` explicitly is honest, not malformed, and
+    # describing it as "not one of [FAIL, PARTIAL, PASS, UNKNOWN]" is a false
+    # sentence that sends a reader hunting a producer bug that is not there.
+    if (
+        result["verdict"] == UNKNOWN
+        and doc.get("verdict") not in _VALID_VERDICTS
+        and not producer_reason
+    ):
         # Includes every pit_parity.json written BEFORE config#7199 — those
         # carry no `verdict` key at all, and the absence of the field is
         # exactly the condition §2.3a rule 2 governs.
@@ -588,8 +596,44 @@ def _enrich_contamination(result: dict, doc: dict) -> dict:
         ) if "source_path" in result else (
             "contamination verdict absent or unrecognised — treated as UNKNOWN."
         )
-    result["reason"] = producer_reason or "contamination verdict PASS."
+    result["reason"] = producer_reason or _default_contamination_reason(result)
     return result
+
+
+def _default_contamination_reason(result: dict) -> str:
+    """The reason line when the producer supplied no ``verdict_reason``.
+
+    Derived from the VERDICT, never a constant. A single default string here is
+    the "renders measured-X as Y" class this fleet has shipped before: the
+    producer's ``verdict_reason`` is an optional field, so a ``FAIL`` written
+    without one would otherwise carry the literal sentence "contamination
+    verdict PASS." onto the Report Card, the Director digest and the console —
+    a FAIL described, in prose, as a pass. The verdict field would still be
+    correct; the sentence a human reads would not, and the sentence is the
+    surface. Defence in depth: the producer is expected to supply a reason on
+    every non-PASS, and this must be safe when it does not.
+    """
+    verdict = result.get("verdict")
+    fraction = result.get("coverage_fraction")
+    covered = "" if fraction is None else f" Coverage {fraction:.0%} of the window."
+    if verdict == PASS:
+        return "contamination verdict PASS — no material look-ahead delta." + covered
+    if verdict == FAIL:
+        return (
+            "contamination verdict FAIL, with no reason supplied by the producer — "
+            "this cycle's numbers are NOT established free of look-ahead "
+            "contamination." + covered
+        )
+    if verdict == PARTIAL:
+        return (
+            "contamination verdict PARTIAL, with no reason supplied by the producer "
+            "— the check answered over a strict subset of the window and the "
+            "remainder is unmeasured. Not a pass." + covered
+        )
+    return (
+        "contamination verdict UNKNOWN — the check did not answer. Not a pass."
+        + covered
+    )
 
 
 def read_contamination_verdict(bucket: str, run_date: str, s3_client=None) -> dict:

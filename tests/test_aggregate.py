@@ -194,6 +194,63 @@ class TestBuildReportCard:
         # same as failing the card (sf-pipeline-policy §2.3a).
         assert card["overall"]["grade"] is not None
 
+    @pytest.mark.parametrize(
+        "contamination,expected_verdict",
+        [
+            # The literal 2026-08-07 artifact: the walk-forward pass hit its
+            # 2700s wall, so the report carries no verdict field at all.
+            ({"schema": "pit_parity-1.0.0", "run_date": RUN_DATE,
+              "status": "failed", "error_class": "RuntimeError",
+              "error_msg": "pit_parity walkforward pass timed out after 2700s: ...",
+              "observational": True}, "UNKNOWN"),
+            # Material look-ahead contamination actually FOUND.
+            ({"schema": "pit_parity-1.1.0", "run_date": RUN_DATE,
+              "status": "failed", "verdict": "FAIL",
+              "verdict_reason": "MATERIAL look-ahead delta on log_cum_return.",
+              "coverage": {"coverage_fraction": 1.0},
+              "materiality": {"material": True}}, "FAIL"),
+            # Answered honestly over a subset — real evidence, but not a pass.
+            ({"schema": "pit_parity-1.1.0", "run_date": RUN_DATE,
+              "status": "ok", "verdict": "PARTIAL",
+              "verdict_reason": "PARTIAL: clean over 62.0% of the window.",
+              "coverage": {"coverage_fraction": 0.62, "budget_stopped": True},
+              "materiality": {"material": False}}, "PARTIAL"),
+        ],
+        ids=["timed_out_2026_08_07", "material_contamination", "partial_coverage"],
+    )
+    def test_a_failed_contamination_check_cannot_coexist_with_an_ok_card(
+        self, s3, contamination, expected_verdict,
+    ):
+        """config#7199, the headline. THREE CLEAN ARITHMETIC HALVES and a
+        contamination check that failed, timed out, or only partly answered —
+        the card must not present itself as `ok`. This is the assertion that
+        would have caught 2026-08-07, where every arithmetic input was fine and
+        the only unanswered question was the load-bearing one.
+
+        Parameterised across all three non-PASS shapes because a guard that only
+        catches ABSENCE would still let a FAIL through, and a FAIL is the case
+        where contamination was actually detected.
+        """
+        import json as _json
+        _seed_full(s3)
+        self._seed_verdicts(s3)
+        s3.put_object(
+            Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/pit_parity.json",
+            Body=_json.dumps(contamination).encode(),
+        )
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        assert card["contamination_verdict"] == expected_verdict
+        assert card["degraded_contamination"] is True
+        assert card["status"] != "ok"
+        assert card["status"] == "partial"
+        # The arithmetic half is untouched and still says so — two claims, two
+        # fields. Collapsing them would make this indistinguishable from a
+        # broken Sharpe.
+        assert card["attestation"]["arithmetic_verdict"] == "PASS"
+        # And the card is still GRADED. Withholding the guarantee is not the
+        # same as failing the pipeline (sf-pipeline-policy §2.3a).
+        assert card["overall"]["grade"] is not None
+
     def test_full_artifacts_produce_ok_status(self, s3):
         _seed_full(s3)
         self._seed_verdicts(s3)

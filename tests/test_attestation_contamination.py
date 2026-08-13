@@ -247,3 +247,92 @@ def test_nothing_here_raises_on_a_broken_s3(monkeypatch):
     monkeypatch.setattr(att, "run_evaluator_attestation", lambda: {"verdict": att.PASS})
     block = att.build_run_attestation("b", "2026-08-15", s3_client=_Boom())
     assert block["verdict"] == att.UNKNOWN
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The reason SENTENCE, not only the verdict field (config#7199)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# `verdict_reason` is an OPTIONAL producer field. The verdict field being right
+# is not sufficient: the reason line is what the Report Card, the Director
+# digest and the console render as prose, and a non-PASS described in prose as
+# a pass is the "renders measured-X as Y" failure this fleet has shipped before.
+
+@pytest.mark.parametrize("verdict", [att.FAIL, att.PARTIAL, att.UNKNOWN])
+def test_a_non_pass_never_reads_as_a_pass_when_the_producer_sent_no_reason(verdict):
+    """The failing branch, proved. Drop `verdict_reason` from the artifact and
+    the rendered sentence must still say the guarantee is withheld."""
+    body = _report(verdict=verdict)
+    doc = json.loads(body)
+    doc.pop("verdict_reason")
+    result = att.read_contamination_verdict(
+        "b", "2026-08-15", s3_client=_S3({_KEY: json.dumps(doc).encode()}),
+    )
+    assert result["verdict"] == verdict
+    reason = result["reason"]
+    # The sentence names THIS verdict and says the guarantee is withheld. The
+    # pre-fix behaviour rendered the literal "contamination verdict PASS." here.
+    assert verdict in reason, reason
+    assert "verdict PASS" not in reason, reason
+    assert "not a pass" in reason.lower() or "NOT established" in reason, reason
+    assert not att.verdict_is_pass(result["verdict"])
+
+
+def test_a_pass_with_no_producer_reason_still_reads_as_a_pass():
+    """The other polarity — the guard above must not turn every verdict into a
+    withholding sentence, or it would be a check that cannot pass."""
+    doc = json.loads(_report())
+    doc.pop("verdict_reason")
+    result = att.read_contamination_verdict(
+        "b", "2026-08-15", s3_client=_S3({_KEY: json.dumps(doc).encode()}),
+    )
+    assert result["verdict"] == att.PASS
+    assert "PASS" in result["reason"]
+
+
+def test_a_reasonless_fail_coverage_is_stated_not_implied():
+    doc = json.loads(_report(
+        verdict=att.FAIL,
+        coverage={"coverage_fraction": 0.62, "budget_stopped": True},
+        materiality={"material": True},
+    ))
+    doc.pop("verdict_reason")
+    result = att.read_contamination_verdict(
+        "b", "2026-08-15", s3_client=_S3({_KEY: json.dumps(doc).encode()}),
+    )
+    assert "62%" in result["reason"]
+
+
+def test_a_producer_supplied_reason_is_never_overwritten(monkeypatch):
+    block = _build(monkeypatch, _report(
+        verdict=att.FAIL, verdict_reason="MATERIAL contamination detected.",
+        materiality={"material": True},
+    ))
+    assert "MATERIAL contamination detected." in block["contamination"]["reason"]
+
+
+def test_an_explicit_unknown_is_not_described_as_a_malformed_verdict():
+    """An artifact saying `verdict: "UNKNOWN"` is HONEST, not malformed. Calling
+    it 'not one of [FAIL, PARTIAL, PASS, UNKNOWN]' is a false sentence that
+    sends a reader hunting a producer bug that does not exist."""
+    doc = json.loads(_report(verdict=att.UNKNOWN))
+    doc.pop("verdict_reason")
+    result = att.read_contamination_verdict(
+        "b", "2026-08-15", s3_client=_S3({_KEY: json.dumps(doc).encode()}),
+    )
+    assert result["verdict"] == att.UNKNOWN
+    assert "not one of" not in result["reason"], result["reason"]
+    assert "did not answer" in result["reason"]
+
+
+def test_a_genuinely_unrecognised_verdict_still_names_the_vocabulary():
+    """The other polarity — a producer that starts writing "ok" must still be
+    called out, or the guard above would suppress a real contract break."""
+    doc = json.loads(_report(verdict="ok"))
+    doc.pop("verdict_reason")
+    result = att.read_contamination_verdict(
+        "b", "2026-08-15", s3_client=_S3({_KEY: json.dumps(doc).encode()}),
+    )
+    assert result["verdict"] == att.UNKNOWN
+    assert "not one of" in result["reason"]
+    assert "'ok'" in result["reason"]
