@@ -1,0 +1,116 @@
+{
+  "_fixture_note": "VERBATIM grade blocks from the real published card s3://alpha-engine-research/evaluator/2026-08-07/report_card.json (overall 55.68560475209855, C+). Only the tiles/_provenance payload and the sector_teams detail were stripped for size; every grade/letter/reason value is untouched. The 'grading_weights' block is the one this producer now stamps (grading/scorecard.py) \u2014 it was NOT on the historical card, which is exactly the defect config-I7202 fixes. tests/test_scorecard_coverage.py asserts those stamped weights reproduce the historical published number, which is what makes them the real weights rather than a claim.",
+  "schema_version": 1,
+  "status": "ok",
+  "research": {
+    "grade": 52.41787348484848,
+    "letter": "C+",
+    "components": {
+      "scanner": {
+        "grade": 33.331104166666655,
+        "letter": "D+"
+      },
+      "sector_teams": [],
+      "sector_teams_avg": {
+        "grade": null,
+        "letter": "N/A"
+      },
+      "macro_agent": {
+        "grade": 39.967200000000005,
+        "letter": "C-"
+      },
+      "cio": {
+        "grade": null,
+        "letter": "N/A",
+        "reason": "insufficient data"
+      },
+      "composite_scoring": {
+        "grade": 40.0,
+        "letter": "C-"
+      },
+      "calibration_diagnostics": {
+        "grade": 90.0,
+        "letter": "A"
+      }
+    }
+  },
+  "predictor": {
+    "grade": 53.04257873129252,
+    "letter": "C+",
+    "components": {
+      "meta_model": {
+        "grade": 57.39154333333333,
+        "letter": "C+"
+      },
+      "veto_gate": {
+        "grade": 47.727177551020404,
+        "letter": "C"
+      }
+    }
+  },
+  "executor": {
+    "grade": 61.308030500960086,
+    "letter": "B-",
+    "components": {
+      "entry_triggers": {
+        "grade": 45.5605,
+        "letter": "C"
+      },
+      "risk_guard": {
+        "grade": 65.67495238095238,
+        "letter": "B"
+      },
+      "exit_rules": {
+        "grade": 50.388000000000005,
+        "letter": "C+"
+      },
+      "position_sizing": {
+        "grade": null,
+        "letter": "N/A",
+        "reason": "insufficient data"
+      },
+      "portfolio": {
+        "grade": 61.88523981581106,
+        "letter": "B-"
+      },
+      "action_entropy": {
+        "grade": 85.44220064624447,
+        "letter": "A-"
+      }
+    }
+  },
+  "overall": {
+    "grade": 55.68560475209855,
+    "letter": "C+"
+  },
+  "grading_weights": {
+    "version": "2026-08-13",
+    "rule": "A component whose grade is null is removed from the denominator; the remaining declared weights are rescaled to sum to 1. grade = sum(w_i * g_i for graded i) / sum(w_i for graded i). weight_present is sum(w_i for graded i) against a declared total of 1.0.",
+    "overall": {
+      "research": 0.4,
+      "predictor": 0.25,
+      "executor": 0.35
+    },
+    "research": {
+      "scanner": 0.1,
+      "sector_teams_avg": 0.25,
+      "macro_agent": 0.1,
+      "cio": 0.2,
+      "composite_scoring": 0.2,
+      "calibration_diagnostics": 0.15
+    },
+    "predictor": {
+      "meta_model": 0.55,
+      "veto_gate": 0.45
+    },
+    "executor": {
+      "entry_triggers": 0.1,
+      "risk_guard": 0.15,
+      "exit_rules": 0.15,
+      "position_sizing": 0.1,
+      "portfolio": 0.25,
+      "excursion": 0.15,
+      "action_entropy": 0.1
+    }
+  }
+}

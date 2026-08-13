@@ -175,7 +175,16 @@ def _cvar_to_grade(cvar_95: float | None, baseline: float = -0.04, ceiling: floa
 
 
 def _weighted_avg(components: list[tuple[float, float | None]]) -> float | None:
-    """Weighted average of (weight, grade) pairs, skipping Nones."""
+    """Weighted average of (weight, grade) pairs, skipping Nones.
+
+    NOTE — this RENORMALIZES: a component whose grade is None is removed from
+    the denominator and the remaining weights are rescaled to sum to 1. That is
+    deliberate (a missing sub-metric must not drag a component to zero) but it
+    is invisible in the returned scalar, which is why the module- and
+    system-level composites additionally publish a coverage block
+    (``_coverage``) naming what dropped out and how much declared weight it
+    carried. See ``alpha-engine-config-I7202``.
+    """
     total_w = 0.0
     total_v = 0.0
     for w, g in components:
@@ -185,6 +194,356 @@ def _weighted_avg(components: list[tuple[float, float | None]]) -> float | None:
     if total_w == 0:
         return None
     return total_v / total_w
+
+
+# ---------------------------------------------------------------------------
+# Declared weight tables — the SINGLE source of the module/system composites
+# ---------------------------------------------------------------------------
+#
+# These were literals inside ``compute_scorecard`` until config-I7202. They are
+# named here for two reasons: the composites below build their (weight, grade)
+# pairs from them so there is exactly one declaration, and they are STAMPED ONTO
+# THE ARTIFACT (``grading_weights``) so a reader can recompute the published
+# grade from the card alone rather than having to read this file at the right
+# commit. A published number whose weights live only in source is not a
+# verifiable number.
+#
+# Each table must sum to 1.0 — asserted by tests/test_scorecard.py.
+
+WEIGHT_TABLE_VERSION = "2026-08-13"
+
+RESEARCH_WEIGHTS: dict[str, float] = {
+    "scanner": 0.10,
+    "sector_teams_avg": 0.25,
+    "macro_agent": 0.10,
+    "cio": 0.20,
+    "composite_scoring": 0.20,
+    "calibration_diagnostics": 0.15,
+}
+
+PREDICTOR_WEIGHTS: dict[str, float] = {
+    "meta_model": 0.55,
+    "veto_gate": 0.45,
+}
+
+EXECUTOR_WEIGHTS: dict[str, float] = {
+    "entry_triggers": 0.10,
+    "risk_guard": 0.15,
+    "exit_rules": 0.15,
+    "position_sizing": 0.10,
+    "portfolio": 0.25,
+    "excursion": 0.15,
+    "action_entropy": 0.10,
+}
+
+OVERALL_WEIGHTS: dict[str, float] = {
+    "research": 0.40,
+    "predictor": 0.25,
+    "executor": 0.35,
+}
+
+#: The renormalization rule, stamped onto the artifact in words. A reader
+#: reproducing the grade needs the rule as much as the numbers.
+RENORMALIZATION_RULE = (
+    "A component whose grade is null is removed from the denominator; the "
+    "remaining declared weights are rescaled to sum to 1. grade = "
+    "sum(w_i * g_i for graded i) / sum(w_i for graded i). weight_present is "
+    "sum(w_i for graded i) against a declared total of 1.0."
+)
+
+#: Coverage floor below which a grade would render PROVISIONAL rather than as a
+#: letter. DELIBERATELY UNSET. Brian's 2026-08-11 ruling
+#: (``ruling_detect_before_enforcing_when_the_floor_is_unmeasured``): a ceiling
+#: with no measured distribution behind it gets a DETECTOR first. Measured
+#: 2026-08-13 over all 15 historical cards in
+#: ``s3://alpha-engine-research/evaluator/*/report_card.json``: effective
+#: coverage has NEVER reached 1.0 on any card (observed range 0.39-0.91 over the
+#: 12 gradable ones, three total-failure cards at 0.0), and the weight table
+#: itself changed three times inside that window. There is no observation of the
+#: healthy state, so any floor would be fitted entirely to degraded data. The
+#: mechanism is built and parameterised; the number is not invented. When a
+#: distribution exists, set this and the PROVISIONAL rendering activates.
+DEFAULT_COVERAGE_FLOOR: float | None = None
+
+
+def _na_reason(
+    artifact: dict | None,
+    *,
+    label: str,
+    ok_statuses: tuple[str, ...] = ("ok",),
+) -> str:
+    """Build a specific N/A reason naming *which* upstream artifact is missing.
+
+    MIRRORED from ``crucible-backtester/analysis/grading.py::_na_reason`` rather
+    than reinvented (``policy-shared-code``; this file is a port of that module
+    and the helper landed there after the port). The generic
+    ``"insufficient data"`` framed a producer-INPUT gap as a sample-size story
+    when it almost always means the upstream analysis was not produced,
+    persisted, or is deliberately retired — a plumbing or lifecycle fact, not a
+    maturity one (config#859 Problem 1b). Two honest cases:
+
+    * input ABSENT (``None``/empty, or present with no ``status``) → the
+      analysis did not run this cycle: ``"no <label> this cycle"``;
+    * input PRESENT carrying a non-ok ``status`` → a real producer signal,
+      surfaced verbatim: ``"<label> status: <status>"``.
+
+    Surfacing the producer's own status verbatim is what makes ``_skip_class``
+    below able to tell a RETIRED component from a FAILED one — the generic
+    string erased that distinction before any reader could see it.
+    """
+    if not artifact:
+        return f"no {label} this cycle"
+    status = artifact.get("status")
+    if status is None:
+        return f"no {label} this cycle"
+    if status in ok_statuses:
+        return f"{label} present"
+    return f"{label} status: {status}"
+
+
+#: Closed taxonomy for WHY a declared weight did not vote. Ordered by how a
+#: reader must act on it. ``failed`` and ``failed_timeout`` are the two that
+#: mean a grade was INFLATED by the drop, and they are counted separately from
+#: the rest (``weight_failed``) precisely so they cannot hide inside a coverage
+#: number that also absorbs legitimate absences.
+SKIP_CLASSES = (
+    "failed_timeout",   # the producer hit a wall — Brian ruling 2026-08-13:
+                        # "anything that is timing out is considered failed"
+    "failed",           # the producer ran and errored
+    "retired",          # DECLARED end-of-life; the weight should be removed
+    "not_implemented",  # the producer has never existed
+    "input_absent",     # the artifact did not arrive this cycle
+    "insufficient_data",  # ran, produced, sample below floor
+    "unknown",
+)
+
+_FAILED_SKIP_CLASSES = frozenset({"failed_timeout", "failed"})
+
+_TIMEOUT_TOKENS = ("timeout", "timed out", "timed_out", "deadline", "wall clock", "walltime")
+_FAILED_TOKENS = ("failed", "failure", "error", "exception", "crash", "aborted", "killed")
+_RETIRED_TOKENS = ("retired", "deprecated", "decommissioned", "sunset")
+_NOT_IMPL_TOKENS = ("not implemented", "not_implemented", "never produced", "simulation-only", "deferred")
+
+
+def _skip_class(entry: Any, reason: str) -> str:
+    """Classify a skip into ``SKIP_CLASSES`` from the producer's own words.
+
+    Deliberately keyed on the reason string the grader emitted, because that is
+    the only channel the producer's status reaches this layer through. Ordered
+    most-serious-first so a reason naming both a timeout and insufficient data
+    classifies as the timeout.
+    """
+    if entry is None:
+        return "input_absent"
+    text = (reason or "").lower()
+    if any(t in text for t in _TIMEOUT_TOKENS):
+        return "failed_timeout"
+    if any(t in text for t in _FAILED_TOKENS):
+        return "failed"
+    if any(t in text for t in _RETIRED_TOKENS):
+        return "retired"
+    if any(t in text for t in _NOT_IMPL_TOKENS):
+        return "not_implemented"
+    if "no " in text and "this cycle" in text:
+        return "input_absent"
+    if "insufficient" in text or "only " in text:
+        return "insufficient_data"
+    return "unknown"
+
+
+def _skip_reason(entry: Any) -> str:
+    """Why a declared component contributed nothing, from its own emitted block.
+
+    Distinguishes the engineering states that a bare null conflates
+    (``observability-policy.md`` §3.5's closed N/A taxonomy, applied here):
+    the producer artifact never arrived, versus it arrived and the grade was
+    not computable, versus the grader said why.
+    """
+    if entry is None:
+        return "component absent from this card (input artifact not read)"
+    if not isinstance(entry, dict):
+        return f"component block is not a grade block (got {type(entry).__name__})"
+    reason = entry.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    return "grade null, no reason emitted by the grader"
+
+
+def _coverage(
+    weights: dict[str, float],
+    graded: dict[str, Any],
+    *,
+    effective: dict[str, float] | None = None,
+    effective_failed: dict[str, float] | None = None,
+    effective_failed_members: dict[str, list[str]] | None = None,
+    floor: float | None = None,
+) -> dict:
+    """Coverage of one composite level: how much declared weight actually voted.
+
+    ``graded`` maps each declared component name to its emitted block (or None
+    when the component was not emitted at all — the case a card cannot show
+    today, because an absent producer removes the key entirely and the weight
+    vanishes with it).
+
+    ``effective`` optionally maps a child name to that child's own
+    ``weight_present_effective``, which is what makes the system level honest:
+    the overall grade can be 100% covered *at its own level* — all three module
+    grades non-null — while two of those modules were themselves computed over
+    little more than half their declared weight. Without the recursive number a
+    reader sees 1.0 and concludes the card is complete.
+    """
+    declared = sum(weights.values())
+    present = 0.0
+    present_effective = 0.0
+    failed_w = 0.0
+    skips: list[dict] = []
+    for name, w in weights.items():
+        entry = graded.get(name)
+        grade = entry.get("grade") if isinstance(entry, dict) else None
+        if grade is None:
+            reason = _skip_reason(entry)
+            klass = _skip_class(entry, reason)
+            if klass in _FAILED_SKIP_CLASSES:
+                failed_w += w
+            skips.append(
+                {"component": name, "weight": w, "reason": reason, "skip_class": klass},
+            )
+            continue
+        present += w
+        present_effective += w * (effective or {}).get(name, 1.0)
+        # A failure inside a CHILD is a failure this level's grade absorbed. It
+        # must not become invisible one level up — that is how a masked failure
+        # reaches the headline number looking like a clean C+.
+        failed_w += w * (effective_failed or {}).get(name, 0.0)
+
+    weight_present = present / declared if declared else 0.0
+    weight_present_effective = present_effective / declared if declared else 0.0
+    weight_failed = failed_w / declared if declared else 0.0
+    failed = [s["component"] for s in skips if s["skip_class"] in _FAILED_SKIP_CLASSES]
+    # Name the MEMBERS, not the container: a roll-up that reports "executor
+    # failed" sends the reader down a level to find out what actually failed
+    # (``observability-policy.md`` §7.2a — a group alert that omits its member
+    # list has traded spam for uselessness).
+    for name, fw in (effective_failed or {}).items():
+        if not fw:
+            continue
+        members = (effective_failed_members or {}).get(name) or [name]
+        failed += [m for m in members if m not in failed]
+
+    # Brian ruling 2026-08-13: "anything that is timing out is considered failed
+    # now". A FAILED component dropped from the denominator INFLATES the grade —
+    # the same defect as the silent renormalization, in its most damaging form.
+    # This build does not change how a failure scores (that moves the grade and
+    # is Brian's call); it makes the masking impossible to miss, and the
+    # qualifier is distinct so a surface cannot render it as ordinary partial
+    # coverage.
+    #
+    # The qualifier reads the EFFECTIVE number, not this level's own. The
+    # overall level is 100% covered at its own level whenever all three module
+    # grades are non-null — which is exactly the reading that let 55.68 render
+    # as an unqualified C+ over 73% of the declared leaf weight.
+    if present == 0.0:
+        qualifier = "UNGRADED"
+    elif failed:
+        qualifier = "PARTIAL-MASKED-FAILURE"
+    elif skips or weight_present_effective < 1.0 - 1e-9:
+        qualifier = "PARTIAL"
+    else:
+        qualifier = "COMPLETE"
+
+    block = {
+        "weight_declared": round(declared, 6),
+        "weight_present": round(weight_present, 6),
+        "weight_present_effective": round(weight_present_effective, 6),
+        "components_declared": len(weights),
+        "components_present": len(weights) - len(skips),
+        "components_skipped": [s["component"] for s in skips],
+        # Zero is a VALUE here, not an absence: a card reporting
+        # weight_failed 0.0 is asserting no failure was dropped, which is what
+        # makes a non-zero one readable as the finding it is.
+        "weight_failed": round(weight_failed, 6),
+        "components_failed": failed,
+        "skip_classes": {
+            s["component"]: s["skip_class"] for s in skips
+        },
+        "skips": skips,
+        "weights": dict(weights),
+        "renormalized": bool(skips) and present > 0.0,
+        "renormalization_factor": (
+            round(declared / present, 6) if present > 0.0 else None
+        ),
+        # The qualifier is a MEASURED fact (coverage < declared), not a
+        # threshold judgement — it needs no invented number and is what stops a
+        # renormalized grade rendering as a plain letter.
+        "qualifier": qualifier,
+        "floor": floor,
+        "floor_status": (
+            "unset-unmeasured (config-I7202: no card has ever reached full "
+            "coverage, so there is no distribution to place a floor below)"
+            if floor is None else "set"
+        ),
+        "provisional": bool(floor is not None and weight_present_effective < floor),
+    }
+    return block
+
+
+def _display(letter: str, coverage: dict | None) -> str:
+    """The string a surface should render instead of the bare letter.
+
+    A renormalized grade never renders as a plain letter — deliverable 3 of
+    config-I7202, satisfied without inventing a threshold.
+    """
+    if not isinstance(coverage, dict):
+        return f"{letter} (coverage UNKNOWN)"
+    q = coverage.get("qualifier")
+    if q == "COMPLETE":
+        return letter
+    if q == "UNGRADED":
+        return "N/A (no component contributed)"
+    pct = coverage.get("weight_present_effective")
+    pct_s = f"{pct:.0%}" if isinstance(pct, (int, float)) else "?"
+    if q == "PARTIAL-MASKED-FAILURE":
+        failed = coverage.get("components_failed") or []
+        fw = coverage.get("weight_failed")
+        fw_s = f"{fw:.0%}" if isinstance(fw, (int, float)) else "?"
+        return (
+            f"{letter} (PARTIAL — {pct_s} of declared weight; "
+            f"{fw_s} DROPPED ON FAILURE: {', '.join(failed)} — grade is inflated)"
+        )
+    return f"{letter} (PARTIAL — {pct_s} of declared weight)"
+
+
+#: Emitted in place of a real coverage block if the coverage computation itself
+#: raises. Deviation from the fleet's fail-loud default is DELIBERATE and
+#: narrow: (a) the failure mode swallowed is a defect in this reporting code,
+#: which is additive to a grade already computed above it by the unchanged
+#: arithmetic path; (b) the primary deliverable — the grade and every component
+#: decomposition — is produced before this block runs and is unaffected; (c) the
+#: recording surface is this literal marker on the artifact plus a
+#: ``logger.exception`` carrying the greppable string below. Withholding the
+#: coverage guarantee beats failing the report-card stage
+#: (``sf-pipeline-policy.md`` §2.3a).
+COVERAGE_UNKNOWN_MARKER = "scorecard_coverage_failed"
+_COVERAGE_UNKNOWN = {
+    "weight_declared": None,
+    "weight_present": None,
+    "weight_present_effective": None,
+    "components_declared": None,
+    "components_present": None,
+    "components_skipped": None,
+    "weight_failed": None,
+    "components_failed": None,
+    "skip_classes": None,
+    "skips": None,
+    "weights": None,
+    "renormalized": None,
+    "renormalization_factor": None,
+    "qualifier": "UNKNOWN",
+    "floor": None,
+    "floor_status": "unknown",
+    "provisional": None,
+    "error": COVERAGE_UNKNOWN_MARKER,
+}
 
 
 def _safe_get(d: dict | None, *keys, default=None) -> Any:
@@ -442,7 +801,8 @@ def _grade_team_skill_composite(
 def _grade_macro(macro_eval: dict | None) -> dict:
     """Grade the macro agent's contribution."""
     if not macro_eval or macro_eval.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(macro_eval, label="macro evaluation")}
 
     acc_lift = macro_eval.get("accuracy_lift")
     alpha_lift = macro_eval.get("alpha_lift")
@@ -472,7 +832,16 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     cio_vs = _safe_get(e2e, "cio_vs_ranking")
 
     if not cio_lift or _safe_get(cio_lift, "n_advance", default=0) < 3:
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        # The producer has emitted ``{"status": "retired", ...}`` here on every
+        # card since 2026-07-17 (six-team + CIO research graph retired
+        # 2026-07-12, config#1580 / config-I2993) and this branch reported it as
+        # "insufficient data" — a DECISION rendered as a defect, and 20% of the
+        # declared research weight silently renormalized away with it
+        # (config-I7202). Surface the producer's own status verbatim.
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": _na_reason(cio_lift, label="CIO lift"),
+        }
 
     clf = _safe_get(cio_lift, "classification")
     precision = _safe_get(clf, "precision")
@@ -533,7 +902,8 @@ def _grade_composite_scoring(signal_quality: dict | None,
                              score_cal: dict | None) -> dict:
     """Grade the composite scoring system (monotonicity + bucket accuracy)."""
     if not signal_quality or signal_quality.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(signal_quality, label="signal quality")}
 
     overall = signal_quality.get("overall", {})
     buckets = signal_quality.get("by_score_bucket", [])
@@ -589,7 +959,8 @@ def _grade_meta_model(predictor_sizing: dict | None,
     if not predictor_sizing or predictor_sizing.get("status") != "ok":
         # Fall back to veto result for any signal of model quality
         if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-            return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+            return {"grade": None, "letter": "N/A",
+                    "reason": _na_reason(predictor_sizing, label="predictor sizing")}
 
     ic_g = _ic_to_grade(ic)
 
@@ -625,7 +996,9 @@ def _grade_veto_gate(veto_result: dict | None,
                      veto_value: dict | None) -> dict:
     """Grade the predictor's veto system."""
     if not veto_result or veto_result.get("status") not in ("ok", "insufficient_lift"):
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(veto_result, label="veto analysis",
+                                     ok_statuses=("ok", "insufficient_lift"))}
 
     # Find the recommended threshold's metrics
     thresholds = veto_result.get("thresholds", [])
@@ -680,7 +1053,8 @@ def _grade_veto_gate(veto_result: dict | None,
 def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
     """Grade entry trigger effectiveness."""
     if not trigger_scorecard or trigger_scorecard.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(trigger_scorecard, label="trigger scorecard")}
 
     summary = trigger_scorecard.get("summary", {})
     triggers = trigger_scorecard.get("triggers", [])
@@ -739,7 +1113,8 @@ def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
 def _grade_risk_guard(shadow_book: dict | None) -> dict:
     """Grade the risk guard's blocking decisions."""
     if not shadow_book or shadow_book.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(shadow_book, label="shadow book")}
 
     assessment = shadow_book.get("assessment", "neutral")
     guard_lift = shadow_book.get("guard_lift")
@@ -806,7 +1181,8 @@ def _grade_risk_guard(shadow_book: dict | None) -> dict:
 def _grade_exit_rules(exit_timing: dict | None) -> dict:
     """Grade exit rule effectiveness."""
     if not exit_timing or exit_timing.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        return {"grade": None, "letter": "N/A",
+                "reason": _na_reason(exit_timing, label="exit timing")}
 
     summary = exit_timing.get("summary", {})
     diagnosis = exit_timing.get("diagnosis", "unknown")
@@ -844,7 +1220,16 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
 def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     """Grade position sizing vs equal-weight baseline."""
     if not sizing_ab or sizing_ab.get("status") != "ok":
-        return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+        # ``backtest/{date}/sizing_ab.json`` has NEVER been written for any date
+        # (verified 2026-08-13 across every card in
+        # s3://alpha-engine-research/evaluator/); the backtester's weekly path
+        # passes ``sizing_ab=None  # simulation-only``. This is a producer that
+        # does not exist, not a thin sample — 10% of the declared executor
+        # weight that has never once applied (config-I7202).
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": _na_reason(sizing_ab, label="sizing A/B"),
+        }
 
     sharpe_diff = sizing_ab.get("sharpe_diff")
     alpha_diff = sizing_ab.get("alpha_diff")
@@ -1024,7 +1409,7 @@ def _grade_action_entropy(action_entropy: dict | None) -> dict:
     if not action_entropy or action_entropy.get("status") != "ok":
         return {
             "grade": None, "letter": "N/A",
-            "reason": "insufficient data",
+            "reason": _na_reason(action_entropy, label="action entropy"),
         }
 
     h_norm = action_entropy.get("entropy_normalized")
@@ -1060,9 +1445,15 @@ def _grade_excursion(excursion_summary: dict | None) -> dict:
         banded 0 → 0.3 → 0.6 → 80
     """
     if not excursion_summary or excursion_summary.get("status") != "ok":
+        # The FOURTH chronically-null component, which config-I7202 did not name
+        # because the card never showed it: when ``excursion_summary`` is None
+        # the key is omitted from ``executor.components`` entirely, so its 15%
+        # declared weight vanished without leaving even a null behind.
+        # ``backtest/{date}/portfolio_excursion.json`` is absent on every date
+        # checked (2026-05-29 .. 2026-08-07).
         return {
             "grade": None, "letter": "N/A",
-            "reason": "insufficient data",
+            "reason": _na_reason(excursion_summary, label="portfolio excursion"),
         }
 
     ratio = excursion_summary.get("mean_mfe_mae_ratio")
@@ -1154,18 +1545,39 @@ def compute_scorecard(
     # existing weights when calibration is absent (calibration_grade.grade
     # is None → _weighted_avg drops it from the average).
     research_grade = _weighted_avg([
-        (0.10, scanner.get("grade")),
-        (0.25, avg_team_grade),
-        (0.10, macro.get("grade")),
-        (0.20, cio.get("grade")),
-        (0.20, composite.get("grade")),
-        (0.15, calibration_grade.get("grade")),
+        (RESEARCH_WEIGHTS["scanner"], scanner.get("grade")),
+        (RESEARCH_WEIGHTS["sector_teams_avg"], avg_team_grade),
+        (RESEARCH_WEIGHTS["macro_agent"], macro.get("grade")),
+        (RESEARCH_WEIGHTS["cio"], cio.get("grade")),
+        (RESEARCH_WEIGHTS["composite_scoring"], composite.get("grade")),
+        (RESEARCH_WEIGHTS["calibration_diagnostics"], calibration_grade.get("grade")),
     ])
+
+    sector_teams_avg = {"grade": avg_team_grade, "letter": _letter(avg_team_grade)}
+    if avg_team_grade is None:
+        # An empty/ungradable team list previously emitted a bare null with no
+        # reason, which reads identically to "the graders all failed". The six-
+        # team research graph was RETIRED 2026-07-12 (config#1580 /
+        # config-I2993) and e2e_lift.team_lift has been `[]` on every card
+        # since — a permanently-absent component carrying 25% of the declared
+        # research weight (config-I7202).
+        retired = _safe_get(e2e_lift, "research_graph_retired")
+        if isinstance(retired, dict) and retired:
+            sector_teams_avg["reason"] = (
+                "sector teams status: retired"
+                + (f" ({retired.get('retired_date')})" if retired.get("retired_date") else "")
+                + (f" — {retired['reason']}" if retired.get("reason") else "")
+            )
+        else:
+            sector_teams_avg["reason"] = (
+                f"no gradable sector team ({len(teams)} team blocks, "
+                f"{len(team_grades)} with a grade)"
+            )
 
     research_components = {
         "scanner": scanner,
         "sector_teams": teams,
-        "sector_teams_avg": {"grade": avg_team_grade, "letter": _letter(avg_team_grade)},
+        "sector_teams_avg": sector_teams_avg,
         "macro_agent": macro,
         "cio": cio,
         "composite_scoring": composite,
@@ -1186,8 +1598,8 @@ def compute_scorecard(
     veto = _grade_veto_gate(veto_result, veto_value)
 
     predictor_grade = _weighted_avg([
-        (0.55, meta.get("grade")),
-        (0.45, veto.get("grade")),
+        (PREDICTOR_WEIGHTS["meta_model"], meta.get("grade")),
+        (PREDICTOR_WEIGHTS["veto_gate"], veto.get("grade")),
     ])
 
     predictor = {
@@ -1212,13 +1624,13 @@ def compute_scorecard(
     entropy_grade = _grade_action_entropy(action_entropy)
 
     executor_grade = _weighted_avg([
-        (0.10, triggers.get("grade")),
-        (0.15, guard.get("grade")),
-        (0.15, exits.get("grade")),
-        (0.10, sizing.get("grade")),
-        (0.25, portfolio.get("grade")),
-        (0.15, excursion_grade.get("grade")),
-        (0.10, entropy_grade.get("grade")),
+        (EXECUTOR_WEIGHTS["entry_triggers"], triggers.get("grade")),
+        (EXECUTOR_WEIGHTS["risk_guard"], guard.get("grade")),
+        (EXECUTOR_WEIGHTS["exit_rules"], exits.get("grade")),
+        (EXECUTOR_WEIGHTS["position_sizing"], sizing.get("grade")),
+        (EXECUTOR_WEIGHTS["portfolio"], portfolio.get("grade")),
+        (EXECUTOR_WEIGHTS["excursion"], excursion_grade.get("grade")),
+        (EXECUTOR_WEIGHTS["action_entropy"], entropy_grade.get("grade")),
     ])
 
     executor_components = {
@@ -1243,9 +1655,9 @@ def compute_scorecard(
     # Overall
     # -----------------------------------------------------------------------
     overall_grade = _weighted_avg([
-        (0.40, research_grade),
-        (0.25, predictor_grade),
-        (0.35, executor_grade),
+        (OVERALL_WEIGHTS["research"], research_grade),
+        (OVERALL_WEIGHTS["predictor"], predictor_grade),
+        (OVERALL_WEIGHTS["executor"], executor_grade),
     ])
 
     # Determine status
@@ -1257,10 +1669,106 @@ def compute_scorecard(
     else:
         status = "ok"
 
-    return {
+    card = {
         "status": status,
         "overall": {"grade": overall_grade, "letter": _letter(overall_grade)},
         "research": research,
         "predictor": predictor,
         "executor": executor,
     }
+
+    # -----------------------------------------------------------------------
+    # Coverage (config-I7202) — additive, and it cannot fail the run.
+    #
+    # Everything above this line is the arithmetic that has always produced the
+    # grade; nothing below changes a single grade value. The coverage block is
+    # computed separately and guarded, so a defect in this reporting code
+    # degrades the guarantee rather than failing the report-card stage three
+    # days before a scheduled weekly run.
+    # -----------------------------------------------------------------------
+    try:
+        research_cov = _coverage(
+            RESEARCH_WEIGHTS,
+            {
+                "scanner": scanner,
+                "sector_teams_avg": sector_teams_avg,
+                "macro_agent": macro,
+                "cio": cio,
+                "composite_scoring": composite,
+                "calibration_diagnostics": calibration_grade,
+            },
+            floor=DEFAULT_COVERAGE_FLOOR,
+        )
+        predictor_cov = _coverage(
+            PREDICTOR_WEIGHTS,
+            {"meta_model": meta, "veto_gate": veto},
+            floor=DEFAULT_COVERAGE_FLOOR,
+        )
+        executor_cov = _coverage(
+            EXECUTOR_WEIGHTS,
+            {
+                "entry_triggers": triggers,
+                "risk_guard": guard,
+                "exit_rules": exits,
+                "position_sizing": sizing,
+                "portfolio": portfolio,
+                "excursion": excursion_grade,
+                "action_entropy": entropy_grade,
+            },
+            floor=DEFAULT_COVERAGE_FLOOR,
+        )
+        overall_cov = _coverage(
+            OVERALL_WEIGHTS,
+            {
+                "research": {"grade": research_grade},
+                "predictor": {"grade": predictor_grade},
+                "executor": {"grade": executor_grade},
+            },
+            effective={
+                "research": research_cov["weight_present_effective"],
+                "predictor": predictor_cov["weight_present_effective"],
+                "executor": executor_cov["weight_present_effective"],
+            },
+            effective_failed={
+                "research": research_cov["weight_failed"],
+                "predictor": predictor_cov["weight_failed"],
+                "executor": executor_cov["weight_failed"],
+            },
+            effective_failed_members={
+                "research": research_cov["components_failed"],
+                "predictor": predictor_cov["components_failed"],
+                "executor": executor_cov["components_failed"],
+            },
+            floor=DEFAULT_COVERAGE_FLOOR,
+        )
+        for block, cov in (
+            (card["overall"], overall_cov),
+            (research, research_cov),
+            (predictor, predictor_cov),
+            (executor, executor_cov),
+        ):
+            block["coverage"] = cov
+            block["display"] = _display(block["letter"], cov)
+        card["grading_weights"] = {
+            "version": WEIGHT_TABLE_VERSION,
+            "rule": RENORMALIZATION_RULE,
+            "overall": dict(OVERALL_WEIGHTS),
+            "research": dict(RESEARCH_WEIGHTS),
+            "predictor": dict(PREDICTOR_WEIGHTS),
+            "executor": dict(EXECUTOR_WEIGHTS),
+        }
+    except Exception:  # noqa: BLE001 — see COVERAGE_UNKNOWN_MARKER rationale
+        logger.exception(
+            "%s: coverage computation raised; the grade is unaffected and is "
+            "emitted with coverage UNKNOWN", COVERAGE_UNKNOWN_MARKER,
+        )
+        for block in (card["overall"], research, predictor, executor):
+            block["coverage"] = dict(_COVERAGE_UNKNOWN)
+            block["display"] = _display(block.get("letter", "N/A"), None)
+        card["grading_weights"] = {
+            "version": WEIGHT_TABLE_VERSION,
+            "rule": RENORMALIZATION_RULE,
+            "error": COVERAGE_UNKNOWN_MARKER,
+        }
+
+    return card
