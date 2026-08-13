@@ -69,20 +69,28 @@ class TestPctToGrade:
 
 
 class TestLiftToGrade:
+    # ``units`` is required and keyword-only as of alpha-engine-config-I2318 —
+    # these anchors are all expressed in percentage points.
     def test_zero_lift_maps_to_40(self):
-        g = _lift_to_grade(0.0)
+        g = _lift_to_grade(0.0, units="pp")
         assert g == pytest.approx(40.0)
 
     def test_positive_lift(self):
-        g = _lift_to_grade(1.5, floor=-2.0, ceiling=3.0)
+        g = _lift_to_grade(1.5, floor=-2.0, ceiling=3.0, units="pp")
         assert 40.0 < g < 100.0
 
     def test_negative_lift(self):
-        g = _lift_to_grade(-1.0, floor=-2.0, ceiling=3.0)
+        g = _lift_to_grade(-1.0, floor=-2.0, ceiling=3.0, units="pp")
         assert 0.0 < g < 40.0
 
     def test_none_returns_none(self):
-        assert _lift_to_grade(None) is None
+        assert _lift_to_grade(None, units="pp") is None
+
+    def test_fraction_units_are_scaled_to_pp(self):
+        """The defect this parameter exists to make unwritable."""
+        assert _lift_to_grade(0.015, floor=-2.0, ceiling=3.0, units="fraction") == pytest.approx(
+            _lift_to_grade(1.5, floor=-2.0, ceiling=3.0, units="pp")
+        )
 
 
 class TestIcToGrade:

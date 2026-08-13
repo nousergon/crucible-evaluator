@@ -85,13 +85,41 @@ def _pct_to_grade(pct: float | None, baseline: float = 0.50,
 
 
 def _lift_to_grade(lift: float | None, floor: float = -2.0,
-                   ceiling: float = 3.0) -> float | None:
-    """Map a lift value (percentage points) to a 0-100 grade.
+                   ceiling: float = 3.0, *, units: str) -> float | None:
+    """Map a lift value to a 0-100 grade against pp-scale anchors.
 
     floor maps to 0, 0.0 maps to 40, ceiling maps to 100.
+
+    ``units`` is REQUIRED and keyword-only. Every producer feeding this helper
+    must declare the scale of the value it emits, because the anchors are
+    calibrated in PERCENTAGE POINTS and most backtester producers emit raw
+    return/probability FRACTIONS:
+
+      - ``"pp"``       value is already in percentage points (e.g. 0.31 = +0.31%).
+      - ``"fraction"`` value is a raw return/probability fraction (e.g. 0.0031
+                       = +0.31%); scaled x100 here before grading.
+      - ``"native"``   value is not a return at all and the anchors are
+                       calibrated on its own scale (e.g. a Sharpe-ratio
+                       difference). No conversion.
+
+    Why this is mandatory rather than defaulted (alpha-engine-config-I2318):
+    the parameter did not exist and the docstring's "percentage points" was a
+    convention only. 7 of 19 live call sites passed fractions against pp
+    anchors, so ``lift`` landed within ~0.5 of the zero-anchor for every
+    realistic input and the term graded a CONSTANT ~40.0 (C-) regardless of the
+    measured value. A default would have preserved exactly that silent failure
+    for the next call site added. Mismatch is now unwritable, and
+    ``tests/test_lift_units_declared.py`` fails the build if any call site
+    omits the declaration.
     """
     if lift is None:
         return None
+    if units == "fraction":
+        lift = lift * 100.0
+    elif units not in ("pp", "native"):
+        raise ValueError(
+            f"units must be one of 'pp' / 'fraction' / 'native', got {units!r}"
+        )
     if lift <= 0:
         # Negative lift: 0 at floor, 40 at zero
         if floor == 0:
@@ -103,6 +131,23 @@ def _lift_to_grade(lift: float | None, floor: float = -2.0,
             return 40.0
         raw = 40.0 + 60.0 * (lift / ceiling)
     return _clamp(raw)
+
+
+def _fmt_lift(value: float | None, units: str, decimals: int = 2,
+              suffix: str = "%") -> str | None:
+    """Render a lift for a ``detail`` block, always in PERCENTAGE POINTS.
+
+    Same ``units`` contract as :func:`_lift_to_grade`, and for the same reason:
+    the display strings carried the identical defect. ``f"{lift:+.2f}%"`` on a
+    raw fraction rendered a measured -0.0031 (-0.31pp) as ``"-0.00%"`` — a real
+    non-zero edge shown as an exact zero, indistinguishable from "no signal".
+    Formatting and grading now read the same declaration, so they cannot
+    disagree about scale (alpha-engine-config-I2318).
+    """
+    if value is None:
+        return None
+    pp = value * 100.0 if units == "fraction" else value
+    return f"{pp:+.{decimals}f}{suffix}"
 
 
 def _ic_to_grade(ic: float | None) -> float | None:
@@ -201,8 +246,80 @@ def _safe_get(d: dict | None, *keys, default=None) -> Any:
 # Component grading functions
 # ---------------------------------------------------------------------------
 
+def _selection_edge_pp(clf: dict | None) -> float | None:
+    """Precision minus the cohort base rate, in percentage points.
+
+    THE metric for a deliberately selective filter, and the one the composite
+    was missing. Precision alone is unreadable without the base rate it is
+    being compared against: 44.1% precision is a 10x lift against a 4% base
+    rate and pure noise against a 43% one. Only the confusion matrix carries
+    the base rate, so it is derived here rather than trusted from a sibling
+    field.
+    """
+    if not isinstance(clf, dict):
+        return None
+    try:
+        tp, fp, fn, tn = (float(clf[k]) for k in ("tp", "fp", "fn", "tn"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    n = tp + fp + fn + tn
+    selected = tp + fp
+    if n <= 0 or selected <= 0:
+        return None
+    precision = tp / selected
+    base_rate = (tp + fn) / n
+    return (precision - base_rate) * 100.0
+
+
+def _max_achievable_recall(clf: dict | None) -> float | None:
+    """Ceiling on recall given how many names this filter actually selects.
+
+    A filter selecting S names out of P positives cannot exceed S/P recall even
+    if every pick is correct. Used to detect the case where the recall band is
+    unreachable by construction and grading against it is a category error.
+    """
+    if not isinstance(clf, dict):
+        return None
+    try:
+        tp, fp, fn = (float(clf[k]) for k in ("tp", "fp", "fn"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    positives = tp + fn
+    if positives <= 0:
+        return None
+    return min(1.0, (tp + fp) / positives)
+
+
+# Recall band for the scanner. A scanner is a SELECTIVE instrument, so this
+# band is only meaningful when the filter's pass rate makes it reachable —
+# see the guard in _grade_scanner.
+_SCANNER_RECALL_BASELINE = 0.10
+_SCANNER_RECALL_CEILING = 0.40
+
+
 def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
-    """Grade the quant scanner filter."""
+    """Grade the quant scanner filter.
+
+    ARM (alpha-engine-config-I2318): the producer stamps ``scanner_lift.arm``
+    precisely so a consumer cannot present a retired gate's record as "the
+    scanner" unlabeled (crucible-backtester ``analysis/end_to_end.py`` §36-42).
+    This grader dropped that field, so the report card showed the retired
+    ``tech_score_baseline`` gate — retired from the live feed 2026-06-29 — as an
+    unqualified "scanner" grade. The arm is now carried into ``detail`` and
+    ``arm``, alongside a pointer to the component that grades the LIVE feed
+    (``attractiveness_ic``, config-I2994).
+
+    HORIZON: grades ``classification_21d`` — the canonical horizon (L4551) —
+    and falls back to the 5d ``classification`` only when the 21d block is
+    absent. The 5d block remains in ``detail`` as a diagnostic.
+
+    RECALL: graded only when the band is physically reachable. A filter passing
+    653 of 15,274 name-days against 6,592 positives caps at 9.9% recall with
+    PERFECT precision — below the 10% baseline — so the term contributed a
+    near-floor constant that measured the filter's selectivity, not its skill.
+    Where the band is unreachable, selection edge (precision - base rate)
+    carries the weight instead.
+    """
     sl = _safe_get(e2e, "scanner_lift")
     if not sl or _safe_get(sl, "n_passing") is None:
         return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
@@ -210,7 +327,13 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     lift = _safe_get(sl, "lift")
     n_passing = _safe_get(sl, "n_passing", default=0)
     n_universe = _safe_get(sl, "n_universe", default=1)
-    clf = _safe_get(sl, "classification")
+    arm = _safe_get(sl, "arm")
+
+    # Canonical 21d horizon first (L4551); 5d is the legacy diagnostic.
+    clf_21d = _safe_get(sl, "classification_21d")
+    clf_5d = _safe_get(sl, "classification")
+    clf = clf_21d if isinstance(clf_21d, dict) and clf_21d.get("tp") is not None else clf_5d
+    horizon = "21d" if clf is clf_21d and clf_21d else "5d"
 
     # Precision/recall from classification metrics (if available)
     precision = _safe_get(clf, "precision")
@@ -218,10 +341,25 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     f1 = _safe_get(clf, "f1")
 
     precision_g = _pct_to_grade(precision, baseline=0.40, ceiling=0.65) if precision is not None else None
-    recall_g = _pct_to_grade(recall, baseline=0.10, ceiling=0.40) if recall is not None else None
+
+    # Only grade recall where the band is reachable at this pass rate.
+    max_recall = _max_achievable_recall(clf)
+    recall_reachable = max_recall is None or max_recall >= _SCANNER_RECALL_BASELINE
+    if recall is not None and recall_reachable:
+        recall_g = _pct_to_grade(
+            recall, baseline=_SCANNER_RECALL_BASELINE, ceiling=_SCANNER_RECALL_CEILING,
+        )
+    else:
+        recall_g = None
+
+    # Selection edge: precision over the cohort base rate, in pp. Anchors are
+    # deliberately tight — a stock filter clearing its own base rate by 5pp on
+    # a 21d horizon is a strong instrument, not a mediocre one.
+    edge_pp = _selection_edge_pp(clf)
+    edge_g = _lift_to_grade(edge_pp, floor=-5.0, ceiling=5.0, units="pp")
 
     # Fallback to lift if no classification data
-    lift_g = _lift_to_grade(lift, floor=-1.5, ceiling=2.5)
+    lift_g = _lift_to_grade(lift, floor=-1.5, ceiling=2.5, units="fraction")
 
     # Leakage from scanner_opt (lower is better)
     leakage = _safe_get(scanner_opt, "leakage_pct")
@@ -230,11 +368,12 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     else:
         leakage_g = None
 
-    if precision_g is not None and recall_g is not None:
+    if precision_g is not None:
         grade = _weighted_avg([
-            (0.35, precision_g),
-            (0.25, recall_g),
-            (0.20, lift_g),
+            (0.25, precision_g),
+            (0.25, edge_g),
+            (0.15, recall_g),
+            (0.15, lift_g),
             (0.20, leakage_g),
         ])
     else:
@@ -243,21 +382,52 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
             (0.45, leakage_g),
         ])
 
-    detail = {}
+    detail = {"horizon": horizon}
     if precision is not None:
         detail["precision"] = f"{precision:.1%}"
+    if edge_pp is not None:
+        detail["selection_edge"] = _fmt_lift(edge_pp, "pp", suffix="pp")
+        detail["base_rate"] = f"{(precision - edge_pp / 100.0):.1%}" if precision is not None else None
     if recall is not None:
         detail["recall"] = f"{recall:.1%}"
+    if max_recall is not None and not recall_reachable:
+        # State the reason the term is absent. A missing component that says
+        # nothing about why is indistinguishable from one that was never wired.
+        detail["recall_graded"] = False
+        detail["recall_ceiling"] = f"{max_recall:.1%}"
+        detail["recall_not_graded_reason"] = (
+            f"max achievable recall at this pass rate is {max_recall:.1%}, below the "
+            f"{_SCANNER_RECALL_BASELINE:.0%} grading baseline — a perfect filter would "
+            f"score at the floor, so the band measures selectivity, not skill"
+        )
     if f1 is not None:
         detail["f1"] = f"{f1:.3f}"
     if lift is not None:
-        detail["lift"] = f"{lift:+.2f}%"
+        detail["lift"] = _fmt_lift(lift, "fraction")
     if leakage is not None:
         detail["leakage"] = f"{leakage:.0%}"
     detail["n_passing"] = n_passing
     detail["n_universe"] = n_universe
+    detail["n_universe_basis"] = "(ticker, eval_date) observations, not tickers"
+    if arm:
+        detail["arm"] = arm
+        detail["live_arm_graded_by"] = (
+            "attractiveness_ic (config-I2994) — the live champion feed's "
+            "attractiveness_score IC. This component is NOT the live scanner."
+        )
+    # 5d stays visible as a diagnostic whenever 21d is what got graded.
+    if horizon == "21d" and isinstance(clf_5d, dict):
+        p5 = clf_5d.get("precision")
+        if p5 is not None:
+            detail["precision_5d_diagnostic"] = f"{p5:.1%}"
+    detail = {k: v for k, v in detail.items() if v is not None}
 
-    return {"grade": grade, "letter": _letter(grade), "detail": detail}
+    out = {"grade": grade, "letter": _letter(grade), "detail": detail}
+    if arm:
+        # Top-level too, not only inside detail — any consumer rendering the
+        # letter without the detail block still sees which arm it describes.
+        out["arm"] = arm
+    return out
 
 
 def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
@@ -305,8 +475,8 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
     recall_g = _pct_to_grade(recall, baseline=0.10, ceiling=0.50) if recall is not None else None
 
     # Lift-based grades (always available)
-    lift_sector_g = _lift_to_grade(lift_vs_sector, floor=-2.0, ceiling=3.0)
-    lift_quant_g = _lift_to_grade(lift_vs_quant, floor=-2.0, ceiling=3.0)
+    lift_sector_g = _lift_to_grade(lift_vs_sector, floor=-2.0, ceiling=3.0, units="fraction")
+    lift_quant_g = _lift_to_grade(lift_vs_quant, floor=-2.0, ceiling=3.0, units="fraction")
 
     if precision_g is not None and recall_g is not None:
         grade = _weighted_avg([
@@ -329,9 +499,9 @@ def _grade_sector_team(team: dict, team_metrics: dict | None = None) -> dict:
     if f1 is not None:
         detail["f1"] = f"{f1:.3f}"
     if lift_vs_sector is not None:
-        detail["lift_vs_sector"] = f"{lift_vs_sector:+.2f}%"
+        detail["lift_vs_sector"] = _fmt_lift(lift_vs_sector, "fraction")
     if lift_vs_quant is not None:
-        detail["lift_vs_quant"] = f"{lift_vs_quant:+.2f}%"
+        detail["lift_vs_quant"] = _fmt_lift(lift_vs_quant, "fraction")
     detail["n_picks"] = n_picks
 
     return {
@@ -371,14 +541,12 @@ def _grade_team_skill_composite(
         exc.get("mean_mfe_mae_ratio"), floor=0.8, mid=1.5, ceiling=2.0,
     ) if exc.get("status") == "ok" else None
     # Excess returns from compute_alpha_vs_benchmark are decimal fractions
-    # (e.g. 0.012 = +1.2%). Convert to percentage-points for _lift_to_grade
-    # which is calibrated on the pp scale used by lift_vs_sector etc.
+    # (e.g. 0.012 = +1.2%); the units="fraction" declaration does the pp
+    # conversion inside _lift_to_grade / _fmt_lift.
     ew_lift = ew.get("excess_return")
     bm_lift = bm.get("excess_return")
-    ew_pp = ew_lift * 100.0 if isinstance(ew_lift, (int, float)) else None
-    bm_pp = bm_lift * 100.0 if isinstance(bm_lift, (int, float)) else None
-    ew_g = _lift_to_grade(ew_pp, floor=-3.0, ceiling=4.0)
-    bm_g = _lift_to_grade(bm_pp, floor=-3.0, ceiling=4.0)
+    ew_g = _lift_to_grade(ew_lift, floor=-3.0, ceiling=4.0, units="fraction")
+    bm_g = _lift_to_grade(bm_lift, floor=-3.0, ceiling=4.0, units="fraction")
 
     grade = _weighted_avg([
         (0.25, ic_g),
@@ -429,9 +597,9 @@ def _grade_team_skill_composite(
     if exc.get("pct_high_quality") is not None:
         detail["pct_high_quality"] = f"{exc['pct_high_quality']:.1%}"
     if ew_lift is not None:
-        detail["alpha_vs_ew_high_vol"] = f"{ew_pp:+.2f}%"
+        detail["alpha_vs_ew_high_vol"] = _fmt_lift(ew_lift, "fraction")
     if bm_lift is not None:
-        detail["alpha_vs_beta_spy"] = f"{bm_pp:+.2f}%"
+        detail["alpha_vs_beta_spy"] = _fmt_lift(bm_lift, "fraction")
 
     return {
         "team_id": team_id, "grade": grade, "letter": _letter(grade),
@@ -448,8 +616,8 @@ def _grade_macro(macro_eval: dict | None) -> dict:
     alpha_lift = macro_eval.get("alpha_lift")
     assessment = macro_eval.get("assessment", "neutral")
 
-    acc_g = _lift_to_grade(acc_lift, floor=-5.0, ceiling=5.0) if acc_lift is not None else None
-    alpha_g = _lift_to_grade(alpha_lift, floor=-1.0, ceiling=2.0) if alpha_lift is not None else None
+    acc_g = _lift_to_grade(acc_lift, floor=-5.0, ceiling=5.0, units="fraction") if acc_lift is not None else None
+    alpha_g = _lift_to_grade(alpha_lift, floor=-1.0, ceiling=2.0, units="fraction") if alpha_lift is not None else None
 
     grade = _weighted_avg([
         (0.50, acc_g),
@@ -458,9 +626,9 @@ def _grade_macro(macro_eval: dict | None) -> dict:
 
     detail = {}
     if acc_lift is not None:
-        detail["accuracy_lift"] = f"{acc_lift:+.1f}pp"
+        detail["accuracy_lift"] = _fmt_lift(acc_lift, "fraction", decimals=2, suffix="pp")
     if alpha_lift is not None:
-        detail["alpha_lift"] = f"{alpha_lift:+.2f}%"
+        detail["alpha_lift"] = _fmt_lift(alpha_lift, "fraction")
     detail["assessment"] = assessment
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
@@ -484,11 +652,11 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
 
     # Lift-based grades (fallback/complement)
     adv_lift = cio_lift.get("lift")
-    lift_g = _lift_to_grade(adv_lift, floor=-3.0, ceiling=3.0)
+    lift_g = _lift_to_grade(adv_lift, floor=-3.0, ceiling=3.0, units="fraction")
 
     # CIO vs mechanical ranking baseline
     ranking_lift = _safe_get(cio_vs, "lift")
-    ranking_g = _lift_to_grade(ranking_lift, floor=-2.0, ceiling=2.0) if ranking_lift is not None else None
+    ranking_g = _lift_to_grade(ranking_lift, floor=-2.0, ceiling=2.0, units="fraction") if ranking_lift is not None else None
 
     if precision_g is not None and recall_g is not None:
         grade = _weighted_avg([
@@ -503,7 +671,7 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
         advance_avg = cio_lift.get("advance_avg")
         if reject_avg is not None and advance_avg is not None:
             rejection_spread = advance_avg - reject_avg
-            rejection_g = _lift_to_grade(rejection_spread, floor=-2.0, ceiling=4.0)
+            rejection_g = _lift_to_grade(rejection_spread, floor=-2.0, ceiling=4.0, units="fraction")
         else:
             rejection_g = None
         grade = _weighted_avg([
@@ -520,9 +688,9 @@ def _grade_cio(e2e: dict | None, cio_opt: dict | None) -> dict:
     if f1 is not None:
         detail["f1"] = f"{f1:.3f}"
     if adv_lift is not None:
-        detail["selection_lift"] = f"{adv_lift:+.2f}%"
+        detail["selection_lift"] = _fmt_lift(adv_lift, "fraction")
     if ranking_lift is not None:
-        detail["vs_ranking"] = f"{ranking_lift:+.2f}%"
+        detail["vs_ranking"] = _fmt_lift(ranking_lift, "fraction")
     detail["n_advance"] = cio_lift.get("n_advance", 0)
     detail["n_reject"] = cio_lift.get("n_reject", 0)
 
@@ -602,7 +770,7 @@ def _grade_meta_model(predictor_sizing: dict | None,
 
     # Sizing lift (does p_up signal correlate with returns?)
     sizing_lift = _safe_get(predictor_sizing, "sizing_lift")
-    sizing_g = _lift_to_grade(sizing_lift, floor=-1.0, ceiling=2.0) if sizing_lift is not None else None
+    sizing_g = _lift_to_grade(sizing_lift, floor=-1.0, ceiling=2.0, units="fraction") if sizing_lift is not None else None
 
     grade = _weighted_avg([
         (0.45, ic_g),
@@ -616,7 +784,7 @@ def _grade_meta_model(predictor_sizing: dict | None,
     if n_total > 0:
         detail["stability"] = f"{n_positive}/{n_total} weeks positive"
     if sizing_lift is not None:
-        detail["sizing_lift"] = f"{sizing_lift:+.2f}%"
+        detail["sizing_lift"] = _fmt_lift(sizing_lift, "fraction")
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
@@ -651,13 +819,13 @@ def _grade_veto_gate(veto_result: dict | None,
         grade = _weighted_avg([
             (0.30, precision_g),
             (0.20, recall_g),
-            (0.20, _lift_to_grade(lift, floor=-5.0, ceiling=20.0) if lift is not None else None),
+            (0.20, _lift_to_grade(lift, floor=-5.0, ceiling=20.0, units="fraction") if lift is not None else None),
             (0.30, value_g),
         ])
     else:
         grade = _weighted_avg([
             (0.40, precision_g),
-            (0.30, _lift_to_grade(lift, floor=-5.0, ceiling=20.0) if lift is not None else None),
+            (0.30, _lift_to_grade(lift, floor=-5.0, ceiling=20.0, units="fraction") if lift is not None else None),
             (0.30, value_g),
         ])
 
@@ -669,7 +837,7 @@ def _grade_veto_gate(veto_result: dict | None,
     if f1 is not None:
         detail["f1"] = f"{f1:.3f}"
     if lift is not None:
-        detail["lift"] = f"{lift:+.1f}pp"
+        detail["lift"] = _fmt_lift(lift, "fraction", decimals=2, suffix="pp")
     if net_value is not None:
         detail["net_value"] = f"${net_value:+,.0f}"
     detail["threshold"] = rec_thresh
@@ -699,7 +867,7 @@ def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
 
     # Overall avg alpha
     avg_alpha = summary.get("avg_realized_alpha")
-    alpha_g = _lift_to_grade(avg_alpha, floor=-3.0, ceiling=5.0)
+    alpha_g = _lift_to_grade(avg_alpha, floor=-3.0, ceiling=5.0, units="pp")
 
     grade = _weighted_avg([
         (0.35, slip_g),
@@ -713,7 +881,7 @@ def _grade_entry_triggers(trigger_scorecard: dict | None) -> dict:
     if win_rate is not None:
         detail["win_rate"] = f"{win_rate:.1%}"
     if avg_alpha is not None:
-        detail["avg_alpha"] = f"{avg_alpha:+.2f}%"
+        detail["avg_alpha"] = _fmt_lift(avg_alpha, "pp")
     detail["n_triggers"] = len(triggers)
     detail["total_entries"] = summary.get("total_entries", 0)
 
@@ -755,7 +923,7 @@ def _grade_risk_guard(shadow_book: dict | None) -> dict:
     recall_g = _pct_to_grade(recall, baseline=0.05, ceiling=0.30) if recall is not None else None
 
     # Guard lift: positive = blocked entries were worse than traded (good)
-    lift_g = _lift_to_grade(guard_lift, floor=-3.0, ceiling=3.0) if guard_lift is not None else None
+    lift_g = _lift_to_grade(guard_lift, floor=-3.0, ceiling=3.0, units="fraction") if guard_lift is not None else None
 
     # Assessment mapping
     assessment_scores = {
@@ -798,7 +966,7 @@ def _grade_risk_guard(shadow_book: dict | None) -> dict:
     if f1 is not None:
         detail["f1"] = f"{f1:.3f}"
     if guard_lift is not None:
-        detail["guard_lift"] = f"{guard_lift:+.2f}%"
+        detail["guard_lift"] = _fmt_lift(guard_lift, "fraction")
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
@@ -815,7 +983,7 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
     capture_g = _ratio_to_grade(capture, target=0.70)
 
     avg_return = summary.get("avg_realized_return")
-    return_g = _lift_to_grade(avg_return, floor=-5.0, ceiling=5.0) if avg_return is not None else None
+    return_g = _lift_to_grade(avg_return, floor=-5.0, ceiling=5.0, units="pp") if avg_return is not None else None
 
     # Diagnosis bonus/penalty
     diag_scores = {
@@ -835,7 +1003,7 @@ def _grade_exit_rules(exit_timing: dict | None) -> dict:
     if capture is not None:
         detail["capture_ratio"] = f"{capture:.2f}"
     if avg_return is not None:
-        detail["avg_return"] = f"{avg_return:+.2f}%"
+        detail["avg_return"] = _fmt_lift(avg_return, "pp")
     detail["n_roundtrips"] = exit_timing.get("n_roundtrips", 0)
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
@@ -851,10 +1019,10 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     assessment = sizing_ab.get("assessment", "no_difference")
 
     # Sharpe improvement: 0 → 50, +0.3 → 80, +0.5 → 95
-    sharpe_g = _lift_to_grade(sharpe_diff, floor=-0.3, ceiling=0.5) if sharpe_diff is not None else None
+    sharpe_g = _lift_to_grade(sharpe_diff, floor=-0.3, ceiling=0.5, units="native") if sharpe_diff is not None else None
 
     # Alpha improvement
-    alpha_g = _lift_to_grade(alpha_diff, floor=-2.0, ceiling=3.0) if alpha_diff is not None else None
+    alpha_g = _lift_to_grade(alpha_diff, floor=-2.0, ceiling=3.0, units="fraction") if alpha_diff is not None else None
 
     grade = _weighted_avg([
         (0.55, sharpe_g),
@@ -865,7 +1033,7 @@ def _grade_position_sizing(sizing_ab: dict | None) -> dict:
     if sharpe_diff is not None:
         detail["sharpe_diff"] = f"{sharpe_diff:+.3f}"
     if alpha_diff is not None:
-        detail["alpha_diff"] = f"{alpha_diff:+.2f}%"
+        detail["alpha_diff"] = _fmt_lift(alpha_diff, "fraction")
 
     return {"grade": grade, "letter": _letter(grade), "detail": detail}
 
@@ -897,7 +1065,7 @@ def _grade_portfolio(signal_quality: dict | None,
     acc_10d = overall.get("accuracy_10d")
     avg_alpha = overall.get("avg_alpha_10d")
     acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
-    alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0) if avg_alpha is not None else None
+    alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0, units="fraction") if avg_alpha is not None else None
 
     sharpe = _safe_get(portfolio_stats, "sharpe_ratio")
     sortino = _safe_get(portfolio_stats, "sortino_ratio")
@@ -944,7 +1112,7 @@ def _grade_portfolio(signal_quality: dict | None,
     if acc_10d is not None:
         detail["accuracy_10d"] = f"{acc_10d:.1%}"
     if avg_alpha is not None:
-        detail["avg_alpha_10d"] = f"{avg_alpha:+.2f}%"
+        detail["avg_alpha_10d"] = _fmt_lift(avg_alpha, "fraction")
     if sharpe is not None:
         detail["sharpe"] = f"{sharpe:.2f}"
     if sortino is not None:
