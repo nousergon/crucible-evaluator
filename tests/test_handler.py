@@ -119,6 +119,35 @@ class TestHandler:
             card = json.loads(obj["Body"].read())
             assert card["tiles_overall_status"] == out["tiles_overall_status"]
 
+    def test_handler_publishes_the_self_test_and_carries_its_verdict(self, s3):
+        """End-to-end: the artifact Brian asked for actually lands, every cycle.
+
+        The wiring is what fails silently — a battery that runs and is never
+        published is indistinguishable from one that never ran.
+        """
+        _seed_eod(s3)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["self_test_verdict"] in ("PASS", "FAIL", "UNKNOWN")
+        assert out["degraded_self_test"] is (out["self_test_verdict"] != "PASS")
+        assert out["self_test_key"] == f"evaluator/{RUN_DATE}/self_test.json"
+
+        # sf-pipeline-policy §2.3a rule 3: the CARD carries the verdict too —
+        # the surface that presents the run's numbers must say whether the
+        # arithmetic behind them was checked.
+        card = json.loads(s3.get_object(Bucket=BUCKET, Key=out["report_card_key"])["Body"].read())
+        assert card["self_test"]["verdict"] == out["self_test_verdict"]
+        assert card["degraded_self_test"] is out["degraded_self_test"]
+
+        body = json.loads(s3.get_object(Bucket=BUCKET, Key=out["self_test_key"])["Body"].read())
+        assert body["schema"] == "evaluator_self_test-1.0.0"
+        assert body["run_date"] == RUN_DATE
+        assert body["verdict"] == out["self_test_verdict"]
+        assert body["libraries"]["nousergon-lib"]
+        assert body["cases"] and all(
+            {"case", "inputs", "expected", "actual", "abs_error", "tolerance", "verdict"}
+            <= set(c) for c in body["cases"]
+        )
+
     def test_no_write_skips_persist(self, s3):
         _seed_eod(s3)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "write": False})
@@ -142,9 +171,16 @@ class TestHandler:
         assert out["report_card_key"] is None
         assert out["latest_key"] == "evaluator/latest/report_card.json"
         s3.get_object(Bucket=BUCKET, Key=out["latest_key"])  # latest exists
-        # the dated weekly key was NOT written.
-        listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/")
-        assert listing.get("KeyCount", 0) == 0
+        # the dated weekly REPORT CARD was NOT written. Asserted on that key
+        # specifically rather than on the whole dated prefix being empty: the
+        # prefix legitimately carries other per-run artifacts (self_test.json,
+        # which publishes on every cycle because it grades the image, not the
+        # card), and an emptiness assertion would silently forbid any of them.
+        keys = {
+            o["Key"] for o in
+            s3.list_objects_v2(Bucket=BUCKET, Prefix=f"evaluator/{RUN_DATE}/").get("Contents", [])
+        }
+        assert f"evaluator/{RUN_DATE}/report_card.json" not in keys
 
     def test_snapshot_absent_defaults_false(self, s3):
         # config-I2556: nousergon-data PR #832 (both the Saturday advisory-child

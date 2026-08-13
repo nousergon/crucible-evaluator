@@ -178,10 +178,15 @@ class TestAgent:
         plan = build_action_plan(_CARD, llm=_FakeLLM(p))
         assert plan.run_date == RUN_DATE  # stamped from provenance
 
-    def test_retry_then_succeed(self):
+    def test_retry_then_succeed(self, monkeypatch):
         llm = _FakeLLM(_plan(), fail_times=1, exc=RuntimeError("overloaded_error"))
         import director.agent as A
-        A.time.sleep = lambda *_: None  # no real sleep
+        # `A.time` IS the stdlib `time` module, so a bare assignment here
+        # disabled `time.sleep` PROCESS-WIDE for every test that ran afterwards
+        # and never restored it — a cross-file leak that made any later
+        # timing-dependent assertion silently vacuous. `monkeypatch` restores it
+        # at teardown; the speed-up is unchanged.
+        monkeypatch.setattr(A.time, "sleep", lambda *_: None)
         plan = build_action_plan(_CARD, llm=llm)
         assert llm.calls == 2 and plan.run_date == RUN_DATE
 
