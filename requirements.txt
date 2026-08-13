@@ -103,7 +103,7 @@ pandas~=3.0
 # dashboard.nousergon.ai. LOAD-BEARING for the emailed link, and
 # tests/test_director_emailer.py now pins the new host — a resolve below
 # 0.54.0 would build a link to the wrong service and the test would say so.
-krepis[flow-doctor,openai]>=0.54.0
+krepis[flow-doctor,openai]>=0.55.0
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
