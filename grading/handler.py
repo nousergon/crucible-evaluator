@@ -31,6 +31,7 @@ from krepis.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
 from grading.experiment_record import build_experiment_record, write_experiment_record
+from grading.self_test import run_self_test, verdict_is_pass, write_self_test
 
 # Structured logging + flow-doctor. Passing a flow-doctor.yaml attaches a
 # FlowDoctorHandler at ERROR (off under pytest), so every log.error() routes
@@ -171,7 +172,32 @@ def handler(event: dict | None = None, context=None) -> dict:
         "Building Report Card v2 for %s (bucket=%s, write=%s, dry_run=%s, snapshot=%s)",
         run_date, bucket, write, dry_run, snapshot,
     )
-    card = build_report_card(bucket, run_date)
+    # ── Published known-answer SELF-TEST (Brian, 2026-08-13) ───────────────
+    # `grading/self_test.py` drives the PRODUCTION portfolio-outcome tile over a
+    # frozen in-memory eod_pnl.csv and compares Sharpe / Sortino / Calmar /
+    # CVaR(95) / max-drawdown against expectations derived on paper from each
+    # metric's definition, plus two metamorphic relations and the
+    # undefined-vs-measured-zero contract.
+    #
+    # It runs HERE, before the card is built, because the question it answers is
+    # "can the arithmetic in THIS image be trusted" — a question whose answer
+    # must not depend on the card build succeeding. It runs on every invocation
+    # (the battery is ~0.5s over 100 in-memory rows, no network, no market data)
+    # and `run_self_test` never raises: any failure resolves to FAIL or UNKNOWN
+    # inside the returned body. sf-pipeline-policy.md §2.3a — withholding a
+    # guarantee beats failing the run, so a non-PASS verdict never aborts the
+    # card; it is carried in this stage's terminal output instead.
+    self_test = run_self_test(run_date=run_date)
+    self_test_pass = verdict_is_pass(self_test.get("verdict"))
+    if not self_test_pass:
+        logger.error(
+            "SELF-TEST %s for %s (%d disagreed, %d could not run) on %s — the "
+            "Report Card's risk metrics are NOT attested this cycle.",
+            self_test.get("verdict"), run_date, self_test.get("n_failed", 0),
+            self_test.get("n_errored", 0), self_test.get("libraries"),
+        )
+
+    card = build_report_card(bucket, run_date, self_test=self_test)
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}
@@ -197,6 +223,23 @@ def handler(event: dict | None = None, context=None) -> dict:
     # a report card, so a record built from one would only ever describe a
     # cycle that emitted nothing (an uninformative, permanently-"failed"
     # record every Friday-PM Preflight Pipeline run).
+    # Persist the self-test beside the card. Isolated and fail-SOFT for the same
+    # reason `experiment_record` below is: this is secondary observability riding
+    # on top of the report-card build, and a bug in it must never turn a healthy
+    # grading cycle into a failed SF state. The verdict still reaches the SF
+    # output via `summary` regardless of whether the write succeeded — so a lost
+    # artifact degrades the evidence, never the verdict.
+    self_test_key_written = None
+    if write:
+        try:
+            self_test_key_written = write_self_test(bucket, run_date, self_test)
+        except Exception as exc:  # noqa: BLE001 — secondary artifact, never fatal
+            logger.warning(
+                "self_test emission failed for %s (verdict=%s is still carried in "
+                "this stage's output; the report card is unaffected): %s",
+                run_date, self_test.get("verdict"), exc, exc_info=True,
+            )
+
     experiment_record_key = None
     if write:
         try:
@@ -225,6 +268,13 @@ def handler(event: dict | None = None, context=None) -> dict:
         "snapshot": snapshot,
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),
         "experiment_record_key": experiment_record_key,
+        # §2.3a rule 3 — every surface presenting the run's results carries the
+        # verdict state. `degraded_self_test` is derived from the verdict rather
+        # than set independently, so the two can never disagree, and a missing
+        # or unrecognised verdict reads as degraded (never as a pass).
+        "self_test_verdict": self_test.get("verdict"),
+        "degraded_self_test": not self_test_pass,
+        "self_test_key": self_test_key_written,
     }
     logger.info(
         "Report Card v2 %s: overall=%s tiles=%s",
