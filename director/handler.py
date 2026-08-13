@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -51,7 +52,7 @@ from director.verdict import (
     withheld_reason,
     withheld_summary,
 )
-from grading.handler import _resolve_run_date
+from grading.handler import _record_stage_coverage, _resolve_run_date
 from krepis.logging import setup_logging
 
 # Structured logging + flow-doctor (see grading/handler.py for the full
@@ -556,13 +557,24 @@ def handler(event: dict | None = None, context=None) -> dict:
     with the grading Lambda — same image, same stamp file).
     """
     event = event or {}
+    _started = datetime.now(timezone.utc)
     if event.get("action") == "check_deploy_drift":
         from grading.deploy_drift import _resolve_function_name, check_deploy_drift
-        return check_deploy_drift(function_name=_resolve_function_name(context))
+        result = check_deploy_drift(function_name=_resolve_function_name(context))
+        # Infrastructure/gate stage: declares no durable artifact — the lib
+        # returns COVERED_NO_OUTPUT, but it must still record that it declared
+        # nothing (config-I7214 §"declares nothing" != "never considered").
+        return _record_stage_coverage(
+            "EvaluatorDirectorDeployDriftCheck", run_date=_resolve_run_date(event),
+            started=_started, result=result,
+        )
 
     if not _enabled():
         logger.info("Director disabled (DIRECTOR_ENABLED off) — no-op.")
-        return {"status": "disabled", "reason": "DIRECTOR_ENABLED is off"}
+        return _record_stage_coverage(
+            "Director", run_date=_resolve_run_date(event), started=_started,
+            result={"status": "disabled", "reason": "DIRECTOR_ENABLED is off"},
+        )
 
     # config#6904: every LLM call in this invocation is quoted against the time
     # actually left, not against a static literal whose sum (2×340 + 2×120 =
@@ -606,7 +618,10 @@ def handler(event: dict | None = None, context=None) -> dict:
         # Saturday run, ROADMAP L4504). Fail-loud (the SF state's Catch is non-fatal):
         # a broken import / revoked key grant surfaces as a caught preflight failure
         # ~18h before the real Saturday Director would hit it.
-        return _dry_run_probe(bucket, run_date, card, s3)
+        return _record_stage_coverage(
+            "Director", run_date=run_date, started=_started,
+            result=_dry_run_probe(bucket, run_date, card, s3),
+        )
 
     if card is None:
         # The ReportCard state should have produced it; absence is a real gap
@@ -720,6 +735,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         **issues_summary,
         **deploy_summary,
     }
+    _record_stage_coverage("Director", run_date=run_date, started=_started, result=summary)
     logger.info("Director plan written: %s", summary)
     return summary
 

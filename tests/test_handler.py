@@ -1,6 +1,8 @@
 """Tests for grading/handler.py — the grading Lambda entrypoint."""
 
 import json
+import sys
+import types
 
 import boto3
 import pytest
@@ -352,3 +354,110 @@ class TestCanaryProbeDispatch:
             out = H.handler({"action": "canary", "bucket": BUCKET})
         assert out["status"] == "ok"
         assert out["probe"] == "canary"
+
+
+# ── Stage-output coverage (config-I7214, the ruled rescope) ──────────────────
+#
+# The single shared implementation is `nousergon_lib.stage_coverage`, landing
+# in a separate nousergon-lib wave — NOT YET at this repo's pinned tag. These
+# tests inject a fake module into sys.modules so the call sites can be
+# exercised without that pin bump; `TestStageCoverageImportDegrades` below
+# separately proves the REAL (current, pin-predates-module) degrade path.
+
+def _install_fake_stage_coverage(monkeypatch, calls=None):
+    """Inject a stand-in `nousergon_lib.stage_coverage` module so the handler's
+    `from nousergon_lib.stage_coverage import assert_stage_coverage` resolves
+    to a controllable fake (Python's import system checks sys.modules before
+    any finder/loader lookup, so this needs no real submodule on disk)."""
+    calls = calls if calls is not None else []
+    fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+
+    def _fake_assert_stage_coverage(stage, *, run_date, window_start):
+        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+        return {"stage": stage, "status": "COVERED", "run_date": run_date}
+
+    fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
+    monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+    return calls
+
+
+class TestStageCoverageReportCard:
+    """(grading Lambda, work dispatch) — the ReportCard SF stage."""
+
+    def test_verdict_lands_under_stage_coverage_with_correct_stage_name(self, s3, monkeypatch):
+        _seed_eod(s3)
+        calls = _install_fake_stage_coverage(monkeypatch)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["stage_coverage"] == {"stage": "ReportCard", "status": "COVERED", "run_date": RUN_DATE}
+        assert [c["stage"] for c in calls] == ["ReportCard"]
+        assert calls[0]["run_date"] == RUN_DATE
+
+
+class TestStageCoverageEvaluatorDeployDriftCheck:
+    """(grading Lambda, check_deploy_drift dispatch) — the
+    EvaluatorDeployDriftCheck SF stage. An infrastructure/gate stage: it
+    declares no durable artifact, but must still record that it declared
+    nothing rather than being silently un-considered."""
+
+    def test_verdict_lands_under_stage_coverage_with_correct_stage_name(self, monkeypatch):
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        calls = _install_fake_stage_coverage(monkeypatch)
+
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+
+        assert out["stage_coverage"]["stage"] == "EvaluatorDeployDriftCheck"
+        assert [c["stage"] for c in calls] == ["EvaluatorDeployDriftCheck"]
+        # never confused with the real work stage this Lambda also backs.
+        assert out["stage_coverage"]["stage"] != "ReportCard"
+
+
+class TestStageCoverageImportDegrades:
+    """Observe mode cannot break the stage it observes: a ModuleNotFoundError
+    from the lib (the pin here predates the module) must never change the
+    handler's own outcome — logged loud, never silent, no `stage_coverage`
+    key on the payload."""
+
+    def test_report_card_outcome_unchanged_when_module_absent(self, s3, monkeypatch):
+        _seed_eod(s3)
+        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["status"] == "ok"
+        assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert "stage_coverage" not in out
+
+    def test_deploy_drift_check_outcome_unchanged_when_module_absent(self, monkeypatch):
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        out = H.handler({"action": "check_deploy_drift"}, context=None)
+        assert out["has_drift"] is False
+        assert "stage_coverage" not in out
+
+
+class TestStageCoverageNeverEnablesEnforcement:
+    """OBSERVE MODE ONLY (config-I7214): no shipped call site may pass an
+    enforcement-enabling argument. `assert_stage_coverage` takes exactly
+    (stage, run_date, window_start) from every call site in this repo — any
+    extra kwarg would be how an enforcement flag could sneak in."""
+
+    def test_call_sites_pass_only_the_observe_mode_signature(self, s3, monkeypatch):
+        seen_kwargs = []
+
+        def _capture(stage, **kwargs):
+            seen_kwargs.append(set(kwargs))
+            return {"stage": stage, "status": "COVERED"}
+
+        fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+        fake_mod.assert_stage_coverage = _capture
+        monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+
+        _seed_eod(s3)
+        H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        H.handler({"action": "check_deploy_drift"}, context=None)
+
+        assert seen_kwargs
+        for kwargs in seen_kwargs:
+            assert kwargs == {"run_date", "window_start"}

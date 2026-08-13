@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 
@@ -117,6 +118,33 @@ def _canary_probe(bucket: str) -> dict:
     return {"status": "ok", "probe": "canary", "run_date": run_date, "bucket": bucket}
 
 
+def _record_stage_coverage(stage: str, run_date: str, started: datetime, result: dict) -> dict:
+    """Merge the end-of-stage output-coverage verdict into a handler's return
+    payload, under ``stage_coverage`` (config-I7214, the ruled rescope).
+
+    Called from EACH SF-Task-mapped return point of a handler, immediately
+    before it returns to Step Functions — the assertion belongs in the
+    stage's own handler asserting its own declared output, never a
+    standalone end-of-run SF state. OBSERVE MODE ONLY: the single
+    enforcement flag lives in ``nousergon_lib.stage_coverage`` and is never
+    enabled from a call site here — a coverage miss is recorded, never
+    raised, before Saturday 2026-08-15 02:00 PT (and after, only on a
+    separate ruled flip).
+
+    ``ImportError`` means the ``nousergon-lib`` git-tag pin in
+    ``requirements.txt`` predates the module (a separate wave bumps the
+    pin) — logged loud so an absent assertion is never mistaken for a
+    covered stage, never swallowed, and the handler's own outcome is
+    unchanged either way.
+    """
+    try:
+        from nousergon_lib.stage_coverage import assert_stage_coverage
+        result["stage_coverage"] = assert_stage_coverage(stage, run_date=run_date, window_start=started)
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+    return result
+
+
 def handler(event: dict | None = None, context=None) -> dict:
     """Build + persist the Report Card v2 for a run date.
 
@@ -133,13 +161,21 @@ def handler(event: dict | None = None, context=None) -> dict:
     freshly-pushed image and returns immediately — see ``_canary_probe``.
     """
     event = event or {}
+    _started = datetime.now(timezone.utc)
     if event.get("action") == "check_deploy_drift":
         from grading.deploy_drift import _resolve_function_name, check_deploy_drift
-        return check_deploy_drift(function_name=_resolve_function_name(context))
+        result = check_deploy_drift(function_name=_resolve_function_name(context))
+        # Infrastructure/gate stage: declares no durable artifact — the lib
+        # returns COVERED_NO_OUTPUT for it, but it must still record that it
+        # declared nothing (config-I7214 §"declares nothing" != "never considered").
+        return _record_stage_coverage(
+            "EvaluatorDeployDriftCheck", run_date=_resolve_run_date({}), started=_started, result=result,
+        )
 
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
 
     if event.get("action") == "canary":
+        # Deploy-time boot probe, not an SF-declared stage — no coverage call.
         return _canary_probe(bucket)
 
     run_date = _resolve_run_date(event)
@@ -276,6 +312,7 @@ def handler(event: dict | None = None, context=None) -> dict:
         "degraded_self_test": not self_test_pass,
         "self_test_key": self_test_key_written,
     }
+    _record_stage_coverage("ReportCard", run_date=run_date, started=_started, result=summary)
     logger.info(
         "Report Card v2 %s: overall=%s tiles=%s",
         run_date, summary["tiles_overall_status"], tile_status,
