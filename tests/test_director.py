@@ -19,7 +19,32 @@ BUCKET = "alpha-engine-research"
 # tests/test_handler.py::TestResolveRunDate.
 RUN_DATE = "2026-05-29"
 
+#: A PASSING §2.3a correctness verdict, in the shape
+#: ``grading/attestation.py::build_run_attestation`` emits.
+#:
+#: This is DELIBERATELY explicit on the happy-path card rather than defaulted in
+#: the handler (config-I7039). The Director's acting authority is gated on the
+#: verdict, and the gate is DEFAULT-DENY: a card with no attestation block reads
+#: as UNKNOWN and withholds. Every test below that exercises issue filing or the
+#: reopen/escalate loop therefore has to state that this cycle was attested —
+#: which is the property under test made structural. A future change that drops
+#: the verdict read would not quietly re-enable those paths; it would have to
+#: delete this block from the fixture first.
+_ATTESTATION_PASS = {
+    "schema": "report_card_attestation-1.0.0",
+    "run_date": RUN_DATE,
+    "verdict": "PASS",
+    "as_of": {"backtester": "2026-08-15T09:41:02Z",
+              "evaluator_stage": "2026-08-15T10:02:55Z"},
+    "evaluator": {"verdict": "PASS", "n_checks": 6},
+    "backtester": {"verdict": "PASS", "n_checks": 6},
+    "evaluator_stage": {"verdict": "PASS", "n_checks": 4},
+    "promotion_withheld": False,
+    "reason": "All three halves attested.",
+}
+
 _CARD = {
+    "attestation": _ATTESTATION_PASS,
     "tiles_overall_status": "RED",
     "_provenance": {"run_date": RUN_DATE, "artifacts": {"n_read": 5, "n_missing": 12}},
     "tiles": {

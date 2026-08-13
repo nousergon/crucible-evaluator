@@ -200,6 +200,16 @@ def build_report_card(
     scorecard["attestation"] = attestation
     scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])
 
+    # The frozen write-contract's version stamp
+    # (nousergon_lib/contracts/report_card.schema.json, `schema_version` const 1).
+    # Found unstamped 2026-08-12 while adding the producer contract test below
+    # (config-I7039): the contract has declared this REQUIRED since config#2343
+    # and the producer has never emitted it, so every card this repo has ever
+    # written is invalid against its own contract — invisibly, because nothing
+    # validated. Consumers are tolerant on read, so this is additive and safe;
+    # `tests/test_report_card_producer_contract.py` is what stops it recurring.
+    scorecard["schema_version"] = 1
+
     scorecard["_provenance"] = {
         "run_date": run_date,
         "grader_source": GRADER_SOURCE,
