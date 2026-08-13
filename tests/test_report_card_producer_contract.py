@@ -117,3 +117,49 @@ class TestCorrectnessBlock:
         # consumer that forgot to look.
         as_of = card["attestation"]["as_of"]
         assert set(as_of) == {"backtester", "evaluator_stage", "contamination"}
+
+
+class TestCoverageBlock:
+    """config-I7202 — coverage is part of what this producer promises to emit.
+
+    Not yet declared in the lib schema (``additionalProperties`` is true, so it
+    validates as unknown fields); this pins the producer side while the schema
+    declaration is tracked separately, exactly as the §2.3a block above does.
+    The card under test is the SPARSE one — the case where coverage matters
+    most, because that is when the renormalization is largest.
+    """
+
+    LEVELS = ("overall", "research", "predictor", "executor")
+
+    def test_declared_weights_are_stamped_on_the_artifact(self, card):
+        # The whole point: a reader recomputes from the card, not from source at
+        # the right commit.
+        gw = card["grading_weights"]
+        assert set(gw) >= {"version", "rule", "overall", "research", "predictor", "executor"}
+        for section in ("overall", "research", "predictor", "executor"):
+            assert abs(sum(gw[section].values()) - 1.0) < 1e-9
+
+    @pytest.mark.parametrize("level", LEVELS)
+    def test_every_level_carries_coverage(self, card, level):
+        cov = card[level]["coverage"]
+        assert set(cov) >= {
+            "weight_present", "weight_present_effective", "components_skipped",
+            "skips", "weights", "qualifier", "weight_failed", "components_failed",
+            "skip_classes", "floor", "provisional",
+        }
+
+    @pytest.mark.parametrize("level", LEVELS)
+    def test_a_partial_grade_never_renders_as_a_bare_letter(self, card, level):
+        block = card[level]
+        if block["coverage"]["qualifier"] != "COMPLETE":
+            assert block["display"] != block["letter"]
+
+    def test_the_sparse_card_reports_its_own_emptiness(self, card):
+        # ALWAYS-EMIT, same reasoning as the attestation block: a consumer that
+        # finds no coverage knows the producer never ran, rather than guessing.
+        assert card["overall"]["coverage"]["qualifier"] in {
+            "COMPLETE", "PARTIAL", "PARTIAL-MASKED-FAILURE", "UNGRADED", "UNKNOWN",
+        }
+
+    def test_coverage_survives_the_schema(self, card, schema):
+        jsonschema.validate(instance=card, schema=schema)
