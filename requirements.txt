@@ -7,7 +7,7 @@ pyyaml~=6.0
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
-setuptools>=83.0.0
+setuptools>=84.0.0
 
 # Numerics for grading / report-card aggregation
 numpy~=2.5
