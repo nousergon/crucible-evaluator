@@ -103,6 +103,18 @@ pandas~=3.0
 # dashboard.nousergon.ai. LOAD-BEARING for the emailed link, and
 # tests/test_director_emailer.py now pins the new host — a resolve below
 # 0.54.0 would build a link to the wrong service and the test would say so.
+#
+# 2026-08-13 (alpha-engine-config-I7179): krepis-PR140 (>=0.57.0) makes
+# `LLMClient` resolve a default `cost_sink` from KREPIS_COST_SINK_BUCKET /
+# KREPIS_COST_SINK_PREFIX when the call site doesn't pass one —
+# director/agent.py's `_default_llm` never has, so the Director's
+# `ultra`-group plan call (the pipeline's single most expensive LLM call)
+# attributed its spend to nothing. It also ships `krepis.aws
+# merge-lambda-env`, the read-modify-write CLI infrastructure/deploy.sh now
+# uses to land the two env vars on the Director Lambda without clobbering
+# the operator-set vars a bare `--environment` write would wipe. Subsumed by
+# the higher floor below; kept because the floor's REASON is not recoverable
+# from the version number.
 # v0.59.2 (krepis#148, alpha-engine-config-I7334/-I7357): the FIRST release
 # shipping krepis.stage_coverage — the module
 # `grading/handler.py::_record_stage_coverage` imports. It was briefly added to

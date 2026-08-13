@@ -177,6 +177,25 @@ else
   aws lambda wait function-active --function-name "$DIRECTOR_FUNCTION" --region "$REGION"
 fi
 
+# ── Cost-sink environment (alpha-engine-config-I7179) ──────────────────────
+# The Director's `krepis.llm.LLMClient` (director/agent.py::_default_llm) is
+# built with no `cost_sink` — the pipeline's single most expensive LLM call
+# (`ultra` group) attributes its spend to nothing. The fix is not a per-call-
+# site `cost_sink=` (that reproduces the gap for the next call site); krepis
+# 0.57.0 (krepis-PR140) makes `LLMClient` resolve a default sink from
+# KREPIS_COST_SINK_BUCKET / KREPIS_COST_SINK_PREFIX when `cost_sink` is not
+# supplied. So this only needs to land the two env vars on the function.
+#
+# A bare `update-function-configuration --environment` REPLACES the whole
+# variable map — exactly what the comment above this block explains we must
+# not do to DIRECTOR_ENABLED / KREPIS_LITELLM_PROXY_URL, which exist only on
+# the live function and are invisible here. `krepis.aws merge-lambda-env`
+# (also krepis 0.57.0) is a read-modify-write merge: it reads the function's
+# current environment, adds/overwrites only the keys named with --set, and
+# writes the union back — so it can set these two variables with the exact
+# same safety property as omitting --environment above.
+python3 -m krepis.aws merge-lambda-env --function-name "$DIRECTOR_FUNCTION" --set KREPIS_COST_SINK_BUCKET=alpha-engine-research --set KREPIS_COST_SINK_PREFIX=decision_artifacts/_cost_raw --region "$REGION"
+
 if ! $NO_CANARY; then
   # Flag-AGNOSTIC canary: invoke with dry_run=true so it's side-effect-free in
   # BOTH flag states (the bug that broke the 2026-06-07 deploys: the old canary
