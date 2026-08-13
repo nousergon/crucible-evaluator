@@ -35,7 +35,13 @@ def test_director_plan_url_and_slug():
     assert de.DIRECTOR_SLUG == "director"
     assert (
         de.director_plan_url("2026-06-26")
-        == "https://console.nousergon.ai/director?date=2026-06-26"
+        == "https://dashboard.nousergon.ai/director?date=2026-06-26"
+        # NOT console.nousergon.ai: that hostname was handed to nousergon-console
+        # v2 and the Streamlit dashboard this slug resolves against now lives at
+        # dashboard.nousergon.ai (krepis#137 / alpha-engine-config#6140, merged
+        # 2026-08-12). krepis.console.DEFAULT_CONSOLE_BASE_URL is the single
+        # source; this literal exists to catch it moving again, so it is pinned
+        # rather than imported.
     )
     assert de.director_plan_url(
         "2026-06-26", "https://stage.example.com/"
@@ -44,7 +50,7 @@ def test_director_plan_url_and_slug():
 
 def test_build_director_digest_summary_risks_items_and_link():
     subject, plain, html = de.build_director_digest(_plan(), "2026-06-26")
-    url = "https://console.nousergon.ai/director?date=2026-06-26"
+    url = "https://dashboard.nousergon.ai/director?date=2026-06-26"
     # Subject summarizes count + priority mix.
     assert "Director | 2026-06-26 | 2 action items" in subject
     assert "P0:1" in subject and "P2:1" in subject
@@ -79,7 +85,7 @@ def test_send_director_digest_returns_transport_result(monkeypatch):
     monkeypatch.setattr(ks, "send_email", _fake_send)
     assert de.send_director_digest(_plan(), "2026-06-26") is True
     assert "Director | 2026-06-26" in sent["subject"]
-    assert "console.nousergon.ai/director?date=2026-06-26" in sent["body"]
+    assert "dashboard.nousergon.ai/director?date=2026-06-26" in sent["body"]
 
 
 def test_send_director_digest_never_raises_on_bad_plan(monkeypatch):

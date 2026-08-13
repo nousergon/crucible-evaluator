@@ -76,9 +76,91 @@ def _loop_summary_line(loop_summary: dict | None) -> str | None:
     return "Director loop: " + ", ".join(parts)
 
 
+def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:
+    """``(subject_prefix, plain_banner, html_banner)`` for a non-PASS verdict.
+
+    ``sf-pipeline-policy.md`` §2.3a rule 3: every surface presenting the run's
+    results carries the verdict state. This email IS such a surface — it is the
+    one Brian reads first — and a digest of action items derived from numbers
+    nothing checked, sent with no qualifier, is the guarantee being granted by
+    default in the most consequential place it could be.
+
+    ``None`` on PASS: the banner exists to withhold, and an all-clear banner on
+    every one of ~52 emails a year trains the eye past the ones that matter.
+    The verdict is still stated in the footer on a PASS.
+    """
+    from director.verdict import actions_withheld
+
+    vb = verdict_block or {}
+    if not actions_withheld(vb):
+        return None
+
+    verdict = vb.get("verdict", "UNKNOWN")
+    reason = (vb.get("reason") or "").strip()
+    as_of = vb.get("as_of") or {}
+    as_of_line = ", ".join(
+        f"{k}: {v or 'never'}" for k, v in sorted(as_of.items())
+    ) or "no verdict timestamps recorded"
+
+    if verdict == "FAIL":
+        headline = (
+            "CORRECTNESS ATTESTATION: FAIL — the numbers behind this plan are "
+            "WRONG, not merely unverified."
+        )
+        prefix = "[NUMBERS WRONG] "
+    else:
+        headline = (
+            "CORRECTNESS ATTESTATION: UNKNOWN — the numbers behind this plan are "
+            "NOT established as correct."
+        )
+        prefix = "[UNVERIFIED] "
+
+    withheld_line = (
+        "Because of this the Director did NOT file issues and did NOT run its "
+        "reopen/escalate loop this cycle. The plan below is advisory diagnosis "
+        "only; nothing was tracked, reopened or escalated from it."
+    )
+    plain = "\n".join([
+        f"!! {headline}",
+        f"   {reason}" if reason else "",
+        f"   Verdict as-of — {as_of_line}",
+        f"   {withheld_line}",
+        "",
+    ])
+    html = (
+        "<div style=\"border:2px solid #b00;background:#fff3f3;padding:10px 12px;"
+        "margin:0 0 16px;\">"
+        f"<p style='margin:0 0 6px;font-size:14px;'><b>&#9888; {headline}</b></p>"
+        + (f"<p style='margin:0 0 6px;font-size:12px;'>{reason}</p>" if reason else "")
+        + f"<p style='margin:0 0 6px;font-size:11px;color:#555;'>Verdict as-of — {as_of_line}</p>"
+        f"<p style='margin:0;font-size:12px;'>{withheld_line}</p>"
+        "</div>"
+    )
+    return prefix, plain, html
+
+
+def _verdict_footer(verdict_block: dict | None) -> str:
+    """The one-line verdict statement every digest carries, PASS included.
+
+    §2.3a rule 3 admits no "only when bad" reading: a surface that states the
+    verdict only when it is not PASS is a surface where silence means pass, and
+    silence is exactly what an absent verdict produces.
+    """
+    vb = verdict_block or {}
+    if not vb:
+        return "Correctness attestation: NOT READ by this digest."
+    as_of = vb.get("as_of") or {}
+    stamps = ", ".join(f"{k} {v or 'never'}" for k, v in sorted(as_of.items()))
+    return (
+        f"Correctness attestation: {vb.get('verdict', 'UNKNOWN')}"
+        + (f" (as-of {stamps})" if stamps else " (no as-of recorded)")
+        + "."
+    )
+
+
 def build_director_digest(
     plan: Any, run_date: str, *, console_base_url: str | None = None,
-    loop_summary: dict | None = None,
+    loop_summary: dict | None = None, verdict_block: dict | None = None,
 ) -> tuple[str, str, str]:
     """Build ``(subject, plain_body, html_body)`` for the weekly action plan.
 
@@ -99,15 +181,23 @@ def build_director_digest(
     for it in items:
         counts[str(it.get("priority", "?"))] = counts.get(str(it.get("priority", "?")), 0) + 1
     pri_summary = " ".join(f"{k}:{counts[k]}" for k in sorted(counts, key=lambda k: _PRIORITY_ORDER.get(k, 9)))
+    banner = _verdict_banner(verdict_block)
+    footer = _verdict_footer(verdict_block)
     subject = (
-        f"Alpha Engine Director | {run_date} | {len(items)} action items"
+        (banner[0] if banner else "")
+        + f"Alpha Engine Director | {run_date} | {len(items)} action items"
         + (f" ({pri_summary})" if counts else "")
     )
 
     ordered = sorted(items, key=lambda it: _PRIORITY_ORDER.get(str(it.get("priority")), 9))
 
     # ── plain body ──
-    plain_lines = [
+    plain_lines = []
+    # §2.3a rule 3 — the verdict precedes the numbers. Above the console link,
+    # because a reader who clicks straight through must have seen it first.
+    if banner:
+        plain_lines += [banner[1]]
+    plain_lines += [
         f"View the full proposed action plan on the console:\n{url}",
         "",
         f"Alpha Engine — Director Weekly Action Plan ({run_date})",
@@ -130,7 +220,8 @@ def build_director_digest(
     loop_line = _loop_summary_line(loop_summary)
     if loop_line:
         plain_lines += ["", loop_line]
-    plain_lines += ["", f"Full detail (rationale, evidence, carry-over, self-grade): {url}"]
+    plain_lines += ["", footer,
+                    f"Full detail (rationale, evidence, carry-over, self-grade): {url}"]
     plain_body = "\n".join(plain_lines)
 
     # ── html body ──
@@ -150,7 +241,8 @@ def build_director_digest(
         "<html><body style=\"font-family:sans-serif;font-size:13px;color:#222;max-width:680px;\">"
         f"<h2 style='margin-bottom:4px;'>Director — Weekly Action Plan</h2>"
         f"<p style='color:#555;font-size:12px;margin-top:0;'>{run_date}</p>"
-        f"<p style='font-size:14px;margin:0 0 16px;'>&#9654; "
+        + (banner[2] if banner else "")
+        + f"<p style='font-size:14px;margin:0 0 16px;'>&#9654; "
         f"<a href=\"{url}\"><b>View the full proposed action plan on the console</b></a></p>"
         + (f"<p><b>System read.</b> {summary}</p>" if summary else "")
         + (f"<h3 style='margin-bottom:2px;'>Top risks</h3>{risks_html}" if risks else "")
@@ -162,6 +254,7 @@ def build_director_digest(
         "<th style='padding:3px 8px;'>Conf</th></tr>"
         f"{rows}</table>"
         + (f"<p style='font-size:12px;'>{loop_line}</p>" if loop_line else "")
+        + f"<p style='font-size:11px;color:#555;margin-top:14px;'>{footer}</p>"
         + "<p style='font-size:10px;color:#aaa;margin-top:20px;'>"
         "Advisory only — the Director proposes; rationale, evidence, carry-over, "
         f"and self-grade are on the console Director page (<a href=\"{url}\">link</a>).</p>"
@@ -172,7 +265,7 @@ def build_director_digest(
 
 def send_director_digest(
     plan: Any, run_date: str, *, console_base_url: str | None = None,
-    loop_summary: dict | None = None,
+    loop_summary: dict | None = None, verdict_block: dict | None = None,
 ) -> bool:
     """Build + send the Director digest. Best-effort: returns the send result and
     NEVER raises (transport is the lib's fire-and-forget ``send_email``; the
@@ -180,6 +273,7 @@ def send_director_digest(
     try:
         subject, plain_body, html_body = build_director_digest(
             plan, run_date, console_base_url=console_base_url, loop_summary=loop_summary,
+            verdict_block=verdict_block,
         )
     except Exception:  # noqa: BLE001 — the email must never break the Director
         log.warning("Director digest: build failed — skipping email", exc_info=True)
