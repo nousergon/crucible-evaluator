@@ -118,7 +118,13 @@ def _statement(verdict: str, unmeasured: list[tuple[str, str]], degraded: list[s
     the numbers were fine. The distinction between the two is the entire content
     of §2.3a rule 2, and it survives only if the words survive.
     """
-    if verdict == MEASURED:
+    # alpha-engine-config-I7312: gated on `not degraded` as well as the verdict,
+    # deliberately belt-and-braces. The verdict now folds `degraded` in, so this
+    # branch is unreachable with a fired family — but the sentence ASSERTS "no
+    # fail-open degradation", and a claim that can only be true because of a
+    # computation two functions away is how this was wrong in the first place.
+    # Read the evidence here, not the summary of it.
+    if verdict == MEASURED and not degraded:
         head = (
             f"VERIFIED — all {n_gates} pre-spend correctness gates reported "
             "MEASURED this cycle, and the Step Function recorded no fail-open "
@@ -162,10 +168,17 @@ def read_gate_state(gate_state: Any) -> dict:
     Returns a block carrying, in both polarities:
 
     ``verdict``
-        ``MEASURED`` only when every gate in :data:`GATE_LABELS` reported
-        ``MEASURED``; ``UNKNOWN`` otherwise — including when the SF sent nothing
-        at all, which is the case every Report Card written before
+        ``MEASURED`` only when ALL THREE hold: every gate in
+        :data:`GATE_LABELS` reported ``MEASURED``, every family in
+        :data:`DEGRADED_FAMILY_LABELS` was reported, and none of them fired.
+        ``UNKNOWN`` otherwise — including when the SF sent nothing at all,
+        which is the case for every Report Card written before
         ``alpha-engine-config-I7282`` was in.
+
+        The third clause is ``alpha-engine-config-I7312``. A fired family means
+        something on this run failed OPEN, so the attestation is withheld —
+        which is not the same as saying the grades are wrong, and the statement
+        keeps that distinction.
     ``gates``
         per-gate ``{status, reason}``, one entry per gate, always all of them.
     ``unmeasured``
@@ -222,12 +235,47 @@ def read_gate_state(gate_state: Any) -> dict:
         if not isinstance(gate_state.get(fam), bool)
     ]
 
-    verdict = MEASURED if not unmeasured and not families_unreported else UNKNOWN
+    # alpha-engine-config-I7312: `degraded` — the families that actually FIRED
+    # — belongs in the verdict, not only in the narrative below it.
+    #
+    # The MEASURED statement asserts TWO things: that every gate reported
+    # MEASURED, *and* that the Step Function recorded no fail-open degradation.
+    # Computing the verdict from `unmeasured` + `families_unreported` alone made
+    # the second half unfalsifiable — and because `_statement` returns early on
+    # MEASURED, its `if degraded:` clause was unreachable on exactly the runs
+    # that needed it. A run rendered "VERIFIED ... no fail-open degradation"
+    # while this same block carried `degraded_families: ["gate_degraded"]`.
+    #
+    # The combination is reachable without any probe going UNKNOWN, because
+    # THREE SF states write `$.gate_degraded=true` that GATE_LABELS does not
+    # cover: EvaluatorGateDegraded, EvaluatorDirectorGateDegraded, and
+    # SetMutexAcquireDegradedFlag. It stayed hidden only because
+    # `pipeline_contract` had been UNKNOWN on every production run to date
+    # (alpha-engine-config-I7281), which forced the verdict UNKNOWN anyway.
+    #
+    # A fired family is not evidence the grades are WRONG — the non-MEASURED
+    # branch says exactly that ("UNATTESTED, not wrong"), which is why folding
+    # it in here is safe: it withholds the attestation without claiming a defect.
+    verdict = (
+        MEASURED
+        if not unmeasured and not families_unreported and not degraded
+        else UNKNOWN
+    )
     if families_unreported and not unmeasured:
         top_reason = top_reason or (
             "the SF reported no value for the fail-open degradation "
             f"{'families' if len(families_unreported) > 1 else 'family'} "
             f"{', '.join(families_unreported)} — unreported is not false."
+        )
+    if degraded and not unmeasured:
+        # Without this the head renders "NOT VERIFIED — " with an empty reason:
+        # this is the one path where the verdict is UNKNOWN and NEITHER a gate
+        # nor an unreported family explains why.
+        top_reason = top_reason or (
+            f"{len(degraded)} fail-open "
+            f"{'degradations were' if len(degraded) > 1 else 'degradation was'} "
+            "recorded on this run, so the run's pre-spend protection was "
+            "incomplete even though every gate that DID report reported MEASURED."
         )
 
     block = {

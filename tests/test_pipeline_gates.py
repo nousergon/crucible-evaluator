@@ -202,3 +202,95 @@ def test_key_name_is_stable():
     """The block sits under one name on the card, the verdict block and the
     stamped plan — a rename is a cross-surface break, so it is pinned."""
     assert PIPELINE_GATES_KEY == "pipeline_gates"
+
+
+# ---------------------------------------------------------------------------
+# 4. alpha-engine-config-I7312 — a fired degradation family withholds the
+#    attestation, and the VERIFIED sentence can never assert otherwise
+#
+# The gap this closes: every pre-existing `gate_degraded=True` case above ALSO
+# sets a probe to UNKNOWN, so the verdict came out UNKNOWN for the other
+# reason and the degradation's own effect on it was never exercised. The
+# combination below — both probes MEASURED, every family reported, one fired —
+# is reachable without any probe going UNKNOWN, because three SF states write
+# `$.gate_degraded=true` that GATE_LABELS does not cover: EvaluatorGateDegraded,
+# EvaluatorDirectorGateDegraded and SetMutexAcquireDegradedFlag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", [
+    "gate_degraded",
+    "health_check_degraded",
+    "parity_degraded",
+    "research_predictor_degraded",
+])
+def test_a_fired_family_withholds_the_verdict_even_with_every_probe_measured(family):
+    block = read_gate_state(_clean_payload(**{family: True}))
+
+    assert block["unmeasured"] == [], "precondition: both probes MEASURED"
+    assert block["families_unreported"] == [], "precondition: every family reported"
+    assert block["degraded_families"] == [family]
+
+    assert block["verdict"] == UNKNOWN, (
+        f"{family} fired and every probe reported MEASURED — the verdict was "
+        "MEASURED before I7312, and the statement it drives asserts BOTH that "
+        "the gates ran AND that nothing degraded."
+    )
+    assert gates_unmeasured(block) is True
+
+
+@pytest.mark.parametrize("family", [
+    "gate_degraded",
+    "health_check_degraded",
+    "parity_degraded",
+    "research_predictor_degraded",
+])
+def test_the_statement_never_claims_no_degradation_when_one_fired(family):
+    block = read_gate_state(_clean_payload(**{family: True}))
+    statement = block["statement"]
+
+    assert "recorded no fail-open degradation" not in statement, (
+        f"the card claimed no fail-open degradation while degraded_families "
+        f"carried {block['degraded_families']} — the contradiction I7312 fixed"
+    )
+    assert statement.startswith("NOT VERIFIED — "), (
+        "the affirmative VERIFIED head is the one that carries the false claim; "
+        f"got: {statement[:40]!r}"
+    )
+    # It must still say what is NOT wrong: a fired family is not evidence the
+    # numbers are bad, and a reader who cannot tell the two apart stops reading.
+    assert "UNATTESTED, not as wrong" in statement
+    assert "FAILED" not in statement
+    # ...and it must name which family, or the operator has nowhere to go.
+    assert "Fail-open degradation recorded on this run" in statement
+
+
+def test_the_reason_is_never_empty_on_the_degradation_only_path():
+    """The one path where the verdict is UNKNOWN and NEITHER an unmeasured gate
+    nor an unreported family explains why. Without its own top_reason the head
+    renders the bare string 'NOT VERIFIED — '."""
+    block = read_gate_state(_clean_payload(gate_degraded=True))
+    assert block["reason"].strip(), "UNKNOWN verdict with no reason"
+    assert "fail-open" in block["reason"]
+    head, _, rest = block["statement"].partition("NOT VERIFIED — ")
+    assert head == "" and rest.strip(), "rendered a bare 'NOT VERIFIED — '"
+
+
+def test_a_genuinely_clean_run_still_verifies():
+    """The fix must not make MEASURED unreachable — a verdict that is always
+    UNKNOWN carries exactly as little information as one that is always
+    MEASURED."""
+    block = read_gate_state(_clean_payload())
+    assert block["verdict"] == MEASURED
+    assert block["degraded_families"] == []
+    assert gates_unmeasured(block) is False
+    assert block["statement"].startswith("VERIFIED — ")
+    assert "recorded no fail-open degradation" in block["statement"]
+
+
+def test_multiple_fired_families_are_all_named():
+    block = read_gate_state(_clean_payload(gate_degraded=True, parity_degraded=True))
+    assert block["verdict"] == UNKNOWN
+    assert set(block["degraded_families"]) == {"gate_degraded", "parity_degraded"}
+    assert "pre-spend gates" in block["statement"]
+    assert "parity verdict" in block["statement"]
