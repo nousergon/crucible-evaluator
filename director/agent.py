@@ -209,8 +209,22 @@ def _assert_routed_through_the_proxy(route: dict) -> None:
         )
 
 
-def _warn_on_degraded_route(route: dict) -> None:
+def _warn_on_degraded_route(
+    route: dict,
+    *,
+    group: str | None = None,
+    metric_name: str = "DirectorRouteFallback",
+) -> None:
     """Alert when the group's declared primary is not what will serve.
+
+    ``group`` and ``metric_name`` default to the Director's own plan call, so
+    every existing caller is unchanged. They are parameters because the retro
+    judge (``director/retro.py``) resolves a DIFFERENT group through the same
+    router and needs the same R12 alert — and emitting its degradation under
+    ``Group=ultra`` / ``DirectorRouteFallback`` would attribute the judge's
+    fallback to the plan call, which is a worse signal than none: the alarm
+    would fire for a component that was healthy. One metric per resolved group,
+    named for the call site that resolved it.
 
     ``model-router-policy`` R12 is explicit that serving from a fallback is an
     *alert*, not a log line. krepis already returns everything needed —
@@ -238,6 +252,7 @@ def _warn_on_degraded_route(route: dict) -> None:
 
     Never raises. A telemetry failure must not take down the weekly plan.
     """
+    group = group or DIRECTOR_GROUP
     skipped = route.get("skipped_entries") or []
     primary = route.get("primary_registry_id") or route.get("primary_model")
     served = route.get("registry_id")
@@ -270,7 +285,7 @@ def _warn_on_degraded_route(route: dict) -> None:
         logger.warning(
             "Director route DEGRADED: group=%s primary=%s served=%s route=%s "
             "context=%s — skipped: %s",
-            DIRECTOR_GROUP, primary, served, route.get("route"),
+            group, primary, served, route.get("route"),
             route.get("exec_context"),
             "; ".join(
                 f"{s.get('registry_id')}: {s.get('reason')}" for s in skipped
@@ -284,11 +299,11 @@ def _warn_on_degraded_route(route: dict) -> None:
                 "CloudWatchMetrics": [{
                     "Namespace": "AlphaEngine/Director",
                     "Dimensions": [["Group"]],
-                    "Metrics": [{"Name": "DirectorRouteFallback", "Unit": "Count"}],
+                    "Metrics": [{"Name": metric_name, "Unit": "Count"}],
                 }],
             },
-            "Group": DIRECTOR_GROUP,
-            "DirectorRouteFallback": 1 if degraded else 0,
+            "Group": group,
+            metric_name: 1 if degraded else 0,
             "served": served,
             "primary": primary,
             "route": route.get("route"),
@@ -296,9 +311,131 @@ def _warn_on_degraded_route(route: dict) -> None:
         }))
     except Exception:
         logger.exception(
-            "Director: failed to emit DirectorRouteFallback — the fallback "
-            "alarm is blind for this run"
+            "Director: failed to emit %s — the fallback alarm is blind for "
+            "this run", metric_name
         )
+
+
+# ── The latency signal (alpha-engine-config-I7311) ───────────────────────────
+#
+# Until 2026-08-14 the duration of the Director's plan call was recorded
+# NOWHERE. Reconstructing it took subtracting two log timestamps by hand
+# (`Director route:` → the `HTTP Request: POST` line), which is why a 2.4×
+# latency climb over ten days — 87s on 2026-08-04, 135s on 2026-08-13, 205s on
+# 2026-08-14 against the same route, same model and same registry max_tokens —
+# was first noticed as a hard SF failure rather than as a trend.
+#
+# `DIRECTOR_PLAN_CEILING_S` is the wall. This is the line drawn well short of
+# it. 0.6 × the ceiling is 204s: at the measured throughput of 99-109 tok/s
+# that is the call already drawing ~21k completion tokens, i.e. exactly the
+# regime the 2026-08-14 run was in the run BEFORE the one that failed. A run
+# that crosses it has not failed and loses nothing — it says so, once, with
+# the numbers attached, while there is still a week to act.
+#
+# It is a FRACTION, not a second literal, so raising the ceiling can never
+# silently move the amber line up with it and re-hide the same regression.
+DIRECTOR_PLAN_AMBER_FRACTION = 0.6
+
+
+def _plan_amber_threshold_s(ceiling_s: float = None) -> float:
+    return DIRECTOR_PLAN_AMBER_FRACTION * (
+        DIRECTOR_PLAN_CEILING_S if ceiling_s is None else ceiling_s
+    )
+
+
+def _emit_plan_latency(
+    *,
+    elapsed_s: float,
+    outcome: str,
+    prompt_chars: int,
+    carryover_items: int,
+    usage=None,
+) -> dict:
+    """Emit one EMF record for one plan ATTEMPT, and return what was emitted.
+
+    **Per attempt, not per invocation, and in a ``finally``.** The per-attempt
+    ceiling is what the call is bounded by, and the attempt that matters most
+    is the one that never returns — on 2026-08-14 the two censored 340s
+    attempts are the whole event. An emitter that only ran after a successful
+    parse would have published nothing on the day the Director hard-failed.
+
+    **Emitted on the healthy path too**, with ``DirectorPlanLatencyAmber: 0``.
+    `observability-policy` §9: a component emitting nothing is not healthy, it
+    is unobserved, and "no data" is never rendered green. This mirrors
+    ``DirectorRouteFallback`` above, whose alarm is only meaningful because the
+    0 is published every run (alpha-engine-config-I6185).
+
+    Never raises: a telemetry failure must not take down the weekly plan. It
+    does log at ERROR, because a silent emitter is the failure mode the metric
+    exists to prevent.
+    """
+    amber_s = _plan_amber_threshold_s()
+    over_amber = elapsed_s >= amber_s
+    record = {
+        "DirectorPlanLatencySeconds": round(elapsed_s, 3),
+        "DirectorPlanLatencyAmber": 1 if over_amber else 0,
+        "DirectorPlanCeilingSeconds": DIRECTOR_PLAN_CEILING_S,
+        "DirectorPlanAmberSeconds": round(amber_s, 1),
+        "DirectorPlanPromptChars": int(prompt_chars),
+        "DirectorPlanCarryoverItems": int(carryover_items),
+        "DirectorPlanPromptTokens": int(getattr(usage, "input_tokens", 0) or 0),
+        "DirectorPlanCompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "DirectorPlanReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
+        "outcome": outcome,
+        "Group": DIRECTOR_GROUP,
+    }
+    if over_amber:
+        logger.warning(
+            "Director plan call AMBER: %.1fs >= %.1fs (%.0f%% of the %.0fs "
+            "ceiling) — outcome=%s prompt_chars=%d carryover_items=%d "
+            "prompt_tokens=%d completion_tokens=%d (reasoning=%d). The call "
+            "has not failed; it is measurably closer to the ceiling than it "
+            "was. alpha-engine-config-I7311: the inputs and the output this "
+            "call must produce both grow, so this number trends up on its own "
+            "and the ceiling does not move.",
+            elapsed_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
+            DIRECTOR_PLAN_CEILING_S, outcome, record["DirectorPlanPromptChars"],
+            record["DirectorPlanCarryoverItems"],
+            record["DirectorPlanPromptTokens"],
+            record["DirectorPlanCompletionTokens"],
+            record["DirectorPlanReasoningTokens"],
+        )
+    else:
+        logger.info(
+            "Director plan call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
+            "prompt_chars=%d carryover_items=%d prompt_tokens=%d "
+            "completion_tokens=%d",
+            outcome, elapsed_s, amber_s, DIRECTOR_PLAN_CEILING_S,
+            record["DirectorPlanPromptChars"],
+            record["DirectorPlanCarryoverItems"],
+            record["DirectorPlanPromptTokens"],
+            record["DirectorPlanCompletionTokens"],
+        )
+    try:
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "AlphaEngine/Director",
+                    "Dimensions": [["Group"]],
+                    "Metrics": [
+                        {"Name": "DirectorPlanLatencySeconds", "Unit": "Seconds"},
+                        {"Name": "DirectorPlanLatencyAmber", "Unit": "Count"},
+                        {"Name": "DirectorPlanPromptTokens", "Unit": "Count"},
+                        {"Name": "DirectorPlanCompletionTokens", "Unit": "Count"},
+                        {"Name": "DirectorPlanCarryoverItems", "Unit": "Count"},
+                    ],
+                }],
+            },
+            **record,
+        }))
+    except Exception:
+        logger.exception(
+            "Director: failed to emit DirectorPlanLatencySeconds — the latency "
+            "trend is blind for this run, which is the condition "
+            "alpha-engine-config-I7311 exists to end"
+        )
+    return record
 
 
 def _load_system_prompt() -> str:
@@ -339,8 +476,16 @@ class _KrepisStructuredDirector:
     def __init__(self, client, *, director_model: str):
         self._client = client
         self._director_model = director_model
+        #: Token usage of the most recent completed attempt, read by
+        #: ``_invoke_with_retry``'s latency emitter. ``None`` until a call
+        #: RETURNS — a timed-out attempt reports no tokens because none were
+        #: reported, and publishing a stale count for it would make the one
+        #: attempt that matters look like the previous healthy one
+        #: (alpha-engine-config-I7311).
+        self.last_usage = None
 
     def invoke(self, messages: list) -> DirectorWeeklyActionPlan:
+        self.last_usage = None
         system, user_content = _split_messages(messages)
         # No `max_tokens=` here. It carried a literal 8000 until 2026-08-04,
         # which SHADOWED the registry: `LLMClient.structured` takes the
@@ -369,6 +514,7 @@ class _KrepisStructuredDirector:
             # Inheriting the default silently doubled every quoted budget.
             attempts=_STRUCTURED_ATTEMPTS,
         )
+        self.last_usage = getattr(result, "usage", None)
         plan: DirectorWeeklyActionPlan = result.parsed
         plan.director_model = self._director_model
         plan.resolved_model = result.model
@@ -533,11 +679,42 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
     return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
 
 
+#: Marker the carry-over section header carries so the emitted latency record
+#: can report how many ledger rows this prompt made the model dispose of —
+#: the quantity that grew 19 → 41 while the call duration grew 87s → 205s
+#: (alpha-engine-config-I7311). Parsed rather than threaded through
+#: ``build_messages``' signature because ``_invoke_with_retry`` is handed
+#: MESSAGES, not the artifacts they were built from, and widening that
+#: boundary to carry telemetry would couple the retry loop to the card.
+_CARRYOVER_COUNT_MARKER = "carry-over ledger, active items="
+
+
+def _carryover_item_count(messages: list) -> int:
+    """How many active ledger rows this prompt carries; 0 when there is no
+    carry-over section (first cycle, empty ledger, or an injected test
+    double's hand-built messages). Never raises."""
+    for _, content in messages:
+        idx = str(content).find(_CARRYOVER_COUNT_MARKER)
+        if idx < 0:
+            continue
+        digits = ""
+        for ch in str(content)[idx + len(_CARRYOVER_COUNT_MARKER):]:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if digits:
+            return int(digits)
+    return 0
+
+
 def _carryover_context(carryover: dict | None) -> str:
     if not carryover or not carryover.get("items"):
         return "No prior action plan on record (this is the first cycle or the ledger is empty)."
-    lines = ["Last week's open action items (carry-over ledger):"]
-    for it in carryover.get("items", []):
+    items = carryover.get("items", [])
+    lines = [
+        f"Last week's open action items ({_CARRYOVER_COUNT_MARKER}{len(items)}):"
+    ]
+    for it in items:
         lines.append(
             f"  - [{it.get('id')}] {it.get('title')} "
             f"(status={it.get('status')}, owner={it.get('proposed_owner')}, priority={it.get('priority')})"
@@ -598,10 +775,27 @@ def _invoke_with_retry(llm, messages, *, budget=None):
     budget = budget or UNBOUNDED
     cost = getattr(llm, "attempt_cost_s", None)
     last = None
+    # Measured once for the whole loop — the prompt does not change between
+    # attempts, and these are the two quantities that explain the duration
+    # (alpha-engine-config-I7311).
+    prompt_chars = sum(len(c) for _, c in messages)
+    carryover_items = _carryover_item_count(messages)
     for attempt in range(1, _MAX_RETRIES + 1):
+        started = time.monotonic()
         try:
-            return llm.invoke(messages)
+            result = llm.invoke(messages)
         except Exception as e:  # noqa: BLE001 — classify + retry transient, raise the rest
+            # Elapsed is read HERE, before the classify/backoff below, so the
+            # published number is the model call and never the backoff the
+            # loop adds after it. Same reason the success path emits before
+            # returning rather than in a `finally`.
+            _emit_plan_latency(
+                elapsed_s=time.monotonic() - started,
+                outcome=f"error:{type(e).__name__}",
+                prompt_chars=prompt_chars,
+                carryover_items=carryover_items,
+                usage=None,
+            )
             last = e
             msg = str(e).lower()
             if attempt >= _MAX_RETRIES or not any(t in msg for t in _RETRYABLE):
@@ -619,6 +813,31 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 raise
             logger.warning("Director LLM transient error (attempt %d): %s — retrying in %ss", attempt, e, delay)
             time.sleep(delay)
+        else:
+            record = _emit_plan_latency(
+                elapsed_s=time.monotonic() - started,
+                outcome="ok",
+                prompt_chars=prompt_chars,
+                carryover_items=carryover_items,
+                usage=getattr(llm, "last_usage", None),
+            )
+            # Also stamp it onto the plan, which is ARCHIVED to
+            # ``director/{run_date}/action_plan.json``. CloudWatch metrics age
+            # out; the artifact does not, and I7311's Closes-when asks for the
+            # route, the resolved model and the token counts to be readable
+            # per invocation from a durable surface. ``DirectorWeeklyActionPlan``
+            # is ``extra="allow"``, so this needs no schema change — and it is
+            # guarded because ``llm=`` is injectable and a test double may
+            # return something that is not a pydantic model.
+            try:
+                result.plan_call_telemetry = record
+            except Exception:  # noqa: BLE001 — telemetry never breaks the plan
+                logger.debug(
+                    "Director: could not stamp plan_call_telemetry onto %r; "
+                    "the EMF record above is still published",
+                    type(result).__name__,
+                )
+            return result
     raise RuntimeError(f"Director LLM failed after {_MAX_RETRIES} attempts") from last
 
 
