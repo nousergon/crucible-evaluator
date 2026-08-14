@@ -355,14 +355,60 @@ def build_backtester_tile(
             reason=(f"parity data_state={parity.get('data_state')}; "
                     f"{'divergence present' if diverged else 'no trade/ticker divergence'}."),
         ))
+    elif parity:
+        # ── A DECLARED failure is a measurement, not a missing input ──────
+        # (alpha-engine-config-I7222). Nine consecutive weekly reports —
+        # 2026-05-29 through 2026-07-17 — carried
+        # `data_state: backtester_replay_error` with every metric 0.0 and
+        # `n_backtester_orders_total: 0`, and nothing anywhere turned red,
+        # because this branch mapped them onto `input_present=False` → N/A,
+        # the SAME rendering as "no file this cycle". The artifact said it
+        # was broken, in writing, every week for eleven weeks, and the only
+        # surface that reads it treated the statement as an absence.
+        #
+        # The producer now stamps `status`/`verdict` on every path (the
+        # degraded emitter, the launcher's absence marker, and the healthy
+        # report alike), so the split below is on evidence the artifact
+        # carries rather than on an allowlist of known-bad `data_state`
+        # strings — a new degraded state cannot go quiet by being unlisted.
+        #
+        # Stale is deliberately still N/A: a report that IS a clean
+        # comparison but belongs to an older cycle is an absence of a
+        # measurement for THIS cycle, and the fleet's staleness detector
+        # owns that fact. Only a present, in-window report that declares
+        # itself not-a-comparison lands here as RED.
+        ds = parity.get("data_state")
+        if parity_stale:
+            components.append(build_metric(
+                name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct",
+                criticality="supporting", n_floor=1, source_path=p_src, input_present=False,
+                na_detail=(f"vectorized_vs_consolidated_parity: stale input — the newest "
+                           f"parity_report.json is {parity_age} day(s) old "
+                           f"(data_state={ds!r})."),
+            ))
+        else:
+            verdict = parity.get("verdict")
+            status_field = parity.get("status")
+            components.append(build_metric(
+                name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct",
+                criticality="supporting", value=0.0, n_samples=1, n_floor=1,
+                target=1.0, red_line=1.0, source_path=p_src, status="RED",
+                reason=(
+                    f"the parity replay produced no usable comparison: "
+                    f"data_state={ds!r}"
+                    + (f", verdict={verdict!r}" if verdict else "")
+                    + (f", status={status_field!r}" if status_field else "")
+                    + ". The backtester-to-executor fill-parity claim is UNPROVEN "
+                      "— this is a measured failure, not a missing input "
+                      "(config-I7222). "
+                    + (parity.get("verdict_reason") or parity.get("data_state_note") or "")
+                ),
+            ))
     else:
-        ds = parity.get("data_state") if parity else None
         components.append(build_metric(
             name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct", criticality="supporting",
             n_floor=1, source_path=p_src, input_present=False,
-            na_detail=(f"vectorized_vs_consolidated_parity: parity_report data_state={ds!r} "
-                       "(not a clean comparison this cycle)." if ds
-                       else "vectorized_vs_consolidated_parity: parity_report.json absent this cycle."),
+            na_detail="vectorized_vs_consolidated_parity: parity_report.json absent this cycle.",
         ))
 
     # 4. fdr_surface_health (supporting) — count of BH-FDR-significant correlations.
