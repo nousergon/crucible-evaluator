@@ -714,16 +714,57 @@ class TestRetro:
         import krepis.secrets as ks
         monkeypatch.setattr(ks, "get_secret", lambda name, **kw: "test-key")
 
+        # The resolver is faked rather than driven against the real registry:
+        # `LLM_MODEL_REGISTRY.yaml` lives in the PRIVATE alpha-engine-config
+        # repo, so a test that resolves for real passes on a laptop that
+        # happens to have that checkout and fails in CI and in the built image
+        # — an ambient-environment dependency, not a test. What is under test
+        # here is this module's CONSUMPTION of the route, which is where the
+        # bug was.
+        seen = {}
+
+        def _fake_resolve(group, **kw):
+            from krepis.llm_config import ModelSpec
+            seen["group"] = group
+            seen["kw"] = kw
+            spec = ModelSpec(
+                provider="litellm_proxy",
+                model="high-deepseek-v4-pro-max",
+                max_tokens=8192,
+                base_url="http://127.0.0.1:8980",
+            )
+            return spec, {
+                "route": "litellm_proxy",
+                "deployment_id": "high-deepseek-v4-pro-max",
+                "provider": "litellm",
+                "registry_id": "litellm:group:high",
+                "primary_model": "deepseek-v4-pro-max",
+                "primary_registry_id": "deepseek-v4-pro-max",
+                "api_base_url": "http://127.0.0.1:8980",
+                "auth_token_type": "placeholder",
+                "skipped_entries": [],
+                "exec_context": "lambda",
+            }
+
+        import krepis.router as KR
+        monkeypatch.setattr(KR, "resolve_group_spec", _fake_resolve)
+
         from director.retro import _KrepisStructuredJudge, _default_llm
         llm = _default_llm()
         assert isinstance(llm, _KrepisStructuredJudge)
+
+        # It asks for a GROUP, and says only where it runs — nothing else about
+        # routing (model-router-policy §2 layer 5, R29).
+        assert seen["group"] == "high"
+        assert seen["kw"]["wire"] == "openai"
+        assert seen["kw"]["exec_context"] == "lambda"
+
         assert llm._judge_group == "high"
-        # Resolved from the registry, not hardcoded here.
-        assert llm._judge_model
-        assert llm._judge_model != llm._judge_group
+        # Taken from the ROUTE, not hardcoded at this call site.
+        assert llm._judge_model == "high-deepseek-v4-pro-max"
         assert llm._client.spec.provider != "openrouter"
-        # max_tokens comes from the registry entry, not pinned at the call site.
-        assert llm._client.spec.max_tokens > 0
+        # max_tokens comes from the registry entry, not pinned here (it was 2000).
+        assert llm._client.spec.max_tokens == 8192
 
     def test_default_llm_refuses_a_route_that_skips_the_proxy(self, monkeypatch):
         """From a Lambda the only conformant route is `litellm_proxy`
