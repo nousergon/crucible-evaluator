@@ -103,14 +103,27 @@ pandas~=3.0
 # dashboard.nousergon.ai. LOAD-BEARING for the emailed link, and
 # tests/test_director_emailer.py now pins the new host — a resolve below
 # 0.54.0 would build a link to the wrong service and the test would say so.
-# v0.59.1 (krepis#148, alpha-engine-config-I7334): ships krepis.stage_coverage
-# — the module `grading/handler.py::_record_stage_coverage` imports. It was
-# briefly added to nousergon-lib (nousergon-lib#314) and immediately removed
-# as a duplicate of the krepis landing (nousergon-lib#315) — it never existed
-# on any released nousergon-lib version, only here. Below this floor, every
+# v0.59.2 (krepis#148, alpha-engine-config-I7334/-I7357): the FIRST release
+# shipping krepis.stage_coverage — the module
+# `grading/handler.py::_record_stage_coverage` imports. It was briefly added to
+# nousergon-lib (nousergon-lib#314) and immediately removed as a duplicate of
+# the krepis landing (nousergon-lib#315) — it never existed on any released
+# nousergon-lib version, only here. Below this floor, every
 # `_record_stage_coverage` call takes the ImportError branch and the I7214
 # assertion never executes (measured live 2026-08-14, alpha-engine-config-I7334).
-krepis[flow-doctor,openai]>=0.59.1
+#
+# The floor was `>=0.59.1` as merged in #209 and that was WRONG — measured by
+# walking the tags, `src/krepis/stage_coverage.py` is ABSENT from v0.59.0 and
+# v0.59.1 and first present at v0.59.2:
+#
+#   $ git ls-tree -r v0.59.1 --name-only | grep -c stage_coverage   -> 0
+#   $ git ls-tree -r v0.59.2 --name-only | grep -c stage_coverage   -> 2
+#
+# 0.59.1 is a real, non-yanked release, so the old floor could resolve to a
+# version lacking the module and silently reproduce the exact ImportError
+# condition #209 exists to close. A floor one patch too low is indistinguishable
+# from a correct one until the resolver happens to pick the gap.
+krepis[flow-doctor,openai]>=0.59.2
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
