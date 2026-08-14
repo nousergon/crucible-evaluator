@@ -626,35 +626,57 @@ class TestRetro:
 
     # ── config#1673: cross-model judge (judge != generator) ─────────
 
-    def test_judge_model_defaults_and_respects_env_override(self, monkeypatch):
-        """RETRO_JUDGE_MODEL is config, not code: env override wins; the
-        default is the high-group primary (DeepSeek V4 Pro Max), deliberately
-        NOT the Director's ``ultra`` group — grading a plan with the model
-        that wrote it is self-grading bias."""
+    def test_judge_group_defaults_and_respects_env_override(self, monkeypatch):
+        """The judge tier is config, not code — and it is a GROUP, never a
+        model id. RETRO_JUDGE_GROUP overrides; the default is `high`,
+        deliberately not the Director's `ultra` — grading a plan with the tier
+        that wrote it is self-grading bias (config#1673)."""
         from director.agent import DIRECTOR_GROUP
-        from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _judge_model
+        from director.retro import RETRO_JUDGE_GROUP_DEFAULT, _judge_group
 
-        monkeypatch.delenv("RETRO_JUDGE_MODEL", raising=False)
-        assert _judge_model() == RETRO_JUDGE_MODEL_DEFAULT == "deepseek-v4-pro-max"
-
-        # The Director now addresses the `ultra` GROUP rather than pinning a
-        # model, so judge != generator can no longer be asserted against a
-        # single constant — the served model depends on which chain entry is
-        # healthy. What IS still assertable: the judge is not the group itself,
-        # and the two are configured independently.
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+        assert _judge_group() == RETRO_JUDGE_GROUP_DEFAULT == "high"
         assert DIRECTOR_GROUP == "ultra"
-        assert _judge_model() != DIRECTOR_GROUP
+        assert _judge_group() != DIRECTOR_GROUP
 
-        # KNOWN GAP, tracked as alpha-engine-config-I6052 and deliberately NOT
-        # asserted here: `deepseek-v4-pro-max` is BOTH this judge default (the
-        # `high` primary) and `ultra`'s LAST fallback. If ultra exhausts its
-        # first three entries the plan is graded by the model that wrote it.
-        # Enforcing that needs the SERVED model at call time, which this unit
-        # test has no access to — asserting a weaker proxy here would make the
-        # invariant look enforced when it is not.
+        monkeypatch.setenv("RETRO_JUDGE_GROUP", "mid")
+        assert _judge_group() == "mid"
 
-        monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-5")
-        assert _judge_model() == "claude-sonnet-5"
+    def test_no_model_id_override_survives_the_router_migration(self, monkeypatch):
+        """RETRO_JUDGE_MODEL is GONE and must stay gone (I6562).
+
+        Setting a literal model id was the reachable way to "unstick" the
+        24-day retro outage, and it is exactly the shortcut that re-pins this
+        call site off the registry and re-hides the router bypass. The tier is
+        overridable; the model is not."""
+        import director.retro as R
+
+        assert not hasattr(R, "RETRO_JUDGE_MODEL_DEFAULT")
+        assert not hasattr(R, "_judge_model")
+
+        # An operator setting the old variable changes nothing.
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+        monkeypatch.setenv("RETRO_JUDGE_MODEL", "gpt-4o")
+        assert R._judge_group() == "high"
+
+    def test_judge_group_may_not_be_the_generators_group(self, monkeypatch):
+        """config#1673 enforced at CALL TIME, not by two constants being
+        distinct — RETRO_JUDGE_GROUP is env-overridable, and an operator
+        setting it to `ultra` would silently turn the retro into self-grading
+        while still producing something shaped like a grade."""
+        import pytest
+        from director.agent import DIRECTOR_GROUP
+        from director.retro import _assert_judge_is_not_the_generator
+
+        _assert_judge_is_not_the_generator("high")  # no raise
+
+        with pytest.raises(RuntimeError, match="judge != generator"):
+            _assert_judge_is_not_the_generator(DIRECTOR_GROUP)
+
+        monkeypatch.setenv("RETRO_JUDGE_GROUP", DIRECTOR_GROUP)
+        from director.retro import _default_llm
+        with pytest.raises(RuntimeError, match="judge != generator"):
+            _default_llm()
 
     def test_grade_prior_plan_injected_llm_never_touches_real_secrets(self, monkeypatch):
         """Test-hygiene guard (bit a previous integration): the llm= injection
@@ -678,21 +700,53 @@ class TestRetro:
         out = grade_prior_plan({"run_date": "2026-05-23"}, _CARD, llm=_FakeLLM(g))
         assert out.calibration == 55
 
-    def test_default_llm_routes_through_krepis_for_configured_judge_model(self, monkeypatch):
-        """_default_llm() must build a krepis.llm.LLMClient (not langchain's
-        ChatAnthropic) targeting the OpenRouter provider + the configured
-        judge alias — never agent.DIRECTOR_MODEL."""
+    def test_default_llm_resolves_the_group_through_the_router_not_a_pinned_model(self, monkeypatch):
+        """_default_llm() resolves a GROUP through krepis.router and takes the
+        model/provider/endpoint from the returned route.
+
+        The regression this guards (I6562): it used to build
+        `ModelSpec(provider="openrouter", model=<literal>)` at this call site
+        and egress straight past the authenticated edge. `provider` must now be
+        whatever the registry says for the proxy route — never the string
+        "openrouter" chosen here."""
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        monkeypatch.setenv("RETRO_JUDGE_MODEL", "claude-sonnet-4-6")
         import krepis.secrets as ks
         monkeypatch.setattr(ks, "get_secret", lambda name, **kw: "test-key")
 
         from director.retro import _KrepisStructuredJudge, _default_llm
         llm = _default_llm()
         assert isinstance(llm, _KrepisStructuredJudge)
-        assert llm._judge_model == "claude-sonnet-4-6"
-        assert llm._client.spec.provider == "openrouter"
-        assert llm._client.spec.model == "claude-sonnet-4-6"
+        assert llm._judge_group == "high"
+        # Resolved from the registry, not hardcoded here.
+        assert llm._judge_model
+        assert llm._judge_model != llm._judge_group
+        assert llm._client.spec.provider != "openrouter"
+        # max_tokens comes from the registry entry, not pinned at the call site.
+        assert llm._client.spec.max_tokens > 0
+
+    def test_default_llm_refuses_a_route_that_skips_the_proxy(self, monkeypatch):
+        """From a Lambda the only conformant route is `litellm_proxy`
+        (model-router-policy R26). The judge shares the plan call's guard —
+        this is the assertion that existed in agent.py and never reached
+        retro.py, which is how the bypass survived (engagement §5)."""
+        import pytest
+        import director.retro as R
+
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+        monkeypatch.setattr(R, "DIRECTOR_EXEC_CONTEXT", "lambda")
+
+        def _fake_resolve(group, **kw):
+            from krepis.llm_config import ModelSpec
+            spec = ModelSpec(provider="openrouter", model="whatever", max_tokens=2000)
+            return spec, {"route": "direct", "deployment_id": "whatever",
+                          "provider": "openrouter", "api_base_url": "https://openrouter.ai",
+                          "auth_token_type": "api_key", "skipped_entries": []}
+
+        import krepis.router as KR
+        monkeypatch.setattr(KR, "resolve_group_spec", _fake_resolve)
+        with pytest.raises(RuntimeError, match="model-router-policy R26"):
+            R._default_llm()
 
     def test_krepis_judge_stamps_judge_model_and_resolved_model(self):
         """End-to-end (hermetic, no network / no anthropic SDK): drives
@@ -705,7 +759,9 @@ class TestRetro:
         model_dump()."""
         from krepis.llm import LLMClient
         from krepis.llm_config import ModelSpec
-        from director.retro import RETRO_JUDGE_MODEL_DEFAULT, _KrepisStructuredJudge, build_messages
+        from director.retro import _KrepisStructuredJudge, build_messages
+
+        _JUDGE_MODEL = "high-deepseek-v4-pro-max"  # as the registry would resolve `high`
 
         class _FakeToolUseBlock:
             def __init__(self, name, input_):
@@ -724,7 +780,7 @@ class TestRetro:
                 self.messages = self
 
             def create(self, **payload):
-                assert payload["model"] == RETRO_JUDGE_MODEL_DEFAULT
+                assert payload["model"] == _JUDGE_MODEL
                 tool_input = {
                     "prior_run_date": "2026-05-23",
                     "grounding": 80,
@@ -741,24 +797,26 @@ class TestRetro:
             assert api_key == "test-key"
             return _FakeAnthropicClient()
 
-        spec = ModelSpec(provider="anthropic", model=RETRO_JUDGE_MODEL_DEFAULT, max_tokens=2000)
+        spec = ModelSpec(provider="anthropic", model=_JUDGE_MODEL, max_tokens=2000)
         client = LLMClient(
             spec,
             api_key="test-key",
             client_factory=_client_factory,
             callsite_id="director-retro-judge",
         )
-        judge = _KrepisStructuredJudge(client, judge_model=RETRO_JUDGE_MODEL_DEFAULT)
+        judge = _KrepisStructuredJudge(client, judge_group="high", judge_model=_JUDGE_MODEL)
 
         messages = build_messages(_plan().model_dump(), _CARD)
         grade = judge.invoke(messages)
 
         assert grade.calibration == 55
-        assert grade.judge_model == RETRO_JUDGE_MODEL_DEFAULT
+        assert grade.judge_group == "high"
+        assert grade.judge_model == _JUDGE_MODEL
         assert grade.resolved_model == "claude-sonnet-4-6-20260115"
-        assert grade.judge_model != grade.resolved_model  # alias vs API-resolved snapshot
+        assert grade.judge_model != grade.resolved_model  # registry-resolved vs API-served
         dumped = grade.model_dump()
-        assert dumped["judge_model"] == RETRO_JUDGE_MODEL_DEFAULT
+        assert dumped["judge_group"] == "high"
+        assert dumped["judge_model"] == _JUDGE_MODEL
         assert dumped["resolved_model"] == "claude-sonnet-4-6-20260115"
 
     def test_handler_persists_judge_model_and_resolved_model(self, s3, monkeypatch):

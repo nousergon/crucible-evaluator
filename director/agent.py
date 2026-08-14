@@ -209,8 +209,22 @@ def _assert_routed_through_the_proxy(route: dict) -> None:
         )
 
 
-def _warn_on_degraded_route(route: dict) -> None:
+def _warn_on_degraded_route(
+    route: dict,
+    *,
+    group: str | None = None,
+    metric_name: str = "DirectorRouteFallback",
+) -> None:
     """Alert when the group's declared primary is not what will serve.
+
+    ``group`` and ``metric_name`` default to the Director's own plan call, so
+    every existing caller is unchanged. They are parameters because the retro
+    judge (``director/retro.py``) resolves a DIFFERENT group through the same
+    router and needs the same R12 alert — and emitting its degradation under
+    ``Group=ultra`` / ``DirectorRouteFallback`` would attribute the judge's
+    fallback to the plan call, which is a worse signal than none: the alarm
+    would fire for a component that was healthy. One metric per resolved group,
+    named for the call site that resolved it.
 
     ``model-router-policy`` R12 is explicit that serving from a fallback is an
     *alert*, not a log line. krepis already returns everything needed —
@@ -238,6 +252,7 @@ def _warn_on_degraded_route(route: dict) -> None:
 
     Never raises. A telemetry failure must not take down the weekly plan.
     """
+    group = group or DIRECTOR_GROUP
     skipped = route.get("skipped_entries") or []
     primary = route.get("primary_registry_id") or route.get("primary_model")
     served = route.get("registry_id")
@@ -270,7 +285,7 @@ def _warn_on_degraded_route(route: dict) -> None:
         logger.warning(
             "Director route DEGRADED: group=%s primary=%s served=%s route=%s "
             "context=%s — skipped: %s",
-            DIRECTOR_GROUP, primary, served, route.get("route"),
+            group, primary, served, route.get("route"),
             route.get("exec_context"),
             "; ".join(
                 f"{s.get('registry_id')}: {s.get('reason')}" for s in skipped
@@ -284,11 +299,11 @@ def _warn_on_degraded_route(route: dict) -> None:
                 "CloudWatchMetrics": [{
                     "Namespace": "AlphaEngine/Director",
                     "Dimensions": [["Group"]],
-                    "Metrics": [{"Name": "DirectorRouteFallback", "Unit": "Count"}],
+                    "Metrics": [{"Name": metric_name, "Unit": "Count"}],
                 }],
             },
-            "Group": DIRECTOR_GROUP,
-            "DirectorRouteFallback": 1 if degraded else 0,
+            "Group": group,
+            metric_name: 1 if degraded else 0,
             "served": served,
             "primary": primary,
             "route": route.get("route"),
@@ -296,8 +311,8 @@ def _warn_on_degraded_route(route: dict) -> None:
         }))
     except Exception:
         logger.exception(
-            "Director: failed to emit DirectorRouteFallback — the fallback "
-            "alarm is blind for this run"
+            "Director: failed to emit %s — the fallback alarm is blind for "
+            "this run", metric_name
         )
 
 
