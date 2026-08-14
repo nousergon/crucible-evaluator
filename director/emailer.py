@@ -89,10 +89,22 @@ def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:
     every one of ~52 emails a year trains the eye past the ones that matter.
     The verdict is still stated in the footer on a PASS.
     """
-    from director.verdict import actions_withheld
+    from director.verdict import PIPELINE_GATES_KEY, actions_withheld
+    from grading.pipeline_gates import gates_unmeasured
 
     vb = verdict_block or {}
+    gates = vb.get(PIPELINE_GATES_KEY) or {}
     if not actions_withheld(vb):
+        # alpha-engine-config-I7282 — the attestation passed, but the pipeline's
+        # own pre-spend correctness gates may not have run. That is a genuinely
+        # milder finding and gets a genuinely milder banner: AMBER, and it says
+        # in its own first sentence that the numbers are unaffected and nothing
+        # was withheld. The calibration is the point — a reader who cannot tell
+        # "a check did not run" from "the numbers are wrong" starts discarding
+        # both, and the week the arithmetic really moves is the week the habit
+        # costs something.
+        if gates and gates_unmeasured(gates):
+            return _gate_only_banner(gates)
         return None
 
     verdict = vb.get("verdict", "UNKNOWN")
@@ -120,11 +132,13 @@ def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:
         "reopen/escalate loop this cycle. The plan below is advisory diagnosis "
         "only; nothing was tracked, reopened or escalated from it."
     )
+    gate_line = (gates.get("statement") or "").strip()
     plain = "\n".join([
         f"!! {headline}",
         f"   {reason}" if reason else "",
         f"   Verdict as-of — {as_of_line}",
         f"   {withheld_line}",
+        f"   Pipeline gates — {gate_line}" if gate_line else "",
         "",
     ])
     html = (
@@ -134,9 +148,53 @@ def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:
         + (f"<p style='margin:0 0 6px;font-size:12px;'>{reason}</p>" if reason else "")
         + f"<p style='margin:0 0 6px;font-size:11px;color:#555;'>Verdict as-of — {as_of_line}</p>"
         f"<p style='margin:0;font-size:12px;'>{withheld_line}</p>"
-        "</div>"
+        + (f"<p style='margin:6px 0 0;font-size:11px;color:#555;'>Pipeline gates — "
+           f"{gate_line}</p>" if gate_line else "")
+        + "</div>"
     )
     return prefix, plain, html
+
+
+def _gate_only_banner(gates: dict) -> tuple[str, str, str]:
+    """The amber banner for an unmeasured pre-spend gate on an otherwise-clean run.
+
+    ``alpha-engine-config-I7282``. Deliberately NOT the red attestation banner:
+
+    * the subject prefix is ``[GATES UNVERIFIED]``, not ``[UNVERIFIED]`` — the
+      two findings are different and must not read as the same one;
+    * the first sentence of the body states what is NOT wrong, because the
+      failure mode being designed against is Brian discarding a usable card;
+    * nothing is withheld, and the banner says so, so the absence of withheld
+      actions is not read as the banner being decorative.
+    """
+    statement = (gates.get("statement") or "").strip()
+    unmeasured = ", ".join(gates.get("unmeasured") or []) or "unnamed"
+    headline = (
+        "PIPELINE GATES: NOT VERIFIED — the weekly run's pre-spend correctness "
+        f"gates did not all run this cycle ({unmeasured})."
+    )
+    context = (
+        "The numbers in this plan are unaffected and nothing was withheld: the "
+        "correctness attestation PASSED, the tiles are real, and the Director "
+        "filed and escalated as usual. What is missing is the earlier check that "
+        "the pipeline's own contract and library pins were sound before it spent. "
+        "Read the plan; do not read it as gate-verified."
+    )
+    plain = "\n".join([
+        f"!  {headline}",
+        f"   {statement}" if statement else "",
+        f"   {context}",
+        "",
+    ])
+    html = (
+        "<div style=\"border:2px solid #b58900;background:#fffbe6;padding:10px 12px;"
+        "margin:0 0 16px;\">"
+        f"<p style='margin:0 0 6px;font-size:14px;'><b>&#9888; {headline}</b></p>"
+        + (f"<p style='margin:0 0 6px;font-size:12px;'>{statement}</p>" if statement else "")
+        + f"<p style='margin:0;font-size:12px;color:#555;'>{context}</p>"
+        "</div>"
+    )
+    return "[GATES UNVERIFIED] ", plain, html
 
 
 def _verdict_footer(verdict_block: dict | None) -> str:
@@ -146,14 +204,25 @@ def _verdict_footer(verdict_block: dict | None) -> str:
     verdict only when it is not PASS is a surface where silence means pass, and
     silence is exactly what an absent verdict produces.
     """
+    from director.verdict import PIPELINE_GATES_KEY
+
     vb = verdict_block or {}
     if not vb:
-        return "Correctness attestation: NOT READ by this digest."
+        return ("Correctness attestation: NOT READ by this digest. "
+                "Pipeline gates: NOT READ by this digest.")
     as_of = vb.get("as_of") or {}
     stamps = ", ".join(f"{k} {v or 'never'}" for k, v in sorted(as_of.items()))
+    # alpha-engine-config-I7282: the footer is the BOTH-POLARITY surface, so the
+    # gate verdict is stated here on a clean run too. A line that appears only on
+    # the bad week cannot be told apart from a producer that stopped emitting.
+    gates = vb.get(PIPELINE_GATES_KEY) or {}
+    gate_verdict = gates.get("verdict", "UNKNOWN") if gates else "NOT READ"
+    gate_detail = ", ".join(gates.get("unmeasured") or []) if gates else ""
     return (
         f"Correctness attestation: {vb.get('verdict', 'UNKNOWN')}"
         + (f" (as-of {stamps})" if stamps else " (no as-of recorded)")
+        + f". Pipeline gates: {gate_verdict}"
+        + (f" (unmeasured: {gate_detail})" if gate_detail else "")
         + "."
     )
 

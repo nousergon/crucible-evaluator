@@ -280,7 +280,11 @@ def test_handler_wires_the_self_test():
     assert "write_self_test(bucket, run_date, self_test)" in source
     assert '"self_test_verdict": self_test.get("verdict")' in source
     assert '"degraded_self_test": not self_test_pass' in source
-    assert "build_report_card(bucket, run_date, self_test=self_test)" in source
+    # alpha-engine-config-I7282 added a second threaded block (`gate_state`) to
+    # the same call; the invariant this line protects is that the self-test is
+    # threaded IN rather than re-run inside the builder, so it pins the kwarg
+    # rather than the full argument list.
+    assert "build_report_card(bucket, run_date, self_test=self_test," in source
 
 
 class TestReportCardCarriesTheVerdict:

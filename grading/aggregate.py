@@ -34,6 +34,7 @@ from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
+from grading.pipeline_gates import gates_unmeasured, read_gate_state
 from grading.self_test import run_self_test
 from grading.self_test import verdict_is_pass as self_test_is_pass
 from grading.module_agg import overall_status
@@ -79,6 +80,7 @@ def build_report_card(
     run_date: str,
     s3_client=None,
     self_test: dict | None = None,
+    gate_state: dict | None = None,
 ) -> dict:
     """Read artifacts → grade → attach provenance. Pure of writes.
 
@@ -232,6 +234,29 @@ def build_report_card(
         attestation.get("contamination_verdict")
     )
     scorecard["contamination_verdict"] = attestation.get("contamination_verdict")
+
+    # alpha-engine-config-I7282 — §2.3a rule 3, third surface and the one that
+    # was carrying NOTHING. `attestation` and `self_test` above answer "is the
+    # arithmetic behind these numbers right"; this answers the prior question
+    # "did the pipeline's own pre-spend correctness gates run at all this
+    # cycle". Until this landed the SF sent the ReportCard Lambda
+    # {date, dry_run, snapshot} and the card rendered identically whether the
+    # gates passed, failed, or (as PipelineContractGate has done on every
+    # production run since it existed — alpha-engine-config-I7281) never
+    # measured anything.
+    #
+    # `gate_state` is threaded in by grading/handler.py from the SF payload.
+    # A caller that omits it does NOT get a pass: read_gate_state(None) resolves
+    # to UNKNOWN with the cause recorded, which is exactly the pre-I7282 state
+    # of the world and must read as such rather than as silence.
+    #
+    # `degraded_pipeline_gates` is DERIVED from the verdict, never set
+    # independently, so the two cannot disagree. `status` is deliberately NOT
+    # moved to "partial" by an unmeasured gate — see pipeline_gates.py's module
+    # docstring for why (a permanently-amber field is a field nobody reads).
+    gate_block = read_gate_state(gate_state)
+    scorecard["pipeline_gates"] = gate_block
+    scorecard["degraded_pipeline_gates"] = gates_unmeasured(gate_block)
 
     # A card whose correctness verdict did not come back cannot present itself
     # as a complete build. On 2026-08-07 the contamination check timed out and

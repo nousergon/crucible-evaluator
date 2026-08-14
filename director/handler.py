@@ -45,13 +45,16 @@ from director.issue_filer import (
 from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from director.verdict import (
+    PIPELINE_GATES_KEY,
     actions_withheld,
     log_verdict,
     read_card_verdict,
+    read_pipeline_gates,
     stamp_plan_artifact,
     withheld_reason,
     withheld_summary,
 )
+from grading.pipeline_gates import log_gate_state
 from grading.handler import _record_stage_coverage, _resolve_run_date
 from krepis.logging import setup_logging
 
@@ -637,6 +640,13 @@ def handler(event: dict | None = None, context=None) -> dict:
     # Absent, unreadable or unrecognised all resolve to UNKNOWN and withhold —
     # never to a pass (config-I7039).
     verdict_block = read_card_verdict(card)
+    # alpha-engine-config-I7282 — the SF's pre-spend correctness gates, threaded
+    # into this Task's payload as `gate_state`. Folded onto the verdict block so
+    # it reaches every surface the attestation already does: the stamped action
+    # plan, the digest email, and this stage's SF output. It gates no Director
+    # action — see read_pipeline_gates' docstring for why that is deliberate.
+    verdict_block[PIPELINE_GATES_KEY] = read_pipeline_gates(event.get("gate_state"), card)
+    log_gate_state(verdict_block[PIPELINE_GATES_KEY], run_date)
     log_verdict(verdict_block, run_date)
 
     ledger = load_ledger(bucket, s3_client=s3)

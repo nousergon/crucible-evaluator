@@ -32,6 +32,7 @@ from krepis.logging import setup_logging
 
 from grading.aggregate import build_report_card, write_report_card
 from grading.experiment_record import build_experiment_record, write_experiment_record
+from grading.pipeline_gates import gates_unmeasured, log_gate_state, read_gate_state
 from grading.self_test import run_self_test, verdict_is_pass, write_self_test
 
 # Structured logging + flow-doctor. Passing a flow-doctor.yaml attaches a
@@ -233,7 +234,19 @@ def handler(event: dict | None = None, context=None) -> dict:
             self_test.get("n_errored", 0), self_test.get("libraries"),
         )
 
-    card = build_report_card(bucket, run_date, self_test=self_test)
+    # ── The SF's correctness-gate state (alpha-engine-config-I7282) ──────────
+    # sf-pipeline-policy.md §2.3a rule 3. `gate_state` is the ReportCard Task's
+    # new payload block: the two pre-spend gate probe payloads plus the four
+    # fail-open degradation families, each seeded at InitializeInput so it is
+    # present in BOTH polarities (a field that appears only on the bad path
+    # cannot be distinguished from a producer that broke). Read here — never
+    # `.get(..., True)`-style — so an absent block resolves to UNKNOWN, which is
+    # precisely the pre-I7282 world and must not read as a clean run.
+    gate_block = read_gate_state(event.get("gate_state"))
+    log_gate_state(gate_block, run_date)
+
+    card = build_report_card(bucket, run_date, self_test=self_test,
+                             gate_state=event.get("gate_state"))
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}
@@ -311,6 +324,15 @@ def handler(event: dict | None = None, context=None) -> dict:
         "self_test_verdict": self_test.get("verdict"),
         "degraded_self_test": not self_test_pass,
         "self_test_key": self_test_key_written,
+        # alpha-engine-config-I7282 — the same clause, applied to the gates that
+        # run BEFORE this stage. Carried in the SF stage output as well as in the
+        # card, so the withholding is visible in the execution history and not
+        # only in the artifact: a stage that quietly rendered an unverified card
+        # and returned status "ok" is the same blindness one layer up.
+        "pipeline_gates_verdict": gate_block["verdict"],
+        "degraded_pipeline_gates": gates_unmeasured(gate_block),
+        "pipeline_gates_unmeasured": gate_block["unmeasured"],
+        "pipeline_gates_statement": gate_block["statement"],
     }
     _record_stage_coverage("ReportCard", run_date=run_date, started=_started, result=summary)
     logger.info(
