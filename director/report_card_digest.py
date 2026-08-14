@@ -15,6 +15,8 @@ Output is plain text (markdown-ish) so it drops straight into the prompt.
 
 from __future__ import annotations
 
+from grading.pipeline_gates import MEASURED, PIPELINE_GATES_KEY
+
 TILE_ORDER = [
     "portfolio_outcome", "research", "predictor", "executor",
     "backtester", "substrate", "agent",
@@ -126,6 +128,22 @@ def summarize_report_card(card: dict) -> str:
             "this cycle — config/executor_params.json and config/producer_champion.json "
             "were NOT updated. The live executor is on the PREVIOUS cycle's "
             "parameters; do not describe any config change as having taken effect."
+        )
+    # alpha-engine-config-I7282 — §2.3a rule 3. The attestation above says
+    # whether the arithmetic behind these numbers is right; this says whether the
+    # pipeline's own pre-spend correctness gates ran at all before it spent. Both
+    # polarities render: a line that appears only on the bad week is
+    # indistinguishable from a producer that stopped emitting.
+    gates = card.get(PIPELINE_GATES_KEY) or {}
+    statement = gates.get("statement")
+    if statement:
+        out.append(("PIPELINE GATES: " if gates.get("verdict") == MEASURED
+                    else "⚠ PIPELINE GATES: ") + statement)
+    else:
+        out.append(
+            "⚠ PIPELINE GATES: UNKNOWN — this card carries no pipeline_gates "
+            "block, so nothing says whether the weekly run's pre-spend "
+            "correctness gates ran. Treat the numbers below as unattested."
         )
     if card.get("degraded_staleness"):
         out.append("⚠ DEGRADED (staleness): stale tiles — "

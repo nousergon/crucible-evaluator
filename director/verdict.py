@@ -65,8 +65,19 @@ from typing import Any
 # pass" bug can be reintroduced (`policy-shared-code` — same repo, so the fix
 # is an import, not a lift).
 from grading.attestation import FAIL, PARTIAL, PASS, UNKNOWN, verdict_is_pass
+from grading.pipeline_gates import (
+    PIPELINE_GATES_KEY,
+    gates_unmeasured,
+    read_gate_state,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [  # re-exported: the Director's callers read the key from here
+    "PIPELINE_GATES_KEY", "ATTESTATION_KEY", "GATED_ACTIONS", "actions_withheld",
+    "log_verdict", "read_card_verdict", "read_pipeline_gates",
+    "stamp_plan_artifact", "withheld_reason", "withheld_summary",
+]
 
 #: The card key carrying the §2.3a block. Cross-repo contract with
 #: ``crucible-evaluator grading/attestation.py::build_run_attestation``, whose
@@ -173,6 +184,45 @@ def read_card_verdict(card: Any) -> dict:
     return result
 
 
+def read_pipeline_gates(gate_state: Any, card: Any = None) -> dict:
+    """The SF's pre-spend correctness-gate state, for the Director's surfaces.
+
+    ``alpha-engine-config-I7282``. Two sources, in precedence order:
+
+    1. ``gate_state`` — the ``Director`` Task's own payload block, threaded
+       straight off the live execution record. Authoritative, because it
+       describes THIS execution.
+    2. the report card's ``pipeline_gates`` block — the same data as the
+       ReportCard stage saw it. Used only when the SF sent nothing, so a
+       dropped payload field degrades to a stale-but-real answer rather than to
+       silence.
+
+    Neither present resolves to ``UNKNOWN`` with the cause recorded, never to a
+    pass (§2.3a rule 2).
+
+    **Deliberately does NOT feed** :func:`actions_withheld`. The attestation
+    verdict answers "are these numbers right", and acting on numbers that are
+    not is what ``GATED_ACTIONS`` exists to prevent. The pre-spend gates answer
+    a different question — "did the pipeline's own contract and pin invariants
+    get checked before it spent" — and an unmeasured one of those does not make
+    the week's metrics wrong. Wiring it into the gate would also, today, stop
+    Director issue filing outright and permanently, because
+    ``PipelineContractGate`` has been ``UNKNOWN`` on every production run since
+    it existed (``alpha-engine-config-I7281``): a silent, indefinite outage
+    introduced by an observability fix. It is rendered on every surface and
+    gates nothing, until I7281 makes a MEASURED result reachable.
+    """
+    if isinstance(gate_state, dict):
+        return read_gate_state(gate_state)
+    if isinstance(card, dict):
+        from_card = card.get(PIPELINE_GATES_KEY)
+        if isinstance(from_card, dict) and from_card.get("verdict"):
+            block = dict(from_card)
+            block["source"] = "report_card"
+            return block
+    return read_gate_state(None)
+
+
 def actions_withheld(verdict_block: dict) -> bool:
     """True when the Director must not exercise its acting authority.
 
@@ -212,6 +262,14 @@ def withheld_summary(verdict_block: dict) -> dict:
     if withheld:
         summary["director_actions_withheld_list"] = list(GATED_ACTIONS)
         summary["correctness_verdict_reason"] = vb.get("reason")
+    # alpha-engine-config-I7282 — §2.3a rule 3 on the SF stage output. Emitted
+    # in BOTH polarities (a key that appears only when something is wrong cannot
+    # be distinguished from a producer that stopped emitting).
+    gates = vb.get(PIPELINE_GATES_KEY) or {}
+    if gates:
+        summary["pipeline_gates_verdict"] = gates.get("verdict", UNKNOWN)
+        summary["degraded_pipeline_gates"] = gates_unmeasured(gates)
+        summary["pipeline_gates_unmeasured"] = list(gates.get("unmeasured") or [])
     return summary
 
 
