@@ -911,11 +911,36 @@ def build_research_tile(
         chosen = (min(top_n, key=lambda e: abs((e.get("n") or 0) - n_surv))
                   if n_surv is not None else top_n[0])
         prize = _alpha(chosen) - lg_alpha
+        # alpha-engine-config-I7213 (symmetry): render each cohort's excess
+        # over the PIT population beside its raw alpha, and do the same for
+        # the live gate. Raw mean_alpha alone is not comparable across arms —
+        # every cohort here is measured on its own cycle set, and the tape of
+        # those cycles is common to selector and population alike. On the
+        # 2026-08-13 card the live gate's +0.0275 stood beside top-20 cohorts
+        # near +0.001 with no denominator on the live leg, so the entire gap
+        # read as selection skill. Absent on pre-I7213 artifacts (e.g.
+        # backtest/2026-08-07) — omitted silently there rather than shown as
+        # a fabricated zero.
+        def _excess_s(e):
+            x = e.get("excess_vs_population")
+            if x is None:
+                return ""
+            p = e.get("excess_p")
+            return f", vs-population {x:+.4f}" + (f" (p={_fmt_p(p)})" if p is not None else "")
+
         rows_s = "; ".join(
             f"top-{e.get('n')}{'(sector-bal)' if e.get('sector_balanced') else ''}: "
             f"capture {_fmt_pct(e.get('capture_rate'))}, alpha {_alpha(e):+.4f}"
+            f"{_excess_s(e)}"
             for e in top_n
         )
+        lg_excess_s = _excess_s(live_gate)
+        pop_s = (f" Population (PIT, same cycles) mean {att_hz} alpha "
+                 f"{live_gate['population_mean_alpha']:+.4f} — every arm above is "
+                 f"stated against it."
+                 if live_gate.get("population_mean_alpha") is not None else
+                 " Population leg absent on this artifact (pre-alpha-engine-config-I7213 "
+                 "producer) — the arms below are raw means with no shared denominator.")
         components.append(build_metric(
             name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
             criticality="supporting",
@@ -924,8 +949,9 @@ def build_research_tile(
             higher_is_better=True, source_path=att_src,
             reason=(f"scanner_feed_counterfactual: top-{chosen.get('n')} attractiveness feed "
                     f"− live gate = {prize:+.4f} mean {att_hz} log-alpha (live gate: capture "
-                    f"{_fmt_pct(live_gate.get('capture_rate'))}, alpha {lg_alpha:+.4f}, "
-                    f"N={n_surv} survivors). All cohorts [{rows_s}]. Sizes the prize of an "
+                    f"{_fmt_pct(live_gate.get('capture_rate'))}, alpha {lg_alpha:+.4f}"
+                    f"{lg_excess_s}, N={n_surv} survivors).{pop_s} All cohorts [{rows_s}]. "
+                    f"Sizes the prize of an "
                     f"attractiveness-ranked scanner feed (config#1398) — opportunity surface, "
                     f"not a failure gate."),
         ))

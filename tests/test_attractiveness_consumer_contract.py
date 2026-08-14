@@ -227,6 +227,59 @@ class TestScannerFeedCounterfactual:
         assert m["status"] == "N/A-MISSING-INPUT"
 
 
+class TestPopulationLegRendering:
+    """alpha-engine-config-I7213 symmetry: the report card must show every arm
+    — attractiveness cohorts AND the live tech_score gate — against the shared
+    PIT population denominator. On the 2026-08-13 live card the live gate's
+    +0.0275 sat beside top-20 cohorts near +0.001 with no denominator on the
+    live leg, so the whole gap read as selection skill when part of it is the
+    tape of the cycles both arms were drawn from.
+    """
+
+    def _doc_with_population_leg(self) -> dict:
+        doc = _fixture()
+        cf = doc["counterfactual"]
+        cf["holding_rule"] = (
+            "weekly rebalance, 21d hold, equal-weight, no intra-period turnover"
+        )
+        cf["live_gate"].update({
+            "population_mean_alpha": 0.0041, "excess_vs_population": 0.0022,
+            "excess_t": 1.9, "excess_p": 0.081, "excess_ci95": [-0.0003, 0.0047],
+        })
+        cf["top_n"][0].update({
+            "population_mean_alpha": 0.0041, "excess_vs_population": 0.0141,
+            "excess_t": 3.4, "excess_p": 0.006, "excess_ci95": [0.0052, 0.0230],
+        })
+        return doc
+
+    def test_live_gate_excess_and_shared_population_are_rendered(self, s3):
+        _put_att(s3, self._doc_with_population_leg())
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "scanner_feed_counterfactual")
+        r = m["status_reason"]
+        # The live gate no longer stands without its denominator...
+        assert "alpha +0.0063, vs-population +0.0022" in r
+        # ...the population it is measured against is named once, explicitly...
+        assert "Population (PIT, same cycles) mean 21d alpha +0.0041" in r
+        # ...and each cohort carries its own excess beside its raw alpha.
+        assert "vs-population +0.0141" in r
+
+    def test_pre_i7213_artifact_says_so_rather_than_showing_zero(self, s3):
+        """An artifact predating the producer (backtest/2026-08-07) has no
+        population leg. Rendering a fabricated 0.0 would be the fleet's
+        could-not-measure == measured-nothing defect; say which it is."""
+        _put_att(s3, _fixture())
+        m = _comp(build_research_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "scanner_feed_counterfactual")
+        r = m["status_reason"]
+        assert "Population leg absent on this artifact" in r
+        assert "vs-population" not in r
+        # The component still grades — the population leg is additive context,
+        # never a new precondition on an existing number.
+        assert m["status"] == "GREEN"
+        assert m["value"] == pytest.approx(0.0121 - 0.0063)
+
+
 class TestWindowedResolution:
     def test_reads_freshest_artifact_within_trailing_window(self, s3):
         # Artifact persisted 3 days before run_date still grades (config#1190).
