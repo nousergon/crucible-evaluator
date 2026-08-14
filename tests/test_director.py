@@ -301,9 +301,13 @@ class TestHandler:
         assert out["director_issues"] == "skipped"
         assert out["director_issues_reason"] == "no token configured"
 
-    def test_check_deploy_drift_dispatches_before_enabled_flag(self, monkeypatch):
+    def test_check_deploy_drift_dispatches_before_enabled_flag(self, s3, monkeypatch):
         # config#2348: the drift probe must run even when DIRECTOR_ENABLED is
         # off (the default) — a dormant-but-stale image is still stale.
+        # `s3` (mock_aws) so the stage-coverage call this dispatch also makes
+        # (config-I7214/I7334) resolves against moto rather than reaching
+        # real AWS — krepis.stage_coverage is genuinely importable now, so
+        # this exercises the REAL library call, not a fake.
         monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
         from director import handler as H
         import grading.deploy_drift as dd
@@ -316,7 +320,9 @@ class TestHandler:
             function_name = "alpha-engine-evaluator-director"
 
         out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
-        assert out == {"has_drift": True, "function_name": "alpha-engine-evaluator-director"}
+        assert out["has_drift"] is True
+        assert out["function_name"] == "alpha-engine-evaluator-director"
+        assert out["stage_coverage"]["stage"] == "EvaluatorDirectorDeployDriftCheck"
 
     def test_issues_filed_when_token_present(self, s3, monkeypatch):
         # Phase H (repointed): with a PAT, the handler files area:director-proposals
@@ -402,30 +408,51 @@ class TestHandler:
         assert out["status"] == "disabled"
 
 
-# ── Stage-output coverage (config-I7214, the ruled rescope) ──────────────────
+# ── Stage-output coverage (config-I7214, config-I7334) ────────────────────────
 #
-# The single shared implementation is `nousergon_lib.stage_coverage`, landing
-# in a separate nousergon-lib wave — NOT YET at this repo's pinned tag. These
-# tests inject a fake module into sys.modules so the call sites can be
-# exercised without that pin bump; `TestStageCoverageImportDegrades` below
-# separately proves the REAL (current, pin-predates-module) degrade path.
+# The single shared implementation is `krepis.stage_coverage` (relocated from
+# `nousergon_lib.stage_coverage`, which never shipped on any released
+# nousergon-lib version — config-I7334). These tests inject a fake module into
+# sys.modules so the call sites can be exercised without a real krepis
+# resolve; `TestStageCoverageImportDegrades` below separately proves the
+# import-failure degrade path (the REAL live behavior before I7334's pin bump).
 
 def _install_fake_stage_coverage(monkeypatch, calls=None):
-    """Inject a stand-in `nousergon_lib.stage_coverage` module so the handler's
-    `from nousergon_lib.stage_coverage import assert_stage_coverage` resolves
+    """Inject a stand-in `krepis.stage_coverage` module so the handler's
+    `from krepis.stage_coverage import assert_stage_coverage` resolves
     to a controllable fake (Python's import system checks sys.modules before
     any finder/loader lookup, so this needs no real submodule on disk)."""
     import types
     calls = calls if calls is not None else []
-    fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+    fake_mod = types.ModuleType("krepis.stage_coverage")
 
     def _fake_assert_stage_coverage(stage, *, run_date, window_start):
         calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
         return {"stage": stage, "status": "COVERED", "run_date": run_date}
 
     fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
-    monkeypatch.setitem(__import__("sys").modules, "nousergon_lib.stage_coverage", fake_mod)
+    monkeypatch.setitem(__import__("sys").modules, "krepis.stage_coverage", fake_mod)
     return calls
+
+
+def _block_stage_coverage_import(monkeypatch):
+    """Force `from krepis.stage_coverage import assert_stage_coverage` to
+    raise ImportError regardless of whether the real module is actually
+    resolvable in this test environment — the module being absent from
+    sys.modules is not sufficient to prove an import failure once krepis
+    provides it (I7334 fixed exactly that gap)."""
+    import builtins
+    import sys
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "krepis.stage_coverage":
+            raise ImportError("No module named 'krepis.stage_coverage'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "krepis.stage_coverage", raising=False)
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
 
 
 class TestStageCoverageDirector:
@@ -489,28 +516,53 @@ class TestStageCoverageEvaluatorDirectorDeployDriftCheck:
 
 class TestStageCoverageImportDegrades:
     """Observe mode cannot break the stage it observes: a ModuleNotFoundError
-    from the lib (the pin here predates the module) must never change the
-    handler's own outcome — logged loud, never silent, no `stage_coverage`
-    key on the payload."""
+    from the lib must never change the handler's own outcome — logged loud
+    AND the `stage_coverage` key is ALWAYS present (never absent, per I7334):
+    status UNMEASURED with a reason, distinguishable from a real COVERED
+    verdict, plus an alarmable CloudWatch metric."""
 
     def test_director_outcome_unchanged_when_module_absent(self, s3, monkeypatch):
-        import sys
-        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        _block_stage_coverage_import(monkeypatch)
         monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
         from director import handler as H
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
         assert out["status"] == "disabled"
-        assert "stage_coverage" not in out
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+        assert "krepis.stage_coverage" in out["stage_coverage"]["reason"]
+        assert out["stage_coverage"]["stage"] == "Director"
 
     def test_deploy_drift_check_outcome_unchanged_when_module_absent(self, monkeypatch):
-        import sys
-        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        _block_stage_coverage_import(monkeypatch)
         from director import handler as H
         import grading.deploy_drift as dd
         monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
         out = H.handler({"action": "check_deploy_drift"}, context=None)
         assert out["has_drift"] is False
-        assert "stage_coverage" not in out
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+        assert out["stage_coverage"]["stage"] == "EvaluatorDirectorDeployDriftCheck"
+
+    def test_unavailable_verdict_never_shares_shape_with_a_real_pass(self, s3, monkeypatch):
+        _block_stage_coverage_import(monkeypatch)
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["stage_coverage"]["status"] != "COVERED"
+        assert out["stage_coverage"]["status"] != "COVERED_NO_OUTPUT"
+
+    def test_unavailable_publishes_alarmable_cloudwatch_metric(self, s3, monkeypatch):
+        _block_stage_coverage_import(monkeypatch)
+        monkeypatch.delenv("DIRECTOR_ENABLED", raising=False)
+        from director import handler as H
+        H.handler({"date": RUN_DATE, "bucket": BUCKET})
+
+        cw = boto3.client("cloudwatch", region_name="us-east-1")
+        stats = cw.list_metrics(Namespace="AlphaEngine", MetricName="StageCoverage")
+        matches = [
+            m for m in stats["Metrics"]
+            if {"Name": "Stage", "Value": "Director"} in m["Dimensions"]
+            and {"Name": "Status", "Value": "UNMEASURED"} in m["Dimensions"]
+        ]
+        assert matches, f"no UNMEASURED/Director StageCoverage metric published: {stats['Metrics']}"
 
 
 class TestStageCoverageNeverEnablesEnforcement:
@@ -528,9 +580,9 @@ class TestStageCoverageNeverEnablesEnforcement:
             seen_kwargs.append(set(kwargs))
             return {"stage": stage, "status": "COVERED"}
 
-        fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+        fake_mod = types.ModuleType("krepis.stage_coverage")
         fake_mod.assert_stage_coverage = _capture
-        monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+        monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake_mod)
 
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
         s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",

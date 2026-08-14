@@ -103,7 +103,14 @@ pandas~=3.0
 # dashboard.nousergon.ai. LOAD-BEARING for the emailed link, and
 # tests/test_director_emailer.py now pins the new host — a resolve below
 # 0.54.0 would build a link to the wrong service and the test would say so.
-krepis[flow-doctor,openai]>=0.55.0
+# v0.59.1 (krepis#148, alpha-engine-config-I7334): ships krepis.stage_coverage
+# — the module `grading/handler.py::_record_stage_coverage` imports. It was
+# briefly added to nousergon-lib (nousergon-lib#314) and immediately removed
+# as a duplicate of the krepis landing (nousergon-lib#315) — it never existed
+# on any released nousergon-lib version, only here. Below this floor, every
+# `_record_stage_coverage` call takes the ImportError branch and the I7214
+# assertion never executes (measured live 2026-08-14, alpha-engine-config-I7334).
+krepis[flow-doctor,openai]>=0.59.1
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
