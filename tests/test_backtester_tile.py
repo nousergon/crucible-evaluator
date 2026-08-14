@@ -96,12 +96,110 @@ class TestParity:
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert _comp(tile, "vectorized_vs_consolidated_parity")["status"] == "GREEN"
 
-    def test_replay_error_missing_input(self, s3):
-        _put(s3, f"backtest/{RUN_DATE}/parity_report.json", {"data_state": "backtester_replay_error"})
+    # ── config-I7222: a declared failure is RED, never N/A ────────────────
+    #
+    # The assertion that used to live here — `status == "N/A-MISSING-INPUT"`
+    # for a `backtester_replay_error` report — PINNED the detection failure.
+    # `backtest/{date}/parity_report.json` is the backtester's only real
+    # grade, and between 2026-05-29 and 2026-07-17 nine consecutive weekly
+    # reports were written carrying `data_state: backtester_replay_error`,
+    # every metric 0.0, `n_backtester_orders_total: 0`. Each one rendered
+    # here as N/A — byte-identical in effect to "no parity_report.json this
+    # cycle". The pipeline said, in writing, nine times, that its own grade
+    # was broken, and the surface built to read it rendered that statement
+    # as no-data. Root cause of the replay abort itself:
+    # `crucible-backtester-PR<N>` (config-I7222) — both replay paths called
+    # `_simulate_single_date` with no ATR map.
+    #
+    # `no data` is never rendered as green, and it is not rendered as
+    # absent-input either when the artifact is present and says FAIL
+    # (principles §2.7).
+
+    def test_a_declared_replay_error_is_red_not_na(self, s3):
+        """The exact payload shape of the nine reports that hid for eleven
+        weeks. This is the assertion whose absence WAS the outage."""
+        _put(s3, f"backtest/{RUN_DATE}/parity_report.json", {
+            "data_state": "backtester_replay_error",
+            "data_state_note": (
+                "Backtester replay raised RuntimeError: atr_map missing EOG at "
+                "decide_entries — load_atr_14_pct contract violated."
+            ),
+            "metrics": {"capture_rate": 0.0, "ticker_jaccard_avg": 0.0,
+                        "data_state": "backtester_replay_error"},
+            "n_backtester_orders_total": 0,
+            "n_backtester_enters": 0,
+        })
         tile = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
         p = _comp(tile, "vectorized_vs_consolidated_parity")
-        assert p["status"] == "N/A-MISSING-INPUT"
+        assert p["status"] == "RED", p
+        assert p["value"] == 0.0
         assert "backtester_replay_error" in p["status_reason"]
+        assert "UNPROVEN" in p["status_reason"]
+
+    def test_the_verdict_fields_are_carried_into_the_reason(self, s3):
+        """The producer now stamps schema/status/verdict on every path. The
+        reason an operator reads must quote them — a RED tile that does not
+        say WHY sends the reader back to S3."""
+        _put(s3, f"backtest/{RUN_DATE}/parity_report.json", {
+            "schema": "parity_report-0.0.0",
+            "data_state": "backtester_replay_error",
+            "status": "failed",
+            "verdict": "FAIL",
+            "verdict_reason": "the parity replay produced no usable comparison this run",
+        })
+        p = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "vectorized_vs_consolidated_parity")
+        assert p["status"] == "RED"
+        assert "FAIL" in p["status_reason"]
+        assert "no usable comparison" in p["status_reason"]
+
+    @pytest.mark.parametrize(
+        "data_state",
+        ["backtester_replay_error", "empty_trades_db", "insufficient_cohort_dates",
+         "some_state_nobody_has_written_yet"],
+    )
+    def test_every_non_ok_data_state_is_red(self, s3, data_state):
+        """Deliberately including an unknown value. The split is on `is this a
+        clean comparison`, not on an allowlist of known-bad strings — an
+        allowlist is how the NEXT degraded state goes quiet."""
+        _put(s3, f"backtest/{RUN_DATE}/parity_report.json", {"data_state": data_state})
+        p = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "vectorized_vs_consolidated_parity")
+        assert p["status"] == "RED", data_state
+
+    def test_the_launcher_absence_marker_is_red(self, s3):
+        """`spot_parity_replay.sh` records a missing artifact as a PRESENT
+        artifact saying it is absent. It carries no `data_state` at all — it
+        must still be red, not N/A."""
+        _put(s3, f"backtest/{RUN_DATE}/parity_report.json", {
+            "schema": "parity_report-0.0.0", "run_date": RUN_DATE,
+            "status": "failed", "verdict": "FAIL",
+            "verdict_reason": "the parity replay produced no report this run",
+            "producer_exit": 1,
+        })
+        p = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "vectorized_vs_consolidated_parity")
+        assert p["status"] == "RED"
+
+    def test_a_genuinely_absent_report_stays_na(self, s3):
+        """Absence is still an absence — the artifact's own non-arrival is
+        owned by the launcher's absence marker and the freshness detector, not
+        by this metric inventing a failure it did not observe."""
+        p = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "vectorized_vs_consolidated_parity")
+        assert p["status"] == "N/A-MISSING-INPUT"
+        assert "absent this cycle" in p["status_reason"]
+
+    def test_a_stale_clean_report_stays_na_not_red(self, s3):
+        """A clean comparison from an older cycle is a missing measurement for
+        THIS cycle, which the staleness detector owns. Turning it RED here
+        would double-count one fact and make the stale signal unreadable."""
+        old = "2026-01-05"
+        _put(s3, f"backtest/{old}/parity_report.json",
+             {"data_state": "ok", "trade_count_divergence": {}, "ticker_set_divergence": {}})
+        p = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3),
+                  "vectorized_vs_consolidated_parity")
+        assert p["status"] == "N/A-MISSING-INPUT"
 
 
 class TestFdrSurface:
