@@ -170,7 +170,18 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
             "is_finding": False,
         }
         try:
-            boto3.client("cloudwatch").put_metric_data(
+            # Explicit region, mirroring grading/tiles/substrate.py's existing
+            # cloudwatch-client construction in this same repo (config-I7334
+            # CI finding: an implicit-region client raises NoRegionError
+            # wherever AWS_REGION/AWS_DEFAULT_REGION isn't already in the
+            # process environment — not guaranteed outside a real Lambda
+            # invocation, e.g. this repo's own docker-image-tests runner —
+            # and a bare `except Exception` around that construction would
+            # have swallowed it into exactly the invisible-log-line failure
+            # mode this fix exists to close).
+            boto3.client(
+                "cloudwatch", region_name=os.environ.get("AWS_REGION", "us-east-1")
+            ).put_metric_data(
                 Namespace=_STAGE_COVERAGE_METRIC_NAMESPACE,
                 MetricData=[
                     {
