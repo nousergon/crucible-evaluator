@@ -119,6 +119,17 @@ def _canary_probe(bucket: str) -> dict:
     return {"status": "ok", "probe": "canary", "run_date": run_date, "bucket": bucket}
 
 
+# The shared primitive was relocated from `nousergon_lib.stage_coverage` to
+# `krepis.stage_coverage` before either ever shipped on a released
+# nousergon-lib version (nousergon-lib#314/#315, config-I7214) — `-m
+# nousergon_lib.<mod>` is a guard-less re-export shim on lib>=0.81.0 that
+# exits 0 SILENTLY under runpy, and half this primitive's callers are bash
+# launchers, so it cannot live on that side. First shipped at krepis 0.59.1.
+_STAGE_COVERAGE_METRIC_NAMESPACE = "AlphaEngine"
+_STAGE_COVERAGE_METRIC_NAME = "StageCoverage"
+_STAGE_COVERAGE_STATUS_UNMEASURED = "UNMEASURED"
+
+
 def _record_stage_coverage(stage: str, run_date: str, started: datetime, result: dict) -> dict:
     """Merge the end-of-stage output-coverage verdict into a handler's return
     payload, under ``stage_coverage`` (config-I7214, the ruled rescope).
@@ -127,22 +138,56 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
     before it returns to Step Functions — the assertion belongs in the
     stage's own handler asserting its own declared output, never a
     standalone end-of-run SF state. OBSERVE MODE ONLY: the single
-    enforcement flag lives in ``nousergon_lib.stage_coverage`` and is never
-    enabled from a call site here — a coverage miss is recorded, never
-    raised, before Saturday 2026-08-15 02:00 PT (and after, only on a
-    separate ruled flip).
+    enforcement flag lives in ``krepis.stage_coverage`` and is never enabled
+    from a call site here — a coverage miss is recorded, never raised.
 
-    ``ImportError`` means the ``nousergon-lib`` git-tag pin in
-    ``requirements.txt`` predates the module (a separate wave bumps the
-    pin) — logged loud so an absent assertion is never mistaken for a
-    covered stage, never swallowed, and the handler's own outcome is
-    unchanged either way.
+    An ``ImportError`` means the ``krepis`` floor in ``requirements.txt``
+    predates the module. It must never look like a covered (or even an
+    un-considered) stage: the fleet rule is "could-not-measure is
+    UNMEASURED, never rendered as benign" (krepis.stage_coverage's own
+    STATUS_UNMEASURED convention, mirrored here since the module that would
+    normally stamp it is exactly what is missing). So the key is ALWAYS
+    present in the returned payload — status COVERED/MISSING/... on a real
+    run, status UNMEASURED with a reason on an import failure — never
+    absent, and never sharing a shape with a verdict that actually ran. A
+    CloudWatch metric is published directly (the library's own recording
+    path is unreachable when its import fails) so the gap is alarmable, not
+    only a log line nothing reads.
     """
     try:
-        from nousergon_lib.stage_coverage import assert_stage_coverage
+        from krepis.stage_coverage import assert_stage_coverage
         result["stage_coverage"] = assert_stage_coverage(stage, run_date=run_date, window_start=started)
     except ImportError as exc:
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        now = datetime.now(timezone.utc)
+        result["stage_coverage"] = {
+            "stage": stage,
+            "status": _STAGE_COVERAGE_STATUS_UNMEASURED,
+            "reason": f"krepis.stage_coverage unimportable: {type(exc).__name__}: {exc}",
+            "run_date": run_date,
+            "recorded_at": now.isoformat(),
+            "enforce": False,
+            "is_finding": False,
+        }
+        try:
+            boto3.client("cloudwatch").put_metric_data(
+                Namespace=_STAGE_COVERAGE_METRIC_NAMESPACE,
+                MetricData=[
+                    {
+                        "MetricName": _STAGE_COVERAGE_METRIC_NAME,
+                        "Dimensions": [
+                            {"Name": "Stage", "Value": stage},
+                            {"Name": "Status", "Value": _STAGE_COVERAGE_STATUS_UNMEASURED},
+                        ],
+                        "Value": 0.0,
+                        "Unit": "None",
+                    }
+                ],
+            )
+        except Exception:  # noqa: BLE001 — fail-soft, already logged at ERROR above
+            logger.error(
+                "stage_coverage: FAILED to publish UNMEASURED metric for %s", stage, exc_info=True,
+            )
     return result
 
 

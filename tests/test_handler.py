@@ -294,7 +294,11 @@ class TestCheckDeployDriftDispatch:
     """config#2348: action=check_deploy_drift short-circuits BEFORE the normal
     report-card build path — no S3/bucket resolution, no tile compute."""
 
-    def test_dispatches_to_deploy_drift_probe(self, monkeypatch):
+    def test_dispatches_to_deploy_drift_probe(self, s3, monkeypatch):
+        # `s3` (mock_aws) so the stage-coverage call this dispatch also makes
+        # (config-I7214/I7334) resolves against moto rather than reaching
+        # real AWS — krepis.stage_coverage is genuinely importable now, so
+        # this exercises the REAL library call, not a fake.
         captured = {}
 
         def _fake_check_deploy_drift(*, function_name):
@@ -308,7 +312,9 @@ class TestCheckDeployDriftDispatch:
             function_name = "alpha-engine-evaluator"
 
         out = H.handler({"action": "check_deploy_drift"}, context=_Ctx())
-        assert out == {"has_drift": False, "function_name": "alpha-engine-evaluator"}
+        assert out["has_drift"] is False
+        assert out["function_name"] == "alpha-engine-evaluator"
+        assert out["stage_coverage"]["stage"] == "EvaluatorDeployDriftCheck"
         assert captured["function_name"] == "alpha-engine-evaluator"
 
     def test_does_not_touch_bucket_or_s3(self, monkeypatch):
@@ -356,28 +362,29 @@ class TestCanaryProbeDispatch:
         assert out["probe"] == "canary"
 
 
-# ── Stage-output coverage (config-I7214, the ruled rescope) ──────────────────
+# ── Stage-output coverage (config-I7214, config-I7334) ────────────────────────
 #
-# The single shared implementation is `nousergon_lib.stage_coverage`, landing
-# in a separate nousergon-lib wave — NOT YET at this repo's pinned tag. These
-# tests inject a fake module into sys.modules so the call sites can be
-# exercised without that pin bump; `TestStageCoverageImportDegrades` below
-# separately proves the REAL (current, pin-predates-module) degrade path.
+# The single shared implementation is `krepis.stage_coverage` (relocated from
+# `nousergon_lib.stage_coverage`, which never shipped on any released
+# nousergon-lib version — config-I7334). These tests inject a fake module into
+# sys.modules so the call sites can be exercised without a real krepis
+# resolve; `TestStageCoverageImportDegrades` below separately proves the
+# import-failure degrade path (the REAL live behavior before I7334's pin bump).
 
 def _install_fake_stage_coverage(monkeypatch, calls=None):
-    """Inject a stand-in `nousergon_lib.stage_coverage` module so the handler's
-    `from nousergon_lib.stage_coverage import assert_stage_coverage` resolves
+    """Inject a stand-in `krepis.stage_coverage` module so the handler's
+    `from krepis.stage_coverage import assert_stage_coverage` resolves
     to a controllable fake (Python's import system checks sys.modules before
     any finder/loader lookup, so this needs no real submodule on disk)."""
     calls = calls if calls is not None else []
-    fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+    fake_mod = types.ModuleType("krepis.stage_coverage")
 
     def _fake_assert_stage_coverage(stage, *, run_date, window_start):
         calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
         return {"stage": stage, "status": "COVERED", "run_date": run_date}
 
     fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
-    monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake_mod)
     return calls
 
 
@@ -412,27 +419,75 @@ class TestStageCoverageEvaluatorDeployDriftCheck:
         assert out["stage_coverage"]["stage"] != "ReportCard"
 
 
+def _block_stage_coverage_import(monkeypatch):
+    """Force `from krepis.stage_coverage import assert_stage_coverage` to
+    raise ImportError regardless of whether the real module is actually
+    resolvable in this test environment — the module being absent from
+    sys.modules is not sufficient to prove an import failure once krepis
+    provides it (I7334 fixed exactly that gap)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "krepis.stage_coverage":
+            raise ImportError("No module named 'krepis.stage_coverage'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "krepis.stage_coverage", raising=False)
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
 class TestStageCoverageImportDegrades:
     """Observe mode cannot break the stage it observes: a ModuleNotFoundError
-    from the lib (the pin here predates the module) must never change the
-    handler's own outcome — logged loud, never silent, no `stage_coverage`
-    key on the payload."""
+    from the lib must never change the handler's own outcome — logged loud
+    AND the `stage_coverage` key is ALWAYS present (never absent, per I7334):
+    status UNMEASURED with a reason, distinguishable from a real COVERED
+    verdict, plus an alarmable CloudWatch metric."""
 
     def test_report_card_outcome_unchanged_when_module_absent(self, s3, monkeypatch):
         _seed_eod(s3)
-        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        _block_stage_coverage_import(monkeypatch)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
         assert out["status"] == "ok"
         assert out["report_card_key"] == f"evaluator/{RUN_DATE}/report_card.json"
-        assert "stage_coverage" not in out
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+        assert "krepis.stage_coverage" in out["stage_coverage"]["reason"]
+        assert out["stage_coverage"]["stage"] == "ReportCard"
 
     def test_deploy_drift_check_outcome_unchanged_when_module_absent(self, monkeypatch):
         import grading.deploy_drift as dd
         monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
-        monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+        _block_stage_coverage_import(monkeypatch)
         out = H.handler({"action": "check_deploy_drift"}, context=None)
         assert out["has_drift"] is False
-        assert "stage_coverage" not in out
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+        assert out["stage_coverage"]["stage"] == "EvaluatorDeployDriftCheck"
+
+    def test_unavailable_verdict_never_shares_shape_with_a_real_pass(self, s3, monkeypatch):
+        """The loud-unavailable signal must be distinguishable on the exact
+        surface a reader sees: the payload's `stage_coverage.status`."""
+        _seed_eod(s3)
+        _block_stage_coverage_import(monkeypatch)
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+        assert out["stage_coverage"]["status"] != "COVERED"
+        assert out["stage_coverage"]["status"] != "COVERED_NO_OUTPUT"
+
+    def test_unavailable_publishes_alarmable_cloudwatch_metric(self, s3, monkeypatch):
+        # `s3` already runs inside `mock_aws()`, which intercepts every
+        # boto3 client (including the cloudwatch one this path constructs).
+        _seed_eod(s3)
+        _block_stage_coverage_import(monkeypatch)
+        H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
+
+        cw = boto3.client("cloudwatch", region_name="us-east-1")
+        stats = cw.list_metrics(Namespace="AlphaEngine", MetricName="StageCoverage")
+        matches = [
+            m for m in stats["Metrics"]
+            if {"Name": "Stage", "Value": "ReportCard"} in m["Dimensions"]
+            and {"Name": "Status", "Value": "UNMEASURED"} in m["Dimensions"]
+        ]
+        assert matches, f"no UNMEASURED/ReportCard StageCoverage metric published: {stats['Metrics']}"
 
 
 class TestStageCoverageNeverEnablesEnforcement:
@@ -448,9 +503,9 @@ class TestStageCoverageNeverEnablesEnforcement:
             seen_kwargs.append(set(kwargs))
             return {"stage": stage, "status": "COVERED"}
 
-        fake_mod = types.ModuleType("nousergon_lib.stage_coverage")
+        fake_mod = types.ModuleType("krepis.stage_coverage")
         fake_mod.assert_stage_coverage = _capture
-        monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_mod)
+        monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake_mod)
 
         _seed_eod(s3)
         H.handler({"date": RUN_DATE, "bucket": BUCKET, "snapshot": True})
