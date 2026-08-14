@@ -30,7 +30,19 @@ _REQUIREMENTS = _REPO_ROOT / "requirements.txt"
 
 # The krepis release that first ships `krepis.stage_coverage`
 # (krepis#148, config-I7214/I7334).
-_STAGE_COVERAGE_INTRODUCED_IN = (0, 59, 1)
+#
+# Corrected 0.59.1 -> 0.59.2 (config-I7357). Measured by walking the krepis
+# tags rather than read off a changelog line:
+#
+#   $ git ls-tree -r v0.59.0 --name-only | grep -c stage_coverage   -> 0
+#   $ git ls-tree -r v0.59.1 --name-only | grep -c stage_coverage   -> 0
+#   $ git ls-tree -r v0.59.2 --name-only | grep -c stage_coverage   -> 2
+#
+# This constant is what the floor assertion below compares against, so while
+# it said 0.59.1 the test PASSED on a floor that could resolve to a release
+# lacking the module — the guard agreed with the bug. A contract test keyed on
+# a wrong constant is worse than no test: it reports the property as held.
+_STAGE_COVERAGE_INTRODUCED_IN = (0, 59, 2)
 
 
 def _krepis_floor() -> tuple[int, int, int]:
