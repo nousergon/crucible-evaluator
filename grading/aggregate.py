@@ -81,6 +81,7 @@ def build_report_card(
     s3_client=None,
     self_test: dict | None = None,
     gate_state: dict | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """Read artifacts → grade → attach provenance. Pure of writes.
 
@@ -94,7 +95,14 @@ def build_report_card(
     flagged partial rerun — the exact scenario (a recovery rerun that skips
     the producer stage) that makes a consumer-side gate load-bearing.
     """
-    freshness_provenance = assert_input_freshness(bucket, run_date, s3_client=s3_client)
+    # dry_run threads to the preflight ONLY (alpha-engine-config-I7392): on the
+    # Friday shell run every producer ran --preflight-only and wrote nothing, so
+    # the gate records UNMEASURED instead of raising. The real run is untouched
+    # — see assert_input_freshness for why that does not weaken the 2026-07-20
+    # ruling, and for what still raises on the dry path.
+    freshness_provenance = assert_input_freshness(
+        bucket, run_date, s3_client=s3_client, dry_run=dry_run,
+    )
 
     inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
     scorecard = compute_scorecard(**inputs)
