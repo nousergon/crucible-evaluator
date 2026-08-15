@@ -6,6 +6,12 @@ research-free-derived artifact whose content is older than the run's week
 HARD-FAILS at preflight with a named-artifact error, AND the normal
 fresh-input path passes unchanged. Covers: stale → raise; fresh → pass;
 missing → raise (not skip).
+
+`alpha-engine-config-I7392` adds the dry path (the Friday-PM shell run) at the
+bottom of this module. Its tests are written to hold the line the easy version
+of that change would have crossed: the real run must still hard-fail
+identically, and a dry run must still fail loud on a read it could not PERFORM,
+as opposed to an artifact that is simply absent.
 """
 
 from __future__ import annotations
@@ -263,3 +269,107 @@ class TestBadRunDate:
     def test_non_iso_run_date_raises(self, s3):
         with pytest.raises(MissingInputArtifactError):
             assert_input_freshness(BUCKET, "not-a-date", s3_client=s3)
+
+
+# ── The dry path (alpha-engine-config-I7392) ───────────────────────────────
+#
+# Context, because these tests only make sense with it. The weekly SF's
+# `ApplyShellRunDefaults` runs every producer with `--preflight-only`, so the
+# Friday shell run writes NO artifacts — and this gate then hard-failed on the
+# absence the same pipeline had just guaranteed. Measured on execution
+# `friday-shell-2026-08-14-validate-final`: the run reached the END of the
+# pipeline with every workload stage green, then died here on
+# `metrics.json: no artifact at backtest/2026-08-14/`.
+#
+# The 2026-07-20 ruling this gate exists for is about a REAL run evaluating
+# stale data. A dry run evaluates nothing and persists nothing, so the premise
+# does not reach it. Everything below exists to keep that carve-out honest.
+
+
+class TestDryPathIsMeasuredNotSkipped:
+    """The dry path must remain evidence. A rehearsal that cannot fail is worse
+    than one that always fails — it is green by construction."""
+
+    def test_dry_run_records_unmeasured_instead_of_raising(self, s3):
+        """The whole point: nothing seeded, dry_run=True, no exception."""
+        prov = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
+
+        assert prov["dry_run"] is True
+        assert prov["measured"] == 0
+        assert prov["unmeasured"] == len(prov["checks"])
+        assert prov["checks"], "the gate reported no checks at all"
+        for check in prov["checks"]:
+            assert check["status"] == "UNMEASURED"
+            assert check["reason"], (
+                f"{check['artifact_id']}: UNMEASURED with no reason — "
+                "indistinguishable from a check that did not run"
+            )
+
+    def test_the_real_run_still_hard_fails_on_the_same_input(self, s3):
+        """The ruling, unchanged. Same bucket, same date, same absence — only
+        `dry_run` differs, and the real path must still raise a NAMED-artifact
+        error. If this ever passes, the carve-out has eaten the guard."""
+        with pytest.raises(MissingInputArtifactError) as exc:
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=False)
+        assert "metrics.json" in str(exc.value)
+
+    def test_dry_run_defaults_to_false(self, s3):
+        """A caller that does not opt in gets the strict gate. The dry path must
+        never be reachable by omission."""
+        with pytest.raises(MissingInputArtifactError):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    def test_a_fully_seeded_dry_run_measures_everything(self, s3):
+        """Both polarities (sf-pipeline-policy 2.3a): a dry run that HAD its
+        inputs must not render like one that had none. Without this, `measured`
+        could be hardcoded to 0 and every assertion above would still pass."""
+        _seed_all_fresh(s3)
+        prov = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
+
+        assert prov["unmeasured"] == 0
+        assert prov["measured"] == len(prov["checks"])
+        assert all(c["status"] == "ok" for c in prov["checks"])
+
+    def test_dry_run_still_raises_when_the_read_cannot_be_PERFORMED(self, s3, monkeypatch):
+        """The load-bearing test.
+
+        An artifact that is ABSENT and a read that is DENIED must not collapse
+        to the same verdict. `_get_json_body` returns None on 404 and re-raises
+        every other ClientError; only the two domain exceptions are absorbed on
+        the dry path. So an AccessDenied still propagates — a dry run against a
+        broken IAM grant fails, exactly as it must, because proving S3
+        IAM/transport works is most of why the rehearsal exists.
+        """
+        from botocore.exceptions import ClientError
+
+        def _denied(*_args, **_kwargs):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject",
+            )
+
+        monkeypatch.setattr(s3, "get_object", _denied)
+
+        with pytest.raises(ClientError) as exc:
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+    def test_dry_run_absorbs_staleness_too_but_reports_it(self, s3):
+        """Stale is the other domain failure. On the dry path it is recorded
+        with its reason rather than raised — and the reason must actually name
+        the staleness, not be an empty string standing in for one."""
+        _seed_all_fresh(s3)
+        # Overwrite metrics.json with content from outside the run week.
+        _seed_metrics(s3, run_date=RUN_DATE)
+        s3.put_object(
+            Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/metrics.json",
+            Body=json.dumps({"run_date": "2026-06-01", "status": "ok"}).encode(),
+        )
+
+        prov = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
+        stale = [c for c in prov["checks"] if c["status"] == "UNMEASURED"]
+        assert stale, "a stale artifact was not reported on the dry path"
+        assert any("stale" in c["reason"].lower() for c in stale)
+
+        # ...and the real run still refuses it.
+        with pytest.raises(StaleInputArtifactError):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=False)

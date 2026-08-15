@@ -341,7 +341,9 @@ _CHECKS = (
 )
 
 
-def assert_input_freshness(bucket: str, run_date: str, s3_client=None) -> dict:
+def assert_input_freshness(
+    bucket: str, run_date: str, s3_client=None, *, dry_run: bool = False,
+) -> dict:
     """Hard preflight: raise ``MissingInputArtifactError`` /
     ``StaleInputArtifactError`` naming the artifact, its resolved content
     date, and the expected window, on the FIRST breach found (fail fast —
@@ -354,6 +356,40 @@ def assert_input_freshness(bucket: str, run_date: str, s3_client=None) -> dict:
     build_report_card`` (called by both the Lambda handler and the CLI) and
     ``grading.aggregate.write_report_card``'s ``snapshot=True`` path, which
     both call this as their first step.
+
+    ``dry_run`` — the Friday-PM shell run (`alpha-engine-config-I7392`)
+    ==============================================================
+
+    The 2026-07-20 ruling this gate exists for is about a REAL run:
+    "if the evaluator is evaluating on stale data its report is COMPLETELY
+    USELESS — it should hard-fail before evaluating stale outputs." That
+    premise does not hold on the dry path, because a dry run evaluates
+    nothing and persists nothing — so it cannot evaluate stale data.
+
+    It could not, however, ever PASS either. The weekly SF's
+    ``ApplyShellRunDefaults`` states "every substantive workload now boots +
+    runs DRY; ZERO skip-exceptions remain", so every producer runs
+    ``--preflight-only`` and writes no artifact. This gate then hard-failed on
+    the absence it had just guaranteed. Measured on execution
+    ``friday-shell-2026-08-14-validate-final``: the run reached the END of the
+    pipeline with every workload stage green, then died here on
+    ``metrics.json: no artifact at backtest/2026-08-14/``. Twelve shell runs
+    exist and only two ever succeeded, both predating that rewire.
+
+    So under ``dry_run`` every check still RUNS — the S3 read is attempted for
+    each artifact, which is precisely what the rehearsal exists to prove
+    (container boot, imports, S3 IAM + transport) — but a missing or stale
+    artifact is recorded as ``UNMEASURED`` with its reason instead of raising.
+
+    **A dry run still fails loud on a real defect, and that is the
+    load-bearing half.** Only ``MissingInputArtifactError`` and
+    ``StaleInputArtifactError`` are absorbed. A read that cannot be PERFORMED
+    — AccessDenied, a transport error, anything that is not a 404 — is raised
+    by ``_get_json_body`` as a ``ClientError`` and propagates untouched, on
+    the dry path exactly as on the real one. Absence-of-artifact and
+    cannot-read must never collapse to the same verdict: a rehearsal that
+    cannot fail is worse than one that always does, because it is green by
+    construction and stops being evidence of anything.
     """
     s3 = s3_client or boto3.client("s3")
     try:
@@ -365,15 +401,47 @@ def assert_input_freshness(bucket: str, run_date: str, s3_client=None) -> dict:
         ) from exc
 
     checked: list[dict] = []
+    unmeasured = 0
     for name, fn in _CHECKS:
-        outcome = fn(s3, bucket, run_d)
+        try:
+            outcome = fn(s3, bucket, run_d)
+        except (MissingInputArtifactError, StaleInputArtifactError) as exc:
+            if not dry_run:
+                raise
+            # Dry path only. NOTE what is NOT caught here: a ClientError from
+            # `_get_json_body` (AccessDenied, transport, anything non-404)
+            # propagates, so "the artifact is absent" and "I could not read"
+            # stay distinguishable. See this function's docstring.
+            unmeasured += 1
+            checked.append({
+                "artifact_id": name,
+                "content_date": None,
+                "window": None,
+                "status": "UNMEASURED",
+                "reason": str(exc),
+            })
+            logger.warning(
+                "freshness_preflight: %s UNMEASURED on the dry path — %s",
+                name, exc,
+            )
+            continue
         checked.append({
             "artifact_id": outcome.artifact_id,
             "content_date": outcome.content_date,
             "window": outcome.window,
+            "status": "ok",
         })
         logger.info(
             "freshness_preflight: %s OK (content_date=%s, window=%s)",
             outcome.artifact_id, outcome.content_date, outcome.window,
         )
-    return {"run_date": run_date, "checks": checked}
+    provenance = {"run_date": run_date, "checks": checked}
+    if dry_run:
+        # Stated in BOTH polarities (sf-pipeline-policy 2.3a): a dry run that
+        # measured everything and one that measured nothing must not render
+        # identically. `dry_run` is present on every dry invocation, and
+        # `unmeasured` says how much of the gate actually had inputs.
+        provenance["dry_run"] = True
+        provenance["unmeasured"] = unmeasured
+        provenance["measured"] = len(_CHECKS) - unmeasured
+    return provenance

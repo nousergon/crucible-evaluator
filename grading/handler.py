@@ -302,7 +302,8 @@ def handler(event: dict | None = None, context=None) -> dict:
     log_gate_state(gate_block, run_date)
 
     card = build_report_card(bucket, run_date, self_test=self_test,
-                             gate_state=event.get("gate_state"))
+                             gate_state=event.get("gate_state"),
+                             dry_run=dry_run)
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}
