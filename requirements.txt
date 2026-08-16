@@ -142,7 +142,12 @@ pandas~=3.0
 # a resolve below 0.59.7 emits rows missing them and keeps that row the
 # weekly substrate health check's single [FAIL]. >=0.59.2 happens to resolve
 # to 0.59.7 today; that is resolution luck, not a requirement.
-krepis[flow-doctor,openai]>=0.59.7
+# Raised to >=0.59.8 (alpha-engine-config-I7423): the FIRST published krepis
+# carrying `krepis.cost_sink.flush_default_sink()`, which both handlers now
+# call in a `finally`. 0.59.7 emits the four contract columns above and has
+# no way to WRITE them — a Lambda container is frozen between invocations,
+# so the sink's `atexit` hook never runs and every buffered record is lost.
+krepis[flow-doctor,openai]>=0.59.8
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
