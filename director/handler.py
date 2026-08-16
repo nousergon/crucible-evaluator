@@ -549,6 +549,46 @@ def _ensure_litellm_credential() -> None:
 
 
 def handler(event: dict | None = None, context=None) -> dict:
+    """Entry point. Runs the handler, then flushes cost telemetry.
+
+    The `finally` is the whole point (alpha-engine-config-I7423).
+    `krepis.cost_sink.S3JsonlCostSink` buffers to 200 records per
+    `(date, callsite_id)` group and otherwise relies on an `atexit` hook —
+    and **an AWS Lambda container is FROZEN between invocations, not exited,
+    so `atexit` never runs.** A handler finishing below the threshold writes
+    nothing at all, and the container may be reclaimed hours later without
+    ever reaching interpreter shutdown.
+
+    Measured 2026-08-15 on weekly-SF execution `watch-rerun-2026-08-15-2`:
+    `AggregateCosts` failed the run with `2 stage(s) ran and emitted no cost
+    record ... Observed producers: (none)`. The env wiring was correct
+    (config#197 merged the cost-sink environment onto this very function),
+    the sink was constructed, the records were priced and accepted, and every
+    one of them died in memory.
+
+    Wrapping `_run` rather than adding the flush before each `return`:
+    `_run` has several return paths and raises on others, and a flush on one
+    of them reproduces the defect on the rest.
+
+    `flush_default_sink` returns 0 when no sink is configured and never
+    raises — telemetry must not take down the work it measures.
+    """
+    try:
+        return _run(event, context)
+    finally:
+        try:
+            from krepis.cost_sink import flush_default_sink
+            _n = flush_default_sink()
+            if _n:
+                logger.info("cost sink flushed: %d object(s)", _n)
+        except ImportError as exc:
+            # Loud, not silent: the image's krepis pin predates the function
+            # (floor is >=0.59.8). Cost records for this invocation are lost,
+            # and AggregateCosts' fan-in coverage check will name this stage.
+            logger.error("cost-sink flush unavailable — records lost: %s", exc)
+
+
+def _run(event: dict | None = None, context=None) -> dict:
     """Build + persist the weekly Director action plan (flag-gated).
 
     ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
