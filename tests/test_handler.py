@@ -111,6 +111,7 @@ class TestHandler:
         assert set(out["tile_status"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
             "backtester", "substrate", "agent", "behavioral", "director_quality",
+            "contribution_lift",
         }
         assert out["tiles_overall_status"] in ("GREEN", "WATCH", "RED", "N/A-NOT-RUN")
         # both written objects round-trip.
