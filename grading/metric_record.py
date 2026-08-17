@@ -115,6 +115,7 @@ def build_metric(
     metric_type: MetricTypeLiteral,
     n_floor: int,
     value: float | None = None,
+    unit: str | None = None,
     n_samples: int | None = None,
     target: float | None = None,
     red_line: float | None = None,
@@ -140,7 +141,6 @@ def build_metric(
     measurement_horizon: str | None = None,
     reliability: str | None = None,
     arm: str | None = None,
-    unit: str | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
 
@@ -292,12 +292,12 @@ def build_metric(
         module=module,
         metric_type=metric_type,
         value=value,
+        unit=unit,
         ci_low=ci_low,
         ci_high=ci_high,
         ci_method=ci_method,
         n_samples=n_samples,
         n_floor=n_floor,
-        unit=unit,
         target=target,
         red_line=red_line,
         trend_4w=trend_4w,
