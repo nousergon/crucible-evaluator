@@ -1,4 +1,9 @@
-"""Tests for grading/aggregate.py — build/write report card + parity compare."""
+"""Tests for grading/aggregate.py — build/write report card.
+
+RC v3 T1 (config-I7474): the backtester-parity compare tests
+(compare_to_backtester/--compare) were deleted along with the mechanism —
+the backtester's v1 grading.json no longer emits a "letter" field.
+"""
 
 import json
 
@@ -9,7 +14,6 @@ from moto import mock_aws
 from grading.aggregate import (
     LATEST_REPORT_CARD_KEY,
     build_report_card,
-    compare_to_backtester,
     latest_report_card_key,
     report_card_key,
     write_report_card,
@@ -448,36 +452,3 @@ class TestWriteReportCard:
         assert latest_report_card_key() == "evaluator/latest/report_card.json"
         assert LATEST_REPORT_CARD_KEY == "evaluator/latest/report_card.json"
 
-
-class TestCompareToBacktester:
-    def test_no_backtester_grading(self, s3):
-        _seed_full(s3)
-        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        result = compare_to_backtester(BUCKET, RUN_DATE, card, s3_client=s3)
-        assert result["status"] == "no_backtester_grading"
-        assert result["mismatches"] == {}
-
-    def test_identical_grading_no_mismatch(self, s3):
-        _seed_full(s3)
-        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        # Seed the backtester grading.json as a copy of the evaluator card
-        # (minus provenance) → parity must be clean.
-        bt = {k: v for k, v in card.items() if k != "_provenance"}
-        s3.put_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/grading.json",
-                      Body=json.dumps(bt).encode("utf-8"))
-        result = compare_to_backtester(BUCKET, RUN_DATE, card, s3_client=s3)
-        assert result["status"] == "compared"
-        assert result["n_mismatch"] == 0
-        assert result["mismatches"] == {}
-
-    def test_differing_overall_letter_flagged(self, s3):
-        _seed_full(s3)
-        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        bt = {k: v for k, v in card.items() if k != "_provenance"}
-        bt["overall"] = {"grade": 10.0, "letter": "F"}  # force a disagreement
-        s3.put_object(Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/grading.json",
-                      Body=json.dumps(bt).encode("utf-8"))
-        result = compare_to_backtester(BUCKET, RUN_DATE, card, s3_client=s3)
-        assert result["n_mismatch"] >= 1
-        assert "overall" in result["mismatches"]
-        assert result["mismatches"]["overall"]["backtester"] == "F"

@@ -88,7 +88,15 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
 
 
 def _coverage(grading: dict) -> tuple[float | None, int, int]:
-    """Fraction of leaf components in grading.json with a non-N/A letter."""
+    """Fraction of leaf components in grading.json with a real (non-N/A) grade.
+
+    RC v3 T1 (config-I7474, 2026-08-16): grading.json's v1 letter grade
+    (A-F) was retired as a rendered surface; the numeric ``grade`` field is
+    retained as a raw diagnostic (compute_scorecard still emits it, just
+    never as a letter). This is v2's own N/A taxonomy applied to that field
+    — a leaf is "graded" iff its ``grade`` is not None — rather than keying
+    off the now-deleted ``letter`` key.
+    """
     total = graded = 0
     for module in ("research", "predictor", "executor"):
         comps = (grading.get(module) or {}).get("components") or {}
@@ -98,11 +106,11 @@ def _coverage(grading: dict) -> tuple[float | None, int, int]:
             if isinstance(v, list):  # sector_teams expands to per-team leaves
                 for item in v:
                     total += 1
-                    if isinstance(item, dict) and item.get("letter") not in (None, "N/A"):
+                    if isinstance(item, dict) and item.get("grade") is not None:
                         graded += 1
             elif isinstance(v, dict):
                 total += 1
-                if v.get("letter") not in (None, "N/A"):
+                if v.get("grade") is not None:
                     graded += 1
     return (graded / total if total else None), graded, total
 
