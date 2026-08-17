@@ -49,6 +49,7 @@ from grading.artifacts import AGENT_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, ge
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.tiles.groom import build_groom_components
+from grading.units import COUNT_AGENTS, FRACTION, MILLISECONDS, USD
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="agent_validation_failure_rate", module=MODULE, metric_type="pct",
             criticality="critical", estimator="wilson_failure_rate",
             measurement_horizon="per_run",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=50,
+            value=blk["value"], unit=FRACTION, n_samples=blk.get("n"), n_floor=50,
             higher_is_better=False, source_path=aq_src,
             reason=(f"agent_validation_failure_rate = {blk['value']:.1%} "
                     f"(N={blk.get('n')} invokes) vs target 2% / red-line 10%."),
@@ -134,7 +135,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if blk is not None and not aq_stale:
         components.append(build_metric(
             name="cost_per_signal", module=MODULE, metric_type="ratio", criticality="supporting",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=5,
+            value=blk["value"], unit=USD, n_samples=blk.get("n"), n_floor=5,
             higher_is_better=False, source_path=aq_src,
             reason=f"cost_per_signal = ${blk['value']:.2f} over {blk.get('n')} finalized signals vs target $1 / red-line $5.",
         ))
@@ -154,7 +155,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if blk is not None and not aq_stale:
         components.append(build_metric(
             name="retry_storm_count", module=MODULE, metric_type="count", criticality="supporting",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=1,
+            value=blk["value"], unit=COUNT_AGENTS, n_samples=blk.get("n"), n_floor=1,
             higher_is_better=False, source_path=aq_src,
             reason=f"retry_storm_count = {blk['value']:.0f} agents at retry ceiling (of {blk.get('n')}) vs target 0 / red-line 5.",
         ))
@@ -174,7 +175,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if blk is not None and not aq_stale:
         components.append(build_metric(
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=1,
+            value=blk["value"], unit=MILLISECONDS, n_samples=blk.get("n"), n_floor=1,
             higher_is_better=False, source_path=aq_src,
             reason=f"agent_latency_p95 = {blk['value']:.0f} ms (N={blk.get('n')}) vs target 15s / red-line 60s.",
         ))
@@ -195,7 +196,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if blk is not None and not aq_stale:
         components.append(build_metric(
             name="judge_rubric_distribution", module=MODULE, metric_type="ratio", criticality="diagnostic",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=10,
+            value=blk["value"], unit=FRACTION, n_samples=blk.get("n"), n_floor=10,
             higher_is_better=False, source_path=aq_src,
             reason=f"judge_rubric_distribution modal-concentration = {blk['value']:.0%} (N={blk.get('n')} evals) vs target 40% / red-line 70% (collapse).",
         ))

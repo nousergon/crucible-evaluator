@@ -35,6 +35,7 @@ from nousergon_lib.quant.stats.intervals import wilson_score_interval
 from grading.artifacts import EXECUTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.units import FRACTION, RATIO
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             components.append(build_metric(
                 name="entry_triggers", module=MODULE, metric_type="pct", criticality="critical",
                 estimator="wilson_winrate", measurement_horizon="intraday_to_exit",
-                value=wr, n_samples=n, n_floor=30, 
+                value=wr, unit=FRACTION, n_samples=n, n_floor=30,
                 ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
                 ci_method="wilson" if w.get("status") == "ok" else None, source_path=ts_src,
                 reason=(f"entry_triggers win-rate vs SPY = {wr:.1%} (Wilson CI "
@@ -140,7 +141,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="risk_guard", module=MODULE, metric_type="pct", criticality="critical",
             estimator="wilson_precision",
-            value=clf.get("precision"), n_samples=n_blk, n_floor=20, 
+            value=clf.get("precision"), unit=FRACTION, n_samples=n_blk, n_floor=20,
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=sb_src,
             reason=(f"risk_guard block-precision = {clf['precision']:.1%} (Wilson CI "
@@ -179,7 +180,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="exit_rules", module=MODULE, metric_type="ratio", criticality="critical",
             estimator="winner_capture_median", measurement_horizon="per_hold",
-            value=cap, n_samples=n_cap, n_floor=15, 
+            value=cap, unit=RATIO, n_samples=n_cap, n_floor=15,
             source_path=et_src, input_present=cap is not None,
             reason=(f"exit_rules {cap_label} = {cap:.2f} (N={n_cap} winners of "
                     f"{exits.get('n_roundtrips')} roundtrips, win_rate={summ.get('win_rate')}); "
@@ -204,7 +205,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if exc and exc.get("status") == "ok" and exc.get("mean_mfe_mae_ratio") is not None and not exc_stale:
         components.append(build_metric(
             name="excursion", module=MODULE, metric_type="ratio", criticality="supporting",
-            value=exc.get("mean_mfe_mae_ratio"), n_samples=exc.get("n"), n_floor=20,
+            value=exc.get("mean_mfe_mae_ratio"), unit=RATIO, n_samples=exc.get("n"), n_floor=20,
             source_path=pe_src,
             reason=f"excursion mean MFE/MAE = {exc['mean_mfe_mae_ratio']:.2f}, pct_high_quality={exc.get('pct_high_quality')}.",
         ))
@@ -243,7 +244,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="action_entropy", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="normalized_shannon_entropy_of_decision_stream", measurement_horizon="per_cycle",
-            value=h_norm, n_samples=aent.get("n"), n_floor=20, 
+            value=h_norm, unit=FRACTION, n_samples=aent.get("n"), n_floor=20,
             higher_is_better=True, source_path=ae_src,
             reason=(f"action_entropy normalized = {h_norm:.2f} (N={aent.get('n')} decisions"
                     + (f"; most_common={mc!r} at {mcf:.1%}" if mc is not None and mcf is not None else "")
@@ -283,7 +284,7 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="reconciliation_integrity", module=MODULE, metric_type="pct", criticality="critical",
             estimator="reconciliation_match_rate", measurement_horizon="eod",
-            value=mr, n_samples=n_pos, n_floor=1, 
+            value=mr, unit=FRACTION, n_samples=n_pos, n_floor=1,
             source_path=recon_src,
             reason=(
                 f"reconciliation_integrity: ledger-vs-IB position parity = {mr:.1%} "

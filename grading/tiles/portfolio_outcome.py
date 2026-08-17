@@ -38,6 +38,15 @@ from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wil
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.units import (
+    ANNUALIZED_RATIO,
+    DAYS,
+    FRACTION,
+    LOG_RETURN,
+    PCT,
+    PROBABILITY,
+    RATIO,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +309,7 @@ def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
     return build_metric(
         name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
         estimator="ols_slope_newey_west_hac", measurement_horizon="since_inception",
-        value=monthly, n_samples=n_eff, n_floor=_ALPHA_TREND_N_FLOOR,
+        value=monthly, unit=PCT, n_samples=n_eff, n_floor=_ALPHA_TREND_N_FLOOR,
         ci_low=ci_low, ci_high=ci_high, ci_method="newey-west",
         bh_fdr_adjusted_p=p, source_path=src, status=status, reason=reason,
     )
@@ -499,7 +508,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="sharpe_ratio", module=MODULE, metric_type="sharpe", criticality="critical",
         estimator="sharpe_with_bootstrap_ci", measurement_horizon="since_inception",
-        value=sharpe, n_samples=n, n_floor=60, 
+        value=sharpe, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
         ci_low=s_lo, ci_high=s_hi, ci_method=s_m, source_path=src,
         **_tr("sharpe_ratio", sharpe),
     ))
@@ -511,7 +520,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="information_ratio", module=MODULE, metric_type="ratio", criticality="critical",
         estimator="info_ratio_bootstrap_ci", measurement_horizon="since_inception",
-        value=ir, n_samples=n, n_floor=60, 
+        value=ir, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
         ci_low=i_lo, ci_high=i_hi, ci_method=i_m, source_path=src,
     ))
 
@@ -521,7 +530,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="psr", module=MODULE, metric_type="pct", criticality="critical",
         estimator="probabilistic_sharpe", measurement_horizon="since_inception",
-        value=psr_val, n_samples=psr_res.get("n", n), n_floor=60, 
+        value=psr_val, unit=PROBABILITY, n_samples=psr_res.get("n", n), n_floor=60,
         source_path=src,
     ))
 
@@ -530,7 +539,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="alpha_vs_spy", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="cumulative_log_alpha", measurement_horizon="since_inception",
-        value=log_alpha, n_samples=n, n_floor=60, source_path=src,
+        value=log_alpha, unit=LOG_RETURN, n_samples=n, n_floor=60, source_path=src,
         **_tr("alpha_vs_spy", log_alpha),
     ))
 
@@ -539,7 +548,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="max_drawdown", module=MODULE, metric_type="ratio", criticality="critical",
         estimator="peak_to_trough_nav", measurement_horizon="since_inception",
-        value=mdd, n_samples=len(nav), n_floor=2, source_path=src,
+        value=mdd, unit=FRACTION, n_samples=len(nav), n_floor=2, source_path=src,
     ))
 
     # 6. Sortino (supporting)
@@ -547,7 +556,7 @@ def build_portfolio_outcome_tile(
     so_lo, so_hi, so_m = _ci(_ann_sortino, port) if sortino is not None else (None, None, None)
     components.append(build_metric(
         name="sortino_ratio", module=MODULE, metric_type="sharpe", criticality="supporting",
-        value=sortino, n_samples=n, n_floor=60, 
+        value=sortino, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
         ci_low=so_lo, ci_high=so_hi, ci_method=so_m, source_path=src,
     ))
 
@@ -560,7 +569,7 @@ def build_portfolio_outcome_tile(
             calmar = ann_ret / abs(mdd)
     components.append(build_metric(
         name="calmar_ratio", module=MODULE, metric_type="ratio", criticality="supporting",
-        value=calmar, n_samples=n, n_floor=90, source_path=src,
+        value=calmar, unit=RATIO, n_samples=n, n_floor=90, source_path=src,
     ))
 
     # 8. CVaR(95) daily (supporting) — mean worst-5% daily return.
@@ -569,7 +578,7 @@ def build_portfolio_outcome_tile(
     cv_lo, cv_hi, cv_m = _ci(_neg_cvar, port) if cvar is not None else (None, None, None)
     components.append(build_metric(
         name="cvar_95_daily", module=MODULE, metric_type="ratio", criticality="supporting",
-        value=cvar, n_samples=n, n_floor=60, 
+        value=cvar, unit=FRACTION, n_samples=n, n_floor=60,
         ci_low=cv_lo, ci_high=cv_hi, ci_method=cv_m, source_path=src,
     ))
 
@@ -579,7 +588,7 @@ def build_portfolio_outcome_tile(
     hit = w["rate"] if w.get("status") == "ok" else None
     components.append(build_metric(
         name="hit_rate_daily", module=MODULE, metric_type="pct", criticality="diagnostic",
-        value=hit, n_samples=n, n_floor=60, 
+        value=hit, unit=FRACTION, n_samples=n, n_floor=60,
         ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=src,
         **_tr("hit_rate_daily", hit),
@@ -602,7 +611,7 @@ def build_portfolio_outcome_tile(
         beta_status = "RED"
     components.append(build_metric(
         name="beta_vs_spy", module=MODULE, metric_type="ratio", criticality="diagnostic",
-        value=beta, n_samples=n, n_floor=60, source_path=src, status=beta_status,
+        value=beta, unit=RATIO, n_samples=n, n_floor=60, source_path=src, status=beta_status,
         reason=(f"beta_vs_spy = {beta:.3g} (target band 0.7–1.1)." if beta is not None
                 else "beta_vs_spy: too few observations to estimate."),
     ))
@@ -610,7 +619,7 @@ def build_portfolio_outcome_tile(
     # 11. Max-DD duration (diagnostic) — days underwater since prior peak.
     components.append(build_metric(
         name="max_dd_duration_days", module=MODULE, metric_type="duration", criticality="diagnostic",
-        value=float(_max_dd_duration_days(nav)), n_samples=len(nav), n_floor=2,
+        value=float(_max_dd_duration_days(nav)), unit=DAYS, n_samples=len(nav), n_floor=2,
         higher_is_better=False, source_path=src,
     ))
 
@@ -625,7 +634,7 @@ def build_portfolio_outcome_tile(
         dsr_val = dsr_res.get("dsr") if dsr_res.get("status") == "ok" else None
         components.append(build_metric(
             name="dsr", module=MODULE, metric_type="pct", criticality="supporting",
-            value=dsr_val, n_samples=dsr_res.get("n", n), n_floor=60, 
+            value=dsr_val, unit=PROBABILITY, n_samples=dsr_res.get("n", n), n_floor=60,
             source_path=src,
         ))
     else:
@@ -649,7 +658,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="regime_weighted_alpha", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="regime_weighted_log_alpha", measurement_horizon="since_inception",
-        value=rwa["value"], n_samples=rwa["n_samples"], n_floor=_REGIME_ALPHA_N_FLOOR,
+        value=rwa["value"], unit=LOG_RETURN, n_samples=rwa["n_samples"], n_floor=_REGIME_ALPHA_N_FLOOR,
         source_path=src,
         input_present=rwa["na_detail"] is None,
         na_detail=rwa["na_detail"],
