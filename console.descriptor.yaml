@@ -1,89 +1,255 @@
 # Console component descriptor — console-policy.md §2.6.
 #
-# Onboarding this module onto the fleet console is writing this one file: it
-# binds `component_id: alpha-engine-evaluator` (the id already declared in
-# `nous-ergon-ops/governance/observability.d/alpha-engine-evaluator.yaml`) to
-# the places its facts already live. No console-repo edit, no console config
-# entry (alpha-engine-config-I7477).
+# ── Full-row conversion (alpha-engine-config-I7477 deliverable 2) ──────────
+#
+# Through PR#214/this branch's earlier commits, this file bound `metrics` /
+# `artifacts` under a `component_id` whose FULL registry row lived in a
+# separate place — `nous-ergon-ops/governance/observability.d/
+# alpha-engine-evaluator.yaml` — with this file supplying only the bindings.
+# That left ONE identifier declared in TWO places (this file's `component_id`
+# plus the ops row's), which `gather_repo_descriptors.py`'s duplicate check
+# correctly rejects, and an `owning_repo: nousergon-data` on the ops side that
+# does not match the repo this descriptor actually lives in.
+#
+# Ruling (alpha-engine-config-I7477, this session): the descriptor TAKES OVER
+# the id. A metadata-only ops row cannot coexist with a component-owned
+# descriptor for the same component_id — the descriptor must BE the full
+# registry row (`scripts/observability_registry.py`'s complete schema:
+# identity + claim fields, all five signal classes, log/alert/severity/
+# console_surface/retention with reasons) PLUS the console bindings
+# (`metrics`, `artifacts`). `owning_repo` is corrected to `crucible-evaluator`
+# — the repo this file lives in — matching `gather_repo_descriptors.py`'s
+# provenance check (`declared_repo != repo` fails the gather).
+#
+# Live precedent for a descriptor that is a full row, not just bindings:
+# `nousergon-data/registry.d/ae-preflight-sweep.yaml` (nousergon-data#1403).
+#
+# Merge order: this PR merges first; a companion `nous-ergon-ops` PR then
+# deletes `governance/observability.d/alpha-engine-evaluator.yaml` (the row
+# this file now supersedes). See that PR's body for the transient-window
+# note — no quarantine mechanism exists on `nous-ergon-ops` main as of
+# 2026-08-17 to bridge the two merges (searched: no such PR/issue #724
+# exists), so back-to-back merging is the mitigation, stated there.
+#
+# Everything below `component_id` through `retention_reason` is copied
+# verbatim from the ops row being retired (rationale comments included);
+# `owning_repo` is corrected as above. The `metrics`/`artifacts`/lineage
+# sections are this branch's existing bindings, extended with the ops row's
+# `document-fields` correctness-verdict binding (previously declared only on
+# the ops side).
 #
 # Validated against `nousergon-console/console/schemas/component_descriptor.schema.json`
 # by `tests/test_console_descriptor_schema.py` (a vendored copy of that schema
 # lives at `tests/fixtures/component_descriptor.schema.json` — crucible-evaluator
 # has no dependency on nousergon-console, so the schema is a producer-contract
-# fixture like `nousergon_lib.contracts`, not an import).
-#
-# ── What this file delivers, and what it does not ──────────────────────────
-#
-# `alpha-engine-config-I7477` asks for a `metrics` binding that turns every
-# (tile, component) row inside `report_card.json`'s `tiles.*.components` array
-# into its own Signal entity — value, unit, baseline, red_line, ci_low/ci_high,
-# n_samples, trend_decoration, status_reason (RC v2 `MetricRecord` fields,
-# krepis.metrics). That shape — fan out a dict-of-arrays into N entities, one
-# per record, with a `group_field` injected from the dict key and an
-# `id_template` combining it with each record's own name — is EXACTLY what
-# `nousergon-console/config.example.yaml`'s `crucible-report-card` block does
-# today via the `s3-records` ADAPTER (console-side config, forbidden by
-# console-policy.md §2.6). It is NOT one of the five drivers a descriptor can
-# bind to (`console/drivers/__init__.py::DRIVERS` — object-store, log-source,
-# sql-source, document-fields, emitted-envelope, checked 2026-08-16). The
-# closest, `document-fields`, reads a fixed, named set of scalar paths out of
-# ONE entity's document; it has no fan-out, no `group_field`, no per-record
-# `state_field`, and cannot mint N Signal entities from one binding.
-#
-# A `runs` binding for this component's Saturday/weekday SF execution state is
-# ALSO not deliverable today: no driver in `console/drivers/__init__.py` reads
-# a Step Functions execution (no `state-machine` shape exists at the driver
-# layer, only load-bearing example in the fleet registry uses `metrics`/
-# `artifacts`, never `runs`).
-#
-# Both gaps are filed against nousergon-console rather than worked around with
-# a bespoke adapter or an invalid driver reference (§2.6's constraint on this
-# issue, and console-policy.md §2.7: "a descriptor naming a driver that does
-# not exist FAILS THE BUILD" — so this file does not name `s3-records` or
-# `state-machine` as a `driver`, which would be schema-valid but
-# runtime-invalid). See nousergon-console#98 for the
-# missing-driver-capability writeup.
-#
-# What IS delivered here: identity, the `artifacts` binding for the card
-# itself (a driver that exists — `object-store`), and lineage. `metrics` and
-# `runs` are left undeclared rather than populated with a driver name that
-# would pass jsonschema and then fail the console build.
+# fixture like `nousergon_lib.contracts`, not an import) AND against
+# `nous-ergon-ops/scripts/observability_registry.py`'s registry schema (full
+# row, checked by that repo's own PR — this repo has no dependency on
+# nous-ergon-ops either).
 
 component_id: alpha-engine-evaluator
+owning_repo: crucible-evaluator
+substrate: lambda
+origin: aws:lambda:alpha-engine-evaluator
 owner: brian
-owning_repo: nousergon-data
 lifecycle: in-service
+
+authority_tier: unknown
+authority_tier_reason: >-
+  Not audited. Bulk-seeded when the registry was created; before that this
+  component was outside the denominator entirely, so "known, unmeasured" is the
+  honest state rather than a claim in either direction.
+
+signals:
+  execution:
+    status: emitted
+    reason: >-
+      AWS Lambda writes START/END/REPORT per invocation to
+      /aws/lambda/alpha-engine-evaluator; last event 2026-08-12 (probed
+      2026-08-12).
+  cost:
+    status: unknown
+    reason: >-
+      not audited — `observability_audit.py` derives execution and resource from
+      the substrate; this class is a component-specific assertion it cannot make
+  resource:
+    status: unknown
+    reason: >-
+      not audited — `observability_audit.py` derives execution and resource from
+      the substrate; this class is a component-specific assertion it cannot make
+  data:
+    status: unknown
+    reason: >-
+      not audited — `observability_audit.py` derives execution and resource from
+      the substrate; this class is a component-specific assertion it cannot make
+  outcome:
+    status: emitted
+    reason: >-
+      The Report Card this Lambda writes carries a §2.3a CORRECTNESS VERDICT at
+      `attestation.verdict` — a runtime known-answer battery over the deployed
+      quant primitives, plus the simulation engine's and the Evaluator stage's
+      own verdicts read from `backtest/{run_date}/`. The `metrics` binding below
+      renders it. Audited 2026-08-12 (alpha-engine-config-I7039).
+
+log_location: cloudwatch-logs:/aws/lambda/alpha-engine-evaluator
+log_location_reason: >-
+  Declared per §6.2 from a live probe of the substrate, not from a naming
+  convention: `observability_audit.py verify` re-resolves it and fails if it
+  stops resolving. Audited 2026-08-12.
+alert_channel: unknown
+alert_channel_reason: Unaudited at seed.
+severity_source: unknown
+severity_source_reason: Unaudited at seed.
+console_surface: descriptor:metrics/document-fields,s3-records
+console_surface_reason: >-
+  Declared as of alpha-engine-config-I7039; extended alpha-engine-config-I7477
+  (T4, then again at the full-row conversion). This descriptor is now the
+  WHOLE onboarding act (console-policy.md §2.6) — the console's gatherer reads
+  it directly from this repo, and it carries TWO driver claims — `document-fields`
+  for the §2.3a correctness verdict fields, and `s3-records` for the fan-out of
+  every (tile, component) Report Card v2 row into its own Signal
+  (config-I7477's original ask). No console-repo edit, no console config
+  entry, and — as of the full-row conversion — no separate `nous-ergon-ops`
+  row either.
+retention: unknown
+retention_reason: Unaudited at seed.
+
+# ── History: what earlier commits on this branch could not deliver ─────────
+#
+# #214 (this branch's parent) shipped identity + the `artifacts` binding and
+# stopped at `metrics`/`runs`: neither `object-store`'s siblings supported the
+# report card's fan-out shape (one Signal per (tile, component) row) or a
+# Step-Functions execution read at the driver layer at all
+# (`console/drivers/__init__.py::DRIVERS` was object-store, log-source,
+# sql-source, document-fields, emitted-envelope only, 2026-08-16). Filed as
+# nousergon-console#98 (`s3-records` driver) and nousergon-console#99
+# (`state-machine` driver).
+#
+# Both shipped on nousergon-console main 2026-08-17: `console/drivers/s3_records.py`
+# (PR100) and `console/drivers/state_machine.py` (PR102), each sharing its
+# fan-out/status grammar with the console's own config-side adapter via
+# `console/records_shape.py` / `console/state_machine_shape.py` (§2.3 — one
+# grammar, two callers). This branch consumes both.
 
 # ── Artifact: the report card itself ────────────────────────────────────────
 #
 # `object-store` is a registered driver (console/drivers/object_store.py).
 # `latest/report_card.json` is bound rather than the dated key for the same
-# reason the existing attestation binding in the observability registry binds
-# it: a fixed key that always exists renders freshness honestly, where a
-# date-templated key would render ABSENT every day that is not today (a
-# detector that cries wolf, not one that measures).
+# reason the retired ops row bound it: a fixed key that always exists renders
+# freshness honestly, where a date-templated key would render ABSENT every
+# day that is not today (a detector that cries wolf, not one that measures).
 #
-# Cadence corrects alpha-engine-config-I7477's assumed "7d": the live registry
-# row (`nous-ergon-ops/governance/observability.d/alpha-engine-evaluator.yaml`,
-# audited 2026-08-12) declares `cadence_minutes: 1440` — the grading run fires
-# on every NYSE trading day via the postclose exercise chain, not weekly.
+# Cadence corrects alpha-engine-config-I7477's assumed "7d": the retired
+# registry row (audited 2026-08-12) declared `cadence_minutes: 1440` — the
+# grading run fires on every NYSE trading day via the postclose exercise
+# chain, not weekly.
 artifacts:
   driver: object-store
   key: "s3://alpha-engine-research/evaluator/latest/report_card.json"
   cadence_minutes: 1440
 
-# ── Status-mapping note (I7477 deliverable 3) ───────────────────────────────
+# ── Metrics: TWO driver claims — the §2.3a correctness verdict, and one ────
+#    Signal per (tile, component) report-card row ──────────────────────────
 #
-# Once the s3-records-shaped driver capability exists (see above), each
-# (tile, component) row is a Signal-kind entity: console-policy.md §5.1 draws
-# state for a Signal from the value itself, not the twelve-state component
-# vocabulary. The card's own `status` field (RED / WATCH / GREEN / one of the
-# four N/A-* engineering states, krepis.metrics.StatusLiteral) renders
-# VERBATIM as that Signal's state — no translation into HEALTHY/DEGRADED/etc,
-# and no re-derivation: krepis.metrics.derive_letter is display-only, the
-# status is the source of truth on the record already. §5.7's redundant
-# encoding (shape/label plus colour) applies to the RED/WATCH/GREEN/N/A-*
-# vocabulary directly, not to a component-state remap.
+# 1) `document-fields` — the §2.3a correctness verdict. What is being
+#    surfaced: whether the week's numbers are RIGHT, not merely whether they
+#    are fresh. sf-pipeline-policy.md §2.3a — a missing DATA artifact makes a
+#    consumer fail visibly, while a missing CORRECTNESS VERDICT makes every
+#    consumer succeed as though the check had passed. This binding is what
+#    puts the verdict, previously only in the card's JSON, onto the console.
+#
+#    `attestation.verdict` is PASS | FAIL | UNKNOWN and never anything else;
+#    the consumer that writes it treats an absent, unreadable, stale-dated or
+#    unrecognised upstream verdict as UNKNOWN, so a blank here is a broken
+#    card rather than a benign gap. Rendered as text, with no baseline: a
+#    verdict is not better-or-worse than a number, and §5.4 forbids a colour
+#    where there is no baseline to be better than.
+#
+# 2) `s3-records` — one Signal per (tile, component) report-card row. See the
+#    top-of-file header for the `unit`/`baseline` gap this binding
+#    deliberately does not paper over (nousergon-console#104, per-record
+#    `unit_field`/`baseline_field` indirection, not yet shipped).
+#
+#    `status` (RED/WATCH/GREEN/N/A-*) is bound as `state_field` and renders
+#    VERBATIM as each Signal's state (console-policy.md §5.1's second half) —
+#    no translation into the twelve-state component vocabulary (I7477
+#    deliverable 3).
+#
+# ── `runs`: NOT delivered — architectural mismatch, not a driver gap ────────
+#
+# The evaluator's grading run is not its own state machine. It is one Task
+# state ("Evaluator") inside the shared weekly pipeline
+# `arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline`
+# (`nous-ergon-ops/nousergon-console/config.d/pipeline-reliability-weekly.yaml`
+# `stage_states`, measured 2026-08-17). `state-machine` (driver) binds ONE
+# whole state machine's own execution history to Run entities, with no stage
+# filter — by design (`console/drivers/state_machine.py`'s own docstring: "no
+# Cycle/Artifact/horizon-honesty machinery... a component descriptor has
+# nowhere to declare a cycle_key or durable-key field names the way the
+# adapter's console config does"). Binding `runs` here to that ARN would make
+# every one of the pipeline's four stages (MorningEnrich,
+# ResearchPredictorParallel, PredictorTraining, Evaluator) claim the SAME
+# execution history as its own `runs` — a MorningEnrich failure would render
+# as an "alpha-engine-evaluator run failed" even when the Evaluator task never
+# started. That is not what this binding is for, so it is left out.
+#
+# The evaluator's own stage depth IS already on the console, via the adapter
+# side (not this descriptor): the fleet's `pipeline-reliability` config
+# already declares `Evaluator` in its `stage_states`, so `stage_reached` /
+# `stage_depth` render it per weekly cycle. `runs` staying undeclared here is
+# a component-descriptor gap, not a console coverage gap.
+metrics:
+  - driver: document-fields
+    documents:
+      - key: "s3://alpha-engine-research/evaluator/latest/report_card.json"
+        fields:
+          correctness_verdict:
+            path: attestation.verdict
+            render: text
+          correctness_reason:
+            path: attestation.reason
+            render: text
+          backtester_verdict:
+            path: attestation.backtester.verdict
+            render: text
+          backtester_verdict_as_of:
+            path: attestation.as_of.backtester
+            render: text
+          evaluator_stage_verdict:
+            path: attestation.evaluator_stage.verdict
+            render: text
+          evaluator_stage_verdict_as_of:
+            path: attestation.as_of.evaluator_stage
+            render: text
+          promotion_withheld:
+            path: attestation.promotion_withheld
+            render: text
+          tiles_overall_status:
+            path: tiles_overall_status
+            render: text
+    # The weekly graph runs on every NYSE trading day via the postclose
+    # exercise chain, so the card is rewritten daily, not weekly. Declared
+    # because without a cadence staleness is not computable and the console
+    # says so rather than assuming fresh (§5.2).
+    cadence_minutes: 1440
+  - driver: s3-records
+    key: "s3://alpha-engine-research/evaluator/latest/report_card.json"
+    kind: signal
+    records_path: tiles.*.components
+    group_field: tile
+    id_template: "{tile}:{name}"
+    state_field: status
+    fields:
+      value: {path: value}
+      unit: {path: unit, render: text}
+      target: {path: target}
+      red_line: {path: red_line}
+      ci_low: {path: ci_low}
+      ci_high: {path: ci_high}
+      n_samples: {path: n_samples, render: count}
+      trend: {path: trend_decoration, render: text}
+      status_reason: {path: status_reason, render: text}
+    cadence_minutes: 1440
 
 # ── Lineage (§6) ─────────────────────────────────────────────────────────────
 consumes:
