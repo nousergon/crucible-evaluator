@@ -12,42 +12,82 @@
 # has no dependency on nousergon-console, so the schema is a producer-contract
 # fixture like `nousergon_lib.contracts`, not an import).
 #
-# ── What this file delivers, and what it does not ──────────────────────────
+# ── History: what #214 could not deliver, and what changed ─────────────────
 #
-# `alpha-engine-config-I7477` asks for a `metrics` binding that turns every
-# (tile, component) row inside `report_card.json`'s `tiles.*.components` array
-# into its own Signal entity — value, unit, baseline, red_line, ci_low/ci_high,
-# n_samples, trend_decoration, status_reason (RC v2 `MetricRecord` fields,
-# krepis.metrics). That shape — fan out a dict-of-arrays into N entities, one
-# per record, with a `group_field` injected from the dict key and an
-# `id_template` combining it with each record's own name — is EXACTLY what
-# `nousergon-console/config.example.yaml`'s `crucible-report-card` block does
-# today via the `s3-records` ADAPTER (console-side config, forbidden by
-# console-policy.md §2.6). It is NOT one of the five drivers a descriptor can
-# bind to (`console/drivers/__init__.py::DRIVERS` — object-store, log-source,
-# sql-source, document-fields, emitted-envelope, checked 2026-08-16). The
-# closest, `document-fields`, reads a fixed, named set of scalar paths out of
-# ONE entity's document; it has no fan-out, no `group_field`, no per-record
-# `state_field`, and cannot mint N Signal entities from one binding.
+# #214 (this branch's parent) shipped identity + the `artifacts` binding and
+# stopped at `metrics`/`runs`: neither `object-store`'s siblings supported the
+# report card's fan-out shape (one Signal per (tile, component) row) or a
+# Step-Functions execution read at the driver layer at all
+# (`console/drivers/__init__.py::DRIVERS` was object-store, log-source,
+# sql-source, document-fields, emitted-envelope only, 2026-08-16). Filed as
+# nousergon-console#98 (`s3-records` driver) and nousergon-console#99
+# (`state-machine` driver).
 #
-# A `runs` binding for this component's Saturday/weekday SF execution state is
-# ALSO not deliverable today: no driver in `console/drivers/__init__.py` reads
-# a Step Functions execution (no `state-machine` shape exists at the driver
-# layer, only load-bearing example in the fleet registry uses `metrics`/
-# `artifacts`, never `runs`).
+# Both shipped on nousergon-console main 2026-08-17: `console/drivers/s3_records.py`
+# (PR100) and `console/drivers/state_machine.py` (PR102), each sharing its
+# fan-out/status grammar with the console's own config-side adapter via
+# `console/records_shape.py` / `console/state_machine_shape.py` (§2.3 — one
+# grammar, two callers). This branch consumes both.
 #
-# Both gaps are filed against nousergon-console rather than worked around with
-# a bespoke adapter or an invalid driver reference (§2.6's constraint on this
-# issue, and console-policy.md §2.7: "a descriptor naming a driver that does
-# not exist FAILS THE BUILD" — so this file does not name `s3-records` or
-# `state-machine` as a `driver`, which would be schema-valid but
-# runtime-invalid). See nousergon-console#98 for the
-# missing-driver-capability writeup.
+# ── `metrics`: delivered, with one remaining driver gap ─────────────────────
 #
-# What IS delivered here: identity, the `artifacts` binding for the card
-# itself (a driver that exists — `object-store`), and lineage. `metrics` and
-# `runs` are left undeclared rather than populated with a driver name that
-# would pass jsonschema and then fail the console build.
+# `s3-records` reads ONE document (the same `report_card.json` the `artifacts`
+# binding above already names) and fans `tiles.*.components` out into one
+# Signal entity per (tile, component) row — exactly the shape
+# `nousergon-console/config.example.yaml`'s `crucible-report-card` block used
+# to require as console-side config (removed in nousergon-console-PR<TBD>,
+# gated on this binding being live).
+#
+# `value`'s `unit` and `baseline` are asked for as PER-RECORD facts — every
+# krepis.metrics.MetricRecord in the card now carries its own `unit` (krepis
+# 0.59.11, PR158, alpha-engine-config-I7477 prerequisite: `ic` records use
+# `spearman_rho`, `lift`/`ratio` records use `fraction` or `pct`, etc — NOT
+# one unit for the whole fan-out), and its own `target` is the natural
+# baseline. `console/records_shape.py::build_fields` (and the `Field` model it
+# feeds, `console/model/fields.py`) reads BOTH `unit` and `baseline` as
+# LITERAL strings on the binding's `fields` spec — there is no `unit_field` /
+# `baseline_field` indirection resolving them from another path on the same
+# record. A literal here would be wrong for most rows of a fan-out whose
+# whole point is heterogeneous records (a spearman_rho IC row and a pct lift
+# row cannot share one hardcoded unit string), so `value` below is declared
+# WITHOUT `unit`/`baseline`: it renders honestly as "no unit declared"
+# (§5.8's own philosophy — a wrong hardcoded unit is worse than an honest
+# defect) rather than lying. The record's own `unit` and `target` are exposed
+# as plain sibling fields (`unit`, `target`, `render: text`/`value`) so the
+# information is not lost, just not yet wired into `value`'s own descriptor
+# metadata or §5.4 colour. Filed: nousergon-console#<TBD, see PR body> for
+# `unit_field`/`baseline_field` per-record indirection in the `s3-records`
+# driver's `fields` grammar — closing it removes this file's only open gap
+# and lets `value` colour per §5.4.
+#
+# `status` (RED/WATCH/GREEN/N/A-*) is bound as `state_field` and renders
+# VERBATIM as each Signal's state (console-policy.md §5.1's second half) —
+# no translation into the twelve-state component vocabulary (I7477
+# deliverable 3).
+#
+# ── `runs`: NOT delivered — architectural mismatch, not a driver gap ────────
+#
+# The evaluator's grading run is not its own state machine. It is one Task
+# state ("Evaluator") inside the shared weekly pipeline
+# `arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline`
+# (`nous-ergon-ops/nousergon-console/config.d/pipeline-reliability-weekly.yaml`
+# `stage_states`, measured 2026-08-17). `state-machine` (driver) binds ONE
+# whole state machine's own execution history to Run entities, with no stage
+# filter — by design (`console/drivers/state_machine.py`'s own docstring: "no
+# Cycle/Artifact/horizon-honesty machinery... a component descriptor has
+# nowhere to declare a cycle_key or durable-key field names the way the
+# adapter's console config does"). Binding `runs` here to that ARN would make
+# every one of the pipeline's four stages (MorningEnrich,
+# ResearchPredictorParallel, PredictorTraining, Evaluator) claim the SAME
+# execution history as its own `runs` — a MorningEnrich failure would render
+# as an "alpha-engine-evaluator run failed" even when the Evaluator task never
+# started. That is not what this binding is for, so it is left out.
+#
+# The evaluator's own stage depth IS already on the console, via the adapter
+# side (not this descriptor): the fleet's `pipeline-reliability` config
+# already declares `Evaluator` in its `stage_states`, so `stage_reached` /
+# `stage_depth` render it per weekly cycle. `runs` staying undeclared here is
+# a component-descriptor gap, not a console coverage gap.
 
 component_id: alpha-engine-evaluator
 owner: brian
@@ -72,18 +112,29 @@ artifacts:
   key: "s3://alpha-engine-research/evaluator/latest/report_card.json"
   cadence_minutes: 1440
 
-# ── Status-mapping note (I7477 deliverable 3) ───────────────────────────────
+# ── Metrics: one Signal per (tile, component) report-card row ──────────────
 #
-# Once the s3-records-shaped driver capability exists (see above), each
-# (tile, component) row is a Signal-kind entity: console-policy.md §5.1 draws
-# state for a Signal from the value itself, not the twelve-state component
-# vocabulary. The card's own `status` field (RED / WATCH / GREEN / one of the
-# four N/A-* engineering states, krepis.metrics.StatusLiteral) renders
-# VERBATIM as that Signal's state — no translation into HEALTHY/DEGRADED/etc,
-# and no re-derivation: krepis.metrics.derive_letter is display-only, the
-# status is the source of truth on the record already. §5.7's redundant
-# encoding (shape/label plus colour) applies to the RED/WATCH/GREEN/N/A-*
-# vocabulary directly, not to a component-state remap.
+# See the header block above for the `unit`/`baseline` gap this binding
+# deliberately does not paper over.
+metrics:
+  driver: s3-records
+  key: "s3://alpha-engine-research/evaluator/latest/report_card.json"
+  kind: signal
+  records_path: tiles.*.components
+  group_field: tile
+  id_template: "{tile}:{name}"
+  state_field: status
+  fields:
+    value: {path: value}
+    unit: {path: unit, render: text}
+    target: {path: target}
+    red_line: {path: red_line}
+    ci_low: {path: ci_low}
+    ci_high: {path: ci_high}
+    n_samples: {path: n_samples, render: count}
+    trend: {path: trend_decoration, render: text}
+    status_reason: {path: status_reason, render: text}
+  cadence_minutes: 1440
 
 # ── Lineage (§6) ─────────────────────────────────────────────────────────────
 consumes:
