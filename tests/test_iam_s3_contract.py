@@ -80,7 +80,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # evaluator/latest/report_card.json pointer) alongside the existing dated
     # snapshot write -- same "evaluator" prefix, already granted readwrite;
     # no contract/IAM change, just a pin bump.
-    "grading/aggregate.py": 3,
+    # RC v3 T1 (config-I7474, 2026-08-16): compare_to_backtester's
+    # get_object(backtest/{date}/grading.json) site removed along with the
+    # backtester-parity soak-compare mechanism (--compare CLI flag too) —
+    # 3 -> 2. No contract/IAM change: the remaining 2 sites are the same
+    # already-granted "evaluator" prefix writes.
+    "grading/aggregate.py": 2,
     # §2.3a runtime attestation: one get_object call site, shared by
     # `_read_verdict_artifact` across TWO keys — backtest/{run_date}/attestation.json
     # (the simulation engine's verdict) and backtest/{run_date}/evaluator_attestation.json
