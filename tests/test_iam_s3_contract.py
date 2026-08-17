@@ -75,7 +75,13 @@ _ACCESS_SITE_RE = re.compile(
 #      its entry AND mirror the contract change.
 EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "director/carryover.py": 2,
-    "director/handler.py": 7,
+    # config-I7157 (2026-08-17): _run gained a second put_object (the standing
+    # director/latest/action_plan.json pointer) alongside the existing dated
+    # director/{date}/action_plan.json write -- same "director" prefix, already
+    # declared readwrite in grading/iam_s3_contract.json and granted on the
+    # role; no contract/IAM change, just a pin bump. Exactly the
+    # evaluator/latest/report_card.json precedent recorded below.
+    "director/handler.py": 8,
     # config-I2556: write_report_card gained a second put_object (the standing
     # evaluator/latest/report_card.json pointer) alongside the existing dated
     # snapshot write -- same "evaluator" prefix, already granted readwrite;
