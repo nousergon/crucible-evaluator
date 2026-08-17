@@ -126,7 +126,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="turnover", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="l4515_tripwire_rolling_sum", measurement_horizon="5d_rolling",
-            n_floor=1, source_path=trip_src or f"s3://{bucket}/{_SHADOW_PREFIX}/", input_present=False,
+            n_floor=1, band="unbanded", source_path=trip_src or f"s3://{bucket}/{_SHADOW_PREFIX}/", input_present=False,
             na_detail=("turnover: no optimizer_shadow artifact with an ok tripwire block in the "
                        f"trailing {_SHADOW_LOOKBACK_DAYS}d (status="
                        f"{(trip or {}).get('status', 'absent')})."),
@@ -140,7 +140,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="reversal_rate_rolling_window", measurement_horizon=f"{rev.get('window_days', 10)}d_window",
             reliability="medium",
             value=rev["reversal_rate"], n_samples=int(rev.get("n_exits") or 0), n_floor=10,
-            target=0.10, red_line=0.30, source_path=ba_src,
+            source_path=ba_src,
             reason=(f"{rev.get('n_reversals')}/{rev.get('n_exits')} exits re-entered within "
                     f"{rev.get('window_days')}td (rate {rev['reversal_rate']:.1%}) vs provisional "
                     f"target 10% / red-line 30%."),
@@ -149,7 +149,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="decision_reversal", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="reversal_rate_rolling_window", measurement_horizon="10d_window",
-            n_floor=10, target=0.10, red_line=0.30, source_path=ba_src, input_present=False,
+            n_floor=10, source_path=ba_src, input_present=False,
             na_detail=_stale_na("decision_reversal") if ba_stale else _na_detail("decision_reversal"),
         ))
 
@@ -161,7 +161,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="median_rolling_score_std", measurement_horizon=f"{conv.get('window_days', 90)}d_window",
             reliability="medium",
             value=conv["median_score_std"], n_samples=int(conv.get("n_tickers") or 0), n_floor=5,
-            target=5.0, red_line=15.0, source_path=ba_src,
+            source_path=ba_src,
             reason=(f"median per-ticker score std {conv['median_score_std']:.2f} "
                     f"(p90 {conv.get('p90_score_std')}, N={conv.get('n_tickers')} tickers) on the "
                     f"0-100 composite scale vs provisional target 5 / red-line 15."),
@@ -170,7 +170,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="conviction_stability", module=MODULE, metric_type="count", criticality="diagnostic",
             estimator="median_rolling_score_std", measurement_horizon="90d_window",
-            n_floor=5, target=5.0, red_line=15.0, source_path=ba_src, input_present=False,
+            n_floor=5, source_path=ba_src, input_present=False,
             na_detail=_stale_na("conviction_stability") if ba_stale else _na_detail("conviction_stability"),
         ))
 
@@ -182,7 +182,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="median_net_alpha_after_slippage", measurement_horizon="per_roundtrip",
             reliability="medium",
             value=cost["median_net_alpha_pct"], n_samples=int(cost.get("n_roundtrips") or 0), n_floor=15,
-            target=0.5, red_line=0.0, source_path=ba_src,
+            source_path=ba_src,
             reason=(f"median net alpha after entry slippage {cost['median_net_alpha_pct']:+.2f}% "
                     f"(gross {cost.get('median_gross_alpha_pct'):+.2f}%, median slippage "
                     f"{cost.get('median_slippage_pct'):.3f}%, N={cost.get('n_roundtrips')}); "
@@ -192,7 +192,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="cost_adjusted_quality", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="median_net_alpha_after_slippage", measurement_horizon="per_roundtrip",
-            n_floor=15, target=0.5, red_line=0.0, source_path=ba_src, input_present=False,
+            n_floor=15, source_path=ba_src, input_present=False,
             na_detail=_stale_na("cost_adjusted_quality") if ba_stale else _na_detail("cost_adjusted_quality"),
         ))
 
@@ -204,7 +204,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             estimator="median_daily_l1_weight_drift", measurement_horizon="day_over_day",
             reliability="medium",
             value=drift["median_daily_drift"], n_samples=int(drift.get("n_days") or 0), n_floor=10,
-            target=0.05, red_line=0.20, source_path=ba_src,
+            source_path=ba_src,
             reason=(f"median daily one-way L1 weight drift {drift['median_daily_drift']:.1%} "
                     f"(max {drift.get('max_daily_drift'):.1%}, {drift.get('n_spike_days')} spike day(s) "
                     f"> {drift.get('spike_threshold'):.0%}, N={drift.get('n_days')} days)."),
@@ -213,7 +213,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="portfolio_state_drift", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="median_daily_l1_weight_drift", measurement_horizon="day_over_day",
-            n_floor=10, target=0.05, red_line=0.20, source_path=ba_src, input_present=False,
+            n_floor=10, source_path=ba_src, input_present=False,
             na_detail=_stale_na("portfolio_state_drift") if ba_stale else _na_detail("portfolio_state_drift"),
         ))
 

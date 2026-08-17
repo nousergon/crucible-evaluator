@@ -31,6 +31,7 @@ from nousergon_lib.quant.stats.intervals import wilson_score_interval
 from grading.artifacts import RESEARCH_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.history import CardHistory
 from grading.metric_record import build_metric
+from grading.thresholds.registry import resolve as resolve_band
 from grading.module_agg import build_tile
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ def _pick_clf(block: dict) -> tuple[dict | None, str]:
 
 
 def _precision_metric(
-    name, clf, *, criticality, source, target=0.05, red_line=-0.02,
+    name, clf, *, criticality, source,
     lift=None, lift_label=None, missing_detail=None, horizon="5d",
     history: CardHistory | None = None, arm=None,
 ) -> dict:
@@ -120,13 +121,14 @@ def _precision_metric(
     def _tr(value):
         return history.trends_for(MODULE, name, value) if history is not None else {}
 
+    _band = resolve_band(MODULE, name)
     hz = f"[{horizon}] "
     arm_s = f" [arm: {arm}]" if arm else ""
     if not clf or clf.get("precision") is None:
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
             estimator="wilson_precision_edge", measurement_horizon=horizon,
-            n_floor=_PRECISION_FLOOR, target=target, red_line=red_line, source_path=source,
+            n_floor=_PRECISION_FLOOR, source_path=source,
             input_present=False, na_detail=missing_detail or f"{name}: no classification block in e2e_lift this cycle.",
             arm=arm,
             **_tr(None),
@@ -145,7 +147,7 @@ def _precision_metric(
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
             estimator="wilson_precision_edge", measurement_horizon=horizon,
-            value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35,
+            value=precision, n_samples=n_sel, n_floor=_PRECISION_FLOOR, band="raw_precision",
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
             reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
@@ -160,12 +162,12 @@ def _precision_metric(
     return build_metric(
         name=name, module=MODULE, metric_type="pct", criticality=criticality,
         estimator="wilson_precision_edge", measurement_horizon=horizon,
-        value=edge, n_samples=n_sel, n_floor=_PRECISION_FLOOR, target=target, red_line=red_line,
+        value=edge, n_samples=n_sel, n_floor=_PRECISION_FLOOR, 
         ci_low=ci_low, ci_high=ci_high,
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
         reason=(f"{hz}{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
-                f"vs target +{target:.0%} / red-line {red_line:+.0%}{lift_s}{arm_s}.")
+                f"vs target +{_band.target:.0%} / red-line {_band.red_line:+.0%}{lift_s}{arm_s}.")
         if w.get("status") == "ok" else None,
         arm=arm,
         **_tr(edge),
@@ -218,7 +220,7 @@ def build_research_tile(
         rd = (graph_retired or {}).get("retired_date")
         return build_metric(
             name=name, module=MODULE, metric_type=metric_type, criticality="diagnostic",
-            n_floor=1, source_path=e2e_src, arm=f"six_team_cio (retired {rd})",
+            n_floor=1, band="unbanded", source_path=e2e_src, arm=f"six_team_cio (retired {rd})",
             permanent_na_reason=(
                 f"retired {rd}: six-team+CIO research orchestration removed "
                 f"(config#1580 / config-I2993) — measured a graph that no longer "
@@ -269,7 +271,7 @@ def build_research_tile(
         components.append(build_metric(
             name="sector_teams_avg", module=MODULE, metric_type="pct", criticality="critical",
             estimator="wilson_precision_edge", measurement_horizon="21d",
-            n_floor=_PRECISION_FLOOR, target=0.45, red_line=0.35, source_path=e2e_src,
+            n_floor=_PRECISION_FLOOR, band="raw_precision", source_path=e2e_src,
             input_present=False, na_detail="sector_teams_avg: no team_lift list in e2e_lift this cycle.",
             **_tr("sector_teams_avg", None),
         ))
@@ -312,7 +314,7 @@ def build_research_tile(
             name="cio_selection_skill", module=MODULE, metric_type="log_return", criticality="critical",
             estimator="advance_minus_reject_alpha_21d", measurement_horizon="21d",
             reliability="low" if insignificant else "high",
-            value=gap, n_samples=n_sel, n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src,
+            value=gap, n_samples=n_sel, n_floor=60, source_path=e2e_src,
             status="WATCH" if insignificant else None,
             reason=(f"cio_selection_skill: ADVANCE−REJECT 21d log-alpha gap = {gap:+.4f} "
                     f"(ADVANCE {sel.get('advance_alpha_21d')} vs REJECT {sel.get('reject_alpha_21d')}, "
@@ -325,7 +327,7 @@ def build_research_tile(
         components.append(build_metric(
             name="cio_selection_skill", module=MODULE, metric_type="log_return", criticality="critical",
             estimator="advance_minus_reject_alpha_21d", measurement_horizon="21d",
-            n_floor=60, target=0.005, red_line=0.0, source_path=e2e_src, input_present=False,
+            n_floor=60, source_path=e2e_src, input_present=False,
             na_detail="cio_selection_skill: no selection_skill_21d block in e2e_lift this cycle "
                       "(needs cio_evaluations joined to closed-21d universe_returns).",
             **_tr("cio_selection_skill", None),
@@ -389,7 +391,7 @@ def build_research_tile(
             name="research_composite_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator=estimator, measurement_horizon="21d",
             reliability="low" if insig else "high",
-            value=fic, n_samples=n_at, n_floor=n_floor, target=0.03, red_line=0.0, source_path=e2e_src,
+            value=fic, n_samples=n_at, n_floor=n_floor, source_path=e2e_src,
             status="WATCH" if insig else None,
             reason=(f"research_composite_ic: final_score→21d-alpha "
                     f"{'date-clustered ' if use_clustered else ''}rank-IC = {fic:+.3f} "
@@ -404,7 +406,7 @@ def build_research_tile(
         components.append(build_metric(
             name="research_composite_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="rank_ic_vs_21d_alpha", measurement_horizon="21d",
-            n_floor=60, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False,
+            n_floor=60, source_path=e2e_src, input_present=False,
             na_detail="research_composite_ic: no layer_attribution_21d block in e2e_lift this cycle.",
             **_tr("research_composite_ic", None),
         ))
@@ -428,7 +430,7 @@ def build_research_tile(
             name="thinktank_coverage_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=tt_hz,
             reliability="low" if tt_insig else "high",
-            value=tt_ic, n_samples=tt_n, n_floor=8, target=0.03, red_line=0.0,
+            value=tt_ic, n_samples=tt_n, n_floor=8, 
             source_path=e2e_src, status="WATCH" if tt_insig else None, arm=tt_arm,
             reason=(f"thinktank_coverage_ic: challenger shadow score→{tt_hz}-alpha "
                     f"date-clustered rank-IC = {tt_ic:+.3f} "
@@ -444,7 +446,7 @@ def build_research_tile(
         components.append(build_metric(
             name="thinktank_coverage_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=tt_hz,
-            n_floor=8, target=0.03, red_line=0.0, source_path=e2e_src, input_present=False, arm=tt_arm,
+            n_floor=8, source_path=e2e_src, input_present=False, arm=tt_arm,
             na_detail=(f"thinktank_coverage_ic: {tt_na} (observe-only challenger shadow "
                        f"scores, config-I2994; warms up on the 21d realization lag). "
                        f"Feeds no gate."),
@@ -488,7 +490,7 @@ def build_research_tile(
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
             estimator="spearman_calibration", measurement_horizon=cal_horizon,
-            value=rho, n_samples=n_cal, n_floor=30, target=0.10, red_line=0.0, source_path=sc_src,
+            value=rho, n_samples=n_cal, n_floor=30, source_path=sc_src,
             status="WATCH" if flat else None,
             reason=(f"composite_scoring [{cal_horizon}] Spearman rho={rho:+.3f} (score→realized-alpha rank{p_txt}); "
                     f"assessment={assessment}{beat_txt} over N={n_cal}. "
@@ -505,7 +507,7 @@ def build_research_tile(
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
             estimator="legacy_monotonic_binary_deprecated", measurement_horizon=cal_horizon, reliability="low",
-            value=1.0 if mono else 0.0, n_samples=score_cal.get("n"), n_floor=1, source_path=sc_src,
+            value=1.0 if mono else 0.0, n_samples=score_cal.get("n"), n_floor=1, band="unbanded", source_path=sc_src,
             status="WATCH",
             reason=(f"composite_scoring legacy monotonic={mono} — DEPRECATED brittle bucket binary, "
                     f"neutralized to WATCH per L4562 (awaiting a Spearman-bearing score_calibration.json); "
@@ -517,7 +519,7 @@ def build_research_tile(
         components.append(build_metric(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
             estimator="spearman_calibration", measurement_horizon=cal_horizon,
-            n_floor=30, source_path=sc_src, input_present=False,
+            n_floor=30, band="unbanded", source_path=sc_src, input_present=False,
             na_detail="composite_scoring: score_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
 
@@ -527,13 +529,13 @@ def build_research_tile(
         components.append(build_metric(
             name="macro_agent", module=MODULE, metric_type="lift", criticality="supporting",
             value=macro.get("accuracy_lift"), n_samples=macro.get("n_evaluated") or macro.get("n"),
-            n_floor=20, target=0.0, red_line=-3.0, source_path=mac_src,
+            n_floor=20, source_path=mac_src,
             reason=f"macro_agent accuracy_lift={macro['accuracy_lift']:+.1f}pp, assessment={macro.get('assessment')}.",
         ))
     else:
         components.append(build_metric(
             name="macro_agent", module=MODULE, metric_type="lift", criticality="supporting",
-            n_floor=20, target=0.0, red_line=-3.0, source_path=mac_src, input_present=False,
+            n_floor=20, source_path=mac_src, input_present=False,
             na_detail="macro_agent: macro_eval.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
 
@@ -542,13 +544,13 @@ def build_research_tile(
     if pcal and pcal.get("status") == "ok" and pcal.get("ece") is not None:
         components.append(build_metric(
             name="calibration_diagnostics", module=MODULE, metric_type="calibration", criticality="supporting",
-            value=pcal.get("ece"), n_samples=pcal.get("n"), n_floor=100, target=0.05, red_line=0.15,
+            value=pcal.get("ece"), n_samples=pcal.get("n"), n_floor=100, 
             higher_is_better=False, source_path=pc_src,
         ))
     else:
         components.append(build_metric(
             name="calibration_diagnostics", module=MODULE, metric_type="calibration", criticality="supporting",
-            n_floor=100, target=0.05, red_line=0.15, higher_is_better=False, source_path=pc_src,
+            n_floor=100, higher_is_better=False, source_path=pc_src,
             input_present=False,
             na_detail="calibration_diagnostics: portfolio_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
@@ -566,7 +568,7 @@ def build_research_tile(
         components.append(build_metric(
             name="momentum_regime_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
             value=lo, n_samples=mri.get("n_weeks"), n_floor=6,
-            target=0.0, red_line=-0.05, higher_is_better=True, source_path=e2e_src,
+            higher_is_better=True, source_path=e2e_src,
             measurement_horizon="21d",
             reason=(
                 f"momentum_regime_ic: tech_score momentum IC = {lo:+.3f} in low-breadth weeks vs "
@@ -580,7 +582,7 @@ def build_research_tile(
     else:
         components.append(build_metric(
             name="momentum_regime_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
-            n_floor=6, target=0.0, red_line=-0.05, higher_is_better=True, source_path=e2e_src,
+            n_floor=6, higher_is_better=True, source_path=e2e_src,
             input_present=False,
             na_detail=(
                 f"momentum_regime_ic: no ok block in e2e_lift this cycle "
@@ -628,7 +630,7 @@ def build_research_tile(
         _neu_rd = neu_retired.get("retired_date")
         components.append(build_metric(
             name="neutralization_live_efficacy", module=MODULE, metric_type="ic",
-            criticality="diagnostic", n_floor=1, source_path=e2e_src,
+            criticality="diagnostic", n_floor=1, band="unbanded", source_path=e2e_src,
             arm=f"six_team_cio (retired {_neu_rd})",
             permanent_na_reason=(
                 f"retired {_neu_rd}: six-team+CIO research orchestration removed "
@@ -670,7 +672,7 @@ def build_research_tile(
             name="neutralization_live_efficacy", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_neutralized_minus_raw_ic_21d", measurement_horizon="21d",
             reliability="high" if sig else "low",
-            value=delta, n_samples=nwk, n_floor=4, target=0.0, red_line=-0.02,
+            value=delta, n_samples=nwk, n_floor=4, 
             higher_is_better=True, source_path=e2e_src, status=status,
             reason=(
                 f"neutralization_live_efficacy: post-cutover ({cutover_date}) "
@@ -687,7 +689,7 @@ def build_research_tile(
         components.append(build_metric(
             name="neutralization_live_efficacy", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_neutralized_minus_raw_ic_21d", measurement_horizon="21d",
-            n_floor=4, target=0.0, red_line=-0.02, higher_is_better=True, source_path=e2e_src,
+            n_floor=4, higher_is_better=True, source_path=e2e_src,
             input_present=False,
             na_detail=(
                 f"neutralization_live_efficacy: no live_forward block from either the "
@@ -718,14 +720,14 @@ def build_research_tile(
     if blk is not None:
         components.append(build_metric(
             name="judge_rubric_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=10, target=0.85, red_line=0.60,
+            value=blk["value"], n_samples=blk.get("n"), n_floor=10, 
             source_path=aq_src,
             reason=f"judge_rubric_pass_rate = {blk['value']:.1%} (N={blk.get('n')} evals) vs target 85% / red-line 60%.",
         ))
     else:
         components.append(build_metric(
             name="judge_rubric_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=10, target=0.85, red_line=0.60, source_path=aq_src, input_present=False,
+            n_floor=10, source_path=aq_src, input_present=False,
             na_detail="judge_rubric_pass_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
@@ -735,14 +737,14 @@ def build_research_tile(
     if blk is not None:
         components.append(build_metric(
             name="pillar_emit_coverage", module=MODULE, metric_type="pct", criticality="supporting",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=10, target=0.90, red_line=0.50,
+            value=blk["value"], n_samples=blk.get("n"), n_floor=10, 
             source_path=aq_src,
             reason=f"pillar_emit_coverage = {blk['value']:.1%} (N={blk.get('n')} universe entries) vs target 90% / red-line 50%.",
         ))
     else:
         components.append(build_metric(
             name="pillar_emit_coverage", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=10, target=0.90, red_line=0.50, source_path=aq_src, input_present=False,
+            n_floor=10, source_path=aq_src, input_present=False,
             na_detail="pillar_emit_coverage: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
@@ -752,14 +754,14 @@ def build_research_tile(
     if blk is not None:
         components.append(build_metric(
             name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
-            value=blk["value"], n_samples=blk.get("n"), n_floor=1, target=20.0, red_line=8.0,
+            value=blk["value"], n_samples=blk.get("n"), n_floor=1, 
             source_path=aq_src,
             reason=f"signal_volume_adequacy = {blk['value']:.0f} finalized signals vs target 20 / red-line 8.",
         ))
     else:
         components.append(build_metric(
             name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
-            n_floor=1, target=20.0, red_line=8.0, source_path=aq_src, input_present=False,
+            n_floor=1, source_path=aq_src, input_present=False,
             na_detail="signal_volume_adequacy: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
         ))
 
@@ -830,7 +832,7 @@ def build_research_tile(
             name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
             reliability="low" if a_insig else "high", arm=_LIVE_ARM_SCANNER,
-            value=a_ic, n_samples=a_n, n_floor=a_floor, target=0.03, red_line=0.0,
+            value=a_ic, n_samples=a_n, n_floor=a_floor, 
             source_path=att_src, status="WATCH" if a_insig else None,
             reason=(f"attractiveness_ic: attractiveness→{att_hz}-alpha date-clustered rank-IC = "
                     f"{a_ic:+.3f} (p={_fmt_p(a_p)}, N={a_n} eval dates; pooled "
@@ -847,7 +849,7 @@ def build_research_tile(
         components.append(build_metric(
             name="attractiveness_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
-            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            n_floor=8, source_path=att_src, input_present=False,
             arm=_LIVE_ARM_SCANNER,
             na_detail=(f"attractiveness_ic: {_ATT_MISSING} Live champion-feed ranking metric "
                        f"[arm: {_LIVE_ARM_SCANNER}] — replaces the retired research_composite_ic "
@@ -875,7 +877,7 @@ def build_research_tile(
             criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
             reliability="low" if t_insig else "high",
-            value=t_ic, n_samples=t_n, n_floor=8, target=0.03, red_line=0.0,
+            value=t_ic, n_samples=t_n, n_floor=8, 
             source_path=att_src, status="WATCH" if t_insig else None,
             reason=(f"attractiveness_trajectory_ic: pre_repricing_score→{att_hz}-alpha "
                     f"date-clustered rank-IC = {t_ic:+.3f} (p={_fmt_p(t_p)}, N={t_n} eval "
@@ -889,7 +891,7 @@ def build_research_tile(
             name="attractiveness_trajectory_ic", module=MODULE, metric_type="ic",
             criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=att_hz,
-            n_floor=8, target=0.03, red_line=0.0, source_path=att_src, input_present=False,
+            n_floor=8, source_path=att_src, input_present=False,
             na_detail=(f"attractiveness_trajectory_ic: no pre_repricing_score IC block — "
                        f"{_ATT_MISSING} Drives the config#1392 observe→cutover gate once present."),
         ))
@@ -945,7 +947,7 @@ def build_research_tile(
             name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
             criticality="supporting",
             estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
-            value=prize, n_samples=n_surv, n_floor=10, target=0.0, red_line=None,
+            value=prize, n_samples=n_surv, n_floor=10, 
             higher_is_better=True, source_path=att_src,
             reason=(f"scanner_feed_counterfactual: top-{chosen.get('n')} attractiveness feed "
                     f"− live gate = {prize:+.4f} mean {att_hz} log-alpha (live gate: capture "
@@ -960,7 +962,7 @@ def build_research_tile(
             name="scanner_feed_counterfactual", module=MODULE, metric_type="log_return",
             criticality="supporting",
             estimator="matched_breadth_alpha_delta", measurement_horizon=att_hz,
-            n_floor=10, target=0.0, red_line=None, higher_is_better=True,
+            n_floor=10, higher_is_better=True,
             source_path=att_src, input_present=False,
             na_detail=(f"scanner_feed_counterfactual: no usable counterfactual block "
                        f"(needs top_n rows AND a live_gate baseline for a like-for-like "
@@ -995,7 +997,7 @@ def build_research_tile(
             name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
             reliability="low" if j_insig else "high",
-            value=j_ic, n_samples=j_n, n_floor=8, target=0.03, red_line=0.0,
+            value=j_ic, n_samples=j_n, n_floor=8, 
             source_path=aq_src, status="WATCH" if j_insig else None,
             reason=(f"judge_outcome_ic: judge quality-score→{j_hz}-alpha date-clustered "
                     f"rank-IC = {j_ic:+.3f} (p={_fmt_p(j_p)}, N={j_n} eval dates; pooled "
@@ -1012,7 +1014,7 @@ def build_research_tile(
         components.append(build_metric(
             name="judge_outcome_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
             estimator="date_clustered_rank_ic_vs_21d_alpha", measurement_horizon=j_hz,
-            n_floor=8, target=0.03, red_line=0.0, source_path=aq_src, input_present=False,
+            n_floor=8, source_path=aq_src, input_present=False,
             na_detail=("judge_outcome_ic: "
                        + (f"judge_outcome_ic block status={joi_status!r} this cycle "
                           f"(insufficient judge↔realized-alpha joins — accumulating)."
@@ -1100,7 +1102,7 @@ def build_research_tile(
             criticality="critical",
             estimator="date_clustered_mean_excess_vs_pit_population", measurement_horizon=att_hz,
             reliability="low" if insig else "high", arm=_LIVE_ARM_SCANNER,
-            value=sb_excess, n_samples=n_cyc, n_floor=8, target=0.0025, red_line=0.0,
+            value=sb_excess, n_samples=n_cyc, n_floor=8, 
             ci_low=ci_low, ci_high=ci_high, source_path=att_src,
             status="WATCH" if insig else None,
             reason=(f"scanner_basket_return: top-20 sector-balanced attractiveness basket "
@@ -1119,7 +1121,7 @@ def build_research_tile(
             name="scanner_basket_return", module=MODULE, metric_type="log_return",
             criticality="critical",
             estimator="date_clustered_mean_excess_vs_pit_population", measurement_horizon=att_hz,
-            n_floor=8, target=0.0025, red_line=0.0, source_path=att_src, input_present=False,
+            n_floor=8, source_path=att_src, input_present=False,
             arm=_LIVE_ARM_SCANNER,
             na_detail=(f"scanner_basket_return: "
                        + (_ATT_MISSING if not att_ok else
