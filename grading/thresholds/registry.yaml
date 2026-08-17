@@ -258,6 +258,13 @@ metrics:
     signal_volume_adequacy: {target: 20.0, red_line: 8.0, n_floor_declared: 1}
     thinktank_coverage_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
   substrate:
+    # The threshold slot's own scoring records (config#7476). MACHINE-HEALTH
+    # vocabulary: their status answers "was this arm scored?", never "did it
+    # win?" (champion-challenger §8), so they carry NO bar — a Brier threshold
+    # would be exactly the hand-set literal this slot exists to remove. One row
+    # per arm; adding an arm adds its row in the same PR (§10).
+    threshold_arm_brier_declared_v2: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 26}
+    threshold_arm_brier_history_bands_v1: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 26}
     alert_noise_ratio: {target: null, red_line: null, n_floor_declared: 1}
     changelog_coverage: {target: null, red_line: null, n_floor_declared: 1}
     data_quality_incidents: {target: 200.0, red_line: 500.0, higher_is_better: false, n_floor_declared: 1}

@@ -118,6 +118,49 @@ def _extract_series(cards: list[dict]) -> dict[tuple[str, str], list[float]]:
     return series
 
 
+def list_card_keys(s3, bucket: str, before_date: str, n_cards: int) -> list[tuple[str, str]]:
+    """The latest ``n_cards`` dated ``report_card.json`` keys strictly before ``before_date``.
+
+    Returned oldest → newest as ``(date, key)``. Shared by the trend history
+    here and by the threshold slot's cohort loader
+    (``grading/thresholds/cohort.py``) — one listing convention, so the two can
+    never disagree about which cards exist (shared-code policy, second adoption).
+    """
+    dated_keys: list[tuple[str, str]] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=_CARD_PREFIX):
+        for obj in page.get("Contents", []):
+            m = _CARD_KEY_RE.match(obj["Key"])
+            if m and m.group(1) < before_date:
+                dated_keys.append((m.group(1), obj["Key"]))
+    return sorted(dated_keys)[-n_cards:]
+
+
+def read_cards(s3, bucket: str, dated_keys: list[tuple[str, str]]) -> list[tuple[str, dict]]:
+    """Read the listed cards oldest-first as ``(date, parsed_card)``.
+
+    A card deleted between list and get, or half-written by a crashed run, is
+    skipped with a WARN naming it. Any OTHER S3 error raises — a throttle or an
+    auth failure is not "no history".
+    """
+    out: list[tuple[str, dict]] = []
+    for date_s, key in dated_keys:
+        try:
+            resp = s3.get_object(Bucket=bucket, Key=key)
+            out.append((date_s, json.loads(resp["Body"].read())))
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                # Deleted between list and get — a legitimate skip, recorded.
+                logger.warning("Prior card vanished between list and read: s3://%s/%s", bucket, key)
+                continue
+            logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
+            raise
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Skipping corrupt prior card s3://%s/%s: %s", bucket, key, e)
+            continue
+    return out
+
+
 def load_card_history(
     bucket: str,
     run_date: str,
@@ -137,30 +180,8 @@ def load_card_history(
     s3 = s3_client or boto3.client("s3")
     n_cards = max(1, min(n_cards, MAX_HISTORY_CARDS))
 
-    dated_keys: list[tuple[str, str]] = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=_CARD_PREFIX):
-        for obj in page.get("Contents", []):
-            m = _CARD_KEY_RE.match(obj["Key"])
-            if m and m.group(1) < run_date:
-                dated_keys.append((m.group(1), obj["Key"]))
-    dated_keys = sorted(dated_keys)[-n_cards:]  # latest N priors, oldest → newest
-
-    cards: list[dict] = []
-    for date_s, key in dated_keys:
-        try:
-            resp = s3.get_object(Bucket=bucket, Key=key)
-            cards.append(json.loads(resp["Body"].read()))
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-                # Deleted between list and get — a legitimate skip, recorded.
-                logger.warning("Prior card vanished between list and read: s3://%s/%s", bucket, key)
-                continue
-            logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
-            raise
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("Skipping corrupt prior card s3://%s/%s: %s", bucket, key, e)
-            continue
+    dated_keys = list_card_keys(s3, bucket, run_date, n_cards)
+    cards = [card for _date, card in read_cards(s3, bucket, dated_keys)]
 
     n_found = len(cards)
     if n_found < n_cards:

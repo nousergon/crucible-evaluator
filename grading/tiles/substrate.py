@@ -31,6 +31,7 @@ from grading.artifacts import get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
+from grading.thresholds.scoring import build_arm_components, leaderboard_key
 
 logger = logging.getLogger(__name__)
 
@@ -258,8 +259,18 @@ def build_substrate_tile(
     as_of: datetime | None = None,
     sfn_client=None,
     cloudwatch_client=None,
+    threshold_leaderboard: dict | None = None,
+    threshold_leaderboard_error: str | None = None,
 ) -> dict:
     """Build the Substrate Reliability tile.
+
+    ``threshold_leaderboard`` (config#7476) is the scored threshold-slot
+    leaderboard for this cycle, built by ``grading.thresholds.scoring``. It
+    renders as one ``diagnostic`` MetricRecord per arm — machine-health
+    vocabulary, answering "was the arm scored?" and never "did it win?"
+    (champion-challenger §8). Omitted (standalone CLI / tests) or failed
+    (``threshold_leaderboard_error``) → the records grade a loud N/A naming why,
+    because an unscored cycle is unrecoverable and must not read as absence.
 
     ``run_date`` (ISO ``YYYY-MM-DD``) anchors the windowed read of the
     backtester's ``substrate_ops.json`` for ``watchdog_firings`` (config#1151).
@@ -597,6 +608,16 @@ def build_substrate_tile(
             name=name, module=MODULE, metric_type="pct", criticality=crit, n_floor=1,
             source_path=f"s3://{bucket}/", permanent_na_reason=detail,
         ))
+
+    # config#7476 — the threshold champion/challenger slot's own scoring, one
+    # record per arm, every cycle (champion-challenger §3).
+    components.extend(build_arm_components(
+        threshold_leaderboard,
+        module=MODULE,
+        source_path=f"s3://{bucket}/{leaderboard_key(run_date)}" if run_date
+                    else f"s3://{bucket}/evaluator/",
+        error=threshold_leaderboard_error,
+    ))
 
     return build_tile(MODULE, components)
 

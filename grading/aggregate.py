@@ -38,6 +38,7 @@ from grading.pipeline_gates import gates_unmeasured, read_gate_state
 from grading.self_test import run_self_test
 from grading.self_test import verdict_is_pass as self_test_is_pass
 from grading.module_agg import overall_status
+from grading.thresholds.scoring import build_leaderboard
 from nousergon_lib.quant.stats.trial_accumulator import read_cumulative_trial_count
 from grading.tiles.agent import build_agent_tile
 from grading.tiles.backtester import build_backtester_tile
@@ -125,6 +126,26 @@ def build_report_card(
     # counter hasn't been backfilled/seeded yet) degrades to n_trials=None,
     # which portfolio_outcome.py already treats as its pre-existing N/A path
     # — never blocks the report-card build.
+    # config#7476 — the threshold champion/challenger slot. Both arms are scored
+    # on predictive validity against the REALIZED next-cycle objective, every
+    # cycle, whether or not anything could be promoted (champion-challenger §3).
+    # It reads only PRIOR cards, so it is built before the tiles and rendered on
+    # the substrate tile as one machine-health record per arm.
+    #
+    # Fail-SOFT with the reason carried, never silent (§7.2): a bug in the
+    # scoring must not fail the report card, but the failure reaches the card as
+    # an N/A-NOT-RUN naming it — an unscored cycle is unrecoverable and must
+    # never read as absence.
+    threshold_leaderboard: dict | None = None
+    threshold_leaderboard_error: str | None = None
+    try:
+        threshold_leaderboard = build_leaderboard(bucket, run_date, s3_client=s3_client)
+    except Exception as exc:  # noqa: BLE001 — secondary scoring, reported not raised
+        threshold_leaderboard_error = (
+            f"threshold slot scoring failed for {run_date}: {type(exc).__name__}: {exc}"
+        )
+        logger.error(threshold_leaderboard_error, exc_info=True)
+
     n_trials: int | None = None
     try:
         trial_state = read_cumulative_trial_count(bucket, s3_client=s3_client)
@@ -166,12 +187,21 @@ def build_report_card(
         "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
         "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history),
-        "substrate": build_substrate_tile(bucket, run_date, s3_client=s3_client),
+        "substrate": build_substrate_tile(
+            bucket, run_date, s3_client=s3_client,
+            threshold_leaderboard=threshold_leaderboard,
+            threshold_leaderboard_error=threshold_leaderboard_error,
+        ),
         "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
         "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),
         "director_quality": build_director_quality_tile(bucket, run_date, s3_client=s3_client),
     }
     scorecard["tiles"] = tiles
+    # Handed to the handler (which persists it as its own artifact) under a
+    # leading underscore, the same convention `_provenance` uses for a key that
+    # is build output rather than card content. The handler pops it before the
+    # card is written, so the card itself does not carry the whole leaderboard.
+    scorecard["_threshold_leaderboard"] = threshold_leaderboard
     # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
     # any cascade module fails overall), per module_agg.overall_status. The
     # Backtester / Substrate / Agent tiles join later; overall_status tolerates
