@@ -3,6 +3,34 @@
 import pytest
 
 from grading.metric_record import MetricContractError, build_metric
+from grading.units import ANNUALIZED_RATIO, DAYS, FRACTION, PCT, RATIO
+
+
+class TestMetricUnitContract:
+    """config#7485 — a value-bearing MetricRecord must declare its
+    RETURN/measurement unit; enforced at the chokepoint ahead of the krepis
+    validator landing (krepis-PR158)."""
+
+    def test_value_without_unit_raises(self):
+        with pytest.raises(MetricContractError, match="must declare a 'unit'"):
+            build_metric(
+                name="x", module="m", metric_type="ratio", n_floor=10, value=1.0,
+                n_samples=50, target=0.5, red_line=0.0, source_path="s3://b/x",
+            )
+
+    def test_value_with_unit_accepted(self):
+        m = build_metric(
+            name="x", module="m", metric_type="ratio", n_floor=10, value=1.0,
+            unit=RATIO, n_samples=50, target=0.5, red_line=0.0, source_path="s3://b/x",
+        )
+        assert m.unit == RATIO
+
+    def test_no_value_does_not_require_unit(self):
+        m = build_metric(
+            name="x", module="m", metric_type="ratio", n_floor=10, band=None,
+            source_path="s3://b/x", implemented=False, na_detail="not built.",
+        )
+        assert m.value is None
 
 
 class TestMetricReliabilityContract:
@@ -12,7 +40,7 @@ class TestMetricReliabilityContract:
 
     def _mk(self, **kw):
         base = dict(name="x", module="m", metric_type="ratio", n_floor=10, value=1.0,
-                    n_samples=50, target=0.5, red_line=0.0, source_path="s3://b/x",
+                    unit=RATIO, n_samples=50, target=0.5, red_line=0.0, source_path="s3://b/x",
                     criticality="critical")
         base.update(kw)
         return build_metric(**base)
@@ -51,7 +79,7 @@ class TestBuildMetricStatus:
     def test_green_above_target(self):
         m = build_metric(
             name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
-            value=1.4, n_samples=120, n_floor=60, target=1.0, red_line=0.0,
+            value=1.4, unit=ANNUALIZED_RATIO, n_samples=120, n_floor=60, target=1.0, red_line=0.0,
             ci_low=0.8, ci_high=2.0, ci_method="bootstrap", criticality="critical", estimator="test_robust",
             source_path="s3://b/trades/eod_pnl.csv",
         )
@@ -63,7 +91,7 @@ class TestBuildMetricStatus:
     def test_watch_below_target_above_redline(self):
         m = build_metric(
             name="information_ratio", module="portfolio_outcome", metric_type="ratio",
-            value=0.3, n_samples=120, n_floor=60, target=0.5, red_line=0.0,
+            value=0.3, unit=ANNUALIZED_RATIO, n_samples=120, n_floor=60, target=0.5, red_line=0.0,
             source_path="s3://b/x",
         )
         assert m.status == "WATCH"
@@ -72,7 +100,7 @@ class TestBuildMetricStatus:
     def test_red_at_or_below_redline(self):
         m = build_metric(
             name="information_ratio", module="portfolio_outcome", metric_type="ratio",
-            value=-0.1, n_samples=120, n_floor=60, target=0.5, red_line=0.0,
+            value=-0.1, unit=ANNUALIZED_RATIO, n_samples=120, n_floor=60, target=0.5, red_line=0.0,
             source_path="s3://b/x",
         )
         assert m.status == "RED"
@@ -83,7 +111,7 @@ class TestBuildMetricStatus:
         # target>=red_line so higher-is-better holds: -0.08 >= -0.15 → GREEN).
         m = build_metric(
             name="max_drawdown", module="portfolio_outcome", metric_type="ratio",
-            value=-0.08, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
+            value=-0.08, unit=FRACTION, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
             source_path="s3://b/x", criticality="critical", estimator="test_robust",
         )
         assert m.status == "GREEN"
@@ -91,7 +119,7 @@ class TestBuildMetricStatus:
     def test_drawdown_breaches_redline_red(self):
         m = build_metric(
             name="max_drawdown", module="portfolio_outcome", metric_type="ratio",
-            value=-0.30, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
+            value=-0.30, unit=FRACTION, n_samples=80, n_floor=2, target=-0.15, red_line=-0.25,
             source_path="s3://b/x", criticality="critical", estimator="test_robust",
         )
         assert m.status == "RED"
@@ -121,7 +149,7 @@ class TestBuildMetricNA:
     def test_low_n(self):
         m = build_metric(
             name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
-            value=1.5, n_samples=10, n_floor=60, target=1.0, red_line=0.0,
+            value=1.5, unit=ANNUALIZED_RATIO, n_samples=10, n_floor=60, target=1.0, red_line=0.0,
             source_path="s3://b/x",
         )
         assert m.status == "N/A-LOW-N"
@@ -131,7 +159,7 @@ class TestBuildMetricNA:
         # N between 30 and 60 → WATCH regardless of value (Principle 6).
         m = build_metric(
             name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
-            value=2.0, n_samples=45, n_floor=60, target=1.0, red_line=0.0,
+            value=2.0, unit=ANNUALIZED_RATIO, n_samples=45, n_floor=60, target=1.0, red_line=0.0,
             source_path="s3://b/x",
         )
         assert m.status == "WATCH"
@@ -197,7 +225,7 @@ class TestMeasurementArm:
     def test_arm_passes_through(self):
         m = build_metric(
             name="scanner", module="research", metric_type="pct", n_floor=10,
-            value=0.1, n_samples=50, source_path="s3://b/x",
+            value=0.1, unit=PCT, n_samples=50, source_path="s3://b/x",
             arm="tech_score_baseline (retired from live feed 2026-06-29)",
         )
         assert m.arm == "tech_score_baseline (retired from live feed 2026-06-29)"
@@ -207,7 +235,7 @@ class TestBuildMetricExtras:
     def test_status_override_for_band_metric(self):
         m = build_metric(
             name="beta_vs_spy", module="portfolio_outcome", metric_type="ratio",
-            value=0.95, n_samples=80, n_floor=60, source_path="s3://b/x",
+            value=0.95, unit=RATIO, n_samples=80, n_floor=60, source_path="s3://b/x",
             criticality="diagnostic", status="GREEN", reason="beta in band.",
         )
         assert m.status == "GREEN"
@@ -216,7 +244,7 @@ class TestBuildMetricExtras:
     def test_trend_decoration_up(self):
         m = build_metric(
             name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
-            value=1.4, n_samples=120, n_floor=60, target=1.0, red_line=0.0,
+            value=1.4, unit=ANNUALIZED_RATIO, n_samples=120, n_floor=60, target=1.0, red_line=0.0,
             source_path="s3://b/x", trend_4w=[0.9, 1.0, 1.2, 1.4],
         )
         assert m.trend_decoration == "↑↑"
@@ -225,7 +253,7 @@ class TestBuildMetricExtras:
         # For a lower-is-better metric, a rising series is degradation (↓↓).
         m = build_metric(
             name="max_dd_duration_days", module="portfolio_outcome", metric_type="duration",
-            value=40.0, n_samples=80, n_floor=2, source_path="s3://b/x",
+            value=40.0, unit=DAYS, n_samples=80, n_floor=2, source_path="s3://b/x",
             higher_is_better=False, trend_4w=[10.0, 20.0, 30.0, 40.0],
         )
         assert m.trend_decoration == "↓↓"

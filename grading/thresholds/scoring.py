@@ -332,6 +332,7 @@ def build_arm_components(
     zero must never render identically (§3).
     """
     from grading.metric_record import build_metric  # local: avoids an import cycle
+    from grading.units import BRIER_SCORE
 
     reg = registry or load_registry()
     by_arm = {a["arm"]: a for a in (leaderboard or {}).get("arms", [])}
@@ -381,7 +382,7 @@ def build_arm_components(
             name=name, module=module, metric_type="ratio", criticality="diagnostic",
             estimator="brier_leave_one_out_status_rate",
             measurement_horizon=f"{reg.slot.horizon_cycles}_cycles",
-            value=brier, n_samples=n_paired, n_floor=floor_cards, source_path=source_path,
+            value=brier, unit=BRIER_SCORE, n_samples=n_paired, n_floor=floor_cards, source_path=source_path,
             higher_is_better=False, reason=detail,
         ))
     return components

@@ -140,6 +140,7 @@ def build_metric(
     measurement_horizon: str | None = None,
     reliability: str | None = None,
     arm: str | None = None,
+    unit: str | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
 
@@ -194,7 +195,23 @@ def build_metric(
     keeps measuring the old source. ``MetricRecord`` allows extra fields, so
     this passes straight through (same low-risk pattern as ``estimator`` /
     ``reliability`` / ``permanent_na``, config#1153 / L4562).
+
+    ``unit`` (config#7485, krepis-PR158 `unit: str | None` field) is the
+    RETURN/measurement unit of ``value`` — never the statistical kind already
+    carried by ``metric_type`` (an IC's ``metric_type`` is ``"ic"``; its
+    ``unit`` is ``"spearman_rho"`` or ``"rank_ic"``). Use the constants in
+    ``grading/units.py`` rather than a free-form string. **Enforced here at
+    the chokepoint, evaluator-side, ahead of the krepis validator landing**:
+    any value-bearing record built without a ``unit`` raises
+    ``MetricContractError`` — the chokepoint rule (a guard belongs where
+    every caller already passes through, not repeated at each call site).
     """
+    if value is not None and not unit:
+        raise MetricContractError(
+            f"value-bearing metric '{name}' (module='{module}') must declare a "
+            f"'unit' (config#7485) — the RETURN/measurement unit of value, e.g. "
+            f"'pct', 'fraction', 'usd', 'spearman_rho'. See grading/units.py."
+        )
     # config#1153 (operator ruling 2026-07-11, Option A): an "accepted permanent
     # honest-N/A" — a metric deliberately NOT built (a product decision), as
     # opposed to a transient "producer not yet wired" gap. It renders as an
@@ -280,6 +297,7 @@ def build_metric(
         ci_method=ci_method,
         n_samples=n_samples,
         n_floor=n_floor,
+        unit=unit,
         target=target,
         red_line=red_line,
         trend_4w=trend_4w,

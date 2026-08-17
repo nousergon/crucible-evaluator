@@ -39,6 +39,7 @@ from botocore.exceptions import ClientError
 from grading.artifacts import BEHAVIORAL_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.units import FRACTION, PCT, SCORE_POINTS
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="turnover", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="l4515_tripwire_rolling_sum", measurement_horizon=f"{trip.get('rolling_days', 5)}d_rolling",
             reliability="high",  # the tripwire itself is production-paged
-            value=trip["rolling_sum"], n_samples=int(trip.get("n_days_used") or 0), n_floor=1,
+            value=trip["rolling_sum"], unit=FRACTION, n_samples=int(trip.get("n_days_used") or 0), n_floor=1,
             target=(band / 2 if band else None), red_line=band, source_path=trip_src or "",
             reason=(f"one-way turnover rolling sum {trip['rolling_sum']:.1%} over "
                     f"{trip.get('n_days_used')} session(s) vs band {band:.0%}; "
@@ -139,7 +140,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="decision_reversal", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="reversal_rate_rolling_window", measurement_horizon=f"{rev.get('window_days', 10)}d_window",
             reliability="medium",
-            value=rev["reversal_rate"], n_samples=int(rev.get("n_exits") or 0), n_floor=10,
+            value=rev["reversal_rate"], unit=FRACTION, n_samples=int(rev.get("n_exits") or 0), n_floor=10,
             source_path=ba_src,
             reason=(f"{rev.get('n_reversals')}/{rev.get('n_exits')} exits re-entered within "
                     f"{rev.get('window_days')}td (rate {rev['reversal_rate']:.1%}) vs provisional "
@@ -160,7 +161,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="conviction_stability", module=MODULE, metric_type="count", criticality="diagnostic",
             estimator="median_rolling_score_std", measurement_horizon=f"{conv.get('window_days', 90)}d_window",
             reliability="medium",
-            value=conv["median_score_std"], n_samples=int(conv.get("n_tickers") or 0), n_floor=5,
+            value=conv["median_score_std"], unit=SCORE_POINTS, n_samples=int(conv.get("n_tickers") or 0), n_floor=5,
             source_path=ba_src,
             reason=(f"median per-ticker score std {conv['median_score_std']:.2f} "
                     f"(p90 {conv.get('p90_score_std')}, N={conv.get('n_tickers')} tickers) on the "
@@ -181,7 +182,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="cost_adjusted_quality", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="median_net_alpha_after_slippage", measurement_horizon="per_roundtrip",
             reliability="medium",
-            value=cost["median_net_alpha_pct"], n_samples=int(cost.get("n_roundtrips") or 0), n_floor=15,
+            value=cost["median_net_alpha_pct"], unit=PCT, n_samples=int(cost.get("n_roundtrips") or 0), n_floor=15,
             source_path=ba_src,
             reason=(f"median net alpha after entry slippage {cost['median_net_alpha_pct']:+.2f}% "
                     f"(gross {cost.get('median_gross_alpha_pct'):+.2f}%, median slippage "
@@ -203,7 +204,7 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="portfolio_state_drift", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="median_daily_l1_weight_drift", measurement_horizon="day_over_day",
             reliability="medium",
-            value=drift["median_daily_drift"], n_samples=int(drift.get("n_days") or 0), n_floor=10,
+            value=drift["median_daily_drift"], unit=FRACTION, n_samples=int(drift.get("n_days") or 0), n_floor=10,
             source_path=ba_src,
             reason=(f"median daily one-way L1 weight drift {drift['median_daily_drift']:.1%} "
                     f"(max {drift.get('max_daily_drift'):.1%}, {drift.get('n_spike_days')} spike day(s) "
