@@ -164,6 +164,17 @@ ARTIFACT_MAP: dict[str, str] = {
     "action_entropy": "action_entropy.json",
     "excursion_summary": "portfolio_excursion.json",
 }
+# NOTE (RC v3 T5, config-I7473): contribution_lift.json is deliberately NOT
+# added here. ARTIFACT_MAP entries feed straight into
+# ``compute_scorecard(**inputs)`` (the legacy v1 0-100 grader below) — every
+# key here corresponds to a real ``compute_scorecard`` parameter that
+# consumes it. contribution_lift is v2-only (a MetricRecord tile, same class
+# as research/predictor/executor/behavioral's own primary artifacts, none of
+# which route through this map either); adding an unconsumed key would raise
+# ``TypeError: unexpected keyword argument`` the first time the artifact
+# exists in S3. ``grading/tiles/contribution_lift.py`` reads
+# ``backtest/{date}/contribution_lift.json`` directly via
+# ``get_json_windowed``, exactly like every other v2 tile.
 
 # Reserved top-level keys in metrics.json that are NOT part of the
 # signal_quality "overall" block (so we can reconstruct overall by exclusion).

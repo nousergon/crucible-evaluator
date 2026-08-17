@@ -153,6 +153,8 @@ pandas~=3.0
 # call site was already populating unit= evaluator-side ahead of this floor
 # bump (enforced at the grading/metric_record.py chokepoint); this bump is
 # what makes the krepis-side validator start applying to the fleet.
+# Also (krepis#158, RC v3 T5): the same release widens `MetricTypeLiteral` with
+# `"contribution_lift"` — below this floor `metric_type="contribution_lift"` raises.
 krepis[flow-doctor,openai]>=0.59.11
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
