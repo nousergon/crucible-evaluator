@@ -81,6 +81,24 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 
+# The standing, continuously-maintained pointer (alpha-engine-config-I7157),
+# mirroring `grading/aggregate.py::LATEST_REPORT_CARD_KEY` /
+# `write_report_card`'s `evaluator/latest/report_card.json` pattern: every
+# enabled Director run overwrites this key with the same (already-verdict-
+# stamped) body it writes to the dated `plan_key`, so a fixed-key console
+# binding (`nous-ergon-ops/governance/observability.d/
+# alpha-engine-evaluator-director.yaml`) has something to read every day
+# without templating on the run date. The DATED key stays the record any
+# date-scoped reader (`_load_prior_plan`, the retro loader) consumes — this
+# `latest` pointer is deliberately never read back by this module, same as
+# the report-card `latest` pointer is never read by the Director itself.
+LATEST_ACTION_PLAN_KEY = "director/latest/action_plan.json"
+
+
+def latest_action_plan_key() -> str:
+    return LATEST_ACTION_PLAN_KEY
+
+
 # Operator-facing SSM path for the ROADMAP-PR PAT — used ONLY in log/skip
 # messages. Deliberately named without "token"/"secret" so CodeQL's
 # clear-text-logging name heuristic doesn't false-positive: this is a parameter
@@ -708,11 +726,25 @@ def _run(event: dict | None = None, context=None) -> dict:
                              budget=budget)
 
     plan_key = f"director/{run_date}/action_plan.json"
+    stamped_body = stamp_plan_artifact(plan, verdict_block)
     s3.put_object(
         Bucket=bucket, Key=plan_key,
         # §2.3a rule 3 — the plan artifact is the body the console Director page
         # renders, so it carries the verdict alongside the numbers it advises on.
-        Body=stamp_plan_artifact(plan, verdict_block),
+        Body=stamped_body,
+        ContentType="application/json",
+    )
+    # alpha-engine-config-I7157 option (a): also overwrite the standing
+    # `director/latest/action_plan.json` pointer with the SAME stamped body,
+    # mirroring `grading/aggregate.py::write_report_card`'s `evaluator/latest/`
+    # pattern — chosen over binding the console row to the dated key because a
+    # templated-date binding renders absent every day the template doesn't
+    # match, which is a detector that cries wolf rather than one that measures
+    # (the reasoning `nous-ergon-ops-PR614` used for the report-card row
+    # applies identically here).
+    s3.put_object(
+        Bucket=bucket, Key=LATEST_ACTION_PLAN_KEY,
+        Body=stamped_body,
         ContentType="application/json",
     )
     merged = merge_plan_into_ledger(ledger, plan, run_date)
@@ -773,6 +805,7 @@ def _run(event: dict | None = None, context=None) -> dict:
         "n_action_items": len(plan.action_items),
         "n_top_risks": len(plan.top_risks),
         "action_plan_key": plan_key,
+        "latest_action_plan_key": LATEST_ACTION_PLAN_KEY,
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
         "digest_email": "sent" if email_sent else "not_sent",

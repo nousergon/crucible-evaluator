@@ -264,6 +264,26 @@ class TestHandler:
         assert written["run_date"] == RUN_DATE
         assert out["ledger_size"] == 1
 
+    def test_writes_latest_pointer_alongside_dated_key(self, s3, monkeypatch):
+        # alpha-engine-config-I7157 option (a): every enabled run also
+        # overwrites the standing `director/latest/action_plan.json` pointer,
+        # mirroring `grading/aggregate.py::write_report_card`'s
+        # `evaluator/latest/report_card.json` — a fixed key the console's
+        # document-fields binding can read without templating on run_date.
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+        assert out["latest_action_plan_key"] == "director/latest/action_plan.json"
+        assert H.latest_action_plan_key() == "director/latest/action_plan.json"
+        dated = json.loads(s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read())
+        latest = json.loads(s3.get_object(Bucket=BUCKET, Key=out["latest_action_plan_key"])["Body"].read())
+        # Same stamped body (including the §2.3a verdict block) on both keys.
+        assert latest == dated
+
     def test_reads_dated_snapshot_not_latest_pointer(self, s3, monkeypatch):
         # config-I2556: the grading Lambda now ALSO maintains a continuously
         # updated evaluator/latest/report_card.json. Seed it with DIFFERENT
