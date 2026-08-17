@@ -61,6 +61,7 @@ from botocore.exceptions import ClientError
 from grading.metric_record import build_metric
 from grading.thresholds.registry import resolve as resolve_band
 from grading.module_agg import build_tile
+from grading.units import SCORE_0_100
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ def _component(name: str, grade_key: str, grade: dict | None, src: str):
         judge_part = f", judge_model={judge_model}" if judge_model else ""
         return build_metric(
             name=name, module=MODULE, metric_type="ratio", criticality="supporting",
-            value=value, n_samples=1, n_floor=1,
+            value=value, unit=SCORE_0_100, n_samples=1, n_floor=1,
             higher_is_better=True, source_path=src,
             reason=(f"{name} = {value}/100 (prior_run_date={grade.get('prior_run_date')}"
                     f"{judge_part}) vs target {_band.target:g} / red-line {_band.red_line:g}."),

@@ -32,6 +32,7 @@ from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
 from grading.thresholds.scoring import build_arm_components, leaderboard_key
+from grading.units import COUNT_EVENTS, COUNT_ROWS, DAYS, FRACTION
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +300,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="price_cache_freshness", module=MODULE, metric_type="duration", criticality="critical",
             estimator="freshness_age",
-            value=age_d, n_samples=1, n_floor=1, higher_is_better=False,
+            value=age_d, unit=DAYS, n_samples=1, n_floor=1, higher_is_better=False,
             source_path=pc_src,
             reason=f"price_cache_freshness = {age_d:.1f}d since the price cache last refreshed vs target 7d / red-line 14d.",
         ))
@@ -362,7 +363,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
                 estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
-                value=sf["cycle_rate"], n_samples=sf["n_cycles"], n_floor=3, 
+                value=sf["cycle_rate"], unit=FRACTION, n_samples=sf["n_cycles"], n_floor=3,
                 source_path=sf_src,
                 reason=(f"sf_success_rate_4w = {sf['cycle_rate']:.0%} ({sf['n_cycles_clean']}/{sf['n_cycles']} "
                         f"DISTINCT production-role cycles completed clean — recovery counts as clean — in "
@@ -382,7 +383,7 @@ def build_substrate_tile(
                 components.append(build_metric(
                     name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
                     estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
-                    value=sf["unattended_rate"], n_samples=sf["n_unattended"], n_floor=3,
+                    value=sf["unattended_rate"], unit=FRACTION, n_samples=sf["n_unattended"], n_floor=3,
                     source_path=sf_src,
                     reason=(f"unattended_first_pass_rate = {sf['unattended_rate']:.0%} ({sf['n_unattended_ok']}/"
                             f"{sf['n_unattended']} scheduled cycles succeeded with NO operator recovery in "
@@ -425,7 +426,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                value=blocked, n_samples=1, n_floor=1, 
+                value=blocked, unit=COUNT_ROWS, n_samples=1, n_floor=1,
                 higher_is_better=False, source_path=dq_src,
                 reason=(f"data_quality_incidents = {blocked:.0f} feature-store rows BLOCKED by the "
                         f"quality gate over {_SF_WINDOW_DAYS}d (warned: {warned_s}) vs target 200 / "
@@ -472,7 +473,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                value=drift, n_samples=1, n_floor=1, 
+                value=drift, unit=COUNT_EVENTS, n_samples=1, n_floor=1,
                 higher_is_better=False, source_path=sd_src,
                 reason=(f"schema_drift_incidents = {drift:.0f} ArcticDB StreamDescriptorMismatch / "
                         f"DataError write failures over {_SF_WINDOW_DAYS}d vs target 0 / red-line 3. "
@@ -521,7 +522,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
             estimator="per_run_phase_timeout_count", measurement_horizon="per_run",
-            value=float(firings), n_samples=1, n_floor=1,
+            value=float(firings), unit=COUNT_EVENTS, n_samples=1, n_floor=1,
             higher_is_better=False,
             source_path=wf_src,
             reason=(f"watchdog_firings = {firings} backtester phase(s) hit their hard "
@@ -564,7 +565,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="deploy_workflow_success_rate", measurement_horizon=f"trailing_{win}d",
-            value=float(ds_rate), n_samples=int(ds_total), n_floor=3,
+            value=float(ds_rate), unit=FRACTION, n_samples=int(ds_total), n_floor=3,
             source_path=ds_src,
             reason=(f"deploy_success_rate = {float(ds_rate):.0%} ({ds_succ}/{ds_total} terminal "
                     f"deploy-workflow runs across {n_repos} repo(s) succeeded in {win}d) "

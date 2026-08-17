@@ -54,6 +54,7 @@ from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.tiles.predictor import LATEST_KEY, MANIFEST_KEY
+from grading.units import COUNT_EVENTS, COUNT_ITEMS, FRACTION, HOURS, RANK_IC, RATIO
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="evaluator_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion", measurement_horizon="trailing_4w",
-            value=cov, n_samples=total, n_floor=1, source_path=g_src,
+            value=cov, unit=FRACTION, n_samples=total, n_floor=1, source_path=g_src,
             reason=(f"evaluator_coverage = {cov:.0%} ({graded}/{total} leaf components graded, "
                     f"non-N/A) vs target 95% / red-line 80%." if cov is not None else None),
             na_detail="evaluator_coverage: grading.json has no gradable components this cycle.",
@@ -250,7 +251,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="numeric_attestation", module=MODULE, metric_type="pct", criticality="critical",
             estimator="known_answer_battery", measurement_horizon="this_cycle",
-            value=1.0, n_samples=att.get("n_checks") or 1, n_floor=1,
+            value=1.0, unit=FRACTION, n_samples=att.get("n_checks") or 1, n_floor=1,
             source_path=a_src, status="GREEN",
             reason=att["reason"],
         ))
@@ -258,7 +259,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="numeric_attestation", module=MODULE, metric_type="pct", criticality="critical",
             estimator="known_answer_battery", measurement_horizon="this_cycle",
-            value=0.0, n_samples=att.get("n_checks") or 1, n_floor=1,
+            value=0.0, unit=FRACTION, n_samples=att.get("n_checks") or 1, n_floor=1,
             source_path=a_src, status="RED",
             reason=att["reason"],
         ))
@@ -300,7 +301,7 @@ def build_backtester_tile(
             name="evaluator_stage_attestation", module=MODULE, metric_type="pct",
             criticality="critical",
             estimator="known_answer_battery", measurement_horizon="this_cycle",
-            value=1.0, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
+            value=1.0, unit=FRACTION, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
             source_path=s_src, status="GREEN",
             reason=stage_att["reason"],
         ))
@@ -309,7 +310,7 @@ def build_backtester_tile(
             name="evaluator_stage_attestation", module=MODULE, metric_type="pct",
             criticality="critical",
             estimator="known_answer_battery", measurement_horizon="this_cycle",
-            value=0.0, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
+            value=0.0, unit=FRACTION, n_samples=stage_att.get("n_checks") or 1, n_floor=1,
             source_path=s_src, status="RED",
             reason=stage_att["reason"],
         ))
@@ -334,7 +335,7 @@ def build_backtester_tile(
         age_h = (as_of - last_mod).total_seconds() / 3600.0
         components.append(build_metric(
             name="grading_freshness", module=MODULE, metric_type="duration", criticality="supporting",
-            value=age_h, n_samples=1, n_floor=1, 
+            value=age_h, unit=HOURS, n_samples=1, n_floor=1,
             higher_is_better=False, source_path=g_src,
             reason=f"grading_freshness = {age_h:.0f}h since grading.json written vs {_CADENCE_H}h cadence.",
         ))
@@ -358,7 +359,7 @@ def build_backtester_tile(
         diverged = bool(parity.get("trade_count_divergence")) or bool(parity.get("ticker_set_divergence"))
         components.append(build_metric(
             name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct", criticality="supporting",
-            value=0.0 if diverged else 1.0, n_samples=1, n_floor=1, band="unbanded", source_path=p_src,
+            value=0.0 if diverged else 1.0, unit=FRACTION, n_samples=1, n_floor=1, band="unbanded", source_path=p_src,
             status="WATCH" if diverged else "GREEN",
             reason=(f"parity data_state={parity.get('data_state')}; "
                     f"{'divergence present' if diverged else 'no trade/ticker divergence'}."),
@@ -399,7 +400,7 @@ def build_backtester_tile(
             status_field = parity.get("status")
             components.append(build_metric(
                 name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct",
-                criticality="supporting", value=0.0, n_samples=1, n_floor=1,
+                criticality="supporting", value=0.0, unit=FRACTION, n_samples=1, n_floor=1,
                 source_path=p_src, status="RED",
                 reason=(
                     f"the parity replay produced no usable comparison: "
@@ -432,7 +433,7 @@ def build_backtester_tile(
         status, band_desc = _fdr_surface_status(n_sig, attr.get("n_fdr_tests"))
         components.append(build_metric(
             name="fdr_surface_health", module=MODULE, metric_type="count", criticality="supporting",
-            value=float(n_sig), n_samples=attr.get("rows_analyzed"), n_floor=1, source_path=a_src,
+            value=float(n_sig), unit=COUNT_ITEMS, n_samples=attr.get("rows_analyzed"), n_floor=1, source_path=a_src,
             status=status,
             reason=f"fdr_surface_health = {n_sig} BH-FDR-significant correlations (α=0.05) vs {band_desc}.",
         ))
@@ -455,7 +456,7 @@ def build_backtester_tile(
         )
         components.append(build_metric(
             name="auto_apply_rollback_count", module=MODULE, metric_type="count", criticality="diagnostic",
-            value=float(n_rb), n_samples=1, n_floor=1, higher_is_better=False,
+            value=float(n_rb), unit=COUNT_EVENTS, n_samples=1, n_floor=1, higher_is_better=False,
             source_path=f"s3://{bucket}/config/rollback_audit/",
             reason=f"auto_apply_rollback_count = {n_rb} rollback-audit objects in the last 28d vs target 0 / red-line 2.",
         ))
@@ -544,7 +545,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="apply_loop_health", module=MODULE, metric_type="count", criticality="critical",
             estimator="per_loop_outcome_state_machine", measurement_horizon="per_cycle",
-            value=float(len(unhealthy)), n_samples=len(loops), n_floor=1,
+            value=float(len(unhealthy)), unit=COUNT_ITEMS, n_samples=len(loops), n_floor=1,
             higher_is_better=False, source_path=aa_src, status=status, reason=reason,
         ))
     else:
@@ -581,7 +582,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="sample_size_adequacy", module=MODULE, metric_type="ratio", criticality="critical",
             estimator="weakest_link_finalized_signal_count_vs_floor", measurement_horizon="per_cycle",
-            value=ratio, n_samples=wk.get("n"), n_floor=1, 
+            value=ratio, unit=RATIO, n_samples=wk.get("n"), n_floor=1,
             higher_is_better=True, source_path=ss_src,
             reason=(f"sample_size_adequacy: weakest-link adequacy = {ratio:.2f} "
                     f"({weakest}: n={wk.get('n')} vs floor {wk.get('floor')}; {breakdown}). {verdict}"),
@@ -615,7 +616,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="risk_ratio_ci", module=MODULE, metric_type="pct", criticality="critical",
             estimator="block_bootstrap_ci_magnitude_certainty", measurement_horizon="per_cycle",
-            value=1.0 if certain else 0.0, n_samples=n, n_floor=1, source_path=rr_src,
+            value=1.0 if certain else 0.0, unit=FRACTION, n_samples=n, n_floor=1, source_path=rr_src,
             status="GREEN" if certain else "WATCH",
             reason=(f"risk_ratio_ci: all_magnitude_certain={certain} (N={n} vs floor {floor}); "
                     + (f"still straddling zero: {', '.join(sorted(uncertain))}. Size remediation by "
@@ -645,7 +646,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="optimizer_churn", module=MODULE, metric_type="ratio", criticality="critical",
             estimator="max_abs_weight_change_over_guardrail_cap", measurement_horizon="per_cycle",
-            value=cr, n_samples=oc.get("n_params_changed"), n_floor=1,
+            value=cr, unit=RATIO, n_samples=oc.get("n_params_changed"), n_floor=1,
             higher_is_better=False, source_path=oc_src,
             reason=(f"optimizer_churn = {cr:.2f} (max |Δ|={oc.get('max_abs_change')} on "
                     f"{oc.get('max_change_param')!r} vs cap {oc.get('guardrail_cap')}; "
@@ -713,10 +714,16 @@ def build_backtester_tile(
 
     if cpcv_ic is not None and live_ic is not None:
         drift = float(live_ic) - float(cpcv_ic)
+        # AMBIGUOUS(config#7485): drift subtracts a single-window Pearson r
+        # (ic_30d, per the comment above at :688) from a leak-free CPCV mean
+        # rank IC (mean_ic) — the two operands are not the same estimator, so
+        # this delta has no single clean unit. RANK_IC used as the
+        # best-supported reading (matches meta_l2_ic/predictor.py's rank_ic
+        # convention and the cpcv side, which dominates the "expected" leg).
         components.append(build_metric(
             name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
             estimator="ic_delta", measurement_horizon="30d_live_vs_cpcv_oos",
-            value=drift, n_samples=rolling_n, n_floor=10, 
+            value=drift, unit=RANK_IC, n_samples=rolling_n, n_floor=10,
             source_path=bvlp_src,
             reason=(f"backtest_vs_live_parity = {drift:+.3g} (live 30d rolling IC {live_ic:.3g} "
                     f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.3g}) "
@@ -755,7 +762,7 @@ def build_backtester_tile(
         components.append(build_metric(
             name="walk_forward_stability", module=MODULE, metric_type="ratio", criticality="supporting",
             estimator="one_minus_reversal_fraction_over_weekly_window", measurement_horizon="multi_week",
-            value=sr, n_samples=wf.get("weeks_loaded"), n_floor=1,
+            value=sr, unit=RATIO, n_samples=wf.get("weeks_loaded"), n_floor=1,
             higher_is_better=True, source_path=wf_src,
             reason=(f"walk_forward_stability = {sr:.2f} ({wf.get('n_reversals')} reversals of "
                     f"{wf.get('max_possible_reversals')} possible over {wf.get('weeks_loaded')} prior weeks; "

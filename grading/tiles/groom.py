@@ -58,6 +58,7 @@ import boto3
 from krepis.metrics import MetricRecord
 
 from grading.metric_record import build_metric
+from grading.units import COUNT_CHUNKS, COUNT_ISSUES, FRACTION, WET_PER_COMPLETION
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         name="groom_completion_rate", module=MODULE, metric_type="pct", criticality="supporting",
         estimator="disposition_share_trailing_window", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
-        value=rate, n_samples=n_disp, n_floor=30,
+        value=rate, unit=FRACTION, n_samples=n_disp, n_floor=30,
         higher_is_better=True, source_path=src,
         reason=(f"groom_completion_rate = {rate:.1%} ({completions}/{n_disp} dispositions "
                 f"closed/PR'd across {n_runs} runs, {span}) vs provisional target 30% / "
@@ -226,7 +227,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         name="groom_wet_per_completion", module=MODULE, metric_type="ratio", criticality="diagnostic",
         estimator="wet_sum_over_completions", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
-        value=wet_per, n_samples=completions, n_floor=1,
+        value=wet_per, unit=WET_PER_COMPLETION, n_samples=completions, n_floor=1,
         higher_is_better=False, source_path=src,
         reason=(f"groom_wet_per_completion = {wet_per:,.0f} WET ({total_wet:,.0f} WET over "
                 f"{len(wet_runs)} runs / {completions} completions, {span}{null_note}) — "
@@ -254,7 +255,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         name="groom_comment_churn", module=MODULE, metric_type="count", criticality="supporting",
         estimator="distinct_issue_churn_count", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
-        value=float(churn), n_samples=n_issues, n_floor=10,
+        value=float(churn), unit=COUNT_ISSUES, n_samples=n_issues, n_floor=10,
         higher_is_better=False, source_path=src,
         reason=(f"groom_comment_churn = {churn} issue(s) with ≥{_CHURN_MIN_COMMENTS} commented "
                 f"dispositions and no completion in {span} (N={n_issues} distinct issues) vs "
@@ -272,7 +273,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         name="groom_lost_chunks", module=MODULE, metric_type="count", criticality="supporting",
         estimator="chunk_failure_signature_count", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
-        value=float(lost), n_samples=n_runs, n_floor=5,
+        value=float(lost), unit=COUNT_CHUNKS, n_samples=n_runs, n_floor=5,
         higher_is_better=False, source_path=src,
         reason=(f"groom_lost_chunks = {lost} max_turns chunk failure(s) across {n_runs} runs "
                 f"({span}, {len(keys)} artifacts) vs target 0 / red-line 5 "
