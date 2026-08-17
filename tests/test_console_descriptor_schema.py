@@ -92,6 +92,30 @@ def test_descriptor_only_names_registered_drivers():
             )
 
 
+def _s3_records_binding(descriptor: dict) -> dict:
+    """The `s3-records` fan-out binding out of `metrics`.
+
+    `metrics` became a LIST of two bindings at the full-row conversion
+    (alpha-engine-config-I7477 deliverable 2): `document-fields` for the
+    §2.3a correctness verdict (ported from the retired
+    `nous-ergon-ops/governance/observability.d/alpha-engine-evaluator.yaml`
+    row) plus the `s3-records` fan-out this branch already shipped. Selected
+    by driver rather than by list position, so a reorder of the two bindings
+    cannot silently break this test.
+    """
+    bindings = _bindings(descriptor["metrics"])
+    matches = [b for b in bindings if b.get("driver") == "s3-records"]
+    assert len(matches) == 1, f"expected exactly one s3-records metrics binding, found {len(matches)}"
+    return matches[0]
+
+
+def _document_fields_binding(descriptor: dict) -> dict:
+    bindings = _bindings(descriptor["metrics"])
+    matches = [b for b in bindings if b.get("driver") == "document-fields"]
+    assert len(matches) == 1, f"expected exactly one document-fields metrics binding, found {len(matches)}"
+    return matches[0]
+
+
 def test_metrics_binding_uses_s3_records_fanout():
     """T4 deliverable 1: one Signal per (tile, component) report-card row,
     via the `s3-records` driver's fan-out grammar (nousergon-console#98,
@@ -99,14 +123,30 @@ def test_metrics_binding_uses_s3_records_fanout():
     fan-out back to a single-entity binding.
     """
     descriptor = _load_descriptor()
-    metrics = descriptor["metrics"]
-    assert metrics["driver"] == "s3-records"
+    metrics = _s3_records_binding(descriptor)
     assert metrics["kind"] == "signal"
     assert metrics["records_path"] == "tiles.*.components"
     assert metrics["group_field"] == "tile"
     assert metrics["id_template"] == "{tile}:{name}"
     assert metrics["state_field"] == "status"
     assert "cadence_minutes" in metrics
+
+
+def test_metrics_binding_carries_the_correctness_verdict():
+    """Full-row conversion (I7477 deliverable 2): the §2.3a correctness
+    verdict binding, previously declared only on the now-retired
+    `nous-ergon-ops` registry row, is now carried by this descriptor —
+    ported verbatim so the fact does not go dark between the two PRs'
+    merges.
+    """
+    descriptor = _load_descriptor()
+    doc_fields = _document_fields_binding(descriptor)
+    docs = doc_fields["documents"]
+    assert len(docs) == 1
+    fields = docs[0]["fields"]
+    assert fields["correctness_verdict"]["path"] == "attestation.verdict"
+    assert fields["tiles_overall_status"]["path"] == "tiles_overall_status"
+    assert "cadence_minutes" in doc_fields
 
 
 def test_metrics_value_field_has_no_hardcoded_unit_or_baseline():
@@ -122,13 +162,14 @@ def test_metrics_value_field_has_no_hardcoded_unit_or_baseline():
     filed alongside this PR for the missing capability.
     """
     descriptor = _load_descriptor()
-    value_field = descriptor["metrics"]["fields"]["value"]
+    metrics = _s3_records_binding(descriptor)
+    value_field = metrics["fields"]["value"]
     assert "unit" not in value_field
     assert "baseline" not in value_field
     # The record's own unit/target are still surfaced, just not wired into
     # `value`'s own descriptor metadata yet.
-    assert descriptor["metrics"]["fields"]["unit"]["path"] == "unit"
-    assert descriptor["metrics"]["fields"]["target"]["path"] == "target"
+    assert metrics["fields"]["unit"]["path"] == "unit"
+    assert metrics["fields"]["target"]["path"] == "target"
 
 
 def test_runs_binding_is_deliberately_absent():
