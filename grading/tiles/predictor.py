@@ -30,6 +30,7 @@ from grading.artifacts import PREDICTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.units import DAYS, ECE, FRACTION, RANK_IC
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
         estimator="rank_ic", measurement_horizon="21d",
-        value=cpcv_mean, n_samples=n_combos, n_floor=10, 
+        value=cpcv_mean, unit=RANK_IC, n_samples=n_combos, n_floor=10,
         ci_low=ci_low, ci_high=ci_high, ci_method=ci_method, source_path=manifest_src,
         input_present=cpcv_ok, reason=meta_reason,
         reliability=_reliability_for("meta_model_oos_ic_cpcv"),
@@ -177,13 +178,13 @@ def build_predictor_tile(
     components.append(build_metric(
         name="momentum_l1_ic", module=MODULE, metric_type="ic", criticality="critical",
         estimator="rank_ic_oos", measurement_horizon="21d",
-        value=mom_ic, n_samples=n_folds, n_floor=8, 
+        value=mom_ic, unit=RANK_IC, n_samples=n_folds, n_floor=8,
         source_path=manifest_src, input_present=mom_ic is not None,
         reliability=_reliability_for("momentum_median_ic"),
     ))
     components.append(build_metric(
         name="volatility_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
-        value=vol_ic, n_samples=n_folds, n_floor=8, 
+        value=vol_ic, unit=RANK_IC, n_samples=n_folds, n_floor=8,
         source_path=manifest_src, input_present=vol_ic is not None,
         reliability=_reliability_for("volatility_median_ic"),
     ))
@@ -191,7 +192,7 @@ def build_predictor_tile(
     rescal_n = latest.get("research_calibrator_n_samples")
     components.append(build_metric(
         name="research_calibrator_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
-        value=rescal_ic, n_samples=rescal_n, n_floor=50, 
+        value=rescal_ic, unit=RANK_IC, n_samples=rescal_n, n_floor=50,
         source_path=latest_src,
     ))
 
@@ -244,7 +245,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="ensemble_lift_over_best_l1", module=MODULE, metric_type="ic", criticality="critical",
         estimator="ic_delta", measurement_horizon="21d",
-        value=lift, n_samples=n_combos, n_floor=10, 
+        value=lift, unit=RANK_IC, n_samples=n_combos, n_floor=10,
         source_path=manifest_src, input_present=lift_present, reason=lift_reason,
         na_detail=lift_na or "ensemble_lift: needs the leak-free meta IC and a directional standalone L1 alpha-IC.",
         reliability=_reliability_for("meta_l1_standalone_alpha_ic"),
@@ -256,7 +257,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="confidence_calibration_ece", module=MODULE, metric_type="calibration", criticality="critical",
         estimator="expected_calibration_error",
-        value=ece, n_samples=cc.get("n_samples"), n_floor=100, 
+        value=ece, unit=ECE, n_samples=cc.get("n_samples"), n_floor=100,
         higher_is_better=False, source_path=latest_src, input_present=ece is not None,
     ))
 
@@ -267,7 +268,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="output_distribution_gate", module=MODULE, metric_type="pct", criticality="critical",
             estimator="distribution_gate",
-            value=1.0 if passed else 0.0, n_samples=1, n_floor=1, source_path=latest_src,
+            value=1.0 if passed else 0.0, unit=FRACTION, n_samples=1, n_floor=1, source_path=latest_src,
             status="GREEN" if passed else "RED",
             reason=f"output_distribution_gate {'PASS' if passed else 'FAIL'}: {odg.get('reason', '')}".strip(),
         ))
@@ -307,7 +308,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="wilson_precision", measurement_horizon="10d",
-            value=prec, n_samples=n_v, n_floor=30, 
+            value=prec, unit=FRACTION, n_samples=n_v, n_floor=30,
             ci_low=ci_low, ci_high=ci_high, ci_method="wilson" if ci_low is not None else None,
             source_path=veto_src,
             reason=(f"veto_gate_precision [10d] = {prec:.1%} at the live veto threshold {conf:.2f} "
@@ -383,7 +384,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
             criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
-            value=acc_lift, n_samples=n_total, n_floor=30, 
+            value=acc_lift, unit=FRACTION, n_samples=n_total, n_floor=30,
             source_path=cm_src,
             reason=(f"direction_accuracy = {accuracy:.2%} vs always-{majority_class} majority-class "
                     f"baseline {baseline:.2%} (N={n_total}) — lift {acc_lift:+.2%} vs target "
@@ -412,7 +413,7 @@ def build_predictor_tile(
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
                 criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
-                value=prec_lift, n_samples=n_pred, n_floor=30, 
+                value=prec_lift, unit=FRACTION, n_samples=n_pred, n_floor=30,
                 source_path=cm_src,
                 reason=(f"{name}: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
                         f"(N={n_pred} predicted-{cls}) — lift {prec_lift:+.2%} vs target +3pp / red-line 0pp."),
@@ -441,7 +442,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion",
-            value=coverage, n_samples=n_universe, n_floor=1, 
+            value=coverage, unit=FRACTION, n_samples=n_universe, n_floor=1,
             source_path=latest_src,
             reason=(f"inference_coverage = {coverage:.1%} ({n_covered}/{n_universe} tradable-universe "
                     f"tickers predicted) vs target 95% / red-line 80%."),
@@ -466,7 +467,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
             estimator="freshness_age",
-            value=slim_age_d, n_samples=1, n_floor=1, 
+            value=slim_age_d, unit=DAYS, n_samples=1, n_floor=1,
             higher_is_better=False, source_path=slim_src,
             reason=f"slim_cache_freshness = {slim_age_d:.1f}d since the inference slim-cache last refreshed vs target 7d / red-line 14d.",
         ))
@@ -488,9 +489,12 @@ def build_predictor_tile(
         max_ks = float(fdk["max_ks"])
         per_feat = fdk.get("per_feature") or {}
         worst = next(iter(per_feat.items()), None)
+        # AMBIGUOUS(config#7485): the KS statistic is a max CDF-distance bounded
+        # [0,1] — not literally a proportion, but nothing in units.py names a
+        # bounded-statistic unit more precisely; FRACTION is the closest fit.
         components.append(build_metric(
             name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
-            estimator="ks_2samp_max", value=max_ks, n_samples=int(fdk.get("n_samples") or 0),
+            estimator="ks_2samp_max", value=max_ks, unit=FRACTION, n_samples=int(fdk.get("n_samples") or 0),
             n_floor=30, higher_is_better=False, source_path=latest_src,
             reason=(
                 f"feature_drift_ks: worst-feature inference-vs-training KS = {max_ks:.3f} "

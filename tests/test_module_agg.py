@@ -7,13 +7,14 @@ from grading.module_agg import (
     numeric_grade,
     overall_status,
 )
+from grading.units import RATIO
 
 SRC = "s3://b/x"
 
 
 def _crit(status, *, p=None):
     return build_metric(
-        name=f"c_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0,
+        name=f"c_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0, unit=RATIO,
         n_samples=120, target=0.5, red_line=0.0, criticality="critical",
         estimator="test_robust", source_path=SRC, status=status, bh_fdr_adjusted_p=p, reason="x",
     )
@@ -21,7 +22,7 @@ def _crit(status, *, p=None):
 
 def _sup(status):
     return build_metric(
-        name=f"s_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0,
+        name=f"s_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0, unit=RATIO,
         n_samples=120, target=0.5, red_line=0.0, criticality="supporting",
         source_path=SRC, status=status, reason="x",
     )
@@ -29,7 +30,7 @@ def _sup(status):
 
 def _diag(status):
     return build_metric(
-        name=f"d_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0,
+        name=f"d_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0, unit=RATIO,
         n_samples=120, criticality="diagnostic", band=None, source_path=SRC, status=status, reason="x",
     )
 
@@ -138,7 +139,7 @@ class TestBuildTileFreshnessStamps:
 
     def test_source_artifact_dates_mined_from_dated_source_path(self):
         c = build_metric(
-            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0, unit=RATIO,
             n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
             source_path="s3://bucket/backtest/2026-06-05/e2e_lift.json",
             status="GREEN", reason="x",
@@ -148,17 +149,17 @@ class TestBuildTileFreshnessStamps:
 
     def test_multiple_dates_deduped_and_sorted(self):
         c1 = build_metric(
-            name="a", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            name="a", module="m", metric_type="ratio", n_floor=1, value=1.0, unit=RATIO,
             n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
             source_path="s3://bucket/backtest/2026-06-07/x.json", status="GREEN", reason="x",
         )
         c2 = build_metric(
-            name="b", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            name="b", module="m", metric_type="ratio", n_floor=1, value=1.0, unit=RATIO,
             n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
             source_path="s3://bucket/backtest/2026-06-05/y.json", status="GREEN", reason="x",
         )
         c3 = build_metric(
-            name="c", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            name="c", module="m", metric_type="ratio", n_floor=1, value=1.0, unit=RATIO,
             n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
             source_path="s3://bucket/backtest/2026-06-05/z.json", status="GREEN", reason="x",
         )
@@ -169,7 +170,7 @@ class TestBuildTileFreshnessStamps:
         # A "latest" pointer artifact (no embedded date) is an honest gap, not
         # a fabricated attribution.
         c = build_metric(
-            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0,
+            name="x", module="m", metric_type="ratio", n_floor=1, value=1.0, unit=RATIO,
             n_samples=10, target=1.0, red_line=0.0, criticality="supporting",
             source_path="s3://bucket/predictor/metrics/latest.json",
             status="GREEN", reason="x",
