@@ -147,7 +147,13 @@ pandas~=3.0
 # call in a `finally`. 0.59.7 emits the four contract columns above and has
 # no way to WRITE them — a Lambda container is frozen between invocations,
 # so the sink's `atexit` hook never runs and every buffered record is lost.
-krepis[flow-doctor,openai]>=0.59.8
+# Raised to >=0.59.11 (alpha-engine-config-I7485): the FIRST published krepis
+# carrying `unit: str | None` on MetricRecord (krepis-PR158) plus its
+# model_validator requiring unit whenever value is set. Every build_metric
+# call site was already populating unit= evaluator-side ahead of this floor
+# bump (enforced at the grading/metric_record.py chokepoint); this bump is
+# what makes the krepis-side validator start applying to the fleet.
+krepis[flow-doctor,openai]>=0.59.11
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
