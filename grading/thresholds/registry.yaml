@@ -1,0 +1,277 @@
+# registry.yaml — the Report Card v2 threshold slot (alpha-engine-config#7476).
+#
+# WHAT THIS IS
+# Every `target` / `red_line` the card grades a MetricRecord against. Until
+# 2026-08-16 these were ~150 literals scattered across `grading/tiles/*.py`,
+# which made the card's most consequential decision — where GREEN stops and RED
+# starts — unmeasurable: no arm, no history, nothing that could answer whether a
+# GREEN at week t said anything about week t+1.
+#
+# The values below are the literals as they stood at commit 9712bc7, moved here
+# BYTE FOR BYTE. This file is therefore behaviour-preserving on the day it
+# lands: the champion arm (`declared_v2`) reproduces the previous card exactly.
+#
+# HOW IT CHANGES
+# By PR, never by code. `grading/thresholds/promote.py` performs a promotion
+# (swap `slot.champion`, record the evidence in EXPERIMENTS.md); the challenger
+# `history_bands_v1` proposes bands every cycle as shadow output and is scored
+# beside the champion in `evaluator/{date}/threshold_leaderboard.json`.
+#
+# ROW SEMANTICS
+#   target/red_line: null    an ungraded metric — a real, documented state.
+#                            Distinct from an ABSENT row, which raises.
+#   dynamic: true            bands come from the data itself; the call site
+#                            passes them and must say where they come from.
+#   higher_is_better         the DECLARED direction, used by the challenger to
+#                            orient its quantiles. `build_metric` still infers
+#                            its own from the target/red_line ordering exactly
+#                            as before — this field does not feed grading.
+#   n_floor_declared         the sample floor observed at the call site, recorded
+#                            for the challenger's context. Not injected: floors
+#                            are frequently data-dependent and stay with the tile.
+version: 1
+
+slot:
+  id: report_card_thresholds
+  decision: >-
+    the target/red_line bands that turn a measured MetricRecord value into
+    GREEN / WATCH / RED on the weekly Report Card
+  champion: declared_v2
+  arms:
+    - declared_v2         # hand-declared bands, incumbent since RC v2 (bootstrap-promoted, §9.1)
+    - history_bands_v1    # history-derived empirical bands, shadow only
+  arm_detail:
+    declared_v2:
+      kind: declared
+      promoted: 2026-05-22
+      bootstrap: true     # §9.1 — a slot with no prior champion; an arm had to serve
+      note: >-
+        the bands in `metrics:` below. Chosen by hand from the RC v2 design doc
+        (alpha-engine-docs/private/system-report-card-revamp-260522.md); never
+        scored against an outcome until this slot existed.
+    history_bands_v1:
+      kind: derived
+      registered: 2026-08-16
+      module: grading.thresholds.challenger
+      note: >-
+        per-metric empirical bands from the prior-card series, split on the sign
+        of the realized next-cycle objective. Shadow output only — never consumed
+        for status until promoted.
+
+  # The yardstick BOTH arms are scored on. Not the card: the judge is never
+  # scored on the scorecard it grades (champion-challenger §8).
+  objective:
+    name: next_cycle_realized_log_alpha_vs_spy
+    source: >-
+      evaluator/{date}/report_card.json ::
+      tiles.portfolio_outcome.components[name=alpha_vs_spy].value
+    producer: grading/tiles/portfolio_outcome.py:530-535 (estimator cumulative_log_alpha,
+      grading/tiles/portfolio_outcome.py:75)
+    derivation: cumulative_delta
+    derivation_detail: >-
+      `alpha_vs_spy` is CUMULATIVE log-alpha since inception, so the alpha
+      REALIZED between two cards is the difference of their values:
+      objective(t) = value(t + horizon_cycles) - value(t). Prior cards are the
+      SSOT for graded values (the same binding rule grading/history.py states);
+      no re-derivation from raw upstream artifacts.
+    unit: log_return
+    benchmark: SPY
+    horizon_cycles: 4
+    horizon_trading_days: 20
+    horizon_note: >-
+      the fleet-canonical horizon is 21 TRADING days; cards are weekly, so the
+      nearest card-aligned window is 4 cycles = 20 trading days. T2
+      (alpha-engine-config#7475) owns the formal objective spec — when it lands,
+      this block is the single place that changes.
+
+  scoring:
+    metric: brier
+    label: "1[objective > 0]"
+    estimator: leave_one_out_empirical_rate_by_status
+    estimator_detail: >-
+      each arm assigns a status to every graded (module, metric) on card t from
+      its own bands; the predicted P(objective > 0) for a status is that status's
+      empirical hit rate over the cohort with the observation itself held out, so
+      an arm cannot score itself on a rate it defined. Brier = mean squared error
+      of those probabilities against the realized label.
+    statuses_scored: [GREEN, WATCH, RED]
+    cohort_max_cards: 104          # ~2y of weekly cards
+    n_floor_cards: 26              # half a year of PAIRED (t, t+horizon) cards
+    n_floor_per_status: 5
+    clustering: >-
+      observations within one card share a single objective realization, so
+      n_cards is the honest sample size and n_observations is reported beside it.
+      The floor is on CARDS.
+
+  # §4 — hold everything constant except the thing under test.
+  count_matching:
+    rule: shared_cohort_intersection
+    unit: [card_date, module, metric]
+    detail: >-
+      both arms are scored over the intersection of (card, metric) cells where
+      EVERY arm produced a band and the card carried a value-bearing status.
+      An arm that abstains on a metric removes that cell from every arm's
+      cohort, never just its own.
+    vacuity_guard: >-
+      an arm whose bands resolve identically to the champion's on every scored
+      cell is reported `vacuous` — a comparison of a rule with itself is not a
+      comparison.
+
+  # §5.2 — lead by a margin, not merely lead.
+  hysteresis:
+    promotion_margin_brier: 0.02
+    demotion_margin_brier: 0.02
+    cooldown_cycles: 4
+
+  # §7.1 — the horizon may never exceed the retention of the data it reads.
+  # Asserted at load in grading/thresholds/registry.py::parse_registry.
+  retention:
+    source_prefix: "evaluator/"
+    cycle_days: 7
+    expiry_days: null
+    measured: >-
+      2026-08-16, `aws s3api get-bucket-lifecycle-configuration --bucket
+      alpha-engine-research`: two rules only, `staging/` at 7d and `features/` at
+      365d. No rule matches `evaluator/`, so report cards are retained
+      indefinitely and no horizon is structurally impossible. If an expiry rule
+      is ever added to this prefix, set expiry_days here and the load-time
+      assertion becomes live.
+
+# Bands that belong to a BRANCH rather than to a metric — the same fallback rule
+# applied to whichever metric took that path. The metric's own row must still
+# exist; the shared band overrides the numbers.
+shared_bands:
+  unbanded:
+    target: null
+    red_line: null
+    note: >-
+      the N/A construction paths (retired components, whole-tile missing-input
+      shells) that emitted no bands before this registry existed. Preserved
+      exactly: an N/A record carries no bar.
+  raw_precision:
+    target: 0.45
+    red_line: 0.35
+    note: >-
+      grading/tiles/research.py::_precision_metric's base-rate-unavailable
+      fallback, which grades RAW precision instead of precision-minus-base-rate
+      and therefore needs an absolute bar rather than an edge bar.
+
+metrics:
+  agent:
+    agent_latency_p95: {target: 15000.0, red_line: 60000.0, higher_is_better: false, n_floor_declared: 1}
+    agent_validation_failure_rate: {target: 0.02, red_line: 0.1, higher_is_better: false, n_floor_declared: 50}
+    cost_per_signal: {target: 1.0, red_line: 5.0, higher_is_better: false, n_floor_declared: 5}
+    groom_comment_churn: {target: 5.0, red_line: 20.0, higher_is_better: false, n_floor_declared: 10}
+    groom_completion_rate: {target: 0.3, red_line: 0.15, higher_is_better: true, n_floor_declared: 30}
+    groom_lost_chunks: {target: 0.0, red_line: 5.0, higher_is_better: false, n_floor_declared: 5}
+    groom_wet_per_completion: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 1}
+    judge_calibration_cohen_kappa: {target: null, red_line: null, n_floor_declared: 1}
+    judge_rubric_distribution: {target: 0.4, red_line: 0.7, higher_is_better: false, n_floor_declared: 10}
+    retry_storm_count: {target: 0.0, red_line: 5.0, higher_is_better: false, n_floor_declared: 1}
+    stance_source_provenance: {target: 0.95, red_line: 0.5, n_floor_declared: 1}
+  backtester:
+    apply_loop_health: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 1}
+    auto_apply_rollback_count: {target: 0.0, red_line: 2.0, higher_is_better: false, n_floor_declared: 1}
+    backtest_vs_live_parity: {target: 0.0, red_line: -0.05, n_floor_declared: 10}
+    evaluator_coverage: {target: 0.95, red_line: 0.8, n_floor_declared: 1}
+    evaluator_stage_attestation: {target: 1.0, red_line: 1.0, n_floor_declared: 1}
+    fdr_surface_health: {target: null, red_line: null, n_floor_declared: 1}
+    grading_freshness: {target: 168.0, red_line: 192.0, higher_is_better: false, n_floor_declared: 1}
+    numeric_attestation: {target: 1.0, red_line: 1.0, n_floor_declared: 1}
+    optimizer_churn: {target: 0.8, red_line: 1.0, higher_is_better: false, n_floor_declared: 1}
+    risk_ratio_ci: {target: null, red_line: null, n_floor_declared: 1}
+    sample_size_adequacy: {target: 1.0, red_line: 0.5, higher_is_better: true, n_floor_declared: 1}
+    vectorized_vs_consolidated_parity: {target: 1.0, red_line: 1.0, n_floor_declared: 1}
+    walk_forward_stability: {target: 0.8, red_line: 0.5, higher_is_better: true, n_floor_declared: 1}
+  behavioral:
+    conviction_stability: {target: 5.0, red_line: 15.0, n_floor_declared: 5}
+    cost_adjusted_quality: {target: 0.5, red_line: 0.0, n_floor_declared: 15}
+    decision_reversal: {target: 0.1, red_line: 0.3, n_floor_declared: 10}
+    portfolio_state_drift: {target: 0.05, red_line: 0.2, n_floor_declared: 10}
+    turnover:
+      target: null
+      red_line: null
+      dynamic: true
+      n_floor_declared: 1
+      note: >-
+        bands are the L4515 executor turnover tripwire's own published rolling band (red_line=band, target=band/2) — read from optimizer_shadow tripwire, not declared here
+  director_quality:
+    director_actionability: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
+    director_calibration: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
+    director_grounding: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
+  executor:
+    action_entropy: {target: 0.7, red_line: 0.3, higher_is_better: true, n_floor_declared: 20}
+    entry_triggers: {target: 0.55, red_line: 0.45, n_floor_declared: 30}
+    excursion: {target: 1.5, red_line: 0.8, n_floor_declared: 20}
+    exit_rules: {target: 0.7, red_line: 0.4, n_floor_declared: 15}
+    position_sizing: {target: 0.0, red_line: -0.3, n_floor_declared: 20}
+    reconciliation_integrity: {target: 1.0, red_line: 0.9, n_floor_declared: 1}
+    risk_guard: {target: 0.55, red_line: 0.4, n_floor_declared: 20}
+  portfolio_outcome:
+    alpha_trend: {target: 0.0, red_line: null, n_floor_declared: 60}
+    alpha_vs_spy: {target: 0.0, red_line: -0.05, n_floor_declared: 60}
+    beta_vs_spy: {target: null, red_line: null, n_floor_declared: 60}
+    calmar_ratio: {target: 1.0, red_line: 0.0, n_floor_declared: 90}
+    cvar_95_daily: {target: -0.01, red_line: -0.04, n_floor_declared: 60}
+    dsr: {target: 0.95, red_line: 0.5, n_floor_declared: 60}
+    hit_rate_daily: {target: 0.55, red_line: 0.45, n_floor_declared: 60}
+    information_ratio: {target: 0.5, red_line: 0.0, n_floor_declared: 60}
+    max_dd_duration_days: {target: 30.0, red_line: 90.0, higher_is_better: false, n_floor_declared: 2}
+    max_drawdown: {target: -0.15, red_line: -0.25, n_floor_declared: 2}
+    psr: {target: 0.95, red_line: 0.5, n_floor_declared: 60}
+    regime_weighted_alpha: {target: 0.0, red_line: 0.0, n_floor_declared: 30}
+    sharpe_ratio: {target: 1.0, red_line: 0.0, n_floor_declared: 60}
+    sortino_ratio: {target: 1.5, red_line: 0.5, n_floor_declared: 60}
+  predictor:
+    confidence_calibration_ece: {target: 0.05, red_line: 0.15, higher_is_better: false, n_floor_declared: 100}
+    direction_accuracy_vs_majority_baseline: {target: 0.03, red_line: 0.0, n_floor_declared: 30}
+    down_precision_vs_base_rate: {target: 0.03, red_line: 0.0, n_floor_declared: 30}
+    ensemble_lift_over_best_l1: {target: 0.01, red_line: -0.01, n_floor_declared: 10}
+    feature_drift_ks: {target: 0.1, red_line: 0.25, higher_is_better: false, n_floor_declared: 30}
+    inference_coverage: {target: 0.95, red_line: 0.8, n_floor_declared: 1}
+    meta_l2_ic: {target: 0.05, red_line: 0.0, n_floor_declared: 10}
+    momentum_l1_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    output_distribution_gate: {target: null, red_line: null, n_floor_declared: 1}
+    research_calibrator_l1_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 50}
+    slim_cache_freshness: {target: 7.0, red_line: 14.0, higher_is_better: false, n_floor_declared: 1}
+    up_precision_vs_base_rate: {target: 0.03, red_line: 0.0, n_floor_declared: 30}
+    veto_gate_precision: {target: 0.6, red_line: 0.4, n_floor_declared: 30}
+    volatility_l1_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+  research:
+    attractiveness_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    attractiveness_trajectory_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    calibration_diagnostics: {target: 0.05, red_line: 0.15, higher_is_better: false, n_floor_declared: 100}
+    cio: {target: 0.05, red_line: -0.02, n_floor_declared: 30}
+    cio_selection_skill: {target: 0.005, red_line: 0.0, n_floor_declared: 60}
+    composite_scoring: {target: 0.1, red_line: 0.0, n_floor_declared: 30}
+    judge_outcome_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    judge_rubric_pass_rate: {target: 0.85, red_line: 0.6, n_floor_declared: 10}
+    macro_agent: {target: 0.0, red_line: -3.0, n_floor_declared: 20}
+    momentum_regime_ic: {target: 0.0, red_line: -0.05, higher_is_better: true, n_floor_declared: 6}
+    neutralization_live_efficacy: {target: 0.0, red_line: -0.02, higher_is_better: true, n_floor_declared: 4}
+    pillar_emit_coverage: {target: 0.9, red_line: 0.5, n_floor_declared: 10}
+    research_composite_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 60}
+    scanner: {target: 0.05, red_line: -0.02, n_floor_declared: 30}
+    scanner_basket_return: {target: 0.0025, red_line: 0.0, n_floor_declared: 8}
+    scanner_feed_counterfactual: {target: 0.0, red_line: null, higher_is_better: true, n_floor_declared: 10}
+    sector_teams_avg: {target: 0.05, red_line: -0.02, n_floor_declared: 30}
+    signal_volume_adequacy: {target: 20.0, red_line: 8.0, n_floor_declared: 1}
+    thinktank_coverage_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+  substrate:
+    # The threshold slot's own scoring records (config#7476). MACHINE-HEALTH
+    # vocabulary: their status answers "was this arm scored?", never "did it
+    # win?" (champion-challenger §8), so they carry NO bar — a Brier threshold
+    # would be exactly the hand-set literal this slot exists to remove. One row
+    # per arm; adding an arm adds its row in the same PR (§10).
+    threshold_arm_brier_declared_v2: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 26}
+    threshold_arm_brier_history_bands_v1: {target: null, red_line: null, higher_is_better: false, n_floor_declared: 26}
+    alert_noise_ratio: {target: null, red_line: null, n_floor_declared: 1}
+    changelog_coverage: {target: null, red_line: null, n_floor_declared: 1}
+    data_quality_incidents: {target: 200.0, red_line: 500.0, higher_is_better: false, n_floor_declared: 1}
+    deploy_success_rate: {target: 0.95, red_line: 0.8, n_floor_declared: 3}
+    iam_drift: {target: null, red_line: null, n_floor_declared: 1}
+    price_cache_freshness: {target: 7.0, red_line: 14.0, higher_is_better: false, n_floor_declared: 1}
+    schema_drift_incidents: {target: 0.0, red_line: 3.0, higher_is_better: false, n_floor_declared: 1}
+    sf_success_rate_4w: {target: 0.95, red_line: 0.8, n_floor_declared: 3}
+    unattended_first_pass_rate: {target: 0.95, red_line: 0.5, n_floor_declared: 3}
+    watchdog_firings: {target: 0.0, red_line: 2.0, higher_is_better: false, n_floor_declared: 1}

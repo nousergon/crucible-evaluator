@@ -167,10 +167,10 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         # Groomer stopped running or the writer broke across the WHOLE window —
         # a loud, precise degradation on all four records (never a green/quiet
         # card while the pipeline is dark).
-        def _absent(name: str, metric_type, n_floor: int, target, red_line, hib) -> MetricRecord:
+        def _absent(name: str, metric_type, n_floor: int, hib) -> MetricRecord:
             return build_metric(
                 name=name, module=MODULE, metric_type=metric_type, criticality="supporting",
-                n_floor=n_floor, target=target, red_line=red_line, higher_is_better=hib,
+                n_floor=n_floor, higher_is_better=hib,
                 source_path=src, input_present=False,
                 na_detail=(f"{name}: zero groom run artifacts under {src} for {span} — "
                            f"groomer did not run or its writer broke (producer: "
@@ -179,10 +179,10 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
             )
 
         return [
-            _absent("groom_completion_rate", "pct", 30, 0.30, 0.15, True),
-            _absent("groom_wet_per_completion", "ratio", 1, None, None, False),
-            _absent("groom_comment_churn", "count", 10, 5.0, 20.0, False),
-            _absent("groom_lost_chunks", "count", 5, 0.0, 5.0, False),
+            _absent("groom_completion_rate", "pct", 30, True),
+            _absent("groom_wet_per_completion", "ratio", 1, False),
+            _absent("groom_comment_churn", "count", 10, False),
+            _absent("groom_lost_chunks", "count", 5, False),
         ]
 
     n_runs = len(runs)
@@ -202,7 +202,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         estimator="disposition_share_trailing_window", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
         value=rate, n_samples=n_disp, n_floor=30,
-        target=0.30, red_line=0.15, higher_is_better=True, source_path=src,
+        higher_is_better=True, source_path=src,
         reason=(f"groom_completion_rate = {rate:.1%} ({completions}/{n_disp} dispositions "
                 f"closed/PR'd across {n_runs} runs, {span}) vs provisional target 30% / "
                 f"red-line 15% (baseline 7.2%, config#2151)."
@@ -255,7 +255,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         estimator="distinct_issue_churn_count", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
         value=float(churn), n_samples=n_issues, n_floor=10,
-        target=5.0, red_line=20.0, higher_is_better=False, source_path=src,
+        higher_is_better=False, source_path=src,
         reason=(f"groom_comment_churn = {churn} issue(s) with ≥{_CHURN_MIN_COMMENTS} commented "
                 f"dispositions and no completion in {span} (N={n_issues} distinct issues) vs "
                 f"provisional target 5 / red-line 20 (baseline 171 pre-drain, config#2147/#2151)."),
@@ -273,7 +273,7 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
         estimator="chunk_failure_signature_count", measurement_horizon=f"{WINDOW_DAYS}d_window",
         reliability="medium",
         value=float(lost), n_samples=n_runs, n_floor=5,
-        target=0.0, red_line=5.0, higher_is_better=False, source_path=src,
+        higher_is_better=False, source_path=src,
         reason=(f"groom_lost_chunks = {lost} max_turns chunk failure(s) across {n_runs} runs "
                 f"({span}, {len(keys)} artifacts) vs target 0 / red-line 5 "
                 f"(red-line binds once config#2148 lands; baseline ~24)."),

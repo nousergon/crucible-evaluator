@@ -65,11 +65,23 @@ class TestSubstrate:
         assert sf["status"] == "N/A-MISSING-INPUT"
         assert "discoverable" in sf["status_reason"]
 
-    def test_tile_has_ten_components(self, s3):
-        # 10 = the original 9 + the new unattended_first_pass_rate (config#1059).
+    def test_tile_has_twelve_components(self, s3):
+        # 12 = the original 9 + unattended_first_pass_rate (config#1059) + one
+        # threshold-slot scoring record per arm (config#7476, one per registry
+        # arm — champion-challenger §3 scores every arm every cycle).
         tile = build_substrate_tile(BUCKET, s3_client=s3)
-        assert tile["n_components"] == 10
+        assert tile["n_components"] == 12
         assert tile["module"] == "substrate"
+
+    def test_threshold_arm_records_are_present_and_never_silent(self, s3):
+        """A cycle with no leaderboard is a recorded MISS, not an omission."""
+        tile = build_substrate_tile(BUCKET, s3_client=s3)
+        for arm in ("declared_v2", "history_bands_v1"):
+            c = _comp(tile, f"threshold_arm_brier_{arm}")
+            assert c["criticality"] == "diagnostic"
+            assert c["status"] == "N/A-NOT-RUN"
+            assert arm in c["status_reason"]
+            assert c["value"] is None
 
     def test_batch_e_rows_are_accepted_permanent_na(self, s3):
         # config#1153 Option A: alert_noise_ratio / changelog_coverage / iam_drift
