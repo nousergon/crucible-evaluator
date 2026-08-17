@@ -7,13 +7,14 @@ report card to the evaluator's own S3 namespace.
 
 OBSERVE / PARALLEL-RUN (Phase C increment 1):
   The evaluator writes ``evaluator/{date}/report_card.json`` — a NEW key,
-  deliberately NOT the backtester's ``backtest/{date}/grading.json``. During
-  the soak both graders run; we compare letter grades (``--compare``) to verify
-  the evaluator reproduces the backtester's in-process grading from the
-  persisted artifacts. Cutover (dashboard reads the evaluator key; backtester
-  drops its in-process grading call) is a later Phase C step, after the
-  parallel run shows parity. This honours the S3-contract-safety "write both
-  for ≥1 week" rule.
+  deliberately NOT the backtester's ``backtest/{date}/grading.json``. This
+  honours the S3-contract-safety "write both for ≥1 week" rule.
+
+  RC v3 T1 (config-I7474, 2026-08-16): the ``--compare`` backtester-parity
+  soak check (``compare_to_backtester`` / ``_letters``) is deleted — the
+  backtester's v1 letter grade is retired as a rendered surface (its
+  ``analysis/grading.py`` no longer emits a "letter" field at all), so a
+  letter-vs-letter diff against it is no longer meaningful.
 
 The Lambda handler + Saturday-SF wiring arrive in Phase F; this module exposes
 ``build_report_card`` / ``write_report_card`` for that handler and a thin CLI
@@ -27,7 +28,6 @@ import json
 import logging
 
 import boto3
-from botocore.exceptions import ClientError
 
 from grading.artifacts import read_scorecard_inputs
 from grading.attestation import build_run_attestation, verdict_is_pass
@@ -410,53 +410,22 @@ def write_report_card(
     return {"latest_key": latest_key, "dated_key": dated_key}
 
 
-def _letters(scorecard: dict) -> dict[str, str]:
-    """Flatten a scorecard to {path: letter} for parity comparison."""
-    out: dict[str, str] = {"overall": scorecard.get("overall", {}).get("letter", "N/A")}
-    for module in ("research", "predictor", "executor"):
-        mod = scorecard.get(module) or {}
-        out[module] = mod.get("letter", "N/A")
-        for comp_name, comp in (mod.get("components") or {}).items():
-            # sector_teams is a list; the rest are component dicts.
-            if isinstance(comp, dict) and "letter" in comp:
-                out[f"{module}.{comp_name}"] = comp["letter"]
-    return out
-
-
-def compare_to_backtester(
-    bucket: str,
-    run_date: str,
-    scorecard: dict,
-    s3_client=None,
-) -> dict:
-    """Diff the evaluator's letter grades vs the backtester's grading.json.
-
-    Observe-mode parity check. Returns a dict of {path: {evaluator, backtester}}
-    for every path where the two disagree (plus a summary). A clean parallel run
-    has ``mismatches == {}`` on the paths the backtester also grades.
-    """
-    s3 = s3_client or boto3.client("s3")
-    try:
-        resp = s3.get_object(Bucket=bucket, Key=f"backtest/{run_date}/grading.json")
-        bt = json.loads(resp["Body"].read())
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-            return {"status": "no_backtester_grading", "mismatches": {}}
-        raise
-
-    ev_letters = _letters(scorecard)
-    bt_letters = _letters(bt)
-    mismatches: dict[str, dict] = {}
-    for path, bt_letter in bt_letters.items():
-        ev_letter = ev_letters.get(path, "MISSING")
-        if ev_letter != bt_letter:
-            mismatches[path] = {"evaluator": ev_letter, "backtester": bt_letter}
-    return {
-        "status": "compared",
-        "n_paths": len(bt_letters),
-        "n_mismatch": len(mismatches),
-        "mismatches": mismatches,
-    }
+# _letters / compare_to_backtester / --compare deleted RC v3 T1
+# (config-I7474, 2026-08-16): the backtester-parity soak check compared
+# "letter" fields on BOTH sides — crucible-backtester's analysis/grading.py
+# (this repo's compute_scorecard input's counterpart) no longer emits a
+# "letter" key on any level (T1 retires the v1 A-F letter as a RENDERED
+# grade there), so this comparison would now silently read every path as
+# "MISSING" vs the evaluator's own (still-populated) letters — a false
+# 100%-mismatch reading, not a real signal. grading/scorecard.py itself
+# (the compute_scorecard this module still calls below, INCLUDING its
+# coverage/grading_weights renormalization block — config-I7202) is NOT
+# touched: it is not a pure duplicate of the retired v1 grader and a
+# currently-passing producer-contract test
+# (tests/test_report_card_producer_contract.py::TestCoverageBlock) depends
+# on it. Deleting grading/scorecard.py wholesale, as this issue's deliverable
+# 6 literally reads, would break that contract — flagged in the PR body for
+# a ruling rather than guessed through.
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -466,18 +435,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write", action="store_true", help="persist to the evaluator namespace (always overwrites evaluator/latest/report_card.json)")
     parser.add_argument("--no-snapshot", dest="snapshot", action="store_false", default=True,
                          help="with --write: skip the dated evaluator/{date}/report_card.json weekly snapshot (writes latest only)")
-    parser.add_argument("--compare", action="store_true", help="diff letter grades vs the backtester's grading.json")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     scorecard = build_report_card(args.bucket, args.date)
     print(json.dumps(scorecard, indent=2, default=str))
-
-    if args.compare:
-        parity = compare_to_backtester(args.bucket, args.date, scorecard)
-        print("\n--- parity vs backtester grading.json ---")
-        print(json.dumps(parity, indent=2, default=str))
 
     if args.write:
         written = write_report_card(args.bucket, args.date, scorecard, snapshot=args.snapshot)
