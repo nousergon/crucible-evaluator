@@ -113,7 +113,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             criticality="critical", estimator="wilson_failure_rate",
             measurement_horizon="per_run",
             value=blk["value"], n_samples=blk.get("n"), n_floor=50,
-            target=0.02, red_line=0.10, higher_is_better=False, source_path=aq_src,
+            higher_is_better=False, source_path=aq_src,
             reason=(f"agent_validation_failure_rate = {blk['value']:.1%} "
                     f"(N={blk.get('n')} invokes) vs target 2% / red-line 10%."),
         ))
@@ -122,7 +122,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="agent_validation_failure_rate", module=MODULE, metric_type="pct",
             criticality="critical", estimator="wilson_failure_rate",
             measurement_horizon="per_run",
-            n_floor=50, target=0.02, red_line=0.10, higher_is_better=False,
+            n_floor=50, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("agent_validation_failure_rate") if aq_stale
             else "agent_validation_failure_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
@@ -135,13 +135,13 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="cost_per_signal", module=MODULE, metric_type="ratio", criticality="supporting",
             value=blk["value"], n_samples=blk.get("n"), n_floor=5,
-            target=1.0, red_line=5.0, higher_is_better=False, source_path=aq_src,
+            higher_is_better=False, source_path=aq_src,
             reason=f"cost_per_signal = ${blk['value']:.2f} over {blk.get('n')} finalized signals vs target $1 / red-line $5.",
         ))
     else:
         components.append(build_metric(
             name="cost_per_signal", module=MODULE, metric_type="ratio", criticality="supporting",
-            n_floor=5, target=1.0, red_line=5.0, higher_is_better=False,
+            n_floor=5, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("cost_per_signal") if aq_stale
             else "cost_per_signal: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
@@ -155,13 +155,13 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="retry_storm_count", module=MODULE, metric_type="count", criticality="supporting",
             value=blk["value"], n_samples=blk.get("n"), n_floor=1,
-            target=0.0, red_line=5.0, higher_is_better=False, source_path=aq_src,
+            higher_is_better=False, source_path=aq_src,
             reason=f"retry_storm_count = {blk['value']:.0f} agents at retry ceiling (of {blk.get('n')}) vs target 0 / red-line 5.",
         ))
     else:
         components.append(build_metric(
             name="retry_storm_count", module=MODULE, metric_type="count", criticality="supporting",
-            n_floor=1, target=0.0, red_line=5.0, higher_is_better=False,
+            n_floor=1, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("retry_storm_count") if aq_stale
             else "retry_storm_count: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
@@ -175,13 +175,13 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
             value=blk["value"], n_samples=blk.get("n"), n_floor=1,
-            target=15000.0, red_line=60000.0, higher_is_better=False, source_path=aq_src,
+            higher_is_better=False, source_path=aq_src,
             reason=f"agent_latency_p95 = {blk['value']:.0f} ms (N={blk.get('n')}) vs target 15s / red-line 60s.",
         ))
     else:
         components.append(build_metric(
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
-            n_floor=1, target=15000.0, red_line=60000.0, higher_is_better=False,
+            n_floor=1, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("agent_latency_p95") if aq_stale
             else "agent_latency_p95: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
@@ -196,13 +196,13 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         components.append(build_metric(
             name="judge_rubric_distribution", module=MODULE, metric_type="ratio", criticality="diagnostic",
             value=blk["value"], n_samples=blk.get("n"), n_floor=10,
-            target=0.40, red_line=0.70, higher_is_better=False, source_path=aq_src,
+            higher_is_better=False, source_path=aq_src,
             reason=f"judge_rubric_distribution modal-concentration = {blk['value']:.0%} (N={blk.get('n')} evals) vs target 40% / red-line 70% (collapse).",
         ))
     else:
         components.append(build_metric(
             name="judge_rubric_distribution", module=MODULE, metric_type="ratio", criticality="diagnostic",
-            n_floor=10, target=0.40, red_line=0.70, higher_is_better=False,
+            n_floor=10, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("judge_rubric_distribution") if aq_stale
             else "judge_rubric_distribution: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
@@ -212,7 +212,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     #    when signals.json carries `stance_source` (crucible-research#297).
     components.append(build_metric(
         name="stance_source_provenance", module=MODULE, metric_type="pct", criticality="diagnostic",
-        n_floor=1, target=0.95, red_line=0.50, source_path=f"s3://{bucket}/signals/latest.json",
+        n_floor=1, source_path=f"s3://{bucket}/signals/latest.json",
         input_present=False,
         na_detail="stance_source_provenance: signals.json universe entries' `stance_source` field self-activates on the first run carrying it (crucible-research#297).",
     ))

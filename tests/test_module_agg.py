@@ -30,7 +30,7 @@ def _sup(status):
 def _diag(status):
     return build_metric(
         name=f"d_{status}", module="m", metric_type="ratio", n_floor=60, value=1.0,
-        n_samples=120, criticality="diagnostic", source_path=SRC, status=status, reason="x",
+        n_samples=120, criticality="diagnostic", band=None, source_path=SRC, status=status, reason="x",
     )
 
 

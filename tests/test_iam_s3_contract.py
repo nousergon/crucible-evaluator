@@ -124,6 +124,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
     "grading/tiles/substrate.py": 1,
+    # alpha-engine-config-I7476 (RC v3 T3): threshold champion/challenger.
+    # scoring.py writes evaluator/{date}/threshold_leaderboard.json (one
+    # put_object); promote.py reads a leaderboard (one get_object). Both on
+    # the "evaluator" prefix, already granted readwrite -- pin only.
+    "grading/thresholds/promote.py": 1,
+    "grading/thresholds/scoring.py": 1,
 }
 
 

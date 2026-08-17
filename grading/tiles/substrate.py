@@ -31,6 +31,7 @@ from grading.artifacts import get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
+from grading.thresholds.scoring import build_arm_components, leaderboard_key
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +93,6 @@ _SCHEMA_DRIFT_METRIC = "daily_append_schema_drift_count"
 # red-line 2 → exactly 1 = WATCH (a single trip can be a transient infra slowdown —
 # a slow EBS volume, a one-off GC pause), >=2 = RED (repeated caps = a phase
 # systematically exceeding its budget, real degradation needing a root-cause).
-_WATCHDOG_TARGET = 0.0
-_WATCHDOG_RED_LINE = 2.0
 
 # deploy_success_rate (supporting, config#1153 Batch E) — CI/CD deploy-workflow
 # health across the code repos, produced weekly by the Director
@@ -260,8 +259,18 @@ def build_substrate_tile(
     as_of: datetime | None = None,
     sfn_client=None,
     cloudwatch_client=None,
+    threshold_leaderboard: dict | None = None,
+    threshold_leaderboard_error: str | None = None,
 ) -> dict:
     """Build the Substrate Reliability tile.
+
+    ``threshold_leaderboard`` (config#7476) is the scored threshold-slot
+    leaderboard for this cycle, built by ``grading.thresholds.scoring``. It
+    renders as one ``diagnostic`` MetricRecord per arm — machine-health
+    vocabulary, answering "was the arm scored?" and never "did it win?"
+    (champion-challenger §8). Omitted (standalone CLI / tests) or failed
+    (``threshold_leaderboard_error``) → the records grade a loud N/A naming why,
+    because an unscored cycle is unrecoverable and must not read as absence.
 
     ``run_date`` (ISO ``YYYY-MM-DD``) anchors the windowed read of the
     backtester's ``substrate_ops.json`` for ``watchdog_firings`` (config#1151).
@@ -290,7 +299,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="price_cache_freshness", module=MODULE, metric_type="duration", criticality="critical",
             estimator="freshness_age",
-            value=age_d, n_samples=1, n_floor=1, target=7.0, red_line=14.0, higher_is_better=False,
+            value=age_d, n_samples=1, n_floor=1, higher_is_better=False,
             source_path=pc_src,
             reason=f"price_cache_freshness = {age_d:.1f}d since the price cache last refreshed vs target 7d / red-line 14d.",
         ))
@@ -298,7 +307,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="price_cache_freshness", module=MODULE, metric_type="duration", criticality="critical",
             estimator="freshness_age",
-            n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=pc_src,
+            n_floor=1, higher_is_better=False, source_path=pc_src,
             input_present=False,
             na_detail=f"price_cache_freshness: no readable timestamp at {PRICE_CACHE_FRESHNESS_SENTINEL_KEY}.",
         ))
@@ -321,13 +330,13 @@ def build_substrate_tile(
         components.append(build_metric(
             name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
             estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
-            n_floor=3, target=0.95, red_line=0.80, source_path=sf_src,
+            n_floor=3, source_path=sf_src,
             ran=ran, input_present=input_present, na_detail=cycle_detail,
         ))
         components.append(build_metric(
             name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
-            n_floor=3, target=0.95, red_line=0.50, source_path=sf_src,
+            n_floor=3, source_path=sf_src,
             ran=ran, input_present=input_present, na_detail=unatt_detail,
         ))
 
@@ -353,7 +362,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
                 estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
-                value=sf["cycle_rate"], n_samples=sf["n_cycles"], n_floor=3, target=0.95, red_line=0.80,
+                value=sf["cycle_rate"], n_samples=sf["n_cycles"], n_floor=3, 
                 source_path=sf_src,
                 reason=(f"sf_success_rate_4w = {sf['cycle_rate']:.0%} ({sf['n_cycles_clean']}/{sf['n_cycles']} "
                         f"DISTINCT production-role cycles completed clean — recovery counts as clean — in "
@@ -366,7 +375,7 @@ def build_substrate_tile(
                 components.append(build_metric(
                     name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
                     estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
-                    n_floor=3, target=0.95, red_line=0.50, source_path=sf_src, ran=False,
+                    n_floor=3, source_path=sf_src, ran=False,
                     na_detail=f"unattended_first_pass_rate: no scheduled-cadence cycles in the last {_SF_WINDOW_DAYS}d.",
                 ))
             else:
@@ -374,7 +383,7 @@ def build_substrate_tile(
                     name="unattended_first_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
                     estimator="unattended_first_pass_4w", measurement_horizon="trailing_4w",
                     value=sf["unattended_rate"], n_samples=sf["n_unattended"], n_floor=3,
-                    target=0.95, red_line=0.50, source_path=sf_src,
+                    source_path=sf_src,
                     reason=(f"unattended_first_pass_rate = {sf['unattended_rate']:.0%} ({sf['n_unattended_ok']}/"
                             f"{sf['n_unattended']} scheduled cycles succeeded with NO operator recovery in "
                             f"{_SF_WINDOW_DAYS}d: {sf['per_sf_unattended']}) vs target 95% / red-line 50%. "
@@ -407,7 +416,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                n_floor=1, target=200.0, red_line=500.0, higher_is_better=False, source_path=dq_src,
+                n_floor=1, higher_is_better=False, source_path=dq_src,
                 ran=False,
                 na_detail=f"data_quality_incidents: no {_DQ_BLOCKED_METRIC} datapoints in CloudWatch over {_SF_WINDOW_DAYS}d.",
             ))
@@ -416,7 +425,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                value=blocked, n_samples=1, n_floor=1, target=200.0, red_line=500.0,
+                value=blocked, n_samples=1, n_floor=1, 
                 higher_is_better=False, source_path=dq_src,
                 reason=(f"data_quality_incidents = {blocked:.0f} feature-store rows BLOCKED by the "
                         f"quality gate over {_SF_WINDOW_DAYS}d (warned: {warned_s}) vs target 200 / "
@@ -428,7 +437,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="data_quality_incidents", module=MODULE, metric_type="count", criticality="critical",
             estimator="incident_count_4w", measurement_horizon="trailing_4w",
-            n_floor=1, target=200.0, red_line=500.0, higher_is_better=False, source_path=dq_src,
+            n_floor=1, higher_is_better=False, source_path=dq_src,
             input_present=False,
             na_detail=f"data_quality_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
         ))
@@ -452,7 +461,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+                n_floor=1, higher_is_better=False, source_path=sd_src,
                 ran=False,
                 na_detail=(f"schema_drift_incidents: no {_SCHEMA_DRIFT_METRIC} datapoints in CloudWatch "
                            f"over {_SF_WINDOW_DAYS}d (the metric self-activates once a daily_append run "
@@ -463,7 +472,7 @@ def build_substrate_tile(
             components.append(build_metric(
                 name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
                 estimator="incident_count_4w", measurement_horizon="trailing_4w",
-                value=drift, n_samples=1, n_floor=1, target=0.0, red_line=3.0,
+                value=drift, n_samples=1, n_floor=1, 
                 higher_is_better=False, source_path=sd_src,
                 reason=(f"schema_drift_incidents = {drift:.0f} ArcticDB StreamDescriptorMismatch / "
                         f"DataError write failures over {_SF_WINDOW_DAYS}d vs target 0 / red-line 3. "
@@ -477,7 +486,7 @@ def build_substrate_tile(
         components.append(build_metric(
             name="schema_drift_incidents", module=MODULE, metric_type="count", criticality="critical",
             estimator="incident_count_4w", measurement_horizon="trailing_4w",
-            n_floor=1, target=0.0, red_line=3.0, higher_is_better=False, source_path=sd_src,
+            n_floor=1, higher_is_better=False, source_path=sd_src,
             input_present=False,
             na_detail=f"schema_drift_incidents: CloudWatch read failed this cycle ({code}) — grant cloudwatch:GetMetricStatistics to the evaluator role.",
         ))
@@ -513,7 +522,7 @@ def build_substrate_tile(
             name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
             estimator="per_run_phase_timeout_count", measurement_horizon="per_run",
             value=float(firings), n_samples=1, n_floor=1,
-            target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE, higher_is_better=False,
+            higher_is_better=False,
             source_path=wf_src,
             reason=(f"watchdog_firings = {firings} backtester phase(s) hit their hard "
                     f"timeout cap{detail} of {capped} capped phase(s) run vs target 0 / "
@@ -522,7 +531,7 @@ def build_substrate_tile(
     else:
         components.append(build_metric(
             name="watchdog_firings", module=MODULE, metric_type="count", criticality="supporting",
-            n_floor=1, target=_WATCHDOG_TARGET, red_line=_WATCHDOG_RED_LINE,
+            n_floor=1, 
             higher_is_better=False, source_path=wf_src, input_present=False,
             na_detail=(f"watchdog_firings: no substrate_ops.json with a watchdog block in the "
                        f"trailing window ending {run_date} — needs the backtester producer "
@@ -556,7 +565,7 @@ def build_substrate_tile(
             name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="deploy_workflow_success_rate", measurement_horizon=f"trailing_{win}d",
             value=float(ds_rate), n_samples=int(ds_total), n_floor=3,
-            target=0.95, red_line=0.80, source_path=ds_src,
+            source_path=ds_src,
             reason=(f"deploy_success_rate = {float(ds_rate):.0%} ({ds_succ}/{ds_total} terminal "
                     f"deploy-workflow runs across {n_repos} repo(s) succeeded in {win}d) "
                     f"vs target 95% / red-line 80%."),
@@ -573,7 +582,7 @@ def build_substrate_tile(
                   "weekly GH-API producer (grading.producers.deploy_success) to have run.")
         components.append(build_metric(
             name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=3, target=0.95, red_line=0.80, source_path=ds_src,
+            n_floor=3, source_path=ds_src,
             input_present=False, na_detail=na,
         ))
 
@@ -599,6 +608,16 @@ def build_substrate_tile(
             name=name, module=MODULE, metric_type="pct", criticality=crit, n_floor=1,
             source_path=f"s3://{bucket}/", permanent_na_reason=detail,
         ))
+
+    # config#7476 — the threshold champion/challenger slot's own scoring, one
+    # record per arm, every cycle (champion-challenger §3).
+    components.extend(build_arm_components(
+        threshold_leaderboard,
+        module=MODULE,
+        source_path=f"s3://{bucket}/{leaderboard_key(run_date)}" if run_date
+                    else f"s3://{bucket}/evaluator/",
+        error=threshold_leaderboard_error,
+    ))
 
     return build_tile(MODULE, components)
 

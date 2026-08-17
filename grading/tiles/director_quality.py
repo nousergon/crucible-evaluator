@@ -44,7 +44,7 @@ overall via ``module_status``'s critical-gate rule, and (per ``module_agg.py``
 tiles→overall cascade: it contributes to WATCH only, the same class as the
 Agent and Behavioral tiles.
 
-Bands (``target=75`` / ``red_line=40``) are provisional ratified starting
+Bands (registry: ``director_quality.director_*``) are provisional ratified starting
 values — revisit once several cycles of real retro grades accumulate.
 
 Spec: config#1674.
@@ -59,6 +59,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from grading.metric_record import build_metric
+from grading.thresholds.registry import resolve as resolve_band
 from grading.module_agg import build_tile
 
 logger = logging.getLogger(__name__)
@@ -67,10 +68,6 @@ MODULE = "director_quality"
 
 RETRO_TREND_KEY = "director/retro_trend.json"
 
-# Provisional ratified starting bands (config#1674) — 0-100 raw scores,
-# higher is better, revisit once real retro history accumulates.
-_TARGET = 75
-_RED_LINE = 40
 
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
@@ -109,6 +106,7 @@ def _component(name: str, grade_key: str, grade: dict | None, src: str):
     artifact/list is absent — degrades to a precise N/A-MISSING-INPUT, never an
     exception.
     """
+    _band = resolve_band(MODULE, name)
     if grade is not None and grade.get(grade_key) is not None:
         value = grade[grade_key]
         # judge_model is safe-.get() — config#1673 adds it; older persisted
@@ -119,13 +117,13 @@ def _component(name: str, grade_key: str, grade: dict | None, src: str):
         return build_metric(
             name=name, module=MODULE, metric_type="ratio", criticality="supporting",
             value=value, n_samples=1, n_floor=1,
-            target=_TARGET, red_line=_RED_LINE, higher_is_better=True, source_path=src,
+            higher_is_better=True, source_path=src,
             reason=(f"{name} = {value}/100 (prior_run_date={grade.get('prior_run_date')}"
-                    f"{judge_part}) vs target {_TARGET} / red-line {_RED_LINE}."),
+                    f"{judge_part}) vs target {_band.target:g} / red-line {_band.red_line:g}."),
         )
     return build_metric(
         name=name, module=MODULE, metric_type="ratio", criticality="supporting",
-        n_floor=1, target=_TARGET, red_line=_RED_LINE, higher_is_better=True,
+        n_floor=1, higher_is_better=True,
         source_path=src, input_present=False,
         na_detail=(f"{name}: director/retro_trend.json absent or empty this cycle "
                     "(Director disabled, first cycle, or retro skipped — config#1674)."),

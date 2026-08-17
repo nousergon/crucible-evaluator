@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from grading.thresholds.registry import DEFAULT_BAND, resolve as resolve_band
 from krepis.metrics import (
     CriticalityLiteral,
     MetricRecord,
@@ -117,6 +118,7 @@ def build_metric(
     n_samples: int | None = None,
     target: float | None = None,
     red_line: float | None = None,
+    band: str | None = DEFAULT_BAND,
     ci_low: float | None = None,
     ci_high: float | None = None,
     ci_method: str | None = None,
@@ -149,6 +151,27 @@ def build_metric(
     ``higher_is_better`` only affects the trend glyph; when omitted it's inferred
     from the target/red-line ordering (matches ``derive_status``).
 
+    ``target`` / ``red_line`` are NOT supplied by tiles (config#7476). They are
+    resolved here, at the one chokepoint every tile passes through, from the
+    committed threshold registry (``grading/thresholds/registry.yaml``) keyed by
+    ``(module, name)`` and the requested ``band``:
+
+      * ``band="champion"`` (the default) — the champion arm's declared bands.
+        An unregistered ``(module, name)`` raises ``ThresholdRegistryError``:
+        a metric graded against bands nobody declared would grade GREEN by
+        default, which is the silent-pass this slot exists to prevent.
+      * ``band="unbanded"`` / ``"raw_precision"`` — a shared band belonging to a
+        construction BRANCH rather than to the metric (see the registry's
+        ``shared_bands``). The metric's row must still exist.
+      * ``band=None`` — no registry consultation. For a synthetic record built
+        outside the card (tests, ad-hoc tooling); a tile may not use it.
+
+    Explicitly passed ``target``/``red_line`` win over the registry. That escape
+    hatch exists for the one legitimate case — bands the DATA publishes (the
+    L4515 turnover tripwire's own rolling band), whose row is marked
+    ``dynamic: true`` — and ``tests/test_threshold_registry.py`` fails on any
+    other tile call site that passes either.
+
     ``estimator`` / ``measurement_horizon`` / ``reliability`` are the L4562
     metric-reliability contract (ARCHITECTURE §18). A ``criticality="critical"``
     metric MUST declare a non-empty ``estimator`` that is not one of the
@@ -179,6 +202,13 @@ def build_metric(
     # supporting/diagnostic tile) but carries a documented reason plus a
     # permanent_na flag so the report-card cliff-inventory / dashboard can list
     # it as accepted-and-closed rather than pending work.
+    # config#7476 — thresholds come from the registry, not from tile source. An
+    # explicit value wins (the `dynamic: true` rows, whose bands the data
+    # publishes); otherwise the row is consulted and a missing one RAISES.
+    if band is not None and target is None and red_line is None:
+        _band = resolve_band(module, name, band)
+        target, red_line = _band.target, _band.red_line
+
     if permanent_na_reason is not None and value is None:
         implemented = False  # ⇒ derive_status yields N/A-NOT-IMPL
 

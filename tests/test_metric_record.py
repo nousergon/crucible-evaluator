@@ -169,7 +169,7 @@ class TestPermanentNA:
     def test_ordinary_na_not_marked_permanent(self):
         # A transient not-impl (no permanent_na_reason) must NOT be flagged.
         m = build_metric(
-            name="x", module="substrate", metric_type="pct", n_floor=1,
+            name="x", module="substrate", metric_type="pct", n_floor=1, band=None,
             source_path="s3://b/", implemented=False, na_detail="producer not yet wired.",
         )
         assert m.permanent_na is False
@@ -189,7 +189,7 @@ class TestMeasurementArm:
 
     def test_arm_defaults_to_none(self):
         m = build_metric(
-            name="x", module="research", metric_type="pct", n_floor=10,
+            name="x", module="research", metric_type="pct", n_floor=10, band=None,
             source_path="s3://b/x",
         )
         assert m.arm is None

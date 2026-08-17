@@ -111,7 +111,7 @@ def build_predictor_tile(
         miss = build_metric(
             name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
             estimator="rank_ic", measurement_horizon="21d",
-            n_floor=10, target=0.05, red_line=0.0, source_path=manifest_src, input_present=False,
+            n_floor=10, source_path=manifest_src, input_present=False,
             na_detail="predictor metrics + weights manifest both absent this cycle.",
             **_tr("meta_l2_ic", None),
         )
@@ -162,7 +162,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
         estimator="rank_ic", measurement_horizon="21d",
-        value=cpcv_mean, n_samples=n_combos, n_floor=10, target=0.05, red_line=0.0,
+        value=cpcv_mean, n_samples=n_combos, n_floor=10, 
         ci_low=ci_low, ci_high=ci_high, ci_method=ci_method, source_path=manifest_src,
         input_present=cpcv_ok, reason=meta_reason,
         reliability=_reliability_for("meta_model_oos_ic_cpcv"),
@@ -177,13 +177,13 @@ def build_predictor_tile(
     components.append(build_metric(
         name="momentum_l1_ic", module=MODULE, metric_type="ic", criticality="critical",
         estimator="rank_ic_oos", measurement_horizon="21d",
-        value=mom_ic, n_samples=n_folds, n_floor=8, target=0.03, red_line=0.0,
+        value=mom_ic, n_samples=n_folds, n_floor=8, 
         source_path=manifest_src, input_present=mom_ic is not None,
         reliability=_reliability_for("momentum_median_ic"),
     ))
     components.append(build_metric(
         name="volatility_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
-        value=vol_ic, n_samples=n_folds, n_floor=8, target=0.03, red_line=0.0,
+        value=vol_ic, n_samples=n_folds, n_floor=8, 
         source_path=manifest_src, input_present=vol_ic is not None,
         reliability=_reliability_for("volatility_median_ic"),
     ))
@@ -191,7 +191,7 @@ def build_predictor_tile(
     rescal_n = latest.get("research_calibrator_n_samples")
     components.append(build_metric(
         name="research_calibrator_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
-        value=rescal_ic, n_samples=rescal_n, n_floor=50, target=0.03, red_line=0.0,
+        value=rescal_ic, n_samples=rescal_n, n_floor=50, 
         source_path=latest_src,
     ))
 
@@ -244,7 +244,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="ensemble_lift_over_best_l1", module=MODULE, metric_type="ic", criticality="critical",
         estimator="ic_delta", measurement_horizon="21d",
-        value=lift, n_samples=n_combos, n_floor=10, target=0.01, red_line=-0.01,
+        value=lift, n_samples=n_combos, n_floor=10, 
         source_path=manifest_src, input_present=lift_present, reason=lift_reason,
         na_detail=lift_na or "ensemble_lift: needs the leak-free meta IC and a directional standalone L1 alpha-IC.",
         reliability=_reliability_for("meta_l1_standalone_alpha_ic"),
@@ -256,7 +256,7 @@ def build_predictor_tile(
     components.append(build_metric(
         name="confidence_calibration_ece", module=MODULE, metric_type="calibration", criticality="critical",
         estimator="expected_calibration_error",
-        value=ece, n_samples=cc.get("n_samples"), n_floor=100, target=0.05, red_line=0.15,
+        value=ece, n_samples=cc.get("n_samples"), n_floor=100, 
         higher_is_better=False, source_path=latest_src, input_present=ece is not None,
     ))
 
@@ -307,7 +307,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="wilson_precision", measurement_horizon="10d",
-            value=prec, n_samples=n_v, n_floor=30, target=0.60, red_line=0.40,
+            value=prec, n_samples=n_v, n_floor=30, 
             ci_low=ci_low, ci_high=ci_high, ci_method="wilson" if ci_low is not None else None,
             source_path=veto_src,
             reason=(f"veto_gate_precision [10d] = {prec:.1%} at the live veto threshold {conf:.2f} "
@@ -327,7 +327,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
             estimator="wilson_precision", measurement_horizon="10d",
-            n_floor=30, target=0.60, red_line=0.40, source_path=veto_src, input_present=False,
+            n_floor=30, source_path=veto_src, input_present=False,
             na_detail=na,
         ))
     # direction_accuracy_vs_majority_baseline + per-class precision-vs-base-rate
@@ -383,7 +383,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
             criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
-            value=acc_lift, n_samples=n_total, n_floor=30, target=0.03, red_line=0.0,
+            value=acc_lift, n_samples=n_total, n_floor=30, 
             source_path=cm_src,
             reason=(f"direction_accuracy = {accuracy:.2%} vs always-{majority_class} majority-class "
                     f"baseline {baseline:.2%} (N={n_total}) — lift {acc_lift:+.2%} vs target "
@@ -393,7 +393,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
             criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
-            n_floor=30, target=0.03, red_line=0.0, source_path=cm_src, input_present=False,
+            n_floor=30, source_path=cm_src, input_present=False,
             na_detail=_cm_na("direction_accuracy_vs_majority_baseline"),
         ))
 
@@ -412,7 +412,7 @@ def build_predictor_tile(
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
                 criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
-                value=prec_lift, n_samples=n_pred, n_floor=30, target=0.03, red_line=0.0,
+                value=prec_lift, n_samples=n_pred, n_floor=30, 
                 source_path=cm_src,
                 reason=(f"{name}: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
                         f"(N={n_pred} predicted-{cls}) — lift {prec_lift:+.2%} vs target +3pp / red-line 0pp."),
@@ -425,7 +425,7 @@ def build_predictor_tile(
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
                 criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
-                n_floor=30, target=0.03, red_line=0.0, source_path=cm_src, input_present=False,
+                n_floor=30, source_path=cm_src, input_present=False,
                 na_detail=na,
             ))
 
@@ -441,7 +441,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion",
-            value=coverage, n_samples=n_universe, n_floor=1, target=0.95, red_line=0.80,
+            value=coverage, n_samples=n_universe, n_floor=1, 
             source_path=latest_src,
             reason=(f"inference_coverage = {coverage:.1%} ({n_covered}/{n_universe} tradable-universe "
                     f"tickers predicted) vs target 95% / red-line 80%."),
@@ -450,7 +450,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion",
-            value=None, n_floor=1, target=0.95, red_line=0.80, source_path=latest_src, input_present=False,
+            value=None, n_floor=1, source_path=latest_src, input_present=False,
             na_detail=(f"inference_coverage: n_predictions_today={n_preds_today} observed, but the "
                        "tradable-universe denominator (n_universe) is absent/zero in latest.json this "
                        "cycle (predictor config#1075 producer field not present yet)."),
@@ -466,7 +466,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
             estimator="freshness_age",
-            value=slim_age_d, n_samples=1, n_floor=1, target=7.0, red_line=14.0,
+            value=slim_age_d, n_samples=1, n_floor=1, 
             higher_is_better=False, source_path=slim_src,
             reason=f"slim_cache_freshness = {slim_age_d:.1f}d since the inference slim-cache last refreshed vs target 7d / red-line 14d.",
         ))
@@ -474,7 +474,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="slim_cache_freshness", module=MODULE, metric_type="duration", criticality="supporting",
             estimator="freshness_age",
-            n_floor=1, target=7.0, red_line=14.0, higher_is_better=False, source_path=slim_src,
+            n_floor=1, higher_is_better=False, source_path=slim_src,
             input_present=False,
             na_detail="slim_cache_freshness: no objects under predictor/price_cache_slim/ to date-stamp.",
         ))
@@ -491,7 +491,7 @@ def build_predictor_tile(
         components.append(build_metric(
             name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="ks_2samp_max", value=max_ks, n_samples=int(fdk.get("n_samples") or 0),
-            n_floor=30, target=0.10, red_line=0.25, higher_is_better=False, source_path=latest_src,
+            n_floor=30, higher_is_better=False, source_path=latest_src,
             reason=(
                 f"feature_drift_ks: worst-feature inference-vs-training KS = {max_ks:.3f} "
                 f"across {fdk.get('n_features')} cross-sectional features"
@@ -502,7 +502,7 @@ def build_predictor_tile(
     else:
         components.append(build_metric(
             name="feature_drift_ks", module=MODULE, metric_type="ratio", criticality="diagnostic",
-            n_floor=30, target=0.10, red_line=0.25, higher_is_better=False, source_path=latest_src,
+            n_floor=30, higher_is_better=False, source_path=latest_src,
             input_present=False,
             na_detail=(
                 "feature_drift_ks: feature_drift_ks block absent in metrics/latest.json "
