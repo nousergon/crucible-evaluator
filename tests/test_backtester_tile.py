@@ -33,18 +33,20 @@ def _comp(tile, name):
 
 
 # A grading.json mirroring the live v1 shape: lots of N/A in executor/predictor.
+# RC v3 T1 (config-I7474): the v1 "letter" field is retired; a leaf's
+# gradedness is now keyed off "grade" (numeric, None == N/A) instead.
 _GRADING = {
     "status": "partial",
     "research": {"components": {
-        "scanner": {"letter": "D"},
-        "sector_teams": [{"letter": "C"}, {"letter": "N/A"}, {"letter": "B"}],
-        "sector_teams_avg": {"letter": "F"},  # rollup — excluded
-        "macro_agent": {"letter": "C-"},
+        "scanner": {"grade": 35.0},
+        "sector_teams": [{"grade": 45.0}, {"grade": None}, {"grade": 65.0}],
+        "sector_teams_avg": {"grade": 20.0},  # rollup — excluded
+        "macro_agent": {"grade": 38.0},
     }},
-    "predictor": {"components": {"meta_model": {"letter": "C"}, "veto_gate": {"letter": "N/A"}}},
+    "predictor": {"components": {"meta_model": {"grade": 45.0}, "veto_gate": {"grade": None}}},
     "executor": {"components": {
-        "entry_triggers": {"letter": "N/A"}, "risk_guard": {"letter": "N/A"},
-        "exit_rules": {"letter": "N/A"}, "portfolio": {"letter": "B+"},
+        "entry_triggers": {"grade": None}, "risk_guard": {"grade": None},
+        "exit_rules": {"grade": None}, "portfolio": {"grade": 78.0},
     }},
 }
 
