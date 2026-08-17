@@ -115,6 +115,7 @@ def build_metric(
     metric_type: MetricTypeLiteral,
     n_floor: int,
     value: float | None = None,
+    unit: str | None = None,
     n_samples: int | None = None,
     target: float | None = None,
     red_line: float | None = None,
@@ -143,6 +144,12 @@ def build_metric(
     unit: str | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
+
+    ``unit`` (krepis#158, alpha-engine-config-I7485) is a straight passthrough
+    to ``MetricRecord`` — the lib's own ``model_validator`` raises whenever
+    ``value`` is set and ``unit`` is falsy, so a tile that reports a
+    value-bearing metric must pass one. ``None`` is legitimate for an N/A-*
+    record (no value ⇒ nothing to misread the unit of).
 
     ``status`` is derived via the lib (so producer/consumer agree) unless an
     explicit ``status`` is passed — used for band metrics (e.g. beta's two-sided
@@ -292,6 +299,7 @@ def build_metric(
         module=module,
         metric_type=metric_type,
         value=value,
+        unit=unit,
         ci_low=ci_low,
         ci_high=ci_high,
         ci_method=ci_method,

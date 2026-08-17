@@ -291,6 +291,7 @@ class TestBuildReportCard:
         assert set(card["tiles"]) == {
             "portfolio_outcome", "predictor", "research", "executor",
             "backtester", "substrate", "agent", "behavioral", "director_quality",
+            "contribution_lift",
         }
         for tile in card["tiles"].values():
             assert "status" in tile and "components" in tile

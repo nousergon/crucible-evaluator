@@ -195,6 +195,11 @@ metrics:
       n_floor_declared: 1
       note: >-
         bands are the L4515 executor turnover tripwire's own published rolling band (red_line=band, target=band/2) — read from optimizer_shadow tripwire, not declared here
+    # RC v3 T5 (config-I7473/I7484) — grading/tiles/contribution_lift.py rows.
+    # target: null until the replay producer ships and a real bar can be set;
+    # red_line: 0.0 is fixed by the T2 objective spec (any component whose
+    # ablation does not cost the objective grades RED, not ungraded).
+    cost_adjusted_quality_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
   director_quality:
     director_actionability: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
     director_calibration: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
@@ -207,6 +212,11 @@ metrics:
     position_sizing: {target: 0.0, red_line: -0.3, n_floor_declared: 20}
     reconciliation_integrity: {target: 1.0, red_line: 0.9, n_floor_declared: 1}
     risk_guard: {target: 0.55, red_line: 0.4, n_floor_declared: 20}
+    # RC v3 T5 (config-I7473/I7481/I7482) — grading/tiles/contribution_lift.py rows.
+    entry_triggers_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    exit_rules_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    position_sizing_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    risk_guard_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
   portfolio_outcome:
     alpha_trend: {target: 0.0, red_line: null, n_floor_declared: 60}
     alpha_vs_spy: {target: 0.0, red_line: -0.05, n_floor_declared: 60}
@@ -237,6 +247,15 @@ metrics:
     up_precision_vs_base_rate: {target: 0.03, red_line: 0.0, n_floor_declared: 30}
     veto_gate_precision: {target: 0.6, red_line: 0.4, n_floor_declared: 30}
     volatility_l1_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    # RC v3 T5 (config-I7473/I7479/I7480) — grading/tiles/contribution_lift.py rows.
+    direction_accuracy_vs_majority_baseline_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    ensemble_lift_over_best_l1_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    meta_l2_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    momentum_l1_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    output_distribution_gate_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    research_calibrator_l1_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    veto_gate_precision_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    volatility_l1_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
   research:
     attractiveness_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
     attractiveness_trajectory_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
@@ -257,6 +276,20 @@ metrics:
     sector_teams_avg: {target: 0.05, red_line: -0.02, n_floor_declared: 30}
     signal_volume_adequacy: {target: 20.0, red_line: 8.0, n_floor_declared: 1}
     thinktank_coverage_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
+    # RC v3 T5 (config-I7473/I7478/I7483) — grading/tiles/contribution_lift.py rows.
+    attractiveness_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    attractiveness_trajectory_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    calibration_diagnostics_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    cio_selection_skill_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    judge_outcome_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    judge_rubric_pass_rate_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    macro_agent_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    momentum_regime_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    neutralization_live_efficacy_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    research_composite_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    scanner_feed_counterfactual_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    sector_teams_avg_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
+    thinktank_coverage_ic_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
   substrate:
     # The threshold slot's own scoring records (config#7476). MACHINE-HEALTH
     # vocabulary: their status answers "was this arm scored?", never "did it

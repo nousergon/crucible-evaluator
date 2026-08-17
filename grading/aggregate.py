@@ -43,6 +43,7 @@ from nousergon_lib.quant.stats.trial_accumulator import read_cumulative_trial_co
 from grading.tiles.agent import build_agent_tile
 from grading.tiles.backtester import build_backtester_tile
 from grading.tiles.behavioral import build_behavioral_tile
+from grading.tiles.contribution_lift import build_contribution_lift_tile
 from grading.tiles.director_quality import build_director_quality_tile
 from grading.tiles.executor import build_executor_tile
 from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
@@ -176,7 +177,13 @@ def build_report_card(
     #   - director_quality (Tile 9): director/retro_trend.json — the Director's own
     #     weekly Phase-G retro grade of its PRIOR plan (config#1674 — WATCH-only,
     #     never cascades to overall RED, same class as agent/behavioral)
-    # NINE tiles total; the historical numbering skips 8 (0–7 then 9) — there
+    #   - contribution_lift (Tile 10, RC v3 T5, config-I7473): backtest/{date}/
+    #     contribution_lift.json — each component's measured marginal
+    #     contribution to the T2 objective. Not in _CASCADE_MODULES (module_agg.py);
+    #     each record's own `module` field names its REAL owning tile
+    #     (research/predictor/executor/behavioral) so it renders beside that
+    #     component on any surface grouping by a record's own `.module`.
+    # TEN tiles total; the historical numbering skips 8 (0–7, 9, 10) — there
     # is no Tile 8. This dict is the membership source of truth (pinned by
     # tests/test_aggregate.py + test_handler.py).
     tiles = {
@@ -195,6 +202,7 @@ def build_report_card(
         "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
         "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),
         "director_quality": build_director_quality_tile(bucket, run_date, s3_client=s3_client),
+        "contribution_lift": build_contribution_lift_tile(bucket, run_date, s3_client=s3_client),
     }
     scorecard["tiles"] = tiles
     # Handed to the handler (which persists it as its own artifact) under a
