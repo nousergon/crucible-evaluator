@@ -87,8 +87,8 @@ def _full_inputs() -> dict:
     return {
         "signal_quality": {
             "status": "ok",
-            "overall": {"accuracy_10d": 0.58, "avg_alpha_10d": 1.2},
-            "by_score_bucket": [{"bucket": "90+", "accuracy_10d": 0.66}],
+            "overall": {"accuracy_21d": 0.58, "avg_alpha_21d": 1.2},
+            "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.66}],
         },
         "e2e_lift": {
             "status": "ok",
