@@ -63,7 +63,13 @@ class TestReadScorecardInputs:
         # signal_quality.json (neither it nor its metrics.json fallback
         # present) + every mapped artifact missing.
         assert "signal_quality.json" in report.missing
-        assert len(report.missing) == len(ARTIFACT_MAP) + 1
+        # +2, not +1: signal_quality.json and run_scope.json are both read
+        # outside ARTIFACT_MAP — the first because it has a metrics.json
+        # fallback, the second because it is not a `compute_scorecard`
+        # parameter at all (alpha-engine-config-I7620).
+        assert "run_scope.json" in report.missing
+        assert report.run_scope is None
+        assert len(report.missing) == len(ARTIFACT_MAP) + 2
         assert report.read == []
         assert report.signal_quality_source == "absent"
 

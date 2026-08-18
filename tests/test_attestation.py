@@ -541,6 +541,13 @@ class TestProducerConsumerContract:
 
 
 class _StubReport:
+    # `run_scope` mirrors the real ArtifactReport field
+    # (alpha-engine-config-I7620). None is the ABSENT case, which the consumer
+    # must resolve to "scope unknown, grade nothing" — so a stub carrying it as
+    # None exercises the degenerate path these tests care about rather than
+    # bypassing it.
+    run_scope = None
+
     def as_dict(self):
         return {"n_read": 0, "n_missing": 0}
 

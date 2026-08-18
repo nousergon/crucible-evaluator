@@ -198,6 +198,13 @@ class ArtifactReport:
     # historical-date compat path — by_score_bucket is NOT recoverable this
     # way), or None when neither was available.
     signal_quality_source: str | None = None
+    # alpha-engine-config-I7620: the run's own scope block, carried on the
+    # REPORT rather than in `inputs`. `inputs` is splatted into
+    # `compute_scorecard(**inputs)`, where every key must be a real grader
+    # parameter — the same trap ARTIFACT_MAP's note records for
+    # contribution_lift. run_scope is not a grader input; it is the denominator
+    # the grades are rendered against.
+    run_scope: dict | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -245,6 +252,22 @@ def _read_signal_quality(s3, bucket: str, prefix: str) -> tuple[dict | None, str
     return {"status": metrics.get("status"), "overall": overall}, "metrics.json (reconstructed fallback)"
 
 
+def _read_run_scope(s3, bucket: str, prefix: str) -> dict | None:
+    """Read ``run_scope.json`` — which stages this run dispatched.
+
+    Produced by ``nousergon-data``'s ``RunScope`` SF state
+    (``alpha-engine-config-I7620``). Read as its own artifact rather than
+    threaded through the SF payload so the two repos are not coupled through
+    payload shape.
+
+    ``None`` on absence, and absence is meaningful: the consumer resolves it to
+    "scope unknown, grade nothing", never to "everything ran". A card that
+    grades the full stage list against a run that dispatched three of them is
+    confidently wrong; one that says it does not know is merely uninformative.
+    """
+    return get_json(s3, bucket, f"{prefix}/run_scope.json")
+
+
 def read_scorecard_inputs(
     bucket: str,
     run_date: str,
@@ -277,6 +300,22 @@ def read_scorecard_inputs(
             "signal_quality / portfolio + composite-scoring tiles will grade "
             "N/A", bucket, prefix,
         )
+
+    # run_scope: the denominator the card's grades are rendered against
+    # (alpha-engine-config-I7620). Deliberately NOT in ARTIFACT_MAP and NOT in
+    # `inputs` — those keys feed straight into `compute_scorecard(**inputs)` as
+    # grader parameters, and an unconsumed key raises TypeError the first time
+    # the artifact exists in S3 (the trap ARTIFACT_MAP's own note records).
+    report.run_scope = _read_run_scope(s3, bucket, prefix)
+    if report.run_scope is None:
+        report.missing.append("run_scope.json")
+        logger.warning(
+            "Artifact absent: s3://%s/%s/run_scope.json — the card cannot state "
+            "which stages this run dispatched, so its grades carry no known "
+            "denominator", bucket, prefix,
+        )
+    else:
+        report.read.append("run_scope.json")
 
     for param, filename in ARTIFACT_MAP.items():
         data = get_json(s3, bucket, f"{prefix}/{filename}")
