@@ -28,6 +28,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from grading.artifacts import get_json, get_json_windowed
+from grading.run_scope import read_run_scope, scope_unknown
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
@@ -145,7 +146,64 @@ def _discover_sf_arns(sfn) -> list[str]:
     return arns
 
 
-def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
+def _cycle_run_scope(s3, bucket: str, run_date: str | None) -> dict | None:
+    """The run's own scope for ``run_date``, or None when there is no artifact.
+
+    ``backtest/{run_date}/run_scope.json`` (config-I7620) is written by the
+    weekly pipeline's ``RunScope`` state alone. The two trading pipelines do
+    not produce one, and a run predating the artifact does not either — both
+    resolve to None here, and None means "grade exactly as before". Silence
+    never flips a verdict on its own; it only declines to sharpen one.
+    """
+    if not run_date:
+        return None
+    return get_json(s3, bucket, f"backtest/{run_date}/run_scope.json") or None
+
+
+def _cycle_did_the_work(scope_doc: dict | None) -> tuple[bool, str]:
+    """Did this cycle's green run leave anything UNREACHED?
+
+    The question ``sf_success_rate_4w`` claims to answer is "did the work get
+    done?", and until this existed it answered from an exit code alone.
+    Measured 2026-08-15/16: ``watch-rerun-2026-08-16-4`` carried 22 ``skip_*``
+    flags all true, entered exactly one real task, terminated SUCCEEDED in
+    eight minutes, and made the cycle read clean — on a day whose scheduled run
+    died at ``PredictorBacktest`` after 3h53m and produced no report card, no
+    Director plan and no ``backtest/2026-08-15/`` prefix at all.
+
+    The test is ``NOT_REACHED``, deliberately, and not "how many stages ran":
+
+    * ``DISABLED`` is a decision. A partial rerun that dispatches three stages
+      and completes them is a legitimate success, and so is the THU-SAT
+      run-day self-skip. Counting those dirty would make the metric permanently
+      red and therefore unread.
+    * ``ENABLED_FAILED`` is already visible — the execution itself fails.
+    * ``NOT_REACHED`` is the one that means *the run died upstream and left
+      stages neither run nor skipped*, which is precisely "the work did not get
+      done" and precisely what an exit code cannot see.
+
+    Returns ``(clean, detail)``. An absent or unmeasured scope returns
+    ``(True, ...)`` — the pre-existing status-only behaviour.
+    """
+    if scope_doc is None:
+        return True, "no run_scope artifact — graded on terminal status alone"
+    block = read_run_scope(scope_doc)
+    if scope_unknown(block):
+        return True, f"run_scope UNMEASURED — {block.get('statement', '')}"
+    unreached = block.get("not_reached_stages") or []
+    if unreached:
+        return False, (
+            f"{block['graded_count']}/{block['stage_count']} stages dispatched; "
+            f"{len(unreached)} never reached ({', '.join(unreached[:5])}"
+            f"{'...' if len(unreached) > 5 else ''}) — the run died upstream of "
+            "them, so this cycle did NOT complete its work"
+        )
+    return True, f"{block['graded_count']}/{block['stage_count']} stages dispatched, none left unreached"
+
+
+def _sf_success_rate(
+    sfn, as_of: datetime, window_days: int, *, s3=None, bucket: str | None = None,
+) -> dict | None:
     """Cycle-level success across the 3 SFs over the trailing window.
 
     Returns two distinct, complementary metrics (config#1059 / #970 / L4552d) —
@@ -189,11 +247,24 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
     n_unattended_cycles = n_unattended_ok = 0
     per_sf: dict[str, str] = {}
     per_sf_unattended: dict[str, str] = {}
+    scope_detail: dict[str, str] = {}
     for arn in arns:
         runs = list_recent_pipeline_runs(arn, limit=50, client=sfn)
         # Bucket this SF's terminal, role-carrying, in-window executions into
-        # cycles keyed on the UTC date of start_utc.
+        # cycles keyed on the TRADING DAY (`input.run_date`), falling back to
+        # the UTC date of start_utc when the execution input carries none.
+        #
+        # The fallback is the OLD key and it is wrong in a specific direction:
+        # measured 2026-08-15, the weekly pipeline's recovery reruns for
+        # run_date 2026-08-15 started at 20:21 US/Pacific, which is 2026-08-16
+        # in UTC. Keyed on the start date, that cycle splits in two and the
+        # half holding the recovery run reads as a standalone success with no
+        # failed scheduled run beside it. `run_date` arrives on the summary
+        # from nousergon-lib (config-I7644); below the version that supplies
+        # it every weekly execution falls back and WARNS, because a fix that
+        # goes quietly inert on a stale pin is not a fix.
         cycles: dict[object, list[tuple[str, str | None]]] = {}
+        cycle_run_date: dict[object, str | None] = {}
         for r in runs:
             start = getattr(r, "start_utc", None)
             if start is None or start < cutoff:
@@ -210,15 +281,40 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
             status = getattr(raw, "value", raw)
             if status not in _SF_TERMINAL:
                 continue
-            cycles.setdefault(start.date(), []).append((status, role))
+            run_date = getattr(r, "run_date", None)
+            if run_date is None:
+                logger.warning(
+                    "sf_success_rate: %s carries no input.run_date — falling back "
+                    "to the start-date cycle key, which splits an evening "
+                    "recovery rerun into its own cycle (config-I7644).",
+                    getattr(r, "name", "?"),
+                )
+            key = run_date or start.date()
+            cycles.setdefault(key, []).append((status, role))
+            cycle_run_date.setdefault(key, run_date)
 
         sf_cycles = sf_cycles_clean = 0
         sf_unatt = sf_unatt_ok = 0
         for _day, execs in cycles.items():
             sf_cycles += 1
             # Distinct-cycle outcome: clean iff ANY execution in the cycle (the
-            # scheduled run OR a recovery rerun) ultimately SUCCEEDED.
-            if any(st == "SUCCEEDED" for st, _role in execs):
+            # scheduled run OR a recovery rerun) ultimately SUCCEEDED **and**
+            # that cycle's own run scope shows nothing left unreached. Status
+            # alone is what let an 8-minute, 22-flags-all-true no-op stand in
+            # for a four-hour weekly run (config-I7644).
+            succeeded = any(st == "SUCCEEDED" for st, _role in execs)
+            did_work, detail = (True, "")
+            if succeeded and s3 is not None and bucket:
+                did_work, detail = _cycle_did_the_work(
+                    _cycle_run_scope(s3, bucket, cycle_run_date.get(_day))
+                )
+                scope_detail[str(_day)] = detail
+                if not did_work:
+                    logger.warning(
+                        "sf_success_rate: cycle %s terminated SUCCEEDED but %s",
+                        _day, detail,
+                    )
+            if succeeded and did_work:
                 sf_cycles_clean += 1
             # Unattended first-pass: only cycles that HAD a scheduled run count
             # toward the unattended denominator (an operator-only ad-hoc day is
@@ -249,6 +345,10 @@ def _sf_success_rate(sfn, as_of: datetime, window_days: int) -> dict | None:
         "n_unattended_ok": n_unattended_ok,
         "per_sf": per_sf,
         "per_sf_unattended": per_sf_unattended,
+        # Both polarities, per cycle. A rate rendered without its denominator
+        # is not a falsifiable claim, and this is the field that says which
+        # cycles were graded narrow and why.
+        "scope_detail": scope_detail,
     }
 
 
@@ -345,7 +445,7 @@ def build_substrate_tile(
         sfn = sfn_client or boto3.client(
             "stepfunctions", region_name=os.environ.get("AWS_REGION", "us-east-1")
         )
-        sf = _sf_success_rate(sfn, as_of, _SF_WINDOW_DAYS)
+        sf = _sf_success_rate(sfn, as_of, _SF_WINDOW_DAYS, s3=s3, bucket=bucket)
         if sf is None:
             _na_pair(
                 input_present=False,
@@ -369,7 +469,9 @@ def build_substrate_tile(
                         f"DISTINCT production-role cycles completed clean — recovery counts as clean — in "
                         f"{_SF_WINDOW_DAYS}d: {sf['per_sf']}) vs target 95% / red-line 80%. "
                         f"Re-keyed off per-execution (config#1059): a recovered cycle still produced its "
-                        f"artifacts, so downstream tiles are NOT measured on a starved system."),
+                        f"artifacts, so downstream tiles are NOT measured on a starved system. "
+                        f"A cycle whose only green run left stages NOT_REACHED does not count "
+                        f"clean (config-I7644); per-cycle scope: {sf['scope_detail'] or 'no run_scope artifacts in window'}."),
             ))
             # Unattended first-pass (supporting — the true automation target).
             if sf["unattended_rate"] is None:
