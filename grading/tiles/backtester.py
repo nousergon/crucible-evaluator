@@ -184,6 +184,35 @@ def _fdr_surface_status(n_sig: int, n_fdr_tests: int | None) -> tuple[str, str]:
     return "WATCH", band_desc
 
 
+def _loop_converged(entry: dict) -> bool:
+    """Did this loop propose exactly what is already live?
+
+    alpha-engine-config-I7654. The producer stamps ``blocked`` for two
+    structurally different states and the week counter cannot tell them apart:
+
+    * **converged** — the optimizer ran, produced a proposal, and it matches the
+      running config. Measured on ``config/apply_audit/2026-08-14.json``:
+      ``scoring_weights`` proposed ``{quant: 0.5, qual: 0.5}`` against a current
+      of ``{quant: 0.5, qual: 0.5}`` (*"all changes < 2% — not worth updating"*),
+      and ``predictor_params`` proposed ``{veto_confidence: 0.65}`` against a
+      current of ``{veto_confidence: 0.65}``. Both had been "blocked" for NINE
+      weeks. Both were agreeing with the champion.
+    * **genuinely blocked** — nothing cleared the floor, so there is no proposal
+      at all. ``executor_params`` on the same artifact: ``proposed: null``,
+      *"All 60 valid combos backtested with total_alpha < 0.0"*.
+
+    Conflating them put *"3/4 auto-apply loops blocked — the optimization loop
+    is broken"* on the Director's plan as a P1, and buried the one sentence that
+    mattered inside a count of three.
+
+    ``proposed is not None`` IS LOAD-BEARING. Without it, ``None == None``
+    grades the one genuinely-blocked loop as converged, which turns this metric
+    from over-firing into silent — strictly worse than the defect being fixed.
+    """
+    proposed = entry.get("proposed")
+    return proposed is not None and proposed == entry.get("current")
+
+
 def build_backtester_tile(
     bucket: str, run_date: str, s3_client=None, *,
     as_of: datetime | None = None, history: CardHistory | None = None,
@@ -521,7 +550,14 @@ def build_backtester_tile(
             if outcome == "blocked":
                 slugs = ",".join(entry.get("blocked_by") or []) or "unspecified"
                 desc = f"{loop_name} blocked {weeks}w [{slugs}]"
-                if weeks >= 4:
+                if _loop_converged(entry):
+                    # An optimizer proposing exactly what is already live has
+                    # AGREED with the champion, and nine weeks of agreement is a
+                    # champion that keeps winning — the designed outcome of a
+                    # champion/challenger loop, not a stuck one
+                    # (alpha-engine-config-I7654).
+                    healthy.append(f"{loop_name}=converged({weeks}w)")
+                elif weeks >= 4:
                     red.append(desc)
                 elif weeks >= 2:
                     watch.append(desc)
@@ -537,8 +573,14 @@ def build_backtester_tile(
         unhealthy = red + watch
         status = "RED" if red else ("WATCH" if watch else "GREEN")
         if unhealthy:
+            # Converged loops are named alongside, not dropped: a loop that has
+            # agreed with the champion for nine weeks is worth SEEING, it is
+            # just not worth paging about, and a reason listing only the
+            # unhealthy ones cannot be told from one whose producer went quiet.
+            converged = [h for h in healthy if "=converged(" in h]
+            conv_txt = f" Converged (proposal == live): {', '.join(converged)}." if converged else ""
             reason = (f"apply_loop_health: {len(unhealthy)}/{len(loops)} auto-apply loops unhealthy — "
-                      f"{'; '.join(unhealthy)} (as_of {aa.get('as_of')}).")
+                      f"{'; '.join(unhealthy)} (as_of {aa.get('as_of')}).{conv_txt}")
         else:
             reason = (f"apply_loop_health: all {len(loops)} auto-apply loops healthy "
                       f"({', '.join(healthy)}) as_of {aa.get('as_of')}.")
