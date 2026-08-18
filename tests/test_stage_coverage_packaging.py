@@ -46,7 +46,18 @@ _STAGE_COVERAGE_INTRODUCED_IN = (0, 59, 2)
 
 
 def _krepis_floor() -> tuple[int, int, int]:
-    """Parse the `krepis[...]>=X.Y.Z` floor out of requirements.txt.
+    """Parse the pinned krepis version out of requirements.txt.
+
+    Accepts `>=` and `==`. The property this guard defends is "the krepis this
+    image resolves is new enough to ship `krepis.stage_coverage`", and an EXACT
+    pin establishes it at least as strongly as a floor — it is the resolved
+    version, not a lower bound on it.
+
+    Reading only `>=` made the guard fail closed on the correct fix:
+    alpha-engine-config-I7629 converted this line to an exact pin (the rule
+    crucible-predictor already follows — "first-party/fast-moving deps are
+    pinned, never floored") and this test reported the requirement as ABSENT
+    rather than satisfied.
 
     Deliberately regex-based rather than a `packaging` dependency this repo
     does not otherwise declare — the fleet-standard derive-from-real-source
@@ -57,10 +68,12 @@ def _krepis_floor() -> tuple[int, int, int]:
         line = line.strip()
         if line.startswith("#"):
             continue
-        m = re.match(r"^krepis(\[[^\]]*\])?>=(\d+)\.(\d+)\.(\d+)", line)
+        m = re.match(r"^krepis(\[[^\]]*\])?(>=|==)(\d+)\.(\d+)\.(\d+)", line)
         if m:
-            return (int(m.group(2)), int(m.group(3)), int(m.group(4)))
-    raise AssertionError("requirements.txt has no `krepis>=X.Y.Z` floor line")
+            return (int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    raise AssertionError(
+        "requirements.txt has no `krepis>=X.Y.Z` or `krepis==X.Y.Z` line"
+    )
 
 
 def test_krepis_floor_covers_stage_coverage_introduction():

@@ -155,7 +155,24 @@ pandas~=3.0
 # what makes the krepis-side validator start applying to the fleet.
 # Also (krepis#158, RC v3 T5): the same release widens `MetricTypeLiteral` with
 # `"contribution_lift"` — below this floor `metric_type="contribution_lift"` raises.
-krepis[flow-doctor,openai]>=0.59.11
+# EXACT PIN, not a floor (alpha-engine-config-I7629; the rule is already
+# written down at crucible-predictor/requirements.txt:80 — "first-party/
+# fast-moving deps are pinned, never floored", and predictor is the one repo
+# this incident did not touch).
+#
+# krepis 0.59.15/0.59.16 (krepis#95, merged 2026-08-18 17:52) added a
+# fail-closed in-process DLP scan to LLMClient. This image installs only `git`
+# (Dockerfile:6) and carries no gitleaks binary, so EVERY Director LLM call
+# raises `DLP scan blocked outbound request: gitleaks binary not found on PATH
+# — failing closed`. The Director is TERMINAL ON FAILURE (config#6408), so that
+# is a failed weekly execution, not a degraded one.
+#
+# 0.59.14 is the last release before the hook. Adopting the hook properly —
+# bundling the binary and its config so the scan actually RUNS here — is
+# tracked separately; it is a change to what happens inside every Director call
+# and is not something to ship unmeasured days before a scheduled run. Pinning
+# here restores the exact state this image ran in yesterday.
+krepis[flow-doctor,openai]==0.59.14
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
@@ -166,7 +183,7 @@ krepis[flow-doctor,openai]>=0.59.11
 # now `required`, and `stale_tiles` is typed. Below this pin
 # tests/test_report_card_producer_contract.py validates against a schema that
 # cannot fail on a producer which stops emitting any of them.
-nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.69
+nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.68
 
 # Director (Layer C) — single structured LLM call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_GROUP="ultra", resolved through
