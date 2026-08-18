@@ -212,16 +212,25 @@ def read_gate_state(gate_state: Any) -> dict:
             )
         else:
             status_raw = raw.get("status")
+            # `gate_state` crosses a JSON boundary on every real run (the Step
+            # Function's Director payload), and `json.loads` does not intern
+            # scalar VALUES — only object keys. So a gate that correctly reports
+            # "MEASURED" yields a string that is `== MEASURED` but `is not
+            # MEASURED`. Comparing by identity here classified every measured
+            # gate as unmeasured, which forced the verdict to UNKNOWN on every
+            # production run and rendered "2 of 2 gates did not run" over a
+            # block whose own rows said MEASURED / in_sync
+            # (alpha-engine-config-I7614). Value comparison, always.
             status = status_raw if status_raw in _VALID_STATUSES else UNKNOWN
-            if status is UNKNOWN and status_raw not in (None, UNKNOWN):
+            if status == UNKNOWN and status_raw not in (None, UNKNOWN):
                 reason = (
                     f"unrecognised status {status_raw!r} — treated as UNKNOWN, "
                     "never as a pass"
                 )
             else:
                 reason = str(raw.get("reason") or "gate reported no measurement")
-        gates[key] = {"status": status, "reason": reason if status is UNKNOWN else None}
-        if status is not MEASURED:
+        gates[key] = {"status": status, "reason": reason if status == UNKNOWN else None}
+        if status != MEASURED:
             unmeasured.append((key, reason))
 
     degraded = [
