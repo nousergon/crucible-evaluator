@@ -227,15 +227,36 @@ class _FrozenS3:
         raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
 
 
+#: INVOCATION-scoped, not process-scoped: :func:`run_self_test` clears this at
+#: the top of every call. `alpha-engine-config#7621` — the evaluator's grading
+#: Lambda (``alpha-engine-evaluator``, ``grading.handler.handler``, which calls
+#: ``run_self_test`` on every Report Card build) is a real warm-reusable Lambda
+#: execution environment: AWS reuses a container across invocations, so a
+#: module-level dict populated on first use survives from one invocation to the
+#: next inside the same container. A cache that is only safe "until the next
+#: redeploy" is checking the wrong boundary — the container outlives many
+#: invocations between deploys. Today ``_tile_values``'s four fixture variants
+#: are pure functions of code alone (frozen synthetic CSVs, no ``run_date`` or
+#: live S3 data threads into them), so nothing currently varies invocation to
+#: invocation for this specific cache to go stale against. But that is a
+#: property of the current fixtures, not a property the cache itself enforces —
+#: the previous docstring asserted a correctness argument ("a redeploy is a new
+#: process") that is false at the invocation boundary, and the next edit to add
+#: a genuinely per-run input here would inherit a cache with no invalidation
+#: key at all. Clearing per invocation removes the class outright rather than
+#: enumerating what has to change to invalidate it correctly.
 _TILE_CACHE: dict[str, dict] = {}
 
 
 def _tile_values(variant: str) -> dict[str, float | None]:
     """Build the production tile over a frozen variant and return {name: value}.
 
-    Cached for the life of the process so the nine cases pay for four tile
-    builds, not nine. The input is frozen and the path is pure, so the cache
-    cannot mask a change — a redeploy is a new process.
+    Cached for the life of ONE :func:`run_self_test` invocation (the cache is
+    cleared at that function's entry) so the nine cases in a single run pay for
+    four tile builds, not nine — never across invocations, since the evaluator
+    Lambda reuses warm containers and a cross-invocation cache would risk
+    serving a stale tile to a run whose inputs moved. See the module-level
+    ``_TILE_CACHE`` comment for the execution-model evidence.
     """
     if variant in _TILE_CACHE:
         return _TILE_CACHE[variant]
@@ -498,7 +519,14 @@ def run_self_test(
     ``nousergon_lib.quant.selftest.run_self_test`` (alpha-engine-config-I7238);
     this wrapper supplies only this repo's identity (``component``/``schema``),
     default battery (``build_cases``), and resolved provenance.
+
+    Clears ``_TILE_CACHE`` first (`alpha-engine-config#7621`) — the evaluator's
+    grading Lambda reuses warm execution environments across invocations, so a
+    module-level cache left standing from a prior invocation could otherwise be
+    read by this one. This call is the per-invocation boundary that scopes the
+    cache's lifetime; see the ``_TILE_CACHE`` comment above :func:`_tile_values`.
     """
+    _TILE_CACHE.clear()
     return _lib_run_self_test(
         run_date,
         case_provider=case_provider or build_cases,

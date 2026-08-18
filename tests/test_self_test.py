@@ -328,18 +328,22 @@ def test_a_perturbed_sharpe_annualization_is_caught(monkeypatch):
     sharpe_ratio`), so it is bound into the TILE's own namespace and patching
     `nousergon_lib.quant.riskstats.sharpe_ratio` would not reach it.
 
-    REAL FINDING while building this test (not tuned around, reported instead
-    — alpha-engine-config, file separately): `self_test.py`'s own
-    `_TILE_CACHE` docstring claims "the cache cannot mask a change — a
-    redeploy is a new process". That is false within one warm PROCESS: this
-    test's perturbation was invisible until the cache was cleared here,
-    because an earlier case/test in this same session already populated
-    `_TILE_CACHE["base"]`. A Lambda container reused warm across two
-    invocations (AWS does this) would carry the SAME staleness — the second
-    invocation's self-test would silently grade the first invocation's tile,
-    not its own. Clearing the cache below is test-isolation hygiene, not a
-    tuned perturbation; the cache's actual behavior in a warm process is the
-    finding.
+    REAL FINDING while building this test, filed as `alpha-engine-config#7621`
+    and fixed by that issue: `self_test.py`'s own `_TILE_CACHE` docstring
+    claimed "the cache cannot mask a change — a redeploy is a new process".
+    That was false within one warm PROCESS — this test's perturbation was
+    invisible until the cache was cleared here, because an earlier case/test in
+    this same session had already populated `_TILE_CACHE["base"]`. The
+    evaluator's grading Lambda (`alpha-engine-evaluator`) reuses warm
+    containers across invocations (measured: `aws lambda list-functions`
+    against the live function, `PackageType: "Image"`), so the same staleness
+    would occur there — the second invocation's self-test would silently grade
+    the first invocation's tile, not its own. `run_self_test` now clears
+    `_TILE_CACHE` at its own entry (I7621's fix), so the manual clear below is
+    now redundant defense-in-depth for this test's isolation, not the thing
+    that makes the perturbation visible — `test_a_warm_container_reuse_does_not_serve_a_stale_tile`
+    below tests the fix itself, at the `run_self_test` boundary, without any
+    manual clear.
     """
     from grading import self_test as _self_test_module
     from grading.tiles import portfolio_outcome as tile
@@ -368,3 +372,49 @@ def test_a_perturbed_sharpe_annualization_is_caught(monkeypatch):
         # calls the `body` fixture for the first time does not silently grade
         # against this test's perturbation instead of the real implementation.
         _self_test_module._TILE_CACHE.clear()
+
+
+def test_a_warm_container_reuse_does_not_serve_a_stale_tile(monkeypatch):
+    """`alpha-engine-config#7621` — the same-process regression test the issue
+    requires: two consecutive `run_self_test()` calls in ONE process, with
+    different inputs between them, and the second call must not observe the
+    first's cached tile.
+
+    Simulates exactly what a warm Lambda container does: invocation N runs
+    clean and PASSes; invocation N+1 in the SAME process runs against a
+    perturbed `sharpe_ratio` and must FAIL on its own inputs — not silently
+    reuse invocation N's cached "base" tile values (which is what happened
+    before `run_self_test` cleared `_TILE_CACHE` at its own entry). No manual
+    cache clear happens in this test — if the fix regresses, this reproduces
+    the exact failure mode the issue reported: `n_failed == 0` on a run whose
+    inputs actually disagree, because the case read invocation N's stale
+    "base" tile.
+    """
+    from grading.tiles import portfolio_outcome as tile
+
+    original_sharpe_ratio = tile.sharpe_ratio
+
+    def sqrt_365(returns, *, risk_free_rate=0.0, periods_per_year=365):
+        return original_sharpe_ratio(
+            returns, risk_free_rate=risk_free_rate, periods_per_year=periods_per_year,
+        )
+
+    # Invocation N: clean run, populates _TILE_CACHE["base"] with the CORRECT
+    # sharpe_ratio value.
+    first = st.run_self_test(run_date="2026-08-15")
+    first_sharpe_case = next(c for c in first["cases"] if c["case"] == "sharpe_closed_form")
+    assert first_sharpe_case["verdict"] == st.PASS
+
+    # Invocation N+1: SAME process, no manual cache clear, perturbed lib call.
+    # A container reused warm across invocations is exactly this — a second
+    # call into the same module state with different underlying behavior.
+    monkeypatch.setattr(tile, "sharpe_ratio", sqrt_365)
+    second = st.run_self_test(run_date="2026-08-16")
+    second_sharpe_case = next(c for c in second["cases"] if c["case"] == "sharpe_closed_form")
+
+    assert second_sharpe_case["actual"] != first_sharpe_case["actual"], (
+        "invocation N+1 returned invocation N's cached tile value — the "
+        "warm-container cache masked a change between invocations"
+    )
+    assert second_sharpe_case["verdict"] == st.FAIL
+    assert second["n_failed"] >= 1
