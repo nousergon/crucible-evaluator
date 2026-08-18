@@ -1,6 +1,6 @@
 """Tests for `grading/self_test.py` — the published known-answer self-test.
 
-Three layers, and the last two are the load-bearing ones:
+Four layers, and the last two are the load-bearing ones:
 
 1. **The battery agrees on THIS runner.** Every case passes here too, so a CI
    failure and an in-Lambda failure mean the same thing and can be compared.
@@ -11,6 +11,10 @@ Three layers, and the last two are the load-bearing ones:
 3. **The runner's outcome taxonomy holds.** Disagreed => FAIL, could-not-run =>
    UNKNOWN, over-budget => FAIL (Brian ruling 2026-08-13). This is the part that
    decides whether a harness fault gets reported as a correctness regression.
+4. **The battery can actually FAIL** (alpha-engine-config-I7262's acceptance
+   criterion, generalised to this repo since it applies cleanly here too — see
+   `test_a_perturbed_sharpe_annualization_is_caught` below). A self-test never
+   shown to fail is not evidence.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import json
 import math
 
 import pytest
+from nousergon_lib.quant.selftest_perturbation import assert_perturbation_caught
 
 from grading import self_test as st
 
@@ -309,3 +314,57 @@ class TestReportCardCarriesTheVerdict:
     def test_degraded_flag_is_derived_so_it_can_never_disagree(self, verdict, expected_degraded):
         """An absent or unrecognised verdict reads as degraded, never as a pass."""
         assert (not st.verdict_is_pass(verdict)) is expected_degraded
+
+
+# ── layer 4: the battery can FAIL — generalising I7262's acceptance criterion ──
+
+def test_a_perturbed_sharpe_annualization_is_caught(monkeypatch):
+    """Recreates the EXACT defect class that started this arc
+    (alpha-engine-config-I7236: sqrt(365) vs sqrt(252), a 20.3% divergence)
+    and asserts the battery catches it.
+
+    Perturbed on `grading.tiles.portfolio_outcome.sharpe_ratio` — that module
+    imports the NAME directly (`from nousergon_lib.quant.riskstats import
+    sharpe_ratio`), so it is bound into the TILE's own namespace and patching
+    `nousergon_lib.quant.riskstats.sharpe_ratio` would not reach it.
+
+    REAL FINDING while building this test (not tuned around, reported instead
+    — alpha-engine-config, file separately): `self_test.py`'s own
+    `_TILE_CACHE` docstring claims "the cache cannot mask a change — a
+    redeploy is a new process". That is false within one warm PROCESS: this
+    test's perturbation was invisible until the cache was cleared here,
+    because an earlier case/test in this same session already populated
+    `_TILE_CACHE["base"]`. A Lambda container reused warm across two
+    invocations (AWS does this) would carry the SAME staleness — the second
+    invocation's self-test would silently grade the first invocation's tile,
+    not its own. Clearing the cache below is test-isolation hygiene, not a
+    tuned perturbation; the cache's actual behavior in a warm process is the
+    finding.
+    """
+    from grading import self_test as _self_test_module
+    from grading.tiles import portfolio_outcome as tile
+
+    _self_test_module._TILE_CACHE.clear()
+    original_sharpe_ratio = tile.sharpe_ratio
+
+    def sqrt_365(returns, *, risk_free_rate=0.0, periods_per_year=365):
+        return original_sharpe_ratio(
+            returns, risk_free_rate=risk_free_rate, periods_per_year=periods_per_year,
+        )
+
+    try:
+        out = assert_perturbation_caught(
+            monkeypatch,
+            module_path="grading.tiles.portfolio_outcome",
+            attr="sharpe_ratio",
+            perturbed=sqrt_365,
+            run=lambda: st.run_self_test(run_date="2026-08-15"),
+            case_name="sharpe_closed_form",
+        )
+        assert out["n_failed"] >= 1
+    finally:
+        # The perturbed run wrote a POISONED "base" tile (built with sqrt_365)
+        # into the module cache — clear it so any test after this one that
+        # calls the `body` fixture for the first time does not silently grade
+        # against this test's perturbation instead of the real implementation.
+        _self_test_module._TILE_CACHE.clear()
