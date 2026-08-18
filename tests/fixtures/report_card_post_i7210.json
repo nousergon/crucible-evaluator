@@ -1,0 +1,364 @@
+{
+  "_fixture_note": "SYNTHETIC post-ruling card (alpha-engine-config-I7210, Brian 2026-08-18). Produced by compute_scorecard on the shape the pipeline actually emits today: research graph retired, sizing A/B and excursion never persisted. Its purpose is to pin the POST-ruling artifact shape \u2014 research declares no cio/sector_teams_avg weight, grading_weights.version is 2026-08-18, and grading_weights.retired_components declares the removed pair. The pre-ruling regime stays pinned by report_card_2026-08-07.json, which is a VERBATIM published card and must not be regenerated.",
+  "executor": {
+    "components": {
+      "action_entropy": {
+        "detail": {
+          "alarm": false,
+          "entropy_normalized": 0.796,
+          "most_common": "HOLD",
+          "most_common_fraction": "63.7%",
+          "n": 900
+        },
+        "grade": 85.42857142857144,
+        "letter": "A-"
+      },
+      "entry_triggers": {
+        "detail": {
+          "avg_alpha": "+0.80%",
+          "avg_slippage": "-0.20%",
+          "n_triggers": 1,
+          "per_trigger": [
+            {
+              "grade": 59.85,
+              "letter": "B-",
+              "n_trades": 40,
+              "trigger": "gap"
+            }
+          ],
+          "total_entries": 300,
+          "win_rate": "50.0%"
+        },
+        "grade": 56.17999999999999,
+        "letter": "C+"
+      },
+      "exit_rules": {
+        "detail": {
+          "avg_return": "+0.50%",
+          "capture_ratio": "0.60",
+          "diagnosis": "exits_could_improve",
+          "n_roundtrips": 120
+        },
+        "grade": 57.728571428571435,
+        "letter": "C+"
+      },
+      "portfolio": {
+        "detail": {
+          "accuracy_21d": "58.0%",
+          "avg_alpha_21d": "+1.20%",
+          "calmar": "0.22",
+          "cvar_95": "-2.00%",
+          "information_ratio_spy": "0.40",
+          "max_drawdown": "-1.8%",
+          "sharpe": "0.35",
+          "sortino": "0.56"
+        },
+        "grade": 56.86048266666667,
+        "letter": "C+"
+      },
+      "position_sizing": {
+        "grade": null,
+        "letter": "N/A",
+        "reason": "no sizing A/B this cycle"
+      },
+      "risk_guard": {
+        "detail": {
+          "assessment": "appropriate",
+          "f1": "0.740",
+          "guard_lift": "+60.00%",
+          "n_blocked": 1233,
+          "precision": "63.0%",
+          "recall": "90.0%"
+        },
+        "grade": 86.81428571428572,
+        "letter": "A-"
+      }
+    },
+    "coverage": {
+      "components_declared": 7,
+      "components_failed": [],
+      "components_present": 5,
+      "components_skipped": [
+        "position_sizing",
+        "excursion"
+      ],
+      "floor": null,
+      "floor_status": "unset-unmeasured (config-I7202: no card has ever reached full coverage, so there is no distribution to place a floor below)",
+      "provisional": false,
+      "qualifier": "PARTIAL",
+      "renormalization_factor": 1.333333,
+      "renormalized": true,
+      "skip_classes": {
+        "excursion": "input_absent",
+        "position_sizing": "input_absent"
+      },
+      "skips": [
+        {
+          "component": "position_sizing",
+          "reason": "no sizing A/B this cycle",
+          "scored_zero": false,
+          "skip_class": "input_absent",
+          "weight": 0.1
+        },
+        {
+          "component": "excursion",
+          "reason": "no portfolio excursion this cycle",
+          "scored_zero": false,
+          "skip_class": "input_absent",
+          "weight": 0.15
+        }
+      ],
+      "weight_declared": 1.0,
+      "weight_failed": 0.0,
+      "weight_in_denominator": 0.75,
+      "weight_present": 0.75,
+      "weight_present_effective": 0.75,
+      "weight_scored_zero": 0.0,
+      "weights": {
+        "action_entropy": 0.1,
+        "entry_triggers": 0.1,
+        "excursion": 0.15,
+        "exit_rules": 0.15,
+        "portfolio": 0.25,
+        "position_sizing": 0.1,
+        "risk_guard": 0.15
+      }
+    },
+    "display": "B (PARTIAL \u2014 75% of declared weight)",
+    "grade": 66.74320850793652,
+    "letter": "B"
+  },
+  "grading_weights": {
+    "executor": {
+      "action_entropy": 0.1,
+      "entry_triggers": 0.1,
+      "excursion": 0.15,
+      "exit_rules": 0.15,
+      "portfolio": 0.25,
+      "position_sizing": 0.1,
+      "risk_guard": 0.15
+    },
+    "overall": {
+      "executor": 0.35,
+      "predictor": 0.25,
+      "research": 0.4
+    },
+    "predictor": {
+      "meta_model": 0.55,
+      "veto_gate": 0.45
+    },
+    "research": {
+      "calibration_diagnostics": 0.2727272727272727,
+      "composite_scoring": 0.36363636363636365,
+      "macro_agent": 0.18181818181818182,
+      "scanner": 0.18181818181818182
+    },
+    "retired_components": {
+      "research": [
+        {
+          "component": "cio",
+          "lifecycle": "RETIRED",
+          "reason": "six-team + CIO research orchestration removed \u2014 graded a graph that no longer produces; e2e_lift.cio_lift has carried status=retired on every card since 2026-07-17",
+          "reference": "config#1580 / alpha-engine-config-I2993",
+          "removed_from_weight_table": "2026-08-18",
+          "retired_date": "2026-07-12",
+          "ruling": "alpha-engine-config-I7210 decision 1 (Brian, 2026-08-18)",
+          "superseded_by": "the live-arm scanner attractiveness IC (attractiveness_ic, config-I2994) + the thinktank_coverage challenger arm",
+          "weight_was": 0.2
+        },
+        {
+          "component": "sector_teams_avg",
+          "lifecycle": "RETIRED",
+          "reason": "six-team + CIO research orchestration removed \u2014 graded a graph that no longer produces; e2e_lift.team_lift has been [] on every card since 2026-07-17",
+          "reference": "config#1580 / alpha-engine-config-I2993",
+          "removed_from_weight_table": "2026-08-18",
+          "retired_date": "2026-07-12",
+          "ruling": "alpha-engine-config-I7210 decision 1 (Brian, 2026-08-18)",
+          "superseded_by": "the live-arm scanner attractiveness IC (attractiveness_ic, config-I2994) + the thinktank_coverage challenger arm",
+          "weight_was": 0.25
+        }
+      ]
+    },
+    "rule": "Scoring rule v2026-08-18 (alpha-engine-config-I7210, Brian 2026-08-18). TWO cases, decided by coverage.skip_classes. (1) FAILURE \u2014 a component whose skip_class is 'failed' or 'failed_timeout' SCORES 0.0 and STAYS in the denominator at its full declared weight. It is NOT renormalized away: a failure lowers the grade, so the grade can never rise because the system broke. (2) NON-FAILURE ABSENCE \u2014 a component whose skip_class is 'retired', 'not_implemented', 'input_absent', 'insufficient_data' or 'unknown' is removed from the denominator and the remaining declared weights are rescaled to sum to 1. So grade = sum(w_i * g_i) / sum(w_i) over the SCORING set, where the scoring set is every graded component at its own grade plus every failed component at grade 0.0. weight_present is sum(w_i for graded i) and weight_scored_zero is sum(w_i for failed i), both against a declared total of 1.0; they sum to the fraction of declared weight in the denominator. Cards stamped with an earlier version were computed under the prior rule, where a failure was dropped like any other null \u2014 they are not comparable to this one on the headline number.",
+    "version": "2026-08-18"
+  },
+  "overall": {
+    "coverage": {
+      "components_declared": 3,
+      "components_failed": [],
+      "components_present": 3,
+      "components_skipped": [],
+      "floor": null,
+      "floor_status": "unset-unmeasured (config-I7202: no card has ever reached full coverage, so there is no distribution to place a floor below)",
+      "provisional": false,
+      "qualifier": "PARTIAL",
+      "renormalization_factor": 1.0,
+      "renormalized": false,
+      "skip_classes": {},
+      "skips": [],
+      "weight_declared": 1.0,
+      "weight_failed": 0.0,
+      "weight_in_denominator": 1.0,
+      "weight_present": 1.0,
+      "weight_present_effective": 0.9125,
+      "weight_scored_zero": 0.0,
+      "weights": {
+        "executor": 0.35,
+        "predictor": 0.25,
+        "research": 0.4
+      }
+    },
+    "display": "B (PARTIAL \u2014 91% of declared weight)",
+    "grade": 71.76102947128427,
+    "letter": "B"
+  },
+  "predictor": {
+    "components": {
+      "meta_model": {
+        "detail": {
+          "rank_ic": "0.0278",
+          "sizing_lift": "+1.00%",
+          "stability": "7/8 weeks positive"
+        },
+        "grade": 64.84033333333333,
+        "letter": "B-"
+      },
+      "veto_gate": {
+        "detail": {
+          "f1": "0.310",
+          "lift": "+400.00pp",
+          "net_value": "$+400",
+          "precision": "57.0%",
+          "recall": "21.0%",
+          "threshold": 0.65
+        },
+        "grade": 66.26071428571427,
+        "letter": "B"
+      }
+    },
+    "coverage": {
+      "components_declared": 2,
+      "components_failed": [],
+      "components_present": 2,
+      "components_skipped": [],
+      "floor": null,
+      "floor_status": "unset-unmeasured (config-I7202: no card has ever reached full coverage, so there is no distribution to place a floor below)",
+      "provisional": false,
+      "qualifier": "COMPLETE",
+      "renormalization_factor": 1.0,
+      "renormalized": false,
+      "skip_classes": {},
+      "skips": [],
+      "weight_declared": 1.0,
+      "weight_failed": 0.0,
+      "weight_in_denominator": 1.0,
+      "weight_present": 1.0,
+      "weight_present_effective": 1.0,
+      "weight_scored_zero": 0.0,
+      "weights": {
+        "meta_model": 0.55,
+        "veto_gate": 0.45
+      }
+    },
+    "display": "B",
+    "grade": 65.47950476190476,
+    "letter": "B"
+  },
+  "research": {
+    "components": {
+      "calibration_diagnostics": {
+        "detail": {
+          "ece": 0.03,
+          "n": 400,
+          "quality": null
+        },
+        "grade": 90.0,
+        "letter": "A"
+      },
+      "cio": {
+        "grade": null,
+        "letter": "N/A",
+        "lifecycle": "RETIRED",
+        "reason": "CIO lift status: retired",
+        "retired_date": "2026-07-12",
+        "retired_reference": "config#1580 / alpha-engine-config-I2993",
+        "weighted": false
+      },
+      "composite_scoring": {
+        "detail": {
+          "90+_accuracy": "66.0%",
+          "accuracy_21d": "58.0%",
+          "monotonic": "YES"
+        },
+        "grade": 71.91999999999999,
+        "letter": "B"
+      },
+      "macro_agent": {
+        "detail": {
+          "accuracy_lift": "+100.00pp",
+          "alpha_lift": "+40.00%",
+          "assessment": "neutral"
+        },
+        "grade": 100.0,
+        "letter": "A"
+      },
+      "scanner": {
+        "detail": {
+          "f1": "0.270",
+          "horizon": "5d",
+          "leakage": "10%",
+          "lift": "+80.00%",
+          "n_passing": 600,
+          "n_universe": 15000,
+          "n_universe_basis": "(ticker, eval_date) observations, not tickers",
+          "precision": "44.0%",
+          "recall": "20.0%"
+        },
+        "grade": 61.586666666666666,
+        "letter": "B-"
+      },
+      "sector_teams": [],
+      "sector_teams_avg": {
+        "grade": null,
+        "letter": "N/A",
+        "lifecycle": "RETIRED",
+        "reason": "sector teams status: retired (2026-07-12) \u2014 six-team + macro-economist + CIO research orchestration retired (config#1580)",
+        "retired_date": "2026-07-12",
+        "retired_reference": "config#1580 / alpha-engine-config-I2993",
+        "weighted": false
+      }
+    },
+    "coverage": {
+      "components_declared": 4,
+      "components_failed": [],
+      "components_present": 4,
+      "components_skipped": [],
+      "floor": null,
+      "floor_status": "unset-unmeasured (config-I7202: no card has ever reached full coverage, so there is no distribution to place a floor below)",
+      "provisional": false,
+      "qualifier": "COMPLETE",
+      "renormalization_factor": 1.0,
+      "renormalized": false,
+      "skip_classes": {},
+      "skips": [],
+      "weight_declared": 1.0,
+      "weight_failed": 0.0,
+      "weight_in_denominator": 1.0,
+      "weight_present": 1.0,
+      "weight_present_effective": 1.0,
+      "weight_scored_zero": 0.0,
+      "weights": {
+        "calibration_diagnostics": 0.2727272727272727,
+        "composite_scoring": 0.36363636363636365,
+        "macro_agent": 0.18181818181818182,
+        "scanner": 0.18181818181818182
+      }
+    },
+    "display": "A-",
+    "grade": 80.07757575757576,
+    "letter": "A-"
+  },
+  "run_date": "2026-08-18",
+  "schema_version": 1,
+  "status": "ok"
+}
