@@ -166,7 +166,7 @@ krepis[flow-doctor,openai]>=0.59.11
 # now `required`, and `stale_tiles` is typed. Below this pin
 # tests/test_report_card_producer_contract.py validates against a schema that
 # cannot fail on a producer which stops emitting any of them.
-nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.65
+nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.68
 
 # Director (Layer C) — single structured LLM call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_GROUP="ultra", resolved through
