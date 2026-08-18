@@ -172,7 +172,14 @@ def read_card_verdict(card: Any) -> dict:
                 h.get("verdict") if h.get("verdict") in _VALID_VERDICTS else UNKNOWN
             )
 
-    if verdict is UNKNOWN and raw != UNKNOWN:
+    # Value comparison, not identity: `raw` comes from a JSON-parsed card and
+    # `json.loads` does not intern scalar values, so `verdict is UNKNOWN` is
+    # False whenever the card literally said "UNKNOWN". This branch happens to
+    # reach the right outcome either way, but the identity form is the same
+    # defect that made the pipeline-gate verdict permanently UNKNOWN
+    # (alpha-engine-config-I7614) — it is removed here so the pattern does not
+    # survive anywhere in the attestation read path.
+    if verdict == UNKNOWN and raw != UNKNOWN:
         result["reason"] = (
             f"the card's attestation verdict {raw!r} is not one of "
             f"{sorted(_VALID_VERDICTS)} — treated as UNKNOWN, never as a pass. A "

@@ -294,3 +294,66 @@ def test_multiple_fired_families_are_all_named():
     assert set(block["degraded_families"]) == {"gate_degraded", "parity_degraded"}
     assert "pre-spend gates" in block["statement"]
     assert "parity verdict" in block["statement"]
+
+
+# ---------------------------------------------------------------------------
+# 4. The JSON boundary — alpha-engine-config-I7614
+# ---------------------------------------------------------------------------
+#
+# Every test above builds its payload from string LITERALS in this file.
+# CPython interns those at compile time, so `"MEASURED"` here and `MEASURED` in
+# `grading/pipeline_gates.py` are the same object, and an `is` comparison in the
+# reader behaves identically to `==`. On a real run the payload arrives from the
+# Step Function through `json.loads`, which does not intern scalar values — and
+# there the two forms diverge.
+#
+# That divergence is not hypothetical: it classified every MEASURED gate as
+# unmeasured on every production run, forcing the verdict to UNKNOWN and
+# rendering "2 of 2 pre-spend correctness gates did not run this cycle" over a
+# block whose own rows read MEASURED / in_sync
+# (s3://alpha-engine-research/director/2026-08-14/action_plan.json).
+#
+# So: the payload in these tests MUST cross a real JSON round-trip. A test that
+# constructs the dict in Python cannot fail on this bug and must never be the
+# only coverage of the reader.
+
+
+def _through_json(payload: dict) -> dict:
+    """The payload as the reader actually receives it — never interned."""
+    return json.loads(json.dumps(payload))
+
+
+def test_a_json_parsed_clean_payload_still_verifies():
+    """The regression. Identical to the clean-run test but across the wire."""
+    payload = _through_json(_clean_payload())
+
+    # Guard the guard: if this ever holds, the round-trip stopped being one and
+    # the test below would pass vacuously.
+    assert payload["lib_pin_drift"]["status"] is not MEASURED
+    assert payload["lib_pin_drift"]["status"] == MEASURED
+
+    block = read_gate_state(payload)
+    assert block["verdict"] == MEASURED
+    assert block["unmeasured"] == []
+    assert gates_unmeasured(block) is False
+    assert block["statement"].startswith("VERIFIED")
+
+
+def test_a_json_parsed_unknown_gate_is_still_named_unmeasured():
+    """The other polarity — the fix must not make everything read as measured."""
+    payload = _through_json(
+        _clean_payload(lib_pin_drift={"status": "UNKNOWN",
+                                      "reason": "gate_did_not_run"})
+    )
+    block = read_gate_state(payload)
+    assert block["verdict"] == UNKNOWN
+    assert block["unmeasured"] == ["lib_pin_drift"]
+    assert block["statement"].startswith("NOT VERIFIED")
+
+
+def test_a_json_parsed_unrecognised_status_never_reads_as_measured():
+    payload = _through_json(_clean_payload(pipeline_contract={"status": "ok"}))
+    block = read_gate_state(payload)
+    assert block["gates"]["pipeline_contract"]["status"] == UNKNOWN
+    assert block["verdict"] == UNKNOWN
+    assert "unrecognised status" in block["gates"]["pipeline_contract"]["reason"]
