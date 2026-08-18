@@ -131,6 +131,21 @@ def summarize_report_card(card: dict) -> str:
             "were NOT updated. The live executor is on the PREVIOUS cycle's "
             "parameters; do not describe any config change as having taken effect."
         )
+    # config-I7620 follow-up. PASS above now means "the arithmetic we MEASURED is
+    # right". When the contamination producer was not dispatched, that is a
+    # second, weaker claim than the four-halves one, and the Director must be
+    # told which it is holding — otherwise it re-proposes "fix the pit_parity
+    # timeout" every week against a stage an operator switched off on purpose,
+    # which is exactly what the 2026-08-14 plan did as its P0.
+    if att.get("contamination_in_scope") is False:
+        scope_reason = (att.get("contamination") or {}).get("scope", {}).get("reason", "")
+        out.append(
+            "⚠ CONTAMINATION NOT MEASURED — the look-ahead check was NOT DISPATCHED "
+            f"this run. {scope_reason} This is an operator decision already tracked, "
+            "NOT a failure: do not propose fixing, re-running or diagnosing that "
+            "producer, and do not describe the run as contamination-free."
+        )
+
     # alpha-engine-config-I7282 — §2.3a rule 3. The attestation above says
     # whether the arithmetic behind these numbers is right; this says whether the
     # pipeline's own pre-spend correctness gates ran at all before it spent. Both

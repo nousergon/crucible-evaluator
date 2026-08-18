@@ -69,7 +69,7 @@ import logging
 import math
 import platform
 import time
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -89,6 +89,48 @@ UNKNOWN = "UNKNOWN"
 PARTIAL = "PARTIAL"
 
 _VALID_VERDICTS = frozenset({PASS, FAIL, PARTIAL, UNKNOWN})
+
+#: config-I7620 follow-up — a half whose PRODUCER WAS NOT DISPATCHED THIS RUN.
+#:
+#: Deliberately OUTSIDE ``_VALID_VERDICTS``: no producer may ever write this
+#: value, and :func:`_normalize_verdict` can never yield it. It is assigned by
+#: this module alone, and only when the run-scope artifact — derived from the
+#: state machine definition and the execution history, which cannot disagree
+#: with reality — says the stage that writes the evidence took its skip branch.
+#:
+#: It is NOT a pass. :func:`verdict_is_pass` still returns False for it, so
+#: ``degraded_contamination`` stays True and no surface claims the run was
+#: established contamination-free. What it changes is the COMBINED verdict: an
+#: out-of-scope half is excluded from :func:`_worst` rather than dragging the
+#: whole block to UNKNOWN.
+#:
+#: Why that distinction is the whole point: ``skip_parity: true`` has been set
+#: on the live ``alpha-engine-saturday`` EventBridge target since 2026-08-13 by
+#: a recorded ruling (config-I7309, re-enable gated to phase 3). With the
+#: producer switched off on purpose, the pre-scope reader resolved contamination
+#: to UNKNOWN every single week, the combined verdict to UNKNOWN with it, and
+#: the Director — which reads that verdict under sf-pipeline-policy §2.3a —
+#: withheld ``issue_filing`` and ``loop_verification`` indefinitely. An operator
+#: decision to stop measuring one thing had silently become a decision to stop
+#: the weekly advisory from acting on anything, and nothing on any surface said
+#: so. "The producer never ran this cycle" is a true sentence about a stage that
+#: crashed and a false one about a stage nobody started.
+NOT_IN_SCOPE = "NOT_IN_SCOPE"
+
+#: The stages that must ALL run for ``backtest/{date}/pit_parity.json`` to
+#: exist: the umbrella gate plus the two passes and the compare that writes the
+#: artifact. Named after the ``CheckSkip*`` gates in the weekly SF definition
+#: with the prefix stripped, which is exactly the key the run-scope producer
+#: emits (``nousergon-data infrastructure/lambdas/weekly-run-scope/run_scope.py``).
+#:
+#: Any ONE of them disabled means there is no comparison to report, so the
+#: contamination half is out of scope — not merely thinner.
+CONTAMINATION_PRODUCER_STAGES: tuple[str, ...] = (
+    "Parity",
+    "PitParityWalkforward",
+    "PitParityLookahead",
+    "PitParityCompare",
+)
 
 _TRADING_DAYS = 252
 _RTOL = 1e-12
@@ -650,7 +692,64 @@ def read_contamination_verdict(bucket: str, run_date: str, s3_client=None) -> di
     )
 
 
-def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
+def contamination_scope(run_scope: Any) -> dict:
+    """Whether the contamination producer was DISPATCHED this run.
+
+    ``run_scope`` is the raw ``run_scope.json`` body (or the already-normalized
+    block — both are accepted, because the card reads it in one place and the
+    Director in another and threading two shapes through would be one more way
+    to get it wrong).
+
+    Returns ``{"in_scope": bool, "disabled_stages": [...], "disabled_by": [...],
+    "reason": str}``. **Absence is never out-of-scope.** A missing or
+    unmeasured run-scope artifact leaves the half IN scope, so it resolves to
+    UNKNOWN exactly as it did before this function existed — the failure mode
+    this guards against is a scope reader that goes quiet and thereby excuses
+    every half it can no longer see.
+    """
+    from grading.run_scope import read_run_scope, scope_unknown
+
+    block = run_scope if isinstance(run_scope, dict) and "graded_stages" in run_scope \
+        else read_run_scope(run_scope)
+    if scope_unknown(block):
+        return {
+            "in_scope": True,
+            "disabled_stages": [],
+            "disabled_by": [],
+            "reason": (
+                "run scope not established, so the contamination half is read as "
+                "in scope — an unmeasured denominator never excuses a missing half."
+            ),
+        }
+    disabled = [s for s in CONTAMINATION_PRODUCER_STAGES
+                if s in set(block.get("disabled_stages") or ())]
+    if not disabled:
+        return {
+            "in_scope": True,
+            "disabled_stages": [],
+            "disabled_by": [],
+            "reason": "the contamination producer was dispatched this run.",
+        }
+    flags = sorted(block.get("disabled_by") or ()) or ["an operator skip flag"]
+    return {
+        "in_scope": False,
+        "disabled_stages": disabled,
+        "disabled_by": flags,
+        "reason": (
+            "contamination NOT IN SCOPE this run — "
+            f"{', '.join(disabled)} took the skip branch, disabled by "
+            f"{', '.join(flags)}. The look-ahead check was not asked to run, so "
+            "its silence is a decision and not an absence of evidence. This is "
+            "NOT a pass: the run is not established free of look-ahead "
+            "contamination, it is unmeasured for it on purpose "
+            "(config-I7309 re-enables it in phase 3)."
+        ),
+    }
+
+
+def build_run_attestation(
+    bucket: str, run_date: str, s3_client=None, *, run_scope: Any = None,
+) -> dict:
     """The combined block the Report Card carries at ``report_card["attestation"]``.
 
     Three halves, because three distinct pieces of arithmetic stand between the
@@ -692,11 +791,34 @@ def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
     evaluator_stage = read_evaluator_stage_attestation(bucket, run_date, s3_client=s3_client)
     contamination = read_contamination_verdict(bucket, run_date, s3_client=s3_client)
 
+    # config-I7620 follow-up. The contamination half is the only one whose
+    # producer an operator routinely switches off (`skip_parity`), and until the
+    # run-scope artifact existed there was no machine-readable way to tell
+    # "switched off" from "died". Now there is, so ask it — and only it: this
+    # never inspects the SF input or an env var, because the definition and the
+    # execution history are the two sources that cannot disagree with reality.
+    scope = contamination_scope(run_scope)
+    contamination["scope"] = scope
+    if not scope["in_scope"]:
+        contamination["verdict"] = NOT_IN_SCOPE
+        contamination["reason"] = scope["reason"]
+
     arithmetic_verdict = _worst(
         evaluator["verdict"], backtester["verdict"], evaluator_stage["verdict"],
     )
     contamination_verdict = contamination["verdict"]
-    verdict = _worst(arithmetic_verdict, contamination_verdict)
+    # An out-of-scope half is EXCLUDED from the worst-of rather than folded in.
+    # Folding it in is what made every week UNKNOWN; passing NOT_IN_SCOPE
+    # through `_worst` would do exactly that again, since it is deliberately
+    # outside `_VALID_VERDICTS` and `_worst` maps anything it does not
+    # recognise to UNKNOWN. The combined verdict answers "is what we MEASURED
+    # correct"; `contamination_verdict` continues to answer, separately and
+    # honestly, "did we measure contamination at all" — and NOT_IN_SCOPE is
+    # never a pass there.
+    verdict = (
+        arithmetic_verdict if not scope["in_scope"]
+        else _worst(arithmetic_verdict, contamination_verdict)
+    )
 
     withheld = [
         f"{name}={half['verdict']}"
@@ -733,16 +855,33 @@ def build_run_attestation(bucket: str, run_date: str, s3_client=None) -> dict:
         "backtester": backtester,
         "evaluator_stage": evaluator_stage,
         "contamination": contamination,
+        "contamination_in_scope": scope["in_scope"],
         "promotion_withheld": bool(evaluator_stage.get("promotion_withheld")),
+        # config-I7620 follow-up: an out-of-scope contamination half gets its own
+        # sentence. Rendering it under the four-halves-attested line would claim
+        # a check that was never asked to run, and rendering it as WITHHELD would
+        # repeat the sentence that stopped the Director for three weeks.
         "reason": (
             "All four halves attested — the deployed quant primitives, the backtest "
             "engine, and the Evaluator stage's ranking metrics each agreed with their "
             "hand-derived known answers, and the point-in-time replay found no "
             "material look-ahead contamination over the full window."
+            if verdict == PASS and scope["in_scope"] else
+            "Arithmetic attested over the stages this run dispatched. "
+            f"CONTAMINATION NOT MEASURED: {scope['reason']}"
             if verdict == PASS else
             f"Correctness guarantee WITHHELD: {', '.join(withheld)}. {reasons}".strip()
         ),
     }
     if verdict != PASS:
         logger.error("report card attestation %s for %s: %s", verdict, run_date, block["reason"])
+    elif not scope["in_scope"]:
+        # Both polarities, always. A block that logs only the failing case is
+        # indistinguishable from a producer that stopped running, and "PASS with
+        # one half never measured" is precisely the state that must not slip past
+        # a reader scanning for ERROR lines.
+        logger.warning(
+            "report card attestation PASS for %s with contamination NOT MEASURED: %s",
+            run_date, scope["reason"],
+        )
     return block
