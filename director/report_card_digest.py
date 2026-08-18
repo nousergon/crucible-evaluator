@@ -16,6 +16,8 @@ Output is plain text (markdown-ish) so it drops straight into the prompt.
 from __future__ import annotations
 
 from grading.pipeline_gates import MEASURED, PIPELINE_GATES_KEY
+from grading.run_scope import MEASURED as SCOPE_MEASURED
+from grading.run_scope import RUN_SCOPE_KEY
 
 TILE_ORDER = [
     "portfolio_outcome", "research", "predictor", "executor",
@@ -145,6 +147,35 @@ def summarize_report_card(card: dict) -> str:
             "block, so nothing says whether the weekly run's pre-spend "
             "correctness gates ran. Treat the numbers below as unattested."
         )
+    # alpha-engine-config-I7620 — the DENOMINATOR, rendered before the tiles for
+    # the same reason as the two verdicts above: the Director ACTS on these
+    # numbers, and every one of them was computed over whatever stages this run
+    # dispatched. That set moves. On 2026-08-14 the Director called the
+    # deliberate absence of pit_parity "the producer never ran this cycle" and
+    # withheld its acting authority, because nothing on the card distinguished a
+    # stage switched off by `skip_parity` from a stage that died.
+    #
+    # Both polarities render. A scope line that appears only on a narrow week is
+    # indistinguishable from a producer that stopped emitting one.
+    scope = card.get(RUN_SCOPE_KEY) or {}
+    scope_statement = scope.get("statement")
+    if scope_statement and scope.get("verdict") == SCOPE_MEASURED:
+        out.append("RUN SCOPE: " + scope_statement)
+    elif scope_statement:
+        out.append(
+            "⚠ RUN SCOPE: " + scope_statement
+            + " Grade nothing against a stage list this card cannot confirm was "
+            "dispatched — a narrow run and an unmeasured one are different "
+            "findings."
+        )
+    else:
+        out.append(
+            "⚠ RUN SCOPE: UNKNOWN — this card carries no run_scope block, so "
+            "which stages the week actually dispatched is not established. A "
+            "stage that was switched off by an operator flag is indistinguishable "
+            "here from one that ran and failed; do not report either as the other."
+        )
+
     if card.get("degraded_staleness"):
         out.append("⚠ DEGRADED (staleness): stale tiles — "
                    + ", ".join(card.get("stale_tiles") or []))

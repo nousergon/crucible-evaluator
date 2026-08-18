@@ -35,6 +35,7 @@ from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
 from grading.pipeline_gates import gates_unmeasured, read_gate_state
+from grading.run_scope import RUN_SCOPE_KEY, log_run_scope, read_run_scope, scope_unknown
 from grading.self_test import run_self_test
 from grading.self_test import verdict_is_pass as self_test_is_pass
 from grading.module_agg import overall_status
@@ -303,6 +304,28 @@ def build_report_card(
     gate_block = read_gate_state(gate_state)
     scorecard["pipeline_gates"] = gate_block
     scorecard["degraded_pipeline_gates"] = gates_unmeasured(gate_block)
+
+    # alpha-engine-config-I7620 — the DENOMINATOR. Every grade above is computed
+    # over whatever stages this run actually dispatched, and that set moves: the
+    # weekly pipeline carries 29 skip gates and an operator flipping one changes
+    # which producers ran without changing anything else the card says. The
+    # 2026-08-16 execution terminated SUCCEEDED having dispatched 3 of 29, and
+    # nothing on any surface said so.
+    #
+    # `report.run_scope` is the artifact `RunScope` wrote for THIS run. An absent
+    # or degraded block resolves to UNKNOWN with an empty graded set — never to
+    # "everything ran". A card that grades the full stage list against a run that
+    # dispatched three of them is confidently wrong; one that says it does not
+    # know is merely uninformative.
+    #
+    # Deliberately does NOT move `status`: the scope is legitimately narrow on
+    # every partial rerun, and a permanently-amber field is a field nobody reads
+    # (same reasoning as `degraded_pipeline_gates` above). It is rendered BESIDE
+    # the grade, which is what was missing, not folded INTO it.
+    scope_block = read_run_scope(report.run_scope)
+    scorecard[RUN_SCOPE_KEY] = scope_block
+    scorecard["scope_unknown"] = scope_unknown(scope_block)
+    log_run_scope(scope_block)
 
     # A card whose correctness verdict did not come back cannot present itself
     # as a complete build. On 2026-08-07 the contamination check timed out and
