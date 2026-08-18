@@ -78,25 +78,24 @@ def test_undefined_is_nan_never_a_measured_zero() -> None:
 
 
 def test_sortino_uses_the_full_sample_denominator() -> None:
-    """config-I7271's convention, pinned here so a silent switch fails."""
+    """config-I7271's convention, pinned here so a silent switch fails.
+
+    Both sides are written out from the definition — neither asks the library
+    for the retired n_down convention. config-I7638 deleted that branch from
+    ``nousergon_lib.quant.riskstats`` (a call now raises ValueError), and a
+    drift test whose verdict depends on which library version is installed is
+    the drift it is supposed to catch.
+    """
     r = CORPUS["mixed"]
     n, n_down = len(r), sum(1 for x in r if x < 0)
     got = _ann_sortino(_arr("mixed"))
-    n_down_variant = sortino_ratio(r, denominator="downside") if _has_denominator() else None
-    if n_down_variant is not None:
-        assert got / n_down_variant == pytest.approx(math.sqrt(n / n_down), rel=1e-9)
-    else:
-        # Older pinned library without the `denominator` parameter — assert the
-        # convention directly from the definition instead.
-        mean = sum(r) / n
-        dd = math.sqrt(sum(min(0.0, x) ** 2 for x in r) / n)
-        assert got == pytest.approx(mean / dd * math.sqrt(252), **_TOL)
-
-
-def _has_denominator() -> bool:
-    import inspect
-
-    return "denominator" in inspect.signature(sortino_ratio).parameters
+    mean = sum(r) / n
+    dd_full = math.sqrt(sum(min(0.0, x) ** 2 for x in r) / n)
+    dd_n_down = math.sqrt(sum(x * x for x in r if x < 0.0) / n_down)
+    assert got == pytest.approx(mean / dd_full * math.sqrt(252), **_TOL)
+    # ...and it is sqrt(n / n_down) away from the convention it is NOT on.
+    n_down_variant = mean / dd_n_down * math.sqrt(252)
+    assert got / n_down_variant == pytest.approx(math.sqrt(n / n_down), rel=1e-9)
 
 
 def test_attestation_expectations_agree_with_the_library() -> None:
