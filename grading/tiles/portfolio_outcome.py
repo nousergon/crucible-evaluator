@@ -157,15 +157,21 @@ def _ann_sortino(arr: np.ndarray) -> float:
 
 
 def _ann_ir(arr: np.ndarray) -> float:
-    """Annualized information ratio: mean active / stdev active × √252."""
+    """Annualized information ratio: mean active / stdev active × √252.
+
+    IR is Sharpe computed on the active-return series (risk-free = 0), so this
+    is the same `riskstats.sharpe_ratio` the two adapters above call rather
+    than a fifth copy of `mean / std * sqrt(252)` (config-I7597). Non-finite
+    inputs are dropped first — the library takes a clean series — and the
+    library's `None` for undefined is mapped to this tile's `nan` sentinel,
+    exactly as `_ann_sharpe`/`_ann_sortino` already do.
+    """
     a = np.asarray(arr, dtype=float)
     a = a[np.isfinite(a)]
     if a.size < 2:
         return float("nan")
-    sd = a.std(ddof=1)
-    if sd == 0:
-        return float("nan")
-    return float(a.mean() / sd * math.sqrt(_TRADING_DAYS))
+    v = sharpe_ratio([float(x) for x in a], periods_per_year=_TRADING_DAYS)
+    return float("nan") if v is None else float(v)
 
 
 def _neg_cvar(arr: np.ndarray) -> float:
