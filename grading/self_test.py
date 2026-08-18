@@ -124,26 +124,24 @@ from botocore.exceptions import ClientError
 
 from nousergon_lib.quant.selftest import (
     CASE_TIMEOUT_SECONDS,
-    FAIL,
-    PASS,
-    UNKNOWN,
     Case,
-    SelfTestTimeout as _CaseTimeout,
-    _call_with_timeout,
+    SelfTestTimeout as _CaseTimeout,  # noqa: F401 — re-exported (st._CaseTimeout in tests)
+    _call_with_timeout,  # noqa: F401 — re-exported (st._call_with_timeout in tests)
     code_sha as _lib_code_sha,
     resolved_library_versions as _lib_resolved_library_versions,
     run_self_test as _lib_run_self_test,
-    verdict_is_pass,
+)
+from nousergon_lib.quant.selftest import FAIL as FAIL  # noqa: PLC0414 — re-exported (st.FAIL)
+from nousergon_lib.quant.selftest import PASS as PASS  # noqa: PLC0414 — re-exported (st.PASS)
+from nousergon_lib.quant.selftest import UNKNOWN as UNKNOWN  # noqa: PLC0414 — re-exported (st.UNKNOWN)
+from nousergon_lib.quant.selftest import (
+    verdict_is_pass as verdict_is_pass,  # noqa: PLC0414 — re-exported (st.verdict_is_pass)
 )
 
 logger = logging.getLogger(__name__)
 
 SCHEMA = "evaluator_self_test-1.0.0"
 COMPONENT = "evaluator"
-
-PASS = "PASS"
-FAIL = "FAIL"
-UNKNOWN = "UNKNOWN"
 
 #: ``evaluator/{run_date}/self_test.json`` — beside the run's report card.
 _KEY_TEMPLATE = "evaluator/{run_date}/self_test.json"
@@ -162,10 +160,6 @@ _TRACKED_DISTRIBUTIONS = (
     "pydantic",
     "boto3",
 )
-
-#: Per-case wall-clock budget. Each case is one tile build over 100 in-memory
-#: rows; anything approaching this is a hang, not a slow machine.
-CASE_TIMEOUT_SECONDS = 30.0
 
 #: 1e-9 absolute, per the specification. Every expectation is an exact float64
 #: identity, and the observed agreement is ~1e-15 — the band is far tighter than
