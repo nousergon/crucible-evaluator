@@ -135,7 +135,8 @@ class TestCoverageBlock:
         # The whole point: a reader recomputes from the card, not from source at
         # the right commit.
         gw = card["grading_weights"]
-        assert set(gw) >= {"version", "rule", "overall", "research", "predictor", "executor"}
+        assert set(gw) >= {"version", "rule", "overall", "research", "predictor",
+                           "executor", "retired_components"}
         for section in ("overall", "research", "predictor", "executor"):
             assert abs(sum(gw[section].values()) - 1.0) < 1e-9
 
@@ -145,7 +146,8 @@ class TestCoverageBlock:
         assert set(cov) >= {
             "weight_present", "weight_present_effective", "components_skipped",
             "skips", "weights", "qualifier", "weight_failed", "components_failed",
-            "skip_classes", "floor", "provisional",
+            "skip_classes", "floor", "provisional", "weight_scored_zero",
+            "weight_in_denominator",
         }
 
     @pytest.mark.parametrize("level", LEVELS)
@@ -158,7 +160,7 @@ class TestCoverageBlock:
         # ALWAYS-EMIT, same reasoning as the attestation block: a consumer that
         # finds no coverage knows the producer never ran, rather than guessing.
         assert card["overall"]["coverage"]["qualifier"] in {
-            "COMPLETE", "PARTIAL", "PARTIAL-MASKED-FAILURE", "UNGRADED", "UNKNOWN",
+            "COMPLETE", "PARTIAL", "PARTIAL-FAILURE-SCORED-ZERO", "UNGRADED", "UNKNOWN",
         }
 
     def test_coverage_survives_the_schema(self, card, schema):

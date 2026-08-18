@@ -14,6 +14,20 @@ the difference between a number and a verifiable number, and
 ``_recompute_overall`` below is deliberately written as a CONSUMER would write
 it — no import from ``grading.scorecard``, no shared constant — so that a
 producer-side weight change that is not stamped onto the artifact fails here.
+
+RULING 2026-08-18 (``alpha-engine-config-I7210``, both decisions = option (a)):
+
+* decision 1 — ``research.cio`` (0.20) and ``research.sector_teams_avg`` (0.25)
+  are REMOVED from the weight table and DECLARED retired on the artifact. They
+  graded the six-team + CIO graph retired 2026-07-12, so 45% of research's
+  declared weight was renormalized away every cycle.
+* decision 2 — a ``failed`` / ``failed_timeout`` component SCORES 0.0 and STAYS
+  in the denominator at its full declared weight. It used to drop out and let
+  the survivors renormalize, which made the grade go UP when the system broke.
+
+Both move the published grade. That break with earlier cards is deliberate and
+dated: ``grading_weights.version`` advances to ``2026-08-18`` and the stamped
+rule names the regime, so a reader can tell which one a card was computed under.
 """
 from __future__ import annotations
 
@@ -32,7 +46,16 @@ from grading.scorecard import (
     compute_scorecard,
 )
 
+#: A VERBATIM published card from the PRE-ruling regime
+#: (``s3://alpha-engine-research/evaluator/2026-08-07/report_card.json``,
+#: grading_weights.version 2026-08-13). Never regenerate it — it is the only
+#: check that the stamped weights reproduce a number the system really shipped.
 FIXTURE = Path(__file__).parent / "fixtures" / "report_card_2026-08-07.json"
+
+#: The POST-ruling artifact shape (config-I7210, 2026-08-18): research declares
+#: no cio/sector_teams_avg weight, the retirement is declared on the card, and
+#: the stamped rule describes the failure-scores-zero regime.
+FIXTURE_POST = Path(__file__).parent / "fixtures" / "report_card_post_i7210.json"
 
 # ---------------------------------------------------------------------------
 # The reader-side recomputation. Imports nothing from the producer on purpose.
@@ -41,34 +64,51 @@ FIXTURE = Path(__file__).parent / "fixtures" / "report_card_2026-08-07.json"
 _SECTIONS = ("research", "predictor", "executor")
 
 
-def _recompute_overall(card: dict) -> float | None:
-    """Reproduce ``card['overall']['grade']`` from the card's own JSON.
+_FAILED_CLASSES = {"failed", "failed_timeout"}
 
-    Implements exactly the rule the card states in ``grading_weights.rule``:
-    drop null components, renormalize over the surviving declared weights.
+
+def _recompute_level(
+    weights: dict[str, float],
+    grades: dict[str, float | None],
+    skip_classes: dict[str, str],
+) -> float | None:
+    """One level of the rule the card states in ``grading_weights.rule``.
+
+    A component whose ``skip_class`` is a FAILURE scores 0.0 and stays in the
+    denominator; any other null is dropped and the survivors renormalize
+    (alpha-engine-config-I7210, ruled 2026-08-18).
     """
-    weights = card["grading_weights"]
-    section_grades: dict[str, float | None] = {}
-    for section in _SECTIONS:
-        components = card[section]["components"]
-        num = den = 0.0
-        for name, w in weights[section].items():
-            entry = components.get(name)
-            grade = entry.get("grade") if isinstance(entry, dict) else None
-            if grade is None:
-                continue
-            num += w * grade
-            den += w
-        section_grades[section] = (num / den) if den else None
-
     num = den = 0.0
-    for name, w in weights["overall"].items():
-        g = section_grades[name]
-        if g is None:
-            continue
-        num += w * g
+    for name, w in weights.items():
+        grade = grades.get(name)
+        if grade is None:
+            if skip_classes.get(name) not in _FAILED_CLASSES:
+                continue
+            grade = 0.0  # failure scores zero AT FULL DECLARED WEIGHT
+        num += w * grade
         den += w
     return (num / den) if den else None
+
+
+def _recompute_section(card: dict, section: str) -> float | None:
+    components = card[section]["components"]
+    weights = card["grading_weights"][section]
+    grades = {
+        name: (components.get(name) or {}).get("grade")
+        if isinstance(components.get(name), dict) else None
+        for name in weights
+    }
+    skip_classes = (card[section].get("coverage") or {}).get("skip_classes") or {}
+    return _recompute_level(weights, grades, skip_classes)
+
+
+def _recompute_overall(card: dict) -> float | None:
+    """Reproduce ``card['overall']['grade']`` from the card's own JSON."""
+    section_grades = {s: _recompute_section(card, s) for s in _SECTIONS}
+    skip_classes = (card["overall"].get("coverage") or {}).get("skip_classes") or {}
+    return _recompute_level(
+        card["grading_weights"]["overall"], section_grades, skip_classes,
+    )
 
 
 def _roundtrip(card: dict) -> dict:
@@ -235,19 +275,29 @@ class TestRecomputeFromCardAlone:
 
     def test_section_grades_are_reproducible(self):
         card = _roundtrip(compute_scorecard(**_today_inputs()))
-        weights = card["grading_weights"]
         for section in _SECTIONS:
-            components = card[section]["components"]
-            num = den = 0.0
-            for name, w in weights[section].items():
-                entry = components.get(name)
-                g = entry.get("grade") if isinstance(entry, dict) else None
-                if g is None:
-                    continue
-                num += w * g
-                den += w
-            expected = (num / den) if den else None
-            assert card[section]["grade"] == pytest.approx(expected, abs=1e-9)
+            assert card[section]["grade"] == pytest.approx(
+                _recompute_section(card, section), abs=1e-9,
+            ), section
+
+    def test_a_card_carrying_a_FAILURE_is_reproducible(self):
+        """The regime the 2026-08-18 ruling introduced, from the card alone.
+
+        A reader must be able to reproduce a grade that a failure dragged down
+        — which needs ``coverage.skip_classes`` on the artifact, not just the
+        weights. Without it the stated rule is unexecutable.
+        """
+        inputs = _today_inputs()
+        inputs["exit_timing"] = {"status": "timeout", "reason": "stage timed out at 300s"}
+        card = _roundtrip(compute_scorecard(**inputs))
+        assert card["executor"]["coverage"]["skip_classes"]["exit_rules"] == "failed_timeout"
+        for section in _SECTIONS:
+            assert card[section]["grade"] == pytest.approx(
+                _recompute_section(card, section), abs=1e-9,
+            ), section
+        assert card["overall"]["grade"] == pytest.approx(
+            _recompute_overall(card), abs=1e-9,
+        )
 
     def test_the_stamped_weights_reproduce_a_REAL_published_card(self):
         """The strongest available check: the weights this producer now stamps
@@ -271,6 +321,29 @@ class TestRecomputeFromCardAlone:
         rule = card["grading_weights"]["rule"]
         assert "removed from the denominator" in rule
         assert "rescaled" in rule
+
+    def test_the_stamped_rule_does_not_call_the_failure_case_renormalization(self):
+        """The stamped words must describe what the arithmetic DOES.
+
+        Under the 2026-08-18 ruling a failed component is scored 0 at full
+        weight — that is the opposite of renormalizing it away, and a rule text
+        that still said "a null is removed from the denominator" full stop
+        would send a reader to a different number than the one published.
+        """
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        rule = card["grading_weights"]["rule"]
+        assert "failed_timeout" in rule
+        assert "STAYS in the denominator" in rule
+        assert "NOT renormalized away" in rule
+        # And the regime is dated, so two cards can be told apart.
+        assert card["grading_weights"]["version"] == "2026-08-18"
+
+    def test_the_weight_table_version_advances_with_the_published_grade(self):
+        """A reader comparing two cards must see the TABLE changed, not the
+        system. Removing 45% of research's declared weight moves the published
+        number; a version left at 2026-08-13 would hide that behind a diff."""
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        assert card["grading_weights"]["version"] > "2026-08-13"
 
 
 class TestCoverageIsPublishedAtEveryLevel:
@@ -296,11 +369,62 @@ class TestCoverageIsPublishedAtEveryLevel:
                 assert skip["skip_class"] in SKIP_CLASSES
                 assert skip["weight"] > 0
 
-    def test_research_reports_the_retired_pair(self, card):
+    def test_research_no_longer_declares_the_retired_pair(self, card):
+        """Decision 1, ruled 2026-08-18 (config-I7210).
+
+        ``cio`` and ``sector_teams_avg`` graded a graph retired 2026-07-12.
+        They carried 45% of the declared research weight and were renormalized
+        away every cycle, so research's declared table was fiction. They are
+        gone from the table — research's declared weight now equals its actual
+        weight and ``weight_present`` reads 1.0.
+        """
+        assert "cio" not in RESEARCH_WEIGHTS
+        assert "sector_teams_avg" not in RESEARCH_WEIGHTS
         cov = card["research"]["coverage"]
-        assert set(cov["components_skipped"]) == {"cio", "sector_teams_avg"}
-        assert cov["weight_present"] == pytest.approx(0.55)
-        assert cov["skip_classes"] == {"cio": "retired", "sector_teams_avg": "retired"}
+        assert cov["components_skipped"] == []
+        assert cov["weight_present"] == pytest.approx(1.0)
+        assert cov["qualifier"] == "COMPLETE"
+
+    def test_the_surviving_research_weights_are_the_old_ones_rescaled(self):
+        """The ruling removes dead weight; it does not re-opine on the live
+        components. Every surviving pair keeps its old RATIO."""
+        old = {"scanner": 0.10, "macro_agent": 0.10,
+               "composite_scoring": 0.20, "calibration_diagnostics": 0.15}
+        assert set(RESEARCH_WEIGHTS) == set(old)
+        for name, w_old in old.items():
+            assert RESEARCH_WEIGHTS[name] == pytest.approx(w_old / 0.55, abs=1e-12)
+        assert math.isclose(sum(RESEARCH_WEIGHTS.values()), 1.0, abs_tol=1e-9)
+
+    def test_the_retirement_is_DECLARED_on_the_artifact_not_silently_deleted(self, card):
+        """``observability-policy.md`` §8.3: RETIRED is not ABSENT.
+
+        A reader of a post-ruling card must be able to see WHY research's
+        declared weights changed without diffing two commits of the producer.
+        """
+        retired = card["grading_weights"]["retired_components"]["research"]
+        by_name = {d["component"]: d for d in retired}
+        assert set(by_name) == {"cio", "sector_teams_avg"}
+        for name, weight_was in (("cio", 0.20), ("sector_teams_avg", 0.25)):
+            d = by_name[name]
+            assert d["lifecycle"] == "RETIRED"
+            assert d["weight_was"] == pytest.approx(weight_was)
+            assert d["retired_date"] == "2026-07-12"
+            assert d["removed_from_weight_table"] == "2026-08-18"
+            assert "config-I2993" in d["reference"]
+            assert "I7210" in d["ruling"]
+            assert d["superseded_by"]
+        # The 45% that used to be renormalized away is stated as a number.
+        assert sum(d["weight_was"] for d in retired) == pytest.approx(0.45)
+
+    def test_the_retired_components_are_still_emitted_and_marked_unweighted(self, card):
+        """Removing a weight is not deleting the evidence. The blocks are still
+        computed and published; each says on its own face that it does not
+        vote, so a reader is never left inferring it from the weight table."""
+        for name in ("cio", "sector_teams_avg"):
+            block = card["research"]["components"][name]
+            assert block["lifecycle"] == "RETIRED"
+            assert block["weighted"] is False
+            assert block["retired_date"] == "2026-07-12"
 
     def test_executor_reports_the_two_never_persisted_producers(self, card):
         cov = card["executor"]["coverage"]
@@ -316,10 +440,12 @@ class TestCoverageIsPublishedAtEveryLevel:
         """
         cov = card["overall"]["coverage"]
         assert cov["weight_present"] == pytest.approx(1.0)
+        # Research is now fully covered (the retired pair no longer declares
+        # weight); the executor's two never-persisted producers still are not.
         assert cov["weight_present_effective"] == pytest.approx(
-            0.40 * 0.55 + 0.25 * 1.0 + 0.35 * 0.75,
+            0.40 * 1.0 + 0.25 * 1.0 + 0.35 * 0.75,
         )
-        assert cov["weight_present_effective"] < 0.75
+        assert cov["weight_present_effective"] < 1.0
 
     def test_a_complete_card_reports_full_coverage(self):
         card = _roundtrip(compute_scorecard(**_full_inputs()))
@@ -360,13 +486,15 @@ class TestPartialGradeNeverRendersAsAPlainLetter:
 
 class TestFailureIsNeverJustCoverage:
     """Brian ruling 2026-08-13: anything timing out is FAILED.
+    Brian ruling 2026-08-18 (config-I7210 decision 2): a failed component
+    SCORES 0.0 and STAYS in the denominator at its full declared weight.
 
-    A failed component dropped from the denominator inflates the grade. This
-    build does not change how a failure scores — it makes the masking loud.
+    Dropping a failure from the denominator meant the grade went UP when the
+    system broke — the property that disqualified the card as a track record.
     """
 
-    def _timed_out(self):
-        inputs = _today_inputs()
+    def _timed_out(self, base=None):
+        inputs = base() if base else _today_inputs()
         inputs["exit_timing"] = {"status": "timeout", "reason": "stage timed out at 300s"}
         return _roundtrip(compute_scorecard(**inputs))
 
@@ -380,9 +508,133 @@ class TestFailureIsNeverJustCoverage:
         card = self._timed_out()
         cov = card["executor"]["coverage"]
         assert cov["weight_failed"] == pytest.approx(0.15)
+        assert cov["weight_scored_zero"] == pytest.approx(0.15)
         # And it is loud in the rendering, distinctly from ordinary partial.
-        assert cov["qualifier"] == "PARTIAL-MASKED-FAILURE"
-        assert "DROPPED ON FAILURE" in card["executor"]["display"]
+        assert cov["qualifier"] == "PARTIAL-FAILURE-SCORED-ZERO"
+        assert "SCORED ZERO ON FAILURE" in card["executor"]["display"]
+
+    # -- decision 2: the arithmetic, asserted numerically -------------------
+
+    def test_a_failure_drags_the_grade_down_by_its_FULL_declared_weight(self):
+        """THE decision-2 assertion, on an otherwise COMPLETE card.
+
+        Every other executor component is present, so the denominator is the
+        full 1.0 both times and the drop is exactly w_exit_rules * g_exit_rules
+        — the failed component voting 0 at its declared 0.15, with nothing
+        rescaled onto the survivors.
+        """
+        healthy = _roundtrip(compute_scorecard(**_full_inputs()))
+        broken = self._timed_out(base=_full_inputs)
+
+        g_exit = healthy["executor"]["components"]["exit_rules"]["grade"]
+        assert g_exit is not None and g_exit > 0
+        w_exit = EXECUTOR_WEIGHTS["exit_rules"]
+
+        assert broken["executor"]["coverage"]["weight_in_denominator"] == pytest.approx(1.0)
+        assert broken["executor"]["grade"] == pytest.approx(
+            healthy["executor"]["grade"] - w_exit * g_exit, abs=1e-9,
+        )
+        # ... and it reaches the headline at the overall weight, undiluted.
+        assert broken["overall"]["grade"] == pytest.approx(
+            healthy["overall"]["grade"] - OVERALL_WEIGHTS["executor"] * w_exit * g_exit,
+            abs=1e-9,
+        )
+        # The direction is the whole point: breaking never improves the grade.
+        assert broken["overall"]["grade"] < healthy["overall"]["grade"]
+
+    def test_a_failure_is_NOT_renormalized_onto_the_survivors(self):
+        """The old behaviour, asserted as the thing that must NOT happen.
+
+        Under renormalization the executor grade would have been the survivors'
+        weighted average over 0.85 — a number STRICTLY HIGHER than the healthy
+        grade whenever exit_rules graded below the rest.
+        """
+        healthy = _roundtrip(compute_scorecard(**_full_inputs()))
+        broken = self._timed_out(base=_full_inputs)
+
+        comps = healthy["executor"]["components"]
+        survivors = {k: v for k, v in EXECUTOR_WEIGHTS.items() if k != "exit_rules"}
+        renormalized = (
+            sum(w * comps[k]["grade"] for k, w in survivors.items())
+            / sum(survivors.values())
+        )
+        assert broken["executor"]["grade"] != pytest.approx(renormalized, abs=1e-6)
+        assert broken["executor"]["coverage"]["renormalized"] is False
+
+    def test_a_NON_failure_absence_still_renormalizes(self):
+        """Decision 2 must not turn every absence into a zero.
+
+        ``_today_inputs`` drops sizing_ab and excursion_summary — legitimate
+        never-persisted producers, not failures. Those 0.25 of declared weight
+        are still removed from the denominator and the survivors still rescale.
+        """
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        cov = card["executor"]["coverage"]
+        assert set(cov["components_skipped"]) == {"position_sizing", "excursion"}
+        assert {cov["skip_classes"][c] for c in cov["components_skipped"]} <= {
+            "input_absent", "insufficient_data", "not_implemented",
+        }
+        assert cov["weight_scored_zero"] == 0.0
+        assert cov["renormalized"] is True
+        assert cov["weight_in_denominator"] == pytest.approx(0.75)
+        assert cov["renormalization_factor"] == pytest.approx(1 / 0.75, abs=1e-6)
+
+        comps = card["executor"]["components"]
+        survivors = {k: w for k, w in EXECUTOR_WEIGHTS.items()
+                     if k not in cov["components_skipped"]}
+        assert card["executor"]["grade"] == pytest.approx(
+            sum(w * comps[k]["grade"] for k, w in survivors.items())
+            / sum(survivors.values()),
+            abs=1e-9,
+        )
+
+    def test_a_retired_component_is_not_scored_zero(self):
+        """A retirement is an absence, not a failure — it must never be priced
+        as one. The retired pair no longer declares weight at all, and nothing
+        that remains classifies as failed."""
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        cov = card["research"]["coverage"]
+        assert cov["weight_scored_zero"] == 0.0
+        assert cov["components_failed"] == []
+
+    def test_coverage_and_the_arithmetic_agree_on_the_SAME_failures(self):
+        """The drift test.
+
+        The composite arithmetic and the coverage block are two views of one
+        classification pass (``_resolve_components``). If they ever became two
+        passes again, this fails: the components the coverage block names as
+        failed are exactly the ones the grade priced at 0, checked by
+        recomputing the grade from the coverage block's own verdict.
+        """
+        import grading.scorecard as sc
+
+        inputs = _today_inputs()
+        inputs["exit_timing"] = {"status": "timeout", "reason": "stage timed out at 300s"}
+        inputs["macro_eval"] = {"status": "error", "reason": "macro grader crashed"}
+        card = _roundtrip(compute_scorecard(**inputs))
+
+        for section, table in (
+            ("research", sc.RESEARCH_WEIGHTS),
+            ("predictor", sc.PREDICTOR_WEIGHTS),
+            ("executor", sc.EXECUTOR_WEIGHTS),
+        ):
+            cov = card[section]["coverage"]
+            named = set(cov["components_failed"])
+            from_classes = {
+                c for c, k in cov["skip_classes"].items() if k in _FAILED_CLASSES
+            }
+            assert named == from_classes, section
+            # weight_failed is the sum of exactly those declared weights ...
+            assert cov["weight_failed"] == pytest.approx(
+                sum(table[c] for c in named), abs=1e-6,
+            ), section
+            # ... and the published grade is the one that rule produces.
+            assert card[section]["grade"] == pytest.approx(
+                _recompute_section(card, section), abs=1e-9,
+            ), section
+
+        assert "macro_agent" in card["research"]["coverage"]["components_failed"]
+        assert "exit_rules" in card["executor"]["coverage"]["components_failed"]
 
     def test_zero_is_emitted_as_a_value_when_nothing_failed(self):
         # `no data` must never be indistinguishable from `no failures`.
@@ -390,28 +642,123 @@ class TestFailureIsNeverJustCoverage:
         for level in ("overall", "research", "predictor", "executor"):
             cov = card[level]["coverage"]
             assert cov["weight_failed"] == 0.0
+            assert cov["weight_scored_zero"] == 0.0
             assert cov["components_failed"] == []
-            assert cov["qualifier"] != "PARTIAL-MASKED-FAILURE"
+            assert cov["qualifier"] != "PARTIAL-FAILURE-SCORED-ZERO"
 
     def test_a_masked_failure_reaches_the_HEADLINE_number(self):
         """The one that matters for showing the grade externally.
 
         A component that timed out inside the executor must not become a clean
-        C+ at the top of the card. Without propagation the overall level reads
-        100% covered (all three module grades non-null) and says nothing.
+        C+ at the top of the card. The overall level reads 100% covered (all
+        three module grades non-null); the propagated fields are what stop that
+        reading, and now the number itself carries the loss too.
         """
         card = self._timed_out()
         cov = card["overall"]["coverage"]
-        assert cov["qualifier"] == "PARTIAL-MASKED-FAILURE"
+        assert cov["qualifier"] == "PARTIAL-FAILURE-SCORED-ZERO"
         assert "exit_rules" in cov["components_failed"]
         assert cov["weight_failed"] == pytest.approx(0.35 * 0.15)
-        assert "DROPPED ON FAILURE" in card["overall"]["display"]
+        assert "SCORED ZERO ON FAILURE" in card["overall"]["display"]
 
     def test_a_retirement_is_not_a_failure(self):
         card = _roundtrip(compute_scorecard(**_today_inputs()))
         cov = card["research"]["coverage"]
         assert cov["components_failed"] == []
         assert cov["weight_failed"] == 0.0
+
+
+class TestContinuityAcrossTheRuling:
+    """What the 2026-08-18 ruling does and does not move on the headline.
+
+    The ruling deliberately breaks comparability with pre-2026-08-18 cards.
+    These tests state exactly WHERE the break is, measured rather than
+    asserted, so the claim in the PR body is checkable and stays true.
+    """
+
+    def test_removing_the_retired_pair_does_not_move_the_LAST_published_number(self):
+        """MEASURED, on the real 2026-08-07 card.
+
+        The two removed components were already renormalized away, and the
+        survivors are rescaled PROPORTIONALLY over the 0.55 that actually
+        voted, so the arithmetic is identical term by term. Decision 1 changes
+        what the declared table MEANS (weight_present 0.55 → 1.0, an honest
+        denominator instead of a fictional one) without silently repricing the
+        live components on the way through. If someone later re-weights the
+        survivors on judgement rather than proportion, this test fails and the
+        change has to be argued as the grade change it is.
+        """
+        card = json.loads(FIXTURE.read_text())
+        comps = card["research"]["components"]
+
+        old = card["grading_weights"]["research"]
+        assert set(old) - set(RESEARCH_WEIGHTS) == {"cio", "sector_teams_avg"}
+
+        def _avg(table):
+            num = den = 0.0
+            for name, w in table.items():
+                g = (comps.get(name) or {}).get("grade")
+                if g is None:
+                    continue
+                num += w * g
+                den += w
+            return num / den
+
+        assert _avg(old) == pytest.approx(card["research"]["grade"], abs=1e-9)
+        assert _avg(RESEARCH_WEIGHTS) == pytest.approx(
+            card["research"]["grade"], abs=1e-9,
+        )
+
+    def test_the_break_is_in_the_DENOMINATOR_not_the_number(self):
+        """Same card, same grade, honest coverage: the pre-ruling card reported
+        research at 55% of its declared weight; the post-ruling one reports the
+        same grade at 100%, because the 45% it never had is no longer claimed."""
+        pre = json.loads(FIXTURE.read_text())
+        post = json.loads(FIXTURE_POST.read_text())
+        # The real 2026-08-07 card predates the coverage block, so its coverage
+        # is derived here the way a reader would have had to: from the stamped
+        # weights and which components carried a grade.
+        pre_comps = pre["research"]["components"]
+        pre_present = sum(
+            w for name, w in pre["grading_weights"]["research"].items()
+            if (pre_comps.get(name) or {}).get("grade") is not None
+        )
+        assert pre_present == pytest.approx(0.55)
+        assert post["research"]["coverage"]["weight_present"] == pytest.approx(1.0)
+        assert pre["grading_weights"]["version"] == "2026-08-13"
+        assert post["grading_weights"]["version"] == "2026-08-18"
+
+    def test_decision_2_does_not_move_a_card_with_no_failure(self):
+        """No card in the measured window carries a ``failed`` skip, so the
+        scoring change is latent until something actually breaks — which is the
+        point: it costs nothing on a healthy week and is unmissable on a bad
+        one."""
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        for level in _SECTIONS + ("overall",):
+            assert card[level]["coverage"]["weight_scored_zero"] == 0.0
+        assert card["overall"]["grade"] == pytest.approx(
+            _recompute_overall(card), abs=1e-9,
+        )
+
+    def test_the_post_ruling_fixture_is_the_shape_the_producer_emits(self):
+        """Guards the fixture against drifting from the producer — a stale
+        fixture asserting a regime nobody publishes any more is worse than
+        none."""
+        live = _roundtrip(compute_scorecard(**_today_inputs()))
+        fixture = json.loads(FIXTURE_POST.read_text())
+        assert fixture["grading_weights"]["research"] == live["grading_weights"]["research"]
+        assert fixture["grading_weights"]["rule"] == live["grading_weights"]["rule"]
+        assert (
+            fixture["grading_weights"]["retired_components"]
+            == live["grading_weights"]["retired_components"]
+        )
+        assert fixture["overall"]["grade"] == pytest.approx(
+            live["overall"]["grade"], abs=1e-9,
+        )
+        # And it is recomputable from itself, like any published card.
+        assert fixture["overall"]["grade"] == pytest.approx(
+            _recompute_overall(fixture), abs=1e-9,
+        )
 
 
 class TestCoverageCannotFailTheRun:
