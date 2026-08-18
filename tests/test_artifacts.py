@@ -60,10 +60,12 @@ class TestReadScorecardInputs:
     def test_empty_bucket_all_missing(self, s3):
         inputs, report = read_scorecard_inputs(BUCKET, RUN_DATE, s3_client=s3)
         assert inputs == {}
-        # metrics.json + every mapped artifact missing.
-        assert "metrics.json" in report.missing
+        # signal_quality.json (neither it nor its metrics.json fallback
+        # present) + every mapped artifact missing.
+        assert "signal_quality.json" in report.missing
         assert len(report.missing) == len(ARTIFACT_MAP) + 1
         assert report.read == []
+        assert report.signal_quality_source == "absent"
 
     def test_reads_present_artifacts(self, s3):
         _put(s3, "macro_eval.json", {"status": "ok", "accuracy_lift": 2.0, "alpha_lift": 0.5})
@@ -94,7 +96,11 @@ class TestReadScorecardInputs:
         assert inputs["calibration_diagnostics"]["ece"] == 0.04
         assert inputs["excursion_summary"]["mean_mfe_mae_ratio"] == 1.6
 
-    def test_signal_quality_reconstructed_from_metrics(self, s3):
+    def test_signal_quality_reconstructed_from_metrics_fallback(self, s3):
+        """config-I7599: when signal_quality.json is absent (a historical
+        date), fall back to reconstructing {status, overall} from
+        metrics.json by key exclusion — labelled as a fallback in
+        provenance."""
         _put_metrics(s3, {"accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50})
         inputs, report = read_scorecard_inputs(BUCKET, RUN_DATE, s3_client=s3)
         sq = inputs["signal_quality"]
@@ -104,7 +110,10 @@ class TestReadScorecardInputs:
         # report_card / run_date / status must NOT leak into overall.
         assert "run_date" not in sq["overall"]
         assert "report_card" not in sq["overall"]
-        assert "metrics.json" in report.read
+        # by_score_bucket cannot be recovered through this path.
+        assert "by_score_bucket" not in sq
+        assert "metrics.json (reconstructed fallback)" in report.read
+        assert report.signal_quality_source == "metrics.json (reconstructed fallback)"
 
     def test_metrics_report_card_excluded_from_overall(self, s3):
         body = {"run_date": RUN_DATE, "status": "ok", "accuracy_10d": 0.5,
@@ -113,6 +122,25 @@ class TestReadScorecardInputs:
                       Body=json.dumps(body).encode("utf-8"))
         inputs, _ = read_scorecard_inputs(BUCKET, RUN_DATE, s3_client=s3)
         assert inputs["signal_quality"]["overall"] == {"accuracy_10d": 0.5}
+
+    def test_signal_quality_json_preferred_over_metrics_fallback(self, s3):
+        """config-I7599: signal_quality.json — when present — is read
+        verbatim, including by_score_bucket, and metrics.json is never
+        consulted for this input even if also present with different data."""
+        _put(s3, "signal_quality.json", {
+            "status": "ok",
+            "overall": {"accuracy_21d": 0.60},
+            "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.71, "n": 12}],
+        })
+        _put_metrics(s3, {"accuracy_21d": 0.10})  # deliberately different/stale
+        inputs, report = read_scorecard_inputs(BUCKET, RUN_DATE, s3_client=s3)
+        sq = inputs["signal_quality"]
+        assert sq["overall"]["accuracy_21d"] == 0.60
+        assert sq["by_score_bucket"][0]["bucket"] == "90+"
+        assert "signal_quality.json" in report.read
+        assert report.signal_quality_source == "signal_quality.json"
+        assert "metrics.json" not in report.read
+        assert "metrics.json (reconstructed fallback)" not in report.read
 
     def test_non_nosuchkey_error_raises(self, s3):
         # Reading from a bucket that doesn't exist → NoSuchBucket, not NoSuchKey.

@@ -134,7 +134,9 @@ logger = logging.getLogger(__name__)
 # Each entry is (scorecard_param_name -> s3_filename). The filenames are the
 # exact keys reporter.py writes under backtest/{date}/ (verified against
 # alpha-engine-backtester reporter.py @ f46e7e6). ``signal_quality`` is handled
-# separately (reconstructed from metrics.json) — see _read_signal_quality.
+# separately — read from the first-class signal_quality.json artifact when
+# present, metrics.json-reconstruction as a historical-date fallback
+# otherwise (config-I7599) — see _read_signal_quality.
 #
 # NOTE — known producer-persistence gaps as of 2026-06-04 (these inputs are
 # computed in the backtester but NOT yet persisted to S3, so they read as
@@ -190,6 +192,12 @@ class ArtifactReport:
     prefix: str
     read: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    # config-I7599: which of the two signal_quality read paths supplied
+    # `inputs["signal_quality"]` this build — "signal_quality.json" (the
+    # first-class artifact), "metrics.json (reconstructed fallback)" (the
+    # historical-date compat path — by_score_bucket is NOT recoverable this
+    # way), or None when neither was available.
+    signal_quality_source: str | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -200,27 +208,41 @@ class ArtifactReport:
             "artifacts_missing": sorted(self.missing),
             "n_read": len(self.read),
             "n_missing": len(self.missing),
+            "signal_quality_source": self.signal_quality_source,
         }
 
 
 
 
-def _read_signal_quality(s3, bucket: str, prefix: str) -> dict | None:
-    """Reconstruct the ``signal_quality`` input from ``metrics.json``.
+def _read_signal_quality(s3, bucket: str, prefix: str) -> tuple[dict | None, str]:
+    """Read the ``signal_quality`` input, preferring the first-class
+    ``signal_quality.json`` artifact (config-I7599) and falling back to
+    reconstructing ``{status, overall}`` from ``metrics.json`` by key
+    exclusion only for historical dates that predate it.
 
-    The backtester does not persist the full signal_quality dict standalone; it
-    flattens the ``overall`` block to the top level of ``metrics.json`` (see
-    reporter.save: ``{"run_date", "status", **overall, ["report_card"]}``). We
-    recover ``{"status", "overall": {...}}`` from that — enough for the
-    portfolio + composite-scoring accuracy grades. ``by_score_bucket`` is not
-    persisted, so the composite high-bucket sub-grade stays N/A until a
-    standalone ``signal_quality.json`` is persisted (filed follow-up).
+    Returns ``(signal_quality_dict_or_None, source)`` where ``source`` is
+    ``"signal_quality.json"``, ``"metrics.json (reconstructed fallback)"``,
+    or ``"absent"``.
+
+    The fallback path is brittle by construction: every new top-level
+    ``metrics.json`` key silently becomes a member of ``overall``, and
+    ``by_score_bucket`` cannot be recovered through it at all — it is never
+    flattened to metrics.json's top level (see reporter.save:
+    ``{"run_date", "status", **overall, ["report_card"]}``), which is why the
+    composite-scoring high-bucket sub-grade (``_grade_composite_scoring``)
+    stayed permanently N/A before config-I7599 (crucible-backtester
+    reporter.py::save now writes ``signal_quality.json`` verbatim from
+    ``analysis/signal_quality.py::compute_accuracy``'s return value).
     """
+    sq = get_json(s3, bucket, f"{prefix}/signal_quality.json")
+    if sq is not None:
+        return sq, "signal_quality.json"
+
     metrics = get_json(s3, bucket, f"{prefix}/metrics.json")
     if metrics is None:
-        return None
+        return None, "absent"
     overall = {k: v for k, v in metrics.items() if k not in _METRICS_NON_OVERALL_KEYS}
-    return {"status": metrics.get("status"), "overall": overall}
+    return {"status": metrics.get("status"), "overall": overall}, "metrics.json (reconstructed fallback)"
 
 
 def read_scorecard_inputs(
@@ -240,16 +262,20 @@ def read_scorecard_inputs(
     report = ArtifactReport(run_date=run_date, bucket=bucket, prefix=prefix)
     inputs: dict = {}
 
-    # signal_quality is special (reconstructed from metrics.json).
-    sq = _read_signal_quality(s3, bucket, prefix)
+    # signal_quality: signal_quality.json when present (config-I7599),
+    # metrics.json reconstruction as an explicitly-labelled fallback
+    # otherwise. Provenance recorded on the report either way.
+    sq, sq_source = _read_signal_quality(s3, bucket, prefix)
+    report.signal_quality_source = sq_source
     if sq is not None:
         inputs["signal_quality"] = sq
-        report.read.append("metrics.json")
+        report.read.append(sq_source)
     else:
-        report.missing.append("metrics.json")
+        report.missing.append("signal_quality.json")
         logger.warning(
-            "Artifact absent: s3://%s/%s/metrics.json — signal_quality / "
-            "portfolio + composite-scoring tiles will grade N/A", bucket, prefix,
+            "Artifact absent: s3://%s/%s/{signal_quality.json,metrics.json} — "
+            "signal_quality / portfolio + composite-scoring tiles will grade "
+            "N/A", bucket, prefix,
         )
 
     for param, filename in ARTIFACT_MAP.items():

@@ -725,3 +725,47 @@ class TestGradeCompositeScoringLiveHorizon:
         assert result["detail"].get("accuracy_21d_reason") == (
             "no accuracy_21d in signal_quality.overall this cycle"
         )
+
+    def test_missing_by_score_bucket_is_explicit_na_not_silent(self):
+        """config-I7599: an empty/absent by_score_bucket (e.g. the
+        metrics.json-reconstruction fallback, which cannot carry it) must
+        leave a reason trace, not just drop the term from the weighted
+        average with no trace — the defect this issue fixes."""
+        result = _grade_composite_scoring(
+            signal_quality={
+                "status": "ok",
+                "overall": _LIVE_SIGNAL_QUALITY_OVERALL,
+                "by_score_bucket": [],
+            },
+            score_cal={"monotonic": True},
+        )
+        assert "90+_accuracy" not in result["detail"]
+        assert "fallback in use" in result["detail"]["90+_accuracy_reason"]
+
+    def test_no_90plus_bucket_present_is_explicit_na_not_silent(self):
+        result = _grade_composite_scoring(
+            signal_quality={
+                "status": "ok",
+                "overall": _LIVE_SIGNAL_QUALITY_OVERALL,
+                "by_score_bucket": [{"bucket": "60-70", "accuracy_21d": 0.5}],
+            },
+            score_cal={"monotonic": True},
+        )
+        assert "90+_accuracy" not in result["detail"]
+        assert result["detail"]["90+_accuracy_reason"] == (
+            "no 90+ bucket in by_score_bucket this cycle"
+        )
+
+    def test_90plus_bucket_missing_accuracy_key_is_explicit_na_not_silent(self):
+        result = _grade_composite_scoring(
+            signal_quality={
+                "status": "ok",
+                "overall": _LIVE_SIGNAL_QUALITY_OVERALL,
+                "by_score_bucket": [{"bucket": "90+", "n": 5}],
+            },
+            score_cal={"monotonic": True},
+        )
+        assert "90+_accuracy" not in result["detail"]
+        assert result["detail"]["90+_accuracy_reason"] == (
+            "90+ bucket present but accuracy_21d missing from it"
+        )

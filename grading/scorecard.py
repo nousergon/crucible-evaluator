@@ -1299,6 +1299,21 @@ def _grade_composite_scoring(signal_quality: dict | None,
         detail["accuracy_21d_reason"] = "no accuracy_21d in signal_quality.overall this cycle"
     if high_acc is not None:
         detail["90+_accuracy"] = f"{high_acc:.1%}"
+    else:
+        # Fail loud (config-I7599): a bare None dropped silently out of the
+        # weighted average by renormalization is exactly what let this
+        # sub-grade stay N/A on every card ever produced without anyone
+        # noticing — say WHY instead.
+        if not buckets:
+            detail["90+_accuracy_reason"] = (
+                "no by_score_bucket in signal_quality this cycle "
+                "(signal_quality.json absent or metrics.json-reconstruction "
+                "fallback in use, which cannot carry by_score_bucket)"
+            )
+        elif high_bucket is None:
+            detail["90+_accuracy_reason"] = "no 90+ bucket in by_score_bucket this cycle"
+        else:
+            detail["90+_accuracy_reason"] = "90+ bucket present but accuracy_21d missing from it"
     if monotonic is not None:
         detail["monotonic"] = "YES" if monotonic else "NO"
 
