@@ -217,10 +217,16 @@ class TestNAComponents:
 
 
 class TestInferenceCoverage:
-    """config#1075: graded from the producer-persisted universe denominator."""
+    """config#1075, re-based on the INTENDED denominator by config-I7648.
+
+    `n_universe` is the research population and the predictor stopped scoring
+    it at the champion cutover; `n_intended` is the set the run was handed.
+    See tests/test_inference_coverage_denominator.py for the live 2026-08-18
+    shape and the no-fallback guarantee.
+    """
 
     def test_high_coverage_green(self, s3):
-        latest = {**_LATEST, "n_universe": 30, "n_universe_covered": 29}
+        latest = {**_LATEST, "n_intended": 30, "n_intended_covered": 29}
         _seed(s3, latest=latest)
         ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
         assert ic["value"] == pytest.approx(29 / 30)
@@ -228,22 +234,32 @@ class TestInferenceCoverage:
         assert "29/30" in ic["status_reason"]
 
     def test_low_coverage_red(self, s3):
-        latest = {**_LATEST, "n_universe": 30, "n_universe_covered": 20}
+        latest = {**_LATEST, "n_intended": 30, "n_intended_covered": 20}
         _seed(s3, latest=latest)
         ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
         assert ic["value"] == pytest.approx(20 / 30)
         assert ic["status"] == "RED"  # 66.7% < red-line 80%
 
     def test_absent_denominator_is_missing_input(self, s3):
-        _seed(s3)  # _LATEST has no n_universe
+        _seed(s3)  # _LATEST has no n_intended
         ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
         assert ic["status"] == "N/A-MISSING-INPUT"
 
-    def test_zero_universe_is_missing_input(self, s3):
-        latest = {**_LATEST, "n_universe": 0, "n_universe_covered": 0}
+    def test_zero_intended_is_missing_input(self, s3):
+        latest = {**_LATEST, "n_intended": 0, "n_intended_covered": 0}
         _seed(s3, latest=latest)
         ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
         assert ic["status"] == "N/A-MISSING-INPUT"  # no /0
+
+    def test_the_research_population_alone_never_grades_coverage(self, s3):
+        """The regression. A latest.json carrying only the OLD pair — exactly
+        what a not-yet-redeployed producer writes — must grade N/A, never
+        23/903. A silent fallback is invisible in the value."""
+        latest = {**_LATEST, "n_universe": 903, "n_universe_covered": 23}
+        _seed(s3, latest=latest)
+        ic = _comp(build_predictor_tile(BUCKET, s3_client=s3), "inference_coverage")
+        assert ic["status"] == "N/A-MISSING-INPUT"
+        assert ic["value"] is None
 
 
 _RUN_DATE = "2026-06-14"

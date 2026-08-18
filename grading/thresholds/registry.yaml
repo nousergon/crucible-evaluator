@@ -239,6 +239,7 @@ metrics:
     ensemble_lift_over_best_l1: {target: 0.01, red_line: -0.01, n_floor_declared: 10}
     feature_drift_ks: {target: 0.1, red_line: 0.25, higher_is_better: false, n_floor_declared: 30}
     inference_coverage: {target: 0.95, red_line: 0.8, n_floor_declared: 1}
+    inference_funnel_width: {target: null, red_line: null, n_floor_declared: 1}
     meta_l2_ic: {target: 0.05, red_line: 0.0, n_floor_declared: 10}
     momentum_l1_ic: {target: 0.03, red_line: 0.0, n_floor_declared: 8}
     output_distribution_gate: {target: null, red_line: null, n_floor_declared: 1}
