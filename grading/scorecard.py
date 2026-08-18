@@ -1076,13 +1076,16 @@ def _grade_composite_scoring(signal_quality: dict | None,
     overall = signal_quality.get("overall", {})
     buckets = signal_quality.get("by_score_bucket", [])
 
-    # Overall accuracy at 10d
-    acc_10d = overall.get("accuracy_10d")
-    acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
+    # Overall accuracy at the canonical 21d horizon (config-I7208; the
+    # producer retired accuracy_10d — mirrors
+    # crucible-backtester/analysis/grading.py::_grade_composite_scoring,
+    # config#1456).
+    acc_21d = overall.get("accuracy_21d")
+    acc_g = _pct_to_grade(acc_21d, baseline=0.45, ceiling=0.70)
 
     # High-score bucket accuracy (90+ should be highest)
     high_bucket = next((b for b in buckets if b.get("bucket") == "90+"), None)
-    high_acc = _safe_get(high_bucket, "accuracy_10d") if high_bucket else None
+    high_acc = _safe_get(high_bucket, "accuracy_21d") if high_bucket else None
     high_g = _pct_to_grade(high_acc, baseline=0.50, ceiling=0.80)
 
     # Monotonicity from calibration
@@ -1096,8 +1099,13 @@ def _grade_composite_scoring(signal_quality: dict | None,
     ])
 
     detail = {}
-    if acc_10d is not None:
-        detail["accuracy_10d"] = f"{acc_10d:.1%}"
+    if acc_21d is not None:
+        detail["accuracy_21d"] = f"{acc_21d:.1%}"
+    elif overall:
+        # Fail loud: the artifact is present but the canonical-horizon key is
+        # absent — say why instead of letting acc_g silently drop out of the
+        # weighted average with no trace in the detail block.
+        detail["accuracy_21d_reason"] = "no accuracy_21d in signal_quality.overall this cycle"
     if high_acc is not None:
         detail["90+_accuracy"] = f"{high_acc:.1%}"
     if monotonic is not None:
@@ -1430,7 +1438,7 @@ def _grade_portfolio(signal_quality: dict | None,
     When ``portfolio_stats`` includes the evaluator-revamp downside-aware
     fields (``sortino_ratio``, ``cvar_95``, plus optionally an
     ``information_ratio_spy`` populated upstream), the composite uses:
-      - 25% accuracy_10d  (selection accuracy, kept)
+      - 25% accuracy_21d  (selection accuracy, kept)
       - 25% Sortino       (replaces Sharpe — penalises downside vol only)
       - 15% Calmar        (annualised return / max drawdown)
       - 15% CVaR(95%)     (tail-risk metric)
@@ -1447,10 +1455,33 @@ def _grade_portfolio(signal_quality: dict | None,
     """
     overall = _safe_get(signal_quality, "overall") or {}
 
-    acc_10d = overall.get("accuracy_10d")
-    avg_alpha = overall.get("avg_alpha_10d")
-    acc_g = _pct_to_grade(acc_10d, baseline=0.45, ceiling=0.70)
-    alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0, units="fraction") if avg_alpha is not None else None
+    # config-I7208: the producer (crucible-backtester) never emitted a 10d
+    # horizon on `overall` — live keys are accuracy_21d/avg_alpha_21d (and
+    # the _5d pair). accuracy_10d/avg_alpha_10d read here always resolved to
+    # None, so this component's alpha term silently dropped out of the
+    # weighted average on every card ever produced. The fleet objective is
+    # per-cycle net-of-cost 21d log-alpha vs SPY (crucible-evaluator-PR198),
+    # so 21d is also the correct horizon, not just the only one available.
+    acc_21d = overall.get("accuracy_21d")
+    avg_alpha = overall.get("avg_alpha_21d")
+    acc_g = _pct_to_grade(acc_21d, baseline=0.45, ceiling=0.70)
+    # Anchor re-derivation (config-I7208): floor=-2.0/ceiling=4.0pp is left
+    # UNCHANGED from the value this call site already carried. That is not
+    # laziness — crucible-backtester/analysis/grading.py::_grade_portfolio is
+    # the SOTA reference this module is a port of (policy-shared-code), it
+    # grades the SAME avg_alpha_21d field, and it uses these exact anchors
+    # (-2.0 floor / 4.0 ceiling) already. Live metrics.json history
+    # (2026-07-10..2026-08-14, s3://alpha-engine-research/backtest/) shows
+    # avg_alpha_21d ranging -0.75pp to +0.02pp, comfortably inside the band,
+    # so no rescaling is warranted by the data either. What WAS wrong is the
+    # ``units`` declaration: avg_alpha_21d is emitted already in percentage
+    # points (confirmed by crucible-backtester's own `f"{avg_alpha:+.2f}%"`
+    # formatting and by the live magnitudes above — a raw-fraction reading
+    # would imply -75% 21d alpha, which is not a real number), not a raw
+    # fraction. ``units="fraction"`` here was silently multiplying an
+    # already-pp value by 100 the one time this call site is exercised with
+    # real 21d data below the anchors' upper reach; ``units="pp"`` is correct.
+    alpha_g = _lift_to_grade(avg_alpha, floor=-2.0, ceiling=4.0, units="pp") if avg_alpha is not None else None
 
     sharpe = _safe_get(portfolio_stats, "sharpe_ratio")
     sortino = _safe_get(portfolio_stats, "sortino_ratio")
@@ -1494,10 +1525,15 @@ def _grade_portfolio(signal_quality: dict | None,
         ])
 
     detail = {}
-    if acc_10d is not None:
-        detail["accuracy_10d"] = f"{acc_10d:.1%}"
+    if acc_21d is not None:
+        detail["accuracy_21d"] = f"{acc_21d:.1%}"
     if avg_alpha is not None:
-        detail["avg_alpha_10d"] = _fmt_lift(avg_alpha, "fraction")
+        detail["avg_alpha_21d"] = _fmt_lift(avg_alpha, "pp")
+    elif overall:
+        # Fail loud: signal_quality is present but avg_alpha_21d is absent —
+        # name the reason instead of letting alpha_g vanish into the
+        # weighted-average renormalization with no trace in the detail block.
+        detail["avg_alpha_21d_reason"] = "no avg_alpha_21d in signal_quality.overall this cycle"
     if sharpe is not None:
         detail["sharpe"] = f"{sharpe:.2f}"
     if sortino is not None:
