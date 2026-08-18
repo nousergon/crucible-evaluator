@@ -35,6 +35,7 @@ from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
 from grading.scorecard import compute_scorecard
 from grading.pipeline_gates import gates_unmeasured, read_gate_state
+from grading.run_scope import RUN_SCOPE_KEY, log_run_scope, read_run_scope, scope_unknown
 from grading.self_test import run_self_test
 from grading.self_test import verdict_is_pass as self_test_is_pass
 from grading.module_agg import overall_status
@@ -247,7 +248,15 @@ def build_report_card(
     # here, the Backtester tile's `numeric_attestation` critical component, and the
     # Director digest. Never raises — a dead verdict stage must not kill the card,
     # and must equally not let it render as verified.
-    attestation = build_run_attestation(bucket, run_date, s3_client=s3_client)
+    # The scope is DERIVED FIRST because the attestation depends on it: the
+    # contamination half's producer is gated by `skip_parity`, and only the
+    # scope artifact can tell a stage that was switched off from one that died
+    # (config-I7620 follow-up). Read here, rendered onto the card lower down
+    # where the denominator belongs — one read, two consumers.
+    scope_block = read_run_scope(report.run_scope)
+    attestation = build_run_attestation(
+        bucket, run_date, s3_client=s3_client, run_scope=scope_block,
+    )
     scorecard["attestation"] = attestation
     scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])
 
@@ -303,6 +312,27 @@ def build_report_card(
     gate_block = read_gate_state(gate_state)
     scorecard["pipeline_gates"] = gate_block
     scorecard["degraded_pipeline_gates"] = gates_unmeasured(gate_block)
+
+    # alpha-engine-config-I7620 — the DENOMINATOR. Every grade above is computed
+    # over whatever stages this run actually dispatched, and that set moves: the
+    # weekly pipeline carries 29 skip gates and an operator flipping one changes
+    # which producers ran without changing anything else the card says. The
+    # 2026-08-16 execution terminated SUCCEEDED having dispatched 3 of 29, and
+    # nothing on any surface said so.
+    #
+    # `report.run_scope` is the artifact `RunScope` wrote for THIS run. An absent
+    # or degraded block resolves to UNKNOWN with an empty graded set — never to
+    # "everything ran". A card that grades the full stage list against a run that
+    # dispatched three of them is confidently wrong; one that says it does not
+    # know is merely uninformative.
+    #
+    # Deliberately does NOT move `status`: the scope is legitimately narrow on
+    # every partial rerun, and a permanently-amber field is a field nobody reads
+    # (same reasoning as `degraded_pipeline_gates` above). It is rendered BESIDE
+    # the grade, which is what was missing, not folded INTO it.
+    scorecard[RUN_SCOPE_KEY] = scope_block
+    scorecard["scope_unknown"] = scope_unknown(scope_block)
+    log_run_scope(scope_block)
 
     # A card whose correctness verdict did not come back cannot present itself
     # as a complete build. On 2026-08-07 the contamination check timed out and

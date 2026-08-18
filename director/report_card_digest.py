@@ -16,6 +16,8 @@ Output is plain text (markdown-ish) so it drops straight into the prompt.
 from __future__ import annotations
 
 from grading.pipeline_gates import MEASURED, PIPELINE_GATES_KEY
+from grading.run_scope import MEASURED as SCOPE_MEASURED
+from grading.run_scope import RUN_SCOPE_KEY
 
 TILE_ORDER = [
     "portfolio_outcome", "research", "predictor", "executor",
@@ -129,6 +131,21 @@ def summarize_report_card(card: dict) -> str:
             "were NOT updated. The live executor is on the PREVIOUS cycle's "
             "parameters; do not describe any config change as having taken effect."
         )
+    # config-I7620 follow-up. PASS above now means "the arithmetic we MEASURED is
+    # right". When the contamination producer was not dispatched, that is a
+    # second, weaker claim than the four-halves one, and the Director must be
+    # told which it is holding — otherwise it re-proposes "fix the pit_parity
+    # timeout" every week against a stage an operator switched off on purpose,
+    # which is exactly what the 2026-08-14 plan did as its P0.
+    if att.get("contamination_in_scope") is False:
+        scope_reason = (att.get("contamination") or {}).get("scope", {}).get("reason", "")
+        out.append(
+            "⚠ CONTAMINATION NOT MEASURED — the look-ahead check was NOT DISPATCHED "
+            f"this run. {scope_reason} This is an operator decision already tracked, "
+            "NOT a failure: do not propose fixing, re-running or diagnosing that "
+            "producer, and do not describe the run as contamination-free."
+        )
+
     # alpha-engine-config-I7282 — §2.3a rule 3. The attestation above says
     # whether the arithmetic behind these numbers is right; this says whether the
     # pipeline's own pre-spend correctness gates ran at all before it spent. Both
@@ -145,6 +162,35 @@ def summarize_report_card(card: dict) -> str:
             "block, so nothing says whether the weekly run's pre-spend "
             "correctness gates ran. Treat the numbers below as unattested."
         )
+    # alpha-engine-config-I7620 — the DENOMINATOR, rendered before the tiles for
+    # the same reason as the two verdicts above: the Director ACTS on these
+    # numbers, and every one of them was computed over whatever stages this run
+    # dispatched. That set moves. On 2026-08-14 the Director called the
+    # deliberate absence of pit_parity "the producer never ran this cycle" and
+    # withheld its acting authority, because nothing on the card distinguished a
+    # stage switched off by `skip_parity` from a stage that died.
+    #
+    # Both polarities render. A scope line that appears only on a narrow week is
+    # indistinguishable from a producer that stopped emitting one.
+    scope = card.get(RUN_SCOPE_KEY) or {}
+    scope_statement = scope.get("statement")
+    if scope_statement and scope.get("verdict") == SCOPE_MEASURED:
+        out.append("RUN SCOPE: " + scope_statement)
+    elif scope_statement:
+        out.append(
+            "⚠ RUN SCOPE: " + scope_statement
+            + " Grade nothing against a stage list this card cannot confirm was "
+            "dispatched — a narrow run and an unmeasured one are different "
+            "findings."
+        )
+    else:
+        out.append(
+            "⚠ RUN SCOPE: UNKNOWN — this card carries no run_scope block, so "
+            "which stages the week actually dispatched is not established. A "
+            "stage that was switched off by an operator flag is indistinguishable "
+            "here from one that ran and failed; do not report either as the other."
+        )
+
     if card.get("degraded_staleness"):
         out.append("⚠ DEGRADED (staleness): stale tiles — "
                    + ", ".join(card.get("stale_tiles") or []))
