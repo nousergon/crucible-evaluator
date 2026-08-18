@@ -115,7 +115,7 @@ def _seed_full(s3):
         Bucket=BUCKET, Key=f"backtest/{RUN_DATE}/metrics.json",
         Body=json.dumps({
             "run_date": RUN_DATE, "status": "ok",
-            "accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50,
+            "accuracy_21d": 0.58, "avg_alpha_21d": 1.5, "n_21d": 50,
         }).encode("utf-8"),
     )
     _put(s3, "e2e_lift.json", {

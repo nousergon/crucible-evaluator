@@ -15,7 +15,9 @@ from grading.scorecard import (
     _cvar_to_grade,
     _grade_action_entropy,
     _grade_calibration_diagnostics,
+    _grade_composite_scoring,
     _grade_excursion,
+    _grade_portfolio,
     _ic_to_grade,
     _letter,
     _lift_to_grade,
@@ -145,8 +147,8 @@ class TestComputeScorecard:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50},
-                "by_score_bucket": [{"bucket": "90+", "accuracy_10d": 0.71}],
+                "overall": {"accuracy_21d": 0.58, "avg_alpha_21d": 1.5, "n_21d": 50},
+                "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.71}],
             },
         )
         # Only portfolio sub-component has data → executor partial, research/predictor empty
@@ -156,8 +158,8 @@ class TestComputeScorecard:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.58, "avg_alpha_10d": 1.5, "n_10d": 50},
-                "by_score_bucket": [{"bucket": "90+", "accuracy_10d": 0.71}],
+                "overall": {"accuracy_21d": 0.58, "avg_alpha_21d": 1.5, "n_21d": 50},
+                "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.71}],
             },
             e2e_lift={
                 "status": "ok",
@@ -511,7 +513,7 @@ class TestComputeScorecardEvaluatorRevamp:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "overall": {"accuracy_21d": 0.55, "avg_alpha_21d": 1.0, "n_21d": 50},
                 "by_score_bucket": [],
             },
             portfolio_stats={
@@ -530,7 +532,7 @@ class TestComputeScorecardEvaluatorRevamp:
         result = compute_scorecard(
             signal_quality={
                 "status": "ok",
-                "overall": {"accuracy_10d": 0.55, "avg_alpha_10d": 1.0, "n_10d": 50},
+                "overall": {"accuracy_21d": 0.55, "avg_alpha_21d": 1.0, "n_21d": 50},
                 "by_score_bucket": [],
             },
             portfolio_stats={
@@ -617,3 +619,109 @@ class TestSectorTeamSkillComposite:
         # Legacy detail keys.
         assert "lift_vs_sector" in tech["detail"]
         assert "lift_vs_quant" in tech["detail"]
+
+
+# ---------------------------------------------------------------------------
+# config-I7208 regression: signal_quality.overall must be read at the live
+# 21d horizon, not the retired 10d one. Fixture below mirrors the actual key
+# set observed in s3://alpha-engine-research/backtest/2026-08-14/metrics.json
+# (verified 2026-08-18): accuracy_5d, accuracy_21d, avg_alpha_5d,
+# avg_alpha_21d — no accuracy_10d/avg_alpha_10d key has ever been emitted.
+# ---------------------------------------------------------------------------
+
+_LIVE_SIGNAL_QUALITY_OVERALL = {
+    "accuracy_5d": 0.52,
+    "accuracy_21d": 0.58,
+    "avg_alpha_5d": -0.08,
+    # pp scale, matching crucible-backtester/analysis/signal_quality.py and
+    # reporter.py::_alpha_pp — NOT a raw fraction.
+    "avg_alpha_21d": -0.75,
+    "n_5d": 900,
+    "n_21d": 900,
+}
+
+
+class TestGradePortfolioLiveHorizon:
+    def test_alpha_term_resolves_against_live_key_set(self):
+        # This is the exact key set live metrics.json emits. Before
+        # config-I7208, `_grade_portfolio` read avg_alpha_10d — a key that
+        # has never once existed on `overall` — so alpha_g was always None
+        # and the 25%-weighted alpha term silently dropped out of every
+        # portfolio grade ever produced.
+        result = _grade_portfolio(
+            signal_quality={"status": "ok", "overall": _LIVE_SIGNAL_QUALITY_OVERALL},
+            portfolio_stats={"sharpe_ratio": 0.9, "max_drawdown": -0.08},
+        )
+        assert result["grade"] is not None
+        assert "avg_alpha_21d" in result["detail"]
+        assert "avg_alpha_21d_reason" not in result["detail"]
+        assert "avg_alpha_10d" not in result["detail"]
+
+    def test_alpha_units_are_pp_not_fraction(self):
+        # avg_alpha_21d is already in percentage points. If this call site
+        # ever regresses to units="fraction", a real -0.75pp reading would be
+        # misread as -75pp and clamp straight to the grading floor (0)
+        # instead of landing near the middle of the -2.0/4.0pp band.
+        with_alpha = _grade_portfolio(
+            signal_quality={"status": "ok", "overall": _LIVE_SIGNAL_QUALITY_OVERALL},
+            portfolio_stats={"sharpe_ratio": 0.9, "max_drawdown": -0.08},
+        )
+        without_alpha = _grade_portfolio(
+            signal_quality={
+                "status": "ok",
+                "overall": {**_LIVE_SIGNAL_QUALITY_OVERALL, "avg_alpha_21d": None},
+            },
+            portfolio_stats={"sharpe_ratio": 0.9, "max_drawdown": -0.08},
+        )
+        assert with_alpha["grade"] != without_alpha["grade"]
+        # -0.75pp against floor=-2.0/ceiling=4.0 lands well above 0 — a
+        # fraction misread (-75pp) would clamp the alpha term to the floor.
+        assert with_alpha["grade"] > without_alpha["grade"] * 0.5
+
+    def test_missing_avg_alpha_21d_is_explicit_na_not_silent(self):
+        # Fail loud: signal_quality is present and ok, but avg_alpha_21d is
+        # absent from overall (e.g. a partial producer write). The component
+        # must name the gap in `detail`, not silently drop the term with no
+        # trace — matching the existing `_recall_not_graded_reason` /
+        # `_na_reason` convention elsewhere in this module.
+        result = _grade_portfolio(
+            signal_quality={
+                "status": "ok",
+                "overall": {"accuracy_21d": 0.58, "n_21d": 900},
+            },
+            portfolio_stats={"sharpe_ratio": 0.9, "max_drawdown": -0.08},
+        )
+        assert "avg_alpha_21d" not in result["detail"]
+        assert result["detail"].get("avg_alpha_21d_reason") == (
+            "no avg_alpha_21d in signal_quality.overall this cycle"
+        )
+
+
+class TestGradeCompositeScoringLiveHorizon:
+    def test_accuracy_term_resolves_against_live_key_set(self):
+        result = _grade_composite_scoring(
+            signal_quality={
+                "status": "ok",
+                "overall": _LIVE_SIGNAL_QUALITY_OVERALL,
+                "by_score_bucket": [{"bucket": "90+", "accuracy_21d": 0.66}],
+            },
+            score_cal={"monotonic": True},
+        )
+        assert result["grade"] is not None
+        assert "accuracy_21d" in result["detail"]
+        assert "accuracy_10d" not in result["detail"]
+        assert result["detail"]["90+_accuracy"] == "66.0%"
+
+    def test_missing_accuracy_21d_is_explicit_na_not_silent(self):
+        result = _grade_composite_scoring(
+            signal_quality={
+                "status": "ok",
+                "overall": {"avg_alpha_21d": -0.75},
+                "by_score_bucket": [],
+            },
+            score_cal={"monotonic": True},
+        )
+        assert "accuracy_21d" not in result["detail"]
+        assert result["detail"].get("accuracy_21d_reason") == (
+            "no accuracy_21d in signal_quality.overall this cycle"
+        )
