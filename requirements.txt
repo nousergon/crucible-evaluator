@@ -159,7 +159,14 @@ krepis[flow-doctor,openai]>=0.59.11
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
-nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.3
+# Raised to v0.124.65 (alpha-engine-config-I7156, lib#324): the first published
+# release whose frozen report_card contract DECLARES the fields aggregate.py has
+# been emitting since crucible-evaluator#187/#189 — `attestation`,
+# `degraded_attestation`, `degraded_staleness` and `degraded_pipeline_gates` are
+# now `required`, and `stale_tiles` is typed. Below this pin
+# tests/test_report_card_producer_contract.py validates against a schema that
+# cannot fail on a producer which stops emitting any of them.
+nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.65
 
 # Director (Layer C) — single structured LLM call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_GROUP="ultra", resolved through
