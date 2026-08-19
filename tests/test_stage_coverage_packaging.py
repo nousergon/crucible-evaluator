@@ -46,7 +46,14 @@ _STAGE_COVERAGE_INTRODUCED_IN = (0, 59, 2)
 
 
 def _krepis_floor() -> tuple[int, int, int]:
-    """Parse the `krepis[...]>=X.Y.Z` floor out of requirements.txt.
+    """Parse the resolved krepis version out of requirements.txt.
+
+    Accepts either `krepis[...]>=X.Y.Z` (a floor) or `krepis[...]==X.Y.Z`
+    (an exact pin, per §139 — first-party/fast-moving deps are pinned, never
+    floored). The property under test is "the krepis this image resolves is
+    at or above X" — an exact pin establishes that property MORE strongly
+    than a floor (it IS the resolved version, not a lower bound on it), so
+    the comparator itself is not what matters here (alpha-engine-config-I7635).
 
     Deliberately regex-based rather than a `packaging` dependency this repo
     does not otherwise declare — the fleet-standard derive-from-real-source
@@ -57,10 +64,30 @@ def _krepis_floor() -> tuple[int, int, int]:
         line = line.strip()
         if line.startswith("#"):
             continue
-        m = re.match(r"^krepis(\[[^\]]*\])?>=(\d+)\.(\d+)\.(\d+)", line)
+        m = re.match(r"^krepis(\[[^\]]*\])?(?:>=|==)(\d+)\.(\d+)\.(\d+)", line)
         if m:
             return (int(m.group(2)), int(m.group(3)), int(m.group(4)))
-    raise AssertionError("requirements.txt has no `krepis>=X.Y.Z` floor line")
+    raise AssertionError(
+        "requirements.txt has no `krepis>=X.Y.Z` or `krepis==X.Y.Z` line"
+    )
+
+
+def test_krepis_floor_parses_both_floor_and_exact_pin_forms():
+    """Regression guard for the exact defect I7635 fixed: converting the
+    floor to an exact pin must not make this guard report the requirement
+    as ABSENT. Exercises the regex directly against both comparator forms
+    rather than only the live requirements.txt line, so a future re-floor
+    or re-pin can't silently drop coverage of the form not currently used."""
+    pattern = re.compile(r"^krepis(\[[^\]]*\])?(?:>=|==)(\d+)\.(\d+)\.(\d+)")
+    floor_match = pattern.match("krepis[flow-doctor]>=0.59.16")
+    exact_match = pattern.match("krepis[flow-doctor]==0.59.16")
+    assert floor_match is not None
+    assert exact_match is not None
+    assert (
+        floor_match.group(2, 3, 4)
+        == exact_match.group(2, 3, 4)
+        == ("0", "59", "16")
+    )
 
 
 def test_krepis_floor_covers_stage_coverage_introduction():
