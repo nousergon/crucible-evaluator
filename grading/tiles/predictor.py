@@ -430,22 +430,43 @@ def build_predictor_tile(
                 na_detail=na,
             ))
 
-    # inference_coverage (critical) — fraction of the intended tradable universe
-    # that got a prediction. The producer persists the denominator + covered
-    # count (config#1075); we grade covered/universe ∈ [0,1]. Honest N/A until
-    # the producer field lands (or when the universe is empty this cycle).
+    # inference_coverage (critical) — of the names this run was ASKED to score,
+    # how many got a prediction (alpha-engine-config-I7648).
+    #
+    # It used to divide by `n_universe`, the RESEARCH population, and that
+    # stopped being the set the predictor scores at the champion cutover.
+    # Measured 2026-08-18: all 24 of the day's predictions carried a
+    # `watchlist_source` of `attractiveness_top_20` (20) or `held` (4), while
+    # signals.json declared `universe: 903`. So this graded 23/903 = 2.5%
+    # against a 95% target it was structurally incapable of reaching, held a
+    # CRITICAL component permanently RED, and — because the Director reads the
+    # level — put "restore inference coverage" on the live-sizing de-risk
+    # conditions and "fix the inference_coverage collapse" on the plan as a P0.
+    #
+    # `n_intended` is the producer's declaration of what it was handed
+    # (crucible-predictor write_output.intended_scoring_set). ABSENT GRADES
+    # N/A — never a fallback to `n_universe`. A fallback is how this metric
+    # would go on reporting 2.5% after the fix, invisibly, and "the producer
+    # has not been redeployed yet" must not look like "coverage is fine".
     n_universe = latest.get("n_universe")
-    n_covered = latest.get("n_universe_covered")
+    n_intended = latest.get("n_intended")
+    n_intended_covered = latest.get("n_intended_covered")
+    intended_source = latest.get("intended_source")
     n_preds_today = latest.get("n_predictions_today")
-    if isinstance(n_universe, int) and n_universe > 0 and isinstance(n_covered, int):
-        coverage = n_covered / n_universe
+    if (
+        isinstance(n_intended, int) and n_intended > 0
+        and isinstance(n_intended_covered, int)
+    ):
+        coverage = n_intended_covered / n_intended
+        src_txt = f" [{', '.join(intended_source)}]" if intended_source else ""
         components.append(build_metric(
             name="inference_coverage", module=MODULE, metric_type="pct", criticality="critical",
             estimator="coverage_proportion",
-            value=coverage, unit=FRACTION, n_samples=n_universe, n_floor=1,
+            value=coverage, unit=FRACTION, n_samples=n_intended, n_floor=1,
             source_path=latest_src,
-            reason=(f"inference_coverage = {coverage:.1%} ({n_covered}/{n_universe} tradable-universe "
-                    f"tickers predicted) vs target 95% / red-line 80%."),
+            reason=(f"inference_coverage = {coverage:.1%} ({n_intended_covered}/{n_intended} "
+                    f"names this run was asked to score{src_txt} got a prediction) vs target "
+                    f"95% / red-line 80%."),
         ))
     else:
         components.append(build_metric(
@@ -453,8 +474,38 @@ def build_predictor_tile(
             estimator="coverage_proportion",
             value=None, n_floor=1, source_path=latest_src, input_present=False,
             na_detail=(f"inference_coverage: n_predictions_today={n_preds_today} observed, but the "
-                       "tradable-universe denominator (n_universe) is absent/zero in latest.json this "
-                       "cycle (predictor config#1075 producer field not present yet)."),
+                       "intended-scoring denominator (n_intended) is absent/zero in latest.json "
+                       "this cycle. NOT graded against n_universe: that is the research population "
+                       "(currently n_universe=" + str(n_universe) + "), which the predictor stopped "
+                       "scoring at the champion cutover, and dividing by it reported 2.5% for a run "
+                       "that scored nearly everything it was handed (config-I7648)."),
+        ))
+
+    # inference_funnel_width (supporting) — how much of the research population
+    # the run was even asked about. Split out rather than folded into the
+    # coverage number: a narrowing funnel is a real and consequential change,
+    # and hiding it inside a coverage metric is what made the old number
+    # unreadable in both directions at once.
+    n_covered = latest.get("n_universe_covered")
+    if isinstance(n_universe, int) and n_universe > 0 and isinstance(n_intended, int):
+        width = n_intended / n_universe
+        components.append(build_metric(
+            name="inference_funnel_width", module=MODULE, metric_type="pct",
+            criticality="supporting", estimator="coverage_proportion",
+            value=width, unit=FRACTION, n_samples=n_universe, n_floor=1,
+            source_path=latest_src,
+            reason=(f"inference_funnel_width = {width:.2%} ({n_intended} of {n_universe} "
+                    f"research-population names were handed to the predictor; "
+                    f"{n_covered} of the population ultimately got a prediction). "
+                    f"Observational — the funnel is a design choice, not a defect."),
+        ))
+    else:
+        components.append(build_metric(
+            name="inference_funnel_width", module=MODULE, metric_type="pct",
+            criticality="supporting", estimator="coverage_proportion",
+            value=None, n_floor=1, source_path=latest_src, input_present=False,
+            na_detail=("inference_funnel_width: needs both n_universe (research population) and "
+                       "n_intended (what the predictor was handed) in latest.json."),
         ))
     # slim_cache_freshness (supporting) — days since the 2y inference slim-cache
     # last refreshed (weekly cadence). Sourced directly from the slim-cache
