@@ -33,17 +33,15 @@ Returns a JSON-serializable dict; the SF's Choice state reads ``has_drift``.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import urllib.request
 from pathlib import Path
 
 # Re-imported as a module-level attribute (not called via a fully-qualified
 # path) so `patch.object(deploy_drift, "_fetch_origin_main_sha", ...)` keeps
 # working in tests — mirrors crucible-predictor/inference/deploy_drift.py's
 # own re-export comment.
-from nousergon_lib.preflight import _fetch_origin_main_sha, _safe_urlopen
+from nousergon_lib.preflight import _fetch_origin_main_sha, github_get_json
 
 log = logging.getLogger(__name__)
 
@@ -111,20 +109,19 @@ def _has_deploy_relevant_changes(
     (fail-closed) on any API error — a network blip must not silently pass a
     possibly-real drift.
     """
-    # Inlined f-string (not a formatted variable) — same S310 rationale as
-    # _fetch_origin_main_sha / _is_ancestor in nousergon_lib.preflight: keeps
-    # the https:// scheme provably hardcoded at the call site.
-    req = urllib.request.Request(
+    # Shared retrying fetch (nousergon-lib-PR338): a transient 5xx/429 is
+    # retried with backoff and, if still unresolved, reported as "no answer"
+    # rather than folded into the negative branch. The single-attempt version
+    # of this call shape produced a false deploy-drift halt on the predictor
+    # on 2026-08-20 off one HTTP 500.
+    payload, _definitive = github_get_json(
         f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
-        headers={"Accept": "application/vnd.github+json"},
+        timeout=timeout,
     )
-    try:
-        with _safe_urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
-    except (OSError, json.JSONDecodeError) as exc:
+    if payload is None:
         log.warning(
-            "Deploy-drift: GitHub compare API unreachable (%s) — cannot "
-            "check deploy-relevant paths, treating mismatch as drift", exc,
+            "Deploy-drift: GitHub compare API unresolved for %s %s...%s — cannot "
+            "check deploy-relevant paths, treating mismatch as drift", repo, base, head,
         )
         return True  # fail-closed
 

@@ -7,9 +7,10 @@ uses for the identical re-import)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 import grading.deploy_drift as dd
 
@@ -159,94 +160,37 @@ def test_repo_and_branch_are_threaded_through(tmp_path: Path):
 
 
 # ── _has_deploy_relevant_changes ─────────────────────────────────────────────
+# The compare call now goes through nousergon_lib.preflight.github_get_json,
+# which returns (payload, definitive) and retries transient GitHub failures
+# before giving up (nousergon-lib-PR338). These tests patch that seam.
 
 
-def _mock_urlopen_with_files(files):
-    """Return a fake urlopen context-manager whose response body carries the
-    given ``files`` list inside a compare-API-shaped JSON payload."""
-
-    class _FakeResponse:
-        @staticmethod
-        def read():
-            return json.dumps({"files": files}).encode()
-
-    class _FakeCtx:
-        def __enter__(self):
-            return _FakeResponse()
-
-        def __exit__(self, *args):
-            pass
-
-    return _FakeCtx()
+def _compare_returning_files(files):
+    """Definitive compare answer carrying the given ``files`` list."""
+    return patch.object(dd, "github_get_json", return_value=({"files": files}, True))
 
 
-def test_has_deploy_relevant_changes_true_on_grading_file():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "grading/handler.py"}],
-    )):
+@pytest.mark.parametrize("filename", [
+    "grading/handler.py",
+    "director/handler.py",
+    "requirements.txt",
+    "Dockerfile",
+    "infrastructure/deploy.sh",
+    ".github/workflows/deploy.yml",
+])
+def test_has_deploy_relevant_changes_true_on_deploy_path(filename):
+    with _compare_returning_files([{"filename": filename}]):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
         ) is True
 
 
-def test_has_deploy_relevant_changes_true_on_director_file():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "director/handler.py"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_true_on_requirements():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "requirements.txt"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_true_on_dockerfile():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "Dockerfile"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_true_on_deploy_sh():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "infrastructure/deploy.sh"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_true_on_deploy_yml():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": ".github/workflows/deploy.yml"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_false_on_ci_only_change():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": ".github/workflows/gate-label-guard.yml"}],
-    )):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is False
-
-
-def test_has_deploy_relevant_changes_false_on_docs_change():
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [{"filename": "README.md"}],
-    )):
+@pytest.mark.parametrize("filename", [
+    ".github/workflows/gate-label-guard.yml",
+    "README.md",
+])
+def test_has_deploy_relevant_changes_false_on_non_deploy_path(filename):
+    with _compare_returning_files([{"filename": filename}]):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
         ) is False
@@ -254,21 +198,31 @@ def test_has_deploy_relevant_changes_false_on_docs_change():
 
 def test_has_deploy_relevant_changes_true_on_mixed_changes():
     # One deploy-relevant file among several non-relevant ones → True
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files(
-        [
-            {"filename": ".github/workflows/gate-label-guard.yml"},
-            {"filename": "grading/handler.py"},
-            {"filename": "README.md"},
-        ],
-    )):
+    with _compare_returning_files([
+        {"filename": ".github/workflows/gate-label-guard.yml"},
+        {"filename": "grading/handler.py"},
+        {"filename": "README.md"},
+    ]):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
         ) is True
 
 
-def test_has_deploy_relevant_changes_fail_closed_on_api_error():
-    # API unreachable → fail-closed (treat as drift)
-    with patch.object(dd, "_safe_urlopen", side_effect=OSError("timeout")):
+def test_has_deploy_relevant_changes_fail_closed_on_unresolved_api():
+    """Unresolved after the shared helper's retries → fail-closed (drift).
+
+    Note the payload/definitive split: this branch is reached only after
+    github_get_json has already retried the transient failure, which is the
+    2026-08-20 predictor regression this seam exists to prevent repeating.
+    """
+    with patch.object(dd, "github_get_json", return_value=(None, False)):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
+def test_has_deploy_relevant_changes_fail_closed_on_definitive_404():
+    with patch.object(dd, "github_get_json", return_value=(None, True)):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
         ) is True
@@ -276,17 +230,7 @@ def test_has_deploy_relevant_changes_fail_closed_on_api_error():
 
 def test_has_deploy_relevant_changes_fail_closed_on_empty_files():
     # Compare API returned no files (force-push / empty merge) → conservative
-    with patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files([])):
-        assert dd._has_deploy_relevant_changes(
-            "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
-
-
-def test_has_deploy_relevant_changes_fail_closed_on_json_error():
-    with (
-        patch.object(dd, "_safe_urlopen", return_value=_mock_urlopen_with_files([])),
-        patch.object(json, "loads", side_effect=json.JSONDecodeError("bad json", "", 0)),
-    ):
+    with _compare_returning_files([]):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
         ) is True
