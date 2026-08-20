@@ -40,6 +40,17 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 WORKFLOWS = sorted(WORKFLOW_DIR.glob("*.yml")) + sorted(WORKFLOW_DIR.glob("*.yaml"))
 IDS = [p.name for p in WORKFLOWS]
 
+# The same suite runs inside the built Lambda image, whose /var/task carries the
+# application tree but not `.github/` — nothing there is a workflow, so there is
+# nothing here to assert. Skip on the ABSENCE OF THE DIRECTORY, never on an
+# empty glob: a `.github/workflows/` that exists and yields no files is a
+# discovery regression, and test_the_workflow_dir_actually_has_workflows below
+# must still fail on it.
+pytestmark = pytest.mark.skipif(
+    not WORKFLOW_DIR.is_dir(),
+    reason="no .github/workflows/ — running against the built image, not the source tree",
+)
+
 # `pip install "$(...)"` / `pip install '$(...)'` / `pip install $(...)` —
 # any command substitution reaching pip as a bare requirement argument.
 # `-r <(...)` is the sanctioned form and does not match: the `-r` makes the
