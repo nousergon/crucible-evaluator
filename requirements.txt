@@ -155,7 +155,7 @@ pandas~=3.0
 # what makes the krepis-side validator start applying to the fleet.
 # Also (krepis#158, RC v3 T5): the same release widens `MetricTypeLiteral` with
 # `"contribution_lift"` — below this floor `metric_type="contribution_lift"` raises.
-krepis[flow-doctor,openai]==0.59.17  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635)
+krepis[flow-doctor,openai]==0.59.18  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635)
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
