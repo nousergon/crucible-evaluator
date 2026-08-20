@@ -74,8 +74,20 @@ jobs:
         with:
           python-version: '3.12'
 
+      # `pip install -r`, never `pip install "$(grep ...)"`. Interpolating the
+      # matched LINE into a quoted argument hands pip the trailing inline
+      # comment as part of the requirement, and pip rejects the whole thing:
+      #
+      #   ERROR: Invalid requirement: 'krepis[flow-doctor,openai]==0.59.17
+      #   # pinned per §139 - ...': Expected comma (within version specifier)
+      #
+      # That is exactly what happened when the pin line gained its §139 comment
+      # on 2026-08-19: this workflow went red and STAYED red for four merges,
+      # so crucible-evaluator was merged-but-not-live from 2026-08-19 21:12 UTC
+      # (alpha-engine-config-I7855). Feeding pip a requirements FILE puts
+      # comment handling in pip's own parser instead of in our regex.
       - name: Install krepis (runner-side canary CLI)
-        run: pip install "$(grep '^krepis\[' requirements.txt)"
+        run: pip install -r <(grep '^krepis\[' requirements.txt)
 
       # deploy.sh builds the single ECR image and deploys BOTH the grading
       # Lambda (alpha-engine-evaluator) and the Director Lambda
