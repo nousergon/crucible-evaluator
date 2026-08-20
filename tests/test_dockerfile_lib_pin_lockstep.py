@@ -76,7 +76,17 @@ def test_workflows_do_not_hardcode_first_party_package_pins() -> None:
         return
 
     for workflow_file in workflow_dir.glob("*.yml"):
-        workflow = workflow_file.read_text()
+        # Comment lines are stripped before scanning. A pin inside a `#` comment
+        # is documentation, not a second source of truth — and on 2026-08-20
+        # this guard failed a deploy.yml change whose only offence was QUOTING
+        # the broken pip error message it was fixing (alpha-engine-config-I7855).
+        # A guard that cannot be explained in the file it guards teaches the next
+        # author to describe the incident vaguely, which is the opposite of what
+        # the 2026-07-11 drift incident needs recorded.
+        workflow = "\n".join(
+            line for line in workflow_file.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
 
         for package in first_party_packages:
             hardcoded_pin = re.search(
