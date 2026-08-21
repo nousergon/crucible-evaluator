@@ -8,6 +8,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
+import nousergon_lib.pipeline_status as ps
 from grading.tiles.agent import build_agent_tile
 from grading.tiles.substrate import PRICE_CACHE_FRESHNESS_SENTINEL_KEY, build_substrate_tile
 
@@ -163,12 +164,51 @@ class TestDeploySuccessRate:
 _ARNS = "arn:aws:states:us-east-1:0:stateMachine:alpha-engine-saturday-pipeline"
 
 
+_arn_counter = iter(range(10_000))
+
+
 def _run(status, days_ago, now, role="weekly"):
     # Production runs carry a pipeline_role; role=None mimics an untracked
     # smoke/manual run (excluded from the rate). `days_ago` also keys the cycle
     # (one cycle = one SF + one start UTC-date), so distinct days = distinct
     # cycles, same day = same cycle (e.g. scheduled run + same-day recovery).
-    return SimpleNamespace(status=status, start_utc=now - timedelta(days=days_ago), pipeline_role=role)
+    arn = f"arn:aws:states:us-east-1:0:execution:x:{next(_arn_counter)}"
+    return SimpleNamespace(
+        status=status, start_utc=now - timedelta(days=days_ago), pipeline_role=role,
+        execution_arn=arn,
+    )
+
+
+def _outcome_for(status: str, execution_arn: str) -> ps.WorkOutcome:
+    """A COMPLETED/INCOMPLETE work verdict keyed on status alone — these tests
+    exercise cycle/role bucketing, not the entered-states work-verdict shape
+    itself (that's ``tests/test_sf_cycle_did_the_work.py``, alpha-engine-config
+    -I8069). Bypasses ``classify_work``'s spine lookup so the fixture ARN's
+    state machine name need not be a registered pipeline."""
+    if status == "SUCCEEDED":
+        verdict, reason = ps.WorkVerdict.COMPLETED, "full_run"
+    else:
+        verdict, reason = ps.WorkVerdict.INCOMPLETE, "execution_failed"
+    return ps.WorkOutcome(
+        verdict=verdict, reason=reason, state_machine_name="alpha-engine-saturday-pipeline",
+        status=ps.RunStatus(status), terminal_state="Done" if status == "SUCCEEDED" else "Fail",
+        execution_arn=execution_arn,
+    )
+
+
+def _wire_sf(monkeypatch, runs):
+    """Wire both nousergon_lib.pipeline_status entry points the tile calls:
+    discovery (list_recent_pipeline_runs) and the per-execution work verdict
+    (read_work_outcome, alpha-engine-config-I8069)."""
+    monkeypatch.setattr(
+        "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
+        lambda arn, **kw: runs,
+    )
+    outcomes = {r.execution_arn: _outcome_for(r.status, r.execution_arn) for r in runs}
+    monkeypatch.setattr(
+        "nousergon_lib.pipeline_status.read_work_outcome",
+        lambda execution_arn, client=None: outcomes[execution_arn],
+    )
 
 
 class TestSfSuccessRate:
@@ -176,11 +216,8 @@ class TestSfSuccessRate:
         # 4 distinct days, each a clean scheduled run → 4/4 distinct cycles clean.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("SUCCEEDED", 8, now),
-                               _run("SUCCEEDED", 15, now), _run("SUCCEEDED", 22, now)],
-        )
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now), _run("SUCCEEDED", 8, now),
+                               _run("SUCCEEDED", 15, now), _run("SUCCEEDED", 22, now)])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         assert sf["value"] == pytest.approx(1.0)
@@ -195,11 +232,8 @@ class TestSfSuccessRate:
         # 4 distinct cycles: 1 clean, 3 failed (no recovery) → cycle_rate 0.25.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("FAILED", 2, now),
-                               _run("FAILED", 3, now), _run("TIMED_OUT", 4, now)],
-        )
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now), _run("FAILED", 2, now),
+                               _run("FAILED", 3, now), _run("TIMED_OUT", 4, now)])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         assert sf["value"] == pytest.approx(0.25)
@@ -213,14 +247,11 @@ class TestSfSuccessRate:
         # on distinct days so N clears the floor and a status is gradeable.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [
-                _run("FAILED", 1, now, role="weekly"), _run("SUCCEEDED", 1, now, role="recovery"),
-                _run("FAILED", 8, now, role="weekly"), _run("SUCCEEDED", 8, now, role="recovery"),
-                _run("FAILED", 15, now, role="weekly"), _run("SUCCEEDED", 15, now, role="recovery"),
-            ],
-        )
+        _wire_sf(monkeypatch, [
+            _run("FAILED", 1, now, role="weekly"), _run("SUCCEEDED", 1, now, role="recovery"),
+            _run("FAILED", 8, now, role="weekly"), _run("SUCCEEDED", 8, now, role="recovery"),
+            _run("FAILED", 15, now, role="weekly"), _run("SUCCEEDED", 15, now, role="recovery"),
+        ])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         assert sf["value"] == pytest.approx(1.0)  # 3/3 distinct cycles clean
@@ -235,10 +266,7 @@ class TestSfSuccessRate:
         # Scheduled run succeeds outright, no recovery → both metrics 1.0.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly")],
-        )
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now, role="weekly")])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         assert _comp(tile, "sf_success_rate_4w")["value"] == pytest.approx(1.0)
         assert _comp(tile, "unattended_first_pass_rate")["value"] == pytest.approx(1.0)
@@ -248,10 +276,7 @@ class TestSfSuccessRate:
         # toward cycle_rate but NOT the unattended denominator.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="recovery")],
-        )
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now, role="recovery")])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         assert _comp(tile, "sf_success_rate_4w")["value"] == pytest.approx(1.0)
         # no scheduled cycle → unattended is N/A-NOT-RUN, not a fabricated number
@@ -260,11 +285,8 @@ class TestSfSuccessRate:
     def test_window_excludes_old_and_running(self, s3, monkeypatch):
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now), _run("RUNNING", 1, now),
-                               _run("FAILED", 40, now)],  # RUNNING excluded; 40d old excluded
-        )
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now), _run("RUNNING", 1, now),
+                               _run("FAILED", 40, now)])  # RUNNING excluded; 40d old excluded
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         # day-1 cycle: SUCCEEDED + RUNNING(non-terminal, dropped) → 1 clean cycle.
@@ -275,12 +297,9 @@ class TestSfSuccessRate:
         # role=None (smoke/manual) runs must NOT count toward production reliability.
         now = datetime.now(UTC)
         monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
-        monkeypatch.setattr(
-            "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
-            lambda arn, **kw: [_run("SUCCEEDED", 1, now, role="weekly"),
+        _wire_sf(monkeypatch, [_run("SUCCEEDED", 1, now, role="weekly"),
                                _run("FAILED", 2, now, role=None),  # untracked smoke → excluded
-                               _run("FAILED", 3, now, role=None)],
-        )
+                               _run("FAILED", 3, now, role=None)])
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
         sf = _comp(tile, "sf_success_rate_4w")
         assert sf["n_samples"] == 1  # only the role-carrying cycle counts
