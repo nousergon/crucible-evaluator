@@ -15,7 +15,14 @@ around the functions:
     most likely one to introduce.
 ``TestWithholding``
     what actually stops when the guarantee is withheld — proven by tripwires on
-    the mutating calls, not by reading a status string.
+    the mutating calls, not by reading a status string — and, since Brian's
+    2026-08-22 ruling (``alpha-engine-config-I8187``), what deliberately does
+    NOT stop.
+``TestMutationClassSplit``
+    the gate's subject: the AUTHORITY an action exercises, not a global
+    run-quality flag. A read that informs a human or repairs the Director's own
+    ledger is not the same act as a write that reopens someone's issue, and one
+    verdict flag must not govern both.
 ``TestPassRestoresAuthority``
     the gate is not merely always-closed.
 ``TestSurfaces``
@@ -140,15 +147,66 @@ class TestWithholding:
     def test_loop_verification_never_reopens_or_escalates(self, block, monkeypatch):
         from director import handler as H
         tw = _Tripwire()
-        monkeypatch.setattr(H, "backfill_issue_numbers", tw)
+        backfilled: list[list] = []
+        monkeypatch.setattr(
+            H, "backfill_issue_numbers",
+            lambda items, repo=None, token=None: (backfilled.append(items), 2)[1],
+        )
         monkeypatch.setattr(H, "verify_and_correct", tw)
         ledger = {"items": [{"id": "a", "status": "open"}]}
 
         out = H._verify_loop_best_effort(ledger, _card(), "tok", verdict_block=block)
 
-        assert out["director_loop"] == "withheld"
+        # The MUTATING half stops — a reopen is an accusation with no evidence.
+        assert out["director_loop"] == "mutations_withheld"
         assert tw.calls == 0
-        assert ledger == {"items": [{"id": "a", "status": "open"}]}
+        assert "§2.3a" in out["director_loop_reason"]
+        # ...and the NON-mutating half runs anyway (alpha-engine-config-I8187).
+        # Withholding an own-ledger repair buys no safety: `verify_and_correct`
+        # skips every row with no `issue_number`, so gating the thing that FILLS
+        # `issue_number` dismantles the state the corrections need. Three
+        # consecutive UNKNOWN cycles left all 28 live rows null (I8179).
+        assert out["director_loop_backfilled"] == 2
+        assert backfilled == [ledger["items"]]
+
+    @pytest.mark.parametrize("block", [None, {}, {"verdict": "UNKNOWN"}, {"verdict": "FAIL"}])
+    def test_backfill_runs_before_the_gate_is_evaluated(self, block, monkeypatch):
+        """The ordering, not just the fact. The backfill must complete BEFORE
+        the withholding decision returns, so the cycle the attestation clears
+        already sees the numbers recovered while it was UNKNOWN."""
+        from director import handler as H
+        order: list[str] = []
+        monkeypatch.setattr(
+            H, "backfill_issue_numbers",
+            lambda items, repo=None, token=None: (order.append("backfill"), 1)[1],
+        )
+        monkeypatch.setattr(
+            H, "verify_and_correct",
+            lambda items, card, repo=None, token=None: (order.append("verify"), {})[1],
+        )
+        H._verify_loop_best_effort({"items": []}, _card(), "tok", verdict_block=block)
+        assert order == ["backfill"], "the gate must not sit upstream of the backfill"
+
+    def test_a_failing_backfill_does_not_sink_the_gated_half(self, monkeypatch):
+        """The two halves fail independently — fail-loud, no silent swallow, and
+        no shared try block that lets an own-ledger error suppress the
+        corrections a PASS verdict authorized."""
+        from director import handler as H
+
+        def _boom(items, repo=None, token=None):
+            raise RuntimeError("github 502")
+
+        monkeypatch.setattr(H, "backfill_issue_numbers", _boom)
+        monkeypatch.setattr(
+            H, "verify_and_correct",
+            lambda items, card, repo=None, token=None: {"open": 3},
+        )
+        out = H._verify_loop_best_effort(
+            {"items": []}, _card(), "tok", verdict_block=V.read_card_verdict(_card(_PASS_BLOCK))
+        )
+        assert out["director_loop"] == "ok"
+        assert out["director_loop_open"] == 3
+        assert "github 502" in out["director_loop_backfill_error"]
 
     def test_gate_precedes_the_enable_flag(self, monkeypatch):
         # An unverified cycle must read as WITHHELD, never as "disabled" — the
@@ -163,6 +221,62 @@ class TestWithholding:
         assert s["correctness_verdict"] == "UNKNOWN"
         assert s["director_actions_withheld"] is True
         assert set(s["director_actions_withheld_list"]) == set(V.GATED_ACTIONS)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+class TestMutationClassSplit:
+    """alpha-engine-config-I8187 — the gate's subject is the AUTHORITY an action
+    exercises, never a global run-quality flag."""
+
+    def test_the_two_sets_are_disjoint_and_loop_verification_is_in_neither(self):
+        assert not set(V.MUTATING_ACTIONS) & set(V.UNGATED_ACTIONS)
+        # The atom this ruling dissolved. A gate named after a code path grows
+        # to cover whatever that path later does; one named after an authority
+        # does not.
+        assert "loop_verification" not in V.MUTATING_ACTIONS + V.UNGATED_ACTIONS
+        assert V.GATED_ACTIONS == V.MUTATING_ACTIONS
+
+    @pytest.mark.parametrize("verdict", ["UNKNOWN", "FAIL", "PARTIAL", "PASS"])
+    @pytest.mark.parametrize("action", ["issue_number_backfill", "carryover_reconciliation"])
+    def test_an_ungated_action_is_never_withheld_under_any_verdict(self, verdict, action):
+        block = V.read_card_verdict(_card({**_PASS_BLOCK, "verdict": verdict}))
+        assert V.actions_withheld(block, action=action) is False
+
+    @pytest.mark.parametrize("action", ["issue_filing", "issue_reopen", "carryover_escalation"])
+    def test_a_mutating_action_is_withheld_on_every_non_pass_verdict(self, action):
+        for verdict in ("UNKNOWN", "FAIL", "PARTIAL"):
+            block = V.read_card_verdict(_card({**_PASS_BLOCK, "verdict": verdict}))
+            assert V.actions_withheld(block, action=action) is True
+        clean = V.read_card_verdict(_card(_PASS_BLOCK))
+        assert V.actions_withheld(clean, action=action) is False
+
+    def test_an_undeclared_action_raises_rather_than_guessing(self):
+        # Both silent defaults are wrong: False ships a new mutating action
+        # ungated on a typo, True reinstates the over-broad withholding this
+        # split removed. Fail loud — the fleet's default is RAISE.
+        with pytest.raises(ValueError, match="unknown Director action"):
+            V.actions_withheld(V.read_card_verdict(_card()), action="loop_verification")
+        with pytest.raises(ValueError):
+            V.is_gated_action("issue_filng")
+
+    def test_the_class_question_is_unchanged_by_the_split(self):
+        assert V.actions_withheld(V.read_card_verdict(_card())) is True
+        assert V.actions_withheld(V.read_card_verdict(_card(_PASS_BLOCK))) is False
+
+    def test_both_sides_of_the_split_are_named_on_every_surface(self):
+        # A list appearing only when something stopped cannot be distinguished
+        # from a producer that stopped emitting — so the ran-regardless set is
+        # emitted in BOTH verdict states.
+        for block in (_card(), _card(_PASS_BLOCK)):
+            s = V.withheld_summary(V.read_card_verdict(block))
+            assert set(s["director_actions_ungated_list"]) == set(V.UNGATED_ACTIONS)
+
+    def test_the_plan_artifact_names_what_still_ran(self):
+        block = V.read_card_verdict(_card())
+        body = json.loads(V.stamp_plan_artifact({"action_items": []}, block))
+        assert set(body["actions_withheld"]) == set(V.MUTATING_ACTIONS)
+        assert set(body["actions_ran_regardless"]) == set(V.UNGATED_ACTIONS)
+        assert "loop_verification" not in body["actions_withheld"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -308,7 +422,8 @@ class TestEndToEnd:
         assert out["correctness_verdict"] == "UNKNOWN"
         assert out["director_actions_withheld"] is True
         assert out["director_issues"] == "withheld"
-        assert out["director_loop"] == "withheld"
+        # I8187: the pass no longer goes dark wholesale — only its mutations do.
+        assert out["director_loop"] == "mutations_withheld"
 
         body = json.loads(
             s3.get_object(Bucket=BUCKET,

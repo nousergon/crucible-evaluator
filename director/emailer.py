@@ -67,7 +67,22 @@ def _loop_summary_line(loop_summary: dict | None) -> str | None:
     if the pass didn't run this cycle (no GH token, or an error — those cases
     still show up in the Lambda's own summary/logs, not worth cluttering the
     digest email over)."""
-    if not loop_summary or loop_summary.get("director_loop") != "ok":
+    if not loop_summary:
+        return None
+    status = loop_summary.get("director_loop")
+    if status == "mutations_withheld":
+        # alpha-engine-config-I8187. Under a non-PASS verdict the pass no longer
+        # goes dark: the reopen/escalate half is withheld and the own-ledger
+        # backfill still runs, and the reader is told BOTH halves. Reporting
+        # nothing here would make a narrowed gate indistinguishable from the
+        # pass having stopped — the exact confusion this ruling removed.
+        return (
+            "Director loop: mutations WITHHELD (no reopen, no Decision Queue "
+            "escalation) on an unverified correctness verdict; ledger backfill "
+            f"ran and filled {loop_summary.get('director_loop_backfilled', 0)} "
+            "issue number(s)."
+        )
+    if status != "ok":
         return None
     parts = [
         f"{loop_summary.get(f'director_loop_{key}', 0)} {label}"
