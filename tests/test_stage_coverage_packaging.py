@@ -136,14 +136,38 @@ def test_record_stage_coverage_imports_from_krepis_not_nousergon_lib():
     assert "nousergon_lib.stage_coverage" not in src
 
 
-def test_record_stage_coverage_never_leaves_the_key_absent_on_import_failure():
+def test_record_stage_coverage_never_leaves_the_key_absent_on_a_failed_verdict():
     """Static guard alongside the behavioral tests in test_handler.py /
     test_director.py: the source must assign `result["stage_coverage"]`
-    inside the except ImportError branch, not merely log and fall through
-    with the key absent — an absent key is exactly what a healthy stage
-    also produces, so absence must never be the unavailable signal."""
+    inside the handler branch, not merely log and fall through with the key
+    absent — an absent key is exactly what a healthy stage also produces, so
+    absence must never be the unavailable signal.
+
+    alpha-engine-config-I8155 widened the branch from `except ImportError` to
+    `except (ImportError, ValueError)`: krepis now REFUSES to build a verdict
+    without the SF execution's own run_date (a ValueError), and that refusal
+    must degrade to UNMEASURED here rather than propagate out of the handler
+    — an observer that can kill the stage it observes is a new failure mode
+    bolted onto the one it reports."""
     src = _record_stage_coverage_source()
-    except_idx = src.index("except ImportError")
+    except_idx = src.index("except (ImportError, ValueError)")
     tail = src[except_idx:]
     assert '"UNMEASURED"' in tail or "_STAGE_COVERAGE_STATUS_UNMEASURED" in tail
     assert 'result["stage_coverage"] = {' in tail or 'result["stage_coverage"] = ' in tail
+
+
+def test_record_stage_coverage_catches_the_contract_refusal_not_only_import():
+    """The two failure classes must be handled TOGETHER. Catching only
+    ImportError would let krepis's required-run_date refusal escape and fail
+    the grading Lambda — turning a correct library tightening into an outage
+    (alpha-engine-config-I8155)."""
+    src = _record_stage_coverage_source()
+    assert "except (ImportError, ValueError)" in src, (
+        "grading/handler.py must catch BOTH the missing-library case and "
+        "krepis.stage_coverage's StageCoverageContractError (a ValueError)."
+    )
+    assert "logger.critical" in src, (
+        "a blank run_date is a defect in this handler's own event threading, "
+        "not an environment condition — it must be louder than the "
+        "library-absent case."
+    )

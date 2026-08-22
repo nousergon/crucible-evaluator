@@ -404,3 +404,184 @@ def test_guard_would_have_failed_on_pr75_prefix():
 
     # And the post-fix contract (what we ship) must grant it readwrite.
     assert _granted_prefixes().get("_substrate") == "readwrite"
+
+
+# ── Mechanism 3: library-mediated prefixes -> grant (config-I8156) ───────────
+#
+# **Why mechanisms 1 and 2 could not have caught this.** Both read THIS repo's
+# own AST: (1) counts boto3 access sites per file, (2) resolves the leading
+# segment of a `Key=` / `Prefix=` argument at those same sites. A prefix
+# written by an IMPORTED LIBRARY has no call site in either scan, so the
+# contract's coverage claim was silently scoped to first-party writes while
+# its docstring claimed "every top-level namespace the evaluator's grading +
+# director code reads or writes".
+#
+# Measured 2026-08-22 (alpha-engine-config-I8152): `krepis.stage_coverage`
+# writes `_stage_coverage/` and `krepis.cost_sink` writes `decision_artifacts/`.
+# Neither was declared, `alpha-engine-evaluator-role` never granted either, and
+# it stood undetected for as long as the prefixes have existed — four weekly
+# stages recorded zero coverage verdicts since 2026-08-14 and the Director's
+# LLM spend was never attributed. The failure mode produces no PR signal, no
+# CI signal and no page: only a fail-soft ERROR log nobody reads.
+#
+# The repo had already WRITTEN THIS DOWN rather than closing it, in
+# EXPECTED_PER_FILE_ACCESS_COUNTS above: "config#3104: grading/artifacts.py S3
+# access moved to nousergon_lib.artifact_resolution SSoT; the contract pin for
+# the library-side access sites lives in nousergon-lib, not here." The PIN
+# moved. The GRANT OBLIGATION did not, and nothing checked it.
+#
+# The class fix is `krepis.s3_surface`: the WRITER declares its own top-level
+# prefixes, and every consumer's contract test reads the same declaration. For
+# an env-configured target (`cost_sink`'s KREPIS_COST_SINK_PREFIX) the
+# declaration names the VARIABLE and this test resolves it against THIS repo's
+# own deploy configuration — the value that will actually run, not whatever
+# happens to be set on the machine running pytest.
+
+_KREPIS_FLOOR_HINT = (
+    "This needs a krepis that ships `krepis.s3_surface` (krepis >= 0.59.27). "
+    "Bump the floor in requirements.txt; the krepis PR adding it merges "
+    "before this one (alpha-engine-config-I8156)."
+)
+
+
+def _deploy_environment() -> dict[str, str]:
+    """Lambda environment THIS repo's own deploy script sets.
+
+    Parsed from `infrastructure/deploy.sh`'s `krepis.aws merge-lambda-env
+    --set K=V` invocations. Deliberately NOT `os.environ`: the question is
+    what the deployed function will be configured with, and reading the test
+    runner's environment would answer about a different world -- the same
+    class of error as a coverage claim scoped to a smaller set than its name
+    implies.
+    """
+    script = REPO_ROOT / "infrastructure" / "deploy.sh"
+    if not script.exists():  # packaged//sdist checkouts carry no infrastructure/
+        return {}
+    found: dict[str, str] = {}
+    for match in re.finditer(
+        r"--set\s+([A-Z_][A-Z0-9_]*)=([^\s\\]+)", script.read_text(encoding="utf-8")
+    ):
+        found[match.group(1)] = match.group(2)
+    return found
+
+
+def _imported_krepis_modules() -> dict[str, set[str]]:
+    """``{relative_path: {dotted krepis submodule, ...}}`` over the scan roots.
+
+    Walks the WHOLE tree rather than just module-level statements: every
+    stage-coverage and cost-sink import in this repo is a LAZY import inside a
+    function body, guarded by `try: ... except ImportError`, which is exactly
+    where a module-level-only scan would find nothing and pass.
+    """
+    out: dict[str, set[str]] = {}
+    for rel in _tracked_py_files():
+        try:
+            tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover - a broken file fails elsewhere
+            continue
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "krepis" or alias.name.startswith("krepis."):
+                        modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module == "krepis":
+                    # `from krepis import cost_sink` -- each alias is a module.
+                    modules.update(f"krepis.{a.name}" for a in node.names)
+                elif node.module.startswith("krepis."):
+                    # `from krepis.stage_coverage import assert_stage_coverage`
+                    modules.add(node.module)
+        modules.discard("krepis")  # the package itself declares no surface
+        if modules:
+            out[rel] = modules
+    return out
+
+
+def _s3_surface():
+    try:
+        from krepis import s3_surface as module
+    except ImportError as exc:  # pragma: no cover - exercised by the floor bump
+        pytest.fail(f"cannot import krepis.s3_surface: {exc}. {_KREPIS_FLOOR_HINT}")
+    return module
+
+
+def test_the_krepis_import_scan_actually_finds_the_known_importers():
+    """Guard the guard. A scan that finds nothing passes vacuously, which is
+    precisely how mechanisms 1 and 2 reported full coverage while blind."""
+    imports = _imported_krepis_modules()
+    all_modules = {m for mods in imports.values() for m in mods}
+    assert "krepis.stage_coverage" in all_modules, (
+        "the krepis import scan found no krepis.stage_coverage importer under "
+        f"{_SCAN_ROOTS}; found {sorted(all_modules)}"
+    )
+    assert "krepis.cost_sink" in all_modules, (
+        "the krepis import scan found no krepis.cost_sink importer under "
+        f"{_SCAN_ROOTS}; found {sorted(all_modules)}"
+    )
+
+
+def test_library_mediated_prefixes_are_declared():
+    """Every prefix an IMPORTED krepis module declares it writes must be in the
+    contract, with at least the declared mode."""
+    s3_surface = _s3_surface()
+    granted = _granted_prefixes()
+    environment = _deploy_environment()
+    failures: list[str] = []
+
+    for rel, modules in sorted(_imported_krepis_modules().items()):
+        for module in sorted(modules):
+            try:
+                declared = s3_surface.prefixes_for([module], environment=environment)
+            except ImportError as exc:
+                failures.append(f"{rel} imports {module}, which will not import: {exc}")
+                continue
+            for prefix, mode in sorted(declared.items()):
+                have = granted.get(prefix)
+                if have is None:
+                    failures.append(
+                        f"{prefix}  ({mode}) -- written by {module}, imported by {rel}"
+                    )
+                elif mode == "readwrite" and have != "readwrite":
+                    failures.append(
+                        f"{prefix}  (needs readwrite, contract says {have!r}) -- "
+                        f"written by {module}, imported by {rel}"
+                    )
+
+    assert not failures, (
+        "Imported krepis module(s) write S3 prefix(es) the contract does not "
+        "grant:\n"
+        + "\n".join(f"  - {f}" for f in failures)
+        + "\n\nThis is the alpha-engine-config-I8156 bug class: the prefix has "
+        "no call site in THIS repo, so mechanisms 1 and 2 are structurally "
+        "blind to it, and the runtime failure is a fail-soft ERROR log nobody "
+        "reads. Add the prefix to grading/iam_s3_contract.json with at least "
+        "the declared mode AND grant it on alpha-engine-evaluator-role in "
+        "nous-ergon-ops."
+    )
+
+
+def test_the_two_prefixes_i8152_found_are_covered_by_this_mechanism():
+    """Regression: the exact pair that got through. Not a restatement of the
+    contract file -- it asserts the MECHANISM derives them from the imports."""
+    s3_surface = _s3_surface()
+    imports = _imported_krepis_modules()
+    modules = {m for mods in imports.values() for m in mods}
+    derived = s3_surface.prefixes_for(modules, environment=_deploy_environment())
+    assert derived.get("_stage_coverage") == "readwrite", derived
+    assert derived.get("decision_artifacts") == "readwrite", derived
+
+
+def test_the_cost_sink_prefix_is_resolved_from_this_repos_deploy_config():
+    """The env-configured half. `decision_artifacts` is only derivable because
+    infrastructure/deploy.sh sets KREPIS_COST_SINK_PREFIX; reading os.environ
+    instead would answer about the test runner, not the Lambda."""
+    s3_surface = _s3_surface()
+    environment = _deploy_environment()
+    assert environment.get("KREPIS_COST_SINK_PREFIX", "").startswith(
+        "decision_artifacts"
+    ), environment
+    with_config = s3_surface.prefixes_for(["krepis.cost_sink"], environment=environment)
+    without_config = s3_surface.prefixes_for(["krepis.cost_sink"], environment={})
+    assert with_config == {"decision_artifacts": "readwrite"}
+    assert without_config == {}
