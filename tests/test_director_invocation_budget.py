@@ -83,18 +83,29 @@ class _Context:
 
 @_repo_only
 def test_each_ceiling_is_individually_affordable():
-    """One retried call must fit the function timeout on its own."""
+    """Each call's funded worst case must fit the function timeout on its own.
+
+    "Funded worst case" is the call's per-attempt ceiling times the attempts it
+    is quoted for, plus any time it is required to leave behind for LLM work
+    later in the same invocation. Both terms are part of the contract, so both
+    appear here — before 2026-08-22 the plan's downstream obligation to the
+    retro judge was expressed as ``attempts=2``, which made this test pass by
+    halving the plan call rather than by naming what the halving paid for
+    (alpha-engine-config-I7311).
+    """
     from director.agent import DIRECTOR_PLAN_CEILING_S
+    from director.budget import RETRO_JUDGE_RESERVE_S
     from director.retro import RETRO_JUDGE_CEILING_S
 
     fn_timeout = _deploy_director_timeout()
-    for label, ceiling in (
-        ("director-plan", DIRECTOR_PLAN_CEILING_S),
-        ("director-retro-judge", RETRO_JUDGE_CEILING_S),
+    for label, ceiling, attempts, downstream in (
+        ("director-plan", DIRECTOR_PLAN_CEILING_S, 1, RETRO_JUDGE_RESERVE_S),
+        ("director-retro-judge", RETRO_JUDGE_CEILING_S, 2, 0.0),
     ):
-        worst = ceiling * 2  # timeout + one retry
+        worst = ceiling * attempts + downstream
         assert worst + DEFAULT_RESERVE_S <= fn_timeout, (
-            f"{label}: {ceiling}s × 2 attempts + {DEFAULT_RESERVE_S}s write reserve "
+            f"{label}: {ceiling}s × {attempts} attempt(s) + {downstream}s reserved "
+            f"for downstream LLM work + {DEFAULT_RESERVE_S}s write reserve "
             f"= {worst + DEFAULT_RESERVE_S}s exceeds the {fn_timeout}s function "
             f"timeout on its own. No runtime budget can rescue a ceiling that "
             f"cannot fit even when it runs first."
@@ -126,16 +137,39 @@ def test_the_ceilings_do_not_fit_together_which_is_why_the_budget_exists():
 # No call site may go back to a bare literal
 # ---------------------------------------------------------------------------
 
+def _is_quote_call(node) -> bool:
+    return isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "quote"
+
+
+def _quote_bound_names(tree) -> set[str]:
+    """Local names assigned directly from a ``budget.quote(...)`` call.
+
+    A call site is allowed to bind the quote to a name and pass the name — the
+    Director does, because the same quoted number is ALSO the retry loop's
+    ``attempt_cost_s``, and computing it twice would let the two drift. What is
+    forbidden is a literal, so the test follows the binding rather than
+    demanding the call be inlined.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_quote_call(node.value):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    names.add(tgt.id)
+    return names
+
+
 def _llm_client_calls():
     for path in sorted((_REPO / "director").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        bound = _quote_bound_names(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             name = getattr(func, "id", None) or getattr(func, "attr", None)
             if name == "LLMClient":
-                yield path.name, node
+                yield path.name, (node, bound)
 
 
 def test_there_are_llm_client_call_sites_to_check():
@@ -152,13 +186,17 @@ def test_there_are_llm_client_call_sites_to_check():
 )
 def test_every_llm_client_timeout_is_a_budget_quote(filename, node):
     """`timeout=` must come from `budget.quote(...)`, never a literal."""
-    timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
+    call, quote_bound_names = node
+    timeout = next((kw.value for kw in call.keywords if kw.arg == "timeout"), None)
     assert timeout is not None, (
         f"{filename}: LLMClient constructed with no explicit timeout — it would "
         f"inherit the krepis default (180s), which is the exact regression "
         f"config#6050 fixed"
     )
-    assert isinstance(timeout, ast.Call) and getattr(timeout.func, "attr", "") == "quote", (
+    quoted = _is_quote_call(timeout) or (
+        isinstance(timeout, ast.Name) and timeout.id in quote_bound_names
+    )
+    assert quoted, (
         f"{filename}: LLMClient timeout is a static value. It must be quoted "
         f"through an InvocationBudget so a late invocation shortens or declines "
         f"the call instead of being killed at the function timeout (config#6904)."

@@ -54,7 +54,7 @@ from director.agent import (
     _invoke_with_retry,
     _warn_on_degraded_route,
 )
-from director.budget import UNBOUNDED
+from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
@@ -63,6 +63,18 @@ logger = logging.getLogger(__name__)
 # Per-attempt ceiling for the retro judge (config#6050); a ceiling rather than
 # the budget since config#6904 — see director/budget.py.
 RETRO_JUDGE_CEILING_S = 120.0
+
+# Lockstep guard: the plan call reserves `budget.RETRO_JUDGE_RESERVE_S` for this
+# judge's two attempts. Raising the ceiling here without widening that
+# reservation would let the plan call consume time this judge is owed, which is
+# the 920s-against-900s arithmetic `director/budget.py` exists to prevent — so
+# the two move together or import fails.
+assert RETRO_JUDGE_RESERVE_S == RETRO_JUDGE_CEILING_S * 2, (
+    f"retro judge reservation drift: director/budget.py reserves "
+    f"{RETRO_JUDGE_RESERVE_S}s for this judge but its ceiling is now "
+    f"{RETRO_JUDGE_CEILING_S}s × 2 attempts. Update RETRO_JUDGE_RESERVE_S in "
+    f"director/budget.py in the same change."
+)
 
 # Retro judge capability tier — a GROUP HANDLE resolved through
 # ``krepis.router``, never a model id (config#1673; direct Anthropic → direct
