@@ -59,6 +59,25 @@ _SF_NAMES = (
 _SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
 _SF_WINDOW_DAYS = 28
 
+#: How deep to walk each SF's execution history for the trailing-window scan.
+#:
+#: `list_recent_pipeline_runs` is a COUNT-bounded "most recent N" primitive
+#: built for the dashboard's recent-executions disclosure; this metric needs a
+#: TIME-bounded window. Until the library grows a `since=`-style walk, the
+#: count bound has to be set above the busiest SF's real execution rate and
+#: the truncation case has to be detected rather than assumed away.
+#:
+#: Sized from measurement, not guesswork: ne-weekly-freshness-pipeline ran 102
+#: terminal executions in the 28 days to 2026-08-22 (its day-gate fires Thu-Sat
+#: and reruns are frequent). 400 is ~4x that headroom, and the truncation guard
+#: below is what makes an under-estimate loud instead of silent.
+#:
+#: Cost: each summary is one DescribeExecution on top of one ListExecutions
+#: page, so this is O(limit) API calls per SF against a 25-TPS soft limit. It
+#: is paid once a week by the grading Lambda, and only walks as deep as the SF
+#: actually has executions.
+_SF_EXEC_SCAN_LIMIT = 400
+
 # data_quality_incidents — the data collector's per-run quality gate emits
 # ``AlphaEngine/Data/daily_append_quality_blocked_count`` (rows EXCLUDED from the
 # feature store on a quality failure — the load-bearing incident) +
@@ -216,8 +235,36 @@ def _sf_success_rate(
     per_sf: dict[str, str] = {}
     per_sf_unattended: dict[str, str] = {}
     scope_detail: dict[str, str] = {}
+    truncated: list[str] = []
     for arn in arns:
-        runs = list_recent_pipeline_runs(arn, limit=50, client=sfn)
+        runs = list_recent_pipeline_runs(arn, limit=_SF_EXEC_SCAN_LIMIT, client=sfn)
+        # WINDOW TRUNCATION (alpha-engine-config-I8183). `limit` bounds this
+        # scan by COUNT while the metric's name bounds it by TIME, and the two
+        # disagree the moment an SF is busier than the limit. At the previous
+        # limit=50, measured 2026-08-22: ne-weekly-freshness-pipeline had 102
+        # terminal executions in the trailing 28 days, so the scan reached
+        # back only to 2026-08-04 — an 18-day window published as
+        # `sf_success_rate_4w` over `trailing_4w`.
+        #
+        # A truncated scan yields a TRUE number about a smaller world than its
+        # name claims, which is worse than no number: it is falsifiable-looking
+        # and wrong, and nothing downstream can tell. So this does not silently
+        # widen and hope — it detects the condition and refuses to publish a
+        # rate for it. `list_recent_pipeline_runs` returns most-recent-first,
+        # so if the scan filled to the limit AND its OLDEST execution still
+        # starts after the cutoff, executions inside the window were cut off.
+        if len(runs) >= _SF_EXEC_SCAN_LIMIT:
+            oldest = min((r.start_utc for r in runs if getattr(r, "start_utc", None)), default=None)
+            if oldest is not None and oldest > cutoff:
+                logger.error(
+                    "sf_success_rate: %s returned %d executions (scan limit) whose oldest "
+                    "starts %s, still inside the %dd window opening %s — the window was "
+                    "TRUNCATED and any rate computed from it would describe a shorter "
+                    "period than its own name (alpha-engine-config-I8183). Raise "
+                    "_SF_EXEC_SCAN_LIMIT or move to a time-bounded walk.",
+                    arn.rsplit(":", 1)[-1], len(runs), oldest, window_days, cutoff,
+                )
+                truncated.append(arn.rsplit(":", 1)[-1])
         # Bucket this SF's terminal, role-carrying, in-window executions into
         # cycles keyed on the TRADING DAY (`input.run_date`), falling back to
         # the UTC date of start_utc when the execution input carries none.
@@ -262,7 +309,24 @@ def _sf_success_rate(
                 # or IN_FLIGHT — excluded from the denominator entirely, not
                 # merely marked not-clean (alpha-engine-config-I8069).
                 continue
-            key = run_date or start.date()
+            # NORMALISE TO str (alpha-engine-config-I8183). `run_date` is a
+            # str off the summary; `start.date()` is a datetime.date. Mixed
+            # into one dict they can never collide, so the SAME calendar day
+            # split into TWO cycles whenever some of its executions carried
+            # `input.run_date` and others did not — which is the normal case,
+            # not an edge one: measured 2026-08-22, the weekly SF had 56
+            # executions with a run_date and 46 without, the preopen SF 4 with
+            # and 24 without. The split inflates the DENOMINATOR only (each
+            # half is graded on its own), so it silently drags the rate down.
+            #
+            # Measured effect on the published 2026-08-22 card: weekly 0/16
+            # became 0/13, preopen 13/26 became 13/20, postclose 15/18
+            # unchanged (all 21 of its executions carry a run_date).
+            #
+            # Note this is NOT the fallback's documented limitation above — a
+            # recovery slipping past UTC midnight is rare and conservative.
+            # This is a type mismatch that fired on the common path.
+            key = run_date or start.date().isoformat()
             cycles.setdefault(key, []).append((status, role, outcome))
 
         sf_cycles = sf_cycles_clean = 0
@@ -278,7 +342,13 @@ def _sf_success_rate(
             # no-op stand in for a four-hour weekly run (config-I7644).
             did_work = any(outcome.did_work for _st, _role, outcome in execs)
             detail = "; ".join(outcome.explain() for _st, _role, outcome in execs)
-            scope_detail[str(_day)] = detail
+            # Keyed by (sf, day), not day alone (alpha-engine-config-I8183):
+            # this dict is shared across all three SFs, so on a day two of
+            # them ran, the second overwrote the first last-write-wins and the
+            # card's per-cycle scope showed one pipeline while claiming to
+            # describe the day. The 2026-08-22 card's '2026-08-21' entry
+            # listed only weekly, though preopen also failed that day.
+            scope_detail[f"{arn.rsplit(':', 1)[-1]}:{_day}"] = detail
             if did_work:
                 sf_cycles_clean += 1
             else:
@@ -317,6 +387,10 @@ def _sf_success_rate(
         # is not a falsifiable claim, and this is the field that says which
         # cycles were graded narrow and why.
         "scope_detail": scope_detail,
+        # Non-empty ⇒ at least one SF's window was cut short by the scan
+        # limit, so `cycle_rate` describes a shorter period than its name.
+        # The caller renders N/A rather than publishing it.
+        "truncated": truncated,
     }
 
 
@@ -419,6 +493,23 @@ def build_substrate_tile(
                 input_present=False,
                 cycle_detail="sf_success_rate_4w: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
                 unatt_detail="unattended_first_pass_rate: no pipeline SF ARNs discoverable (set EVALUATOR_SF_ARNS or grant states:ListStateMachines).",
+            )
+        elif sf.get("truncated"):
+            # A rate over a truncated window is a TRUE number about a smaller
+            # world than its own name — `sf_success_rate_4w` / `trailing_4w`
+            # would be read as 28 days by every consumer. N/A is the honest
+            # render; `principles.md` §2.7 — no data is never green, and a
+            # number measured over an unknown period is no data.
+            _na_pair(
+                input_present=False,
+                cycle_detail=(f"sf_success_rate_4w: execution scan TRUNCATED for "
+                              f"{', '.join(sf['truncated'])} — more than {_SF_EXEC_SCAN_LIMIT} "
+                              f"executions inside the {_SF_WINDOW_DAYS}d window, so the scan "
+                              f"covered a shorter period than the metric claims. Raise "
+                              f"_SF_EXEC_SCAN_LIMIT or move to a time-bounded walk "
+                              f"(alpha-engine-config-I8183)."),
+                unatt_detail=(f"unattended_first_pass_rate: execution scan TRUNCATED for "
+                              f"{', '.join(sf['truncated'])} — same window as above."),
             )
         elif sf["cycle_rate"] is None:
             _na_pair(
