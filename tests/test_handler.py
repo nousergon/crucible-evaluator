@@ -1,8 +1,10 @@
 """Tests for grading/handler.py — the grading Lambda entrypoint."""
 
 import json
+import logging
 import sys
 import types
+from datetime import datetime, timezone
 
 import boto3
 import pytest
@@ -517,3 +519,61 @@ class TestStageCoverageNeverEnablesEnforcement:
         assert seen_kwargs
         for kwargs in seen_kwargs:
             assert kwargs == {"run_date", "window_start"}
+
+
+# ── config-I8155: a refused verdict must not kill the stage it observes ──────
+
+
+def test_a_blank_run_date_records_unmeasured_and_never_raises(monkeypatch, caplog):
+    """krepis now REFUSES to build a verdict without the SF execution's own
+    run_date. That refusal is correct at the library — one execution's verdicts
+    landed under two date prefixes on 2026-08-22 because it used to fall back to
+    the cycle date — but an observer that can kill the stage it observes is a
+    new failure mode bolted onto the one it reports."""
+    import types
+
+    from grading import handler as h
+
+    class _Contract(ValueError):
+        pass
+
+    fake = types.ModuleType("krepis.stage_coverage")
+
+    def _refuse(stage, **kwargs):
+        raise _Contract("run_date is REQUIRED and must be non-empty")
+
+    fake.assert_stage_coverage = _refuse
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake)
+
+    result: dict = {}
+    with caplog.at_level(logging.CRITICAL):
+        out = h._record_stage_coverage(
+            "ReportCard", run_date="", started=datetime.now(timezone.utc), result=result
+        )
+
+    assert out["stage_coverage"]["status"] == h._STAGE_COVERAGE_STATUS_UNMEASURED
+    assert "refused" in out["stage_coverage"]["reason"]
+    assert out["stage_coverage"]["is_finding"] is False
+    assert any("REFUSED" in r.message for r in caplog.records)
+
+
+def test_a_normal_run_date_still_reaches_the_library(monkeypatch):
+    import types
+
+    from grading import handler as h
+
+    seen: list = []
+    fake = types.ModuleType("krepis.stage_coverage")
+    fake.assert_stage_coverage = lambda stage, **kw: seen.append((stage, kw)) or {
+        "stage": stage, "status": "COVERED", "run_date": kw["run_date"]
+    }
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake)
+
+    out = h._record_stage_coverage(
+        "ReportCard",
+        run_date="2026-08-22",
+        started=datetime.now(timezone.utc),
+        result={},
+    )
+    assert seen[0][1]["run_date"] == "2026-08-22"
+    assert out["stage_coverage"]["run_date"] == "2026-08-22"
