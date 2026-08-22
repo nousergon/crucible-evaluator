@@ -44,6 +44,14 @@ import os
 import time
 
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
+# Pure, stdlib-only helpers (no boto3, no GitHub call) — the import graph is
+# acyclic: loop_verification -> issue_filer -> roadmap_pr -> schema, and none
+# of those imports agent.
+from director.loop_verification import (
+    ADVERSE_STATUSES,
+    component_status_map,
+    resolve_cited_metrics,
+)
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan
 
@@ -798,17 +806,95 @@ def _carryover_item_count(messages: list) -> int:
     return 0
 
 
-def _carryover_context(carryover: dict | None) -> str:
+def _carryover_context(carryover: dict | None, report_card: dict | None = None) -> str:
+    """Render the carry-over ledger for the prompt, EACH ROW RECONCILED
+    AGAINST THIS WEEK'S CARD (alpha-engine-config-I8178).
+
+    Until 2026-08-22 this rendered ``id``/``title``/``status``/``owner``/
+    ``priority`` straight out of the ledger and nothing else. Nothing on the
+    path between the ledger and the model compared a row's claim to the
+    current numbers, so a claim that entered the ledger once was restated
+    every week thereafter on its own authority, and the restatement was
+    written back to the ledger by ``merge_plan_into_ledger`` — a loop with no
+    term that reads the world.
+
+    ``loop_verification`` was NOT that missing check, and this is the part
+    worth being precise about, because its existence is what made the gap
+    look covered. It compares evidence to the card, but (a) it acts only on
+    ``issue_number`` — null on all 28 live rows measured 2026-08-22, so it
+    ``continue``s past every one of them — (b) it is inside the §2.3a
+    ``actions_withheld`` gate and had been withheld for three consecutive
+    cycles under contamination=UNKNOWN, and (c) decisively, even on a clean
+    run it corrects the GITHUB ISSUE and never the ledger row or this
+    string. All three had to hold for the failure; only (c) is structural,
+    and (c) alone is sufficient. So the annotation below is deliberately NOT
+    routed through that pass: it is computed here, from the card already in
+    hand, with no GitHub call, no ``issue_number``, and no withholding gate
+    — none of which it needs, because it mutates nothing.
+
+    The measured case (2026-08-22): ``inference-coverage-critical`` carried
+    the title "Fix inference_coverage collapse — predictor Lambda KeyError
+    (#7289)". ``#7289`` had been closed 8 days; ``inference_coverage`` read
+    1.0 / GREEN on the very card the Director was reading. It was published
+    as P0 #4 anyway. Three of 28 rows cited only GREEN metrics; nine cited
+    nothing worse than WATCH.
+
+    Rows are annotated, never dropped or reordered. A GREEN metric does not
+    prove an item is finished — the item may name work the metric does not
+    cover, and suppressing it here would be the close-and-look-away failure
+    ``loop_verification``'s own docstring refuses. The reader is told what
+    the card says and left to weigh it; the fix for reasoning from stale text
+    is putting the current fact NEXT TO the text, not deleting the text."""
     if not carryover or not carryover.get("items"):
         return "No prior action plan on record (this is the first cycle or the ledger is empty)."
     items = carryover.get("items", [])
+    status_map = component_status_map(report_card or {})
     lines = [
         f"Last week's open action items ({_CARRYOVER_COUNT_MARKER}{len(items)}):"
     ]
+    if status_map:
+        lines.append(
+            "  Each row is annotated with THIS WEEK'S status for every card metric it "
+            "names ('live card:'). Those statuses come from the card above and OVERRIDE "
+            "the row's own text, which may be weeks old and is not re-measured when it "
+            "is carried. Where a row is marked CONTRADICTED, do not restate its claim: "
+            "either re-ground the item in what the card now says, or mark it resolved."
+        )
+    n_contradicted = 0
     for it in items:
         lines.append(
             f"  - [{it.get('id')}] {it.get('title')} "
             f"(status={it.get('status')}, owner={it.get('proposed_owner')}, priority={it.get('priority')})"
+        )
+        if not status_map:
+            continue
+        # Wider than evidence_still_adverse's evidence-only scope on purpose:
+        # the claim the model restates lives in the TITLE (that is where
+        # "#7289" and "collapse" sat), so the title and rationale are read
+        # too. Safe to widen precisely because this annotates a prompt and
+        # reopens nothing.
+        hits = resolve_cited_metrics(
+            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
+            status_map,
+        )
+        if not hits:
+            lines.append(
+                "      live card: no metric named by this row appears on this week's card "
+                "— its claim is UNVERIFIABLE against current data, so do not restate it as fact."
+            )
+            continue
+        rendered = ", ".join(f"{n}={s or 'UNKNOWN'}" for n, s in sorted(hits.items()))
+        lines.append(f"      live card: {rendered}")
+        if all(s not in ADVERSE_STATUSES for s in hits.values()):
+            n_contradicted += 1
+            lines.append(
+                "      \u26a0 CONTRADICTED BY THIS WEEK'S CARD — every metric this row names "
+                "is non-adverse now. Do NOT carry it forward on its existing wording."
+            )
+    if status_map and n_contradicted:
+        lines.append(
+            f"  ({n_contradicted} of {len(items)} carry-over rows are contradicted by this "
+            f"week's card. A carried row is a claim about the PAST; the card is the present.)"
         )
     return "\n".join(lines)
 
@@ -819,7 +905,7 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
     human = [
         summarize_report_card(report_card),
         "",
-        _carryover_context(carryover),
+        _carryover_context(carryover, report_card),
     ]
     if roadmap_digest:
         human += ["", "Currently-tracked / in-flight work (open backlog — do NOT re-propose):", roadmap_digest]
