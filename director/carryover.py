@@ -279,3 +279,74 @@ def write_ledger(bucket: str, ledger: dict, s3_client=None) -> str:
         ContentType="application/json",
     )
     return LEDGER_KEY
+
+
+# ── Prompt ordering (alpha-engine-config-I8163) ──────────────────────────────
+#
+# This is a DIFFERENT question from retirement above, and the two orderings
+# deliberately point in opposite directions.
+#
+#   * Retirement asks "which rows should stop existing?" — and staleness is the
+#     answer, so it keeps the most-recently-seen and retires the rest.
+#   * This asks "of the rows that all still exist and were all re-proposed
+#     within the last cycle, which ones must the model actually see?" Age-out
+#     has already removed everything the Director stopped believing in, so
+#     recency carries almost no signal here (measured on the live ledger
+#     2026-08-21: all 28 active rows had `last_seen` inside a 9-day window).
+#
+# The ordering, in full, with the reason for each term:
+#
+#   1. PRIORITY ascending (P0 → P3). The Director's own statement about what
+#      matters, and the one field the plan schema constrains. An unknown or
+#      malformed priority sorts last rather than raising.
+#   2. `carry_count` DESCENDING — consecutive weekly runs this id has been
+#      carried without resolving. Within a priority band, the item carried
+#      longest is the one the Director has repeatedly failed to close and the
+#      one closest to `loop_verification`'s escalation threshold. A
+#      freshly-proposed item is re-derivable from this week's card, which is in
+#      the same prompt; a long-carried item exists ONLY in the ledger, so
+#      eliding it is the only way it can actually be lost.
+#   3. `first_seen` ASCENDING, then `id` — tie-breakers that make the order
+#      total and deterministic. The same ledger orders the same way on a
+#      re-run, which is what lets the elision be reported rather than guessed
+#      at (and what keeps the prompt suffix stable enough to be diffable across
+#      runs; prompt-caching-policy §3.3).
+#
+# `evidence`, `confidence` and `horizon` are deliberately NOT terms. They are
+# model-authored text on a row that is never re-measured when it is carried
+# (alpha-engine-config-I8178: 3 of 28 live rows cite only GREEN metrics,
+# including a P0), so ranking on them would rank on the staleness this
+# selection cannot see. Priority and carry-count are the two fields the SYSTEM
+# maintains: priority is re-asserted by the model every week the row is
+# re-proposed, and carry_count is computed by `merge_plan_into_ledger` from
+# observed runs. Neither is a claim about the world that could have gone stale
+# without anything noticing.
+def carry_count(row: dict) -> int:
+    """``carry_count`` as an int; 0 for anything unparseable. Never raises.
+
+    The ledger is a model-written artifact and this runs on the path to the
+    weekly plan, so a malformed field must cost the row its rank, never the
+    run. Same conservative direction as :func:`_parse_run_date`.
+    """
+    try:
+        return int(row.get("carry_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def order_for_prompt(rows: list[dict]) -> list[dict]:
+    """Rank active ledger rows by what the plan call must not lose. Pure/total."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            _PRIORITY_ORDER.get(str(r.get("priority")), len(_PRIORITY_ORDER)),
+            -carry_count(r),
+            _parse_run_date(r.get("first_seen")) or date.max,
+            str(r.get("id", "")),
+        ),
+    )
+
+
+def is_p0(row: dict) -> bool:
+    """``priority == "P0"``, the one band the prompt cap may never elide."""
+    return str(row.get("priority", "")).strip().upper() == "P0"
