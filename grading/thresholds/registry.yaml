@@ -204,6 +204,11 @@ metrics:
     director_actionability: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
     director_calibration: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
     director_grounding: {target: 75, red_line: 40, higher_is_better: true, n_floor_declared: 1}
+    # alpha-engine-config-I8165. Not a provisional band: 0 = the ultra group's
+    # declared primary produced the plan, 1 = a deliberately weaker fallback arm
+    # did. RED on 1 is the point — the second arm was admitted for availability
+    # only, so a fallback-produced plan must never read as an ordinary one.
+    director_route_degraded: {target: 0.0, red_line: 1.0, higher_is_better: false, n_floor_declared: 1}
   executor:
     action_entropy: {target: 0.7, red_line: 0.3, higher_is_better: true, n_floor_declared: 20}
     entry_triggers: {target: 0.55, red_line: 0.45, n_floor_declared: 30}
