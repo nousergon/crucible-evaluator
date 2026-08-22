@@ -45,6 +45,7 @@ import pytest
 from director.agent import (
     DIRECTOR_PLAN_AMBER_FRACTION,
     DIRECTOR_PLAN_CEILING_S,
+    DIRECTOR_PLAN_MEASURED_MAX_S,
     _carryover_context,
     _carryover_item_count,
     _emit_plan_latency,
@@ -193,19 +194,44 @@ class TestMergeRetiresAfterTheUpsert:
 # ── The latency signal ───────────────────────────────────────────────────────
 
 class TestPlanLatencySignal:
-    def test_amber_is_a_fraction_of_the_ceiling_not_a_literal(self):
-        """So raising the ceiling can never silently move the amber line up
-        with it and re-hide the same regression."""
+    def test_amber_is_a_fraction_of_the_measured_need_not_of_the_ceiling(self):
+        """Raising the ceiling must never move the amber line up with it.
+
+        The line was 0.6 x the CEILING until 2026-08-22, which read as
+        ceiling-independent and was the opposite: raising the ceiling
+        340 -> 600 would have moved amber 204s -> 360s, above every duration
+        this call has ever survived, and the trend signal would have gone dark
+        exactly as the trend it watches continued (alpha-engine-config-I7311).
+        The anchor is now the slowest UNCENSORED call ever measured, so the
+        line moves only when the model's own requirement is re-measured.
+        """
         assert _plan_amber_threshold_s() == pytest.approx(
-            DIRECTOR_PLAN_AMBER_FRACTION * DIRECTOR_PLAN_CEILING_S
+            DIRECTOR_PLAN_AMBER_FRACTION * DIRECTOR_PLAN_MEASURED_MAX_S
         )
         assert 0 < DIRECTOR_PLAN_AMBER_FRACTION < 1
+
+    def test_amber_does_not_move_when_the_ceiling_does(self):
+        """The regression this file exists to catch, stated as a test."""
+        import director.agent as agent
+
+        before = _plan_amber_threshold_s()
+        original = agent.DIRECTOR_PLAN_CEILING_S
+        try:
+            agent.DIRECTOR_PLAN_CEILING_S = original * 3
+            assert _plan_amber_threshold_s() == pytest.approx(before), (
+                "the amber line tracked a change to DIRECTOR_PLAN_CEILING_S — it "
+                "is a trend signal about the model's requirement, not a fraction "
+                "of whatever wall the invocation happens to have"
+            )
+        finally:
+            agent.DIRECTOR_PLAN_CEILING_S = original
 
     def test_amber_fires_below_the_ceiling_on_the_measured_regression(self):
         """205.3s is the 2026-08-14 01:55 call that SUCCEEDED, one invocation
         after two that did not. Amber must already be lit there — a signal that
         only fires once the call has failed is the failure it is replacing."""
         assert _plan_amber_threshold_s() < 205.3 < DIRECTOR_PLAN_CEILING_S
+        assert _plan_amber_threshold_s() < DIRECTOR_PLAN_MEASURED_MAX_S
 
     def test_healthy_call_still_publishes_a_zero(self):
         """observability-policy §9: absence of a signal is never rendered

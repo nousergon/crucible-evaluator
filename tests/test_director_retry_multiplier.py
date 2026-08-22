@@ -240,15 +240,16 @@ def test_the_plans_worst_case_still_leaves_the_retro_a_viable_quote():
     not fit together at full size — that is the condition `director/budget.py`
     exists to absorb, and `test_director_invocation_budget.py` pins it. What
     must hold is the shape of the absorption: after the plan has spent its
-    funded worst case (two full-ceiling attempts), the retro is still quoted
-    ABOVE the viability floor, so the Director degrades to a shorter grade
-    rather than declining one outright.
+    funded worst case (one full-ceiling attempt since 2026-08-22 — the second
+    attempt the plan used to be quoted for WAS this reservation, unnamed), the
+    retro is still quoted ABOVE the viability floor, so the Director degrades to
+    a shorter grade rather than declining one outright.
     """
     from director.budget import MIN_VIABLE_CALL_S
     from director.retro import RETRO_JUDGE_CEILING_S
 
     lambda_max = 900  # AWS service maximum for a Lambda function timeout
-    plan_worst = DIRECTOR_PLAN_CEILING_S * 2
+    plan_worst = DIRECTOR_PLAN_CEILING_S  # one quoted attempt (attempts=1)
     left_for_retro = _Clock(lambda_max - plan_worst)
     budget = InvocationBudget(left_for_retro, reserve_s=DEFAULT_RESERVE_S)
     quoted = budget.call_timeout(RETRO_JUDGE_CEILING_S, attempts=2)

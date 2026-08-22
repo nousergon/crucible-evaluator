@@ -43,16 +43,26 @@ import logging
 import os
 import time
 
-from director.budget import UNBOUNDED
+from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan
 
 logger = logging.getLogger(__name__)
 
 # The Director addresses a REGISTRY MODEL GROUP, never a model id. The group's
-# ordered chain (LLM_MODEL_REGISTRY.yaml) is what provides redundancy — as of
-# 2026-08-01 `ultra` is kimi-k3-direct -> glm-5.2-direct -> glm-5.2 ->
-# deepseek-v4-pro-max, deliberately spanning providers.
+# ordered chain (LLM_MODEL_REGISTRY.yaml) is what provides redundancy.
+#
+# Measured 2026-08-22, correcting the claim that stood here: `ultra` resolves to
+# a chain of ONE — `glm-5.2-direct` (zhipu). The other four entries carrying
+# `group: ultra` are not live in it: `kimi-k3` and `kimi-k3-direct` are
+# `deprecated`, `glm-5.2` (openrouter) is `unavailable`, and `claude-fable-5` is
+# excluded from every group by Brian's 2026-07-29 ruling. So
+# `DirectorRouteFallback` cannot be anything but 0 here, and a slow or degraded
+# zhipu is an outage for the Director rather than a fallback — which is what a
+# reader of the old comment ("deliberately spanning providers") would not have
+# expected. Whether that single-arm chain is acceptable for the fleet's
+# highest-stakes call is a ruling, tracked separately; this comment's job is
+# only to stop asserting redundancy that is not there.
 #
 # Why this replaced a pinned model (config#6050 follow-on, 2026-08-01): the
 # prior code built ModelSpec(provider="openrouter", model="glm-5.2") with an
@@ -67,11 +77,37 @@ logger = logging.getLogger(__name__)
 DIRECTOR_GROUP = "ultra"
 
 # Per-attempt ceiling for the plan call (config#6050): under the router edge's
-# 360s proxy_read_timeout, so the client owns the deadline and the failure is
+# proxy_read_timeout, so the client owns the deadline and the failure is
 # attributable. config#6904 made it a ceiling rather than the budget — see
 # director/budget.py and the invariant test in
 # tests/test_director_invocation_budget.py.
-DIRECTOR_PLAN_CEILING_S = 340.0
+#
+# 2026-08-22 (alpha-engine-config-I7311): raised 340 -> 600, and the quote below
+# moved from attempts=2 to a single attempt with the retro judge's time named as
+# an explicit downstream reservation. What forced it: the 2026-08-22 weekly run
+# and its first rerun burned FOUR consecutive attempts censored at 340s (344.5s,
+# 347.3s, 340.2s, 344.5s elapsed, zero completion tokens each) on an unchanged
+# prompt of 48,240 chars / 32 carry-over items. 340 was never the model's
+# requirement -- it was `available/2`, and that divisor was an unnamed
+# reservation for the retro judge wearing a retry's clothes.
+#
+# The derivation, which now has one term per thing the invocation owes:
+#
+#     600 = 900s function timeout
+#         - 240s retro-judge reservation (budget.RETRO_JUDGE_RESERVE_S)
+#         -  45s write reserve            (budget.DEFAULT_RESERVE_S)
+#         =  615s affordable, rounded down to 600
+#
+# so the ceiling stays individually affordable (the invariant
+# tests/test_director_invocation_budget.py asserts) instead of becoming a loose
+# bound the budget silently clamps. Against a measured uncensored need of
+# 170-228s that is 2.6x headroom, where 340s was 1.5x and censoring.
+#
+# The edge must stay ABOVE it -- nous-ergon-ops raised the router's
+# proxy_read_timeout 360s -> 900s in the same arc for exactly that reason; a
+# client deadline at or above the edge's hands the timeout to nginx and it
+# stops being attributable to this call site.
+DIRECTOR_PLAN_CEILING_S = 600.0
 
 # Where this module runs, declared rather than inferred (model-router-policy
 # R29). krepis filters the fallback chain by the registry's `reachable_from`,
@@ -325,21 +361,39 @@ def _warn_on_degraded_route(
 # 2026-08-14 against the same route, same model and same registry max_tokens —
 # was first noticed as a hard SF failure rather than as a trend.
 #
-# `DIRECTOR_PLAN_CEILING_S` is the wall. This is the line drawn well short of
-# it. 0.6 × the ceiling is 204s: at the measured throughput of 99-109 tok/s
-# that is the call already drawing ~21k completion tokens, i.e. exactly the
-# regime the 2026-08-14 run was in the run BEFORE the one that failed. A run
-# that crosses it has not failed and loses nothing — it says so, once, with
-# the numbers attached, while there is still a week to act.
+# `DIRECTOR_PLAN_CEILING_S` is the WALL — a resource fact about the Lambda.
+# Amber is a TREND fact about the model: how close this call is to needing more
+# time than it has ever needed. Those are different quantities, so amber is
+# anchored on the measured requirement, not on the wall.
 #
-# It is a FRACTION, not a second literal, so raising the ceiling can never
-# silently move the amber line up with it and re-hide the same regression.
-DIRECTOR_PLAN_AMBER_FRACTION = 0.6
+# It was 0.6 × the ceiling until 2026-08-22, which read as ceiling-independent
+# and was not: raising the ceiling 340 -> 600 in the same change would have
+# moved amber 204s -> 360s, above every duration the call has ever survived,
+# and the trend signal would have gone dark exactly as the trend continued
+# (alpha-engine-config-I7311). The original comment claimed a fraction "can
+# never silently move the amber line up" — a fraction OF THE WALL is precisely
+# what does.
+#
+# The anchor: five uncensored plan calls measured 2026-08-13 against this route
+# ran 170.1 / 183.0 / 194.9 / 199.5 / 228.0s, every one `finish_reason: stop`.
+# 228.0 is therefore the slowest duration this call is known to REQUIRE, and
+# 0.9 × it is 205.2s — at 99-109 tok/s, the call already drawing ~21k completion
+# tokens, which is the regime the 2026-08-14 run was in the run BEFORE the one
+# that failed. A run that crosses it has not failed and loses nothing: it says
+# so once, with the numbers attached, while there is still a week to act.
+DIRECTOR_PLAN_MEASURED_MAX_S = 228.0
+DIRECTOR_PLAN_AMBER_FRACTION = 0.9
 
 
-def _plan_amber_threshold_s(ceiling_s: float = None) -> float:
+def _plan_amber_threshold_s(measured_max_s: float = None) -> float:
+    """Seconds at which the plan call is reported AMBER.
+
+    Deliberately takes the measured requirement, not the ceiling: the ceiling
+    is what the invocation can afford and moves with the Lambda's budget; this
+    line moves only when the model's own measured need is re-measured.
+    """
     return DIRECTOR_PLAN_AMBER_FRACTION * (
-        DIRECTOR_PLAN_CEILING_S if ceiling_s is None else ceiling_s
+        DIRECTOR_PLAN_MEASURED_MAX_S if measured_max_s is None else measured_max_s
     )
 
 
@@ -350,6 +404,7 @@ def _emit_plan_latency(
     prompt_chars: int,
     carryover_items: int,
     usage=None,
+    ceiling_s: float | None = None,
 ) -> dict:
     """Emit one EMF record for one plan ATTEMPT, and return what was emitted.
 
@@ -369,12 +424,19 @@ def _emit_plan_latency(
     does log at ERROR, because a silent emitter is the failure mode the metric
     exists to prevent.
     """
+    # The bound this attempt actually ran under — the budget's quote when the
+    # caller knows it (a late invocation is quoted less than the ceiling), the
+    # static ceiling otherwise (tests, local runs). Published so the reader can
+    # tell "the model got slower" from "this invocation had less to give".
+    effective_ceiling_s = (
+        DIRECTOR_PLAN_CEILING_S if ceiling_s is None else float(ceiling_s)
+    )
     amber_s = _plan_amber_threshold_s()
     over_amber = elapsed_s >= amber_s
     record = {
         "DirectorPlanLatencySeconds": round(elapsed_s, 3),
         "DirectorPlanLatencyAmber": 1 if over_amber else 0,
-        "DirectorPlanCeilingSeconds": DIRECTOR_PLAN_CEILING_S,
+        "DirectorPlanCeilingSeconds": effective_ceiling_s,
         "DirectorPlanAmberSeconds": round(amber_s, 1),
         "DirectorPlanPromptChars": int(prompt_chars),
         "DirectorPlanCarryoverItems": int(carryover_items),
@@ -387,14 +449,14 @@ def _emit_plan_latency(
     if over_amber:
         logger.warning(
             "Director plan call AMBER: %.1fs >= %.1fs (%.0f%% of the %.0fs "
-            "ceiling) — outcome=%s prompt_chars=%d carryover_items=%d "
+            "slowest measured healthy call) — outcome=%s prompt_chars=%d carryover_items=%d "
             "prompt_tokens=%d completion_tokens=%d (reasoning=%d). The call "
             "has not failed; it is measurably closer to the ceiling than it "
             "was. alpha-engine-config-I7311: the inputs and the output this "
             "call must produce both grow, so this number trends up on its own "
-            "and the ceiling does not move.",
+            "while the measured baseline does not.",
             elapsed_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
-            DIRECTOR_PLAN_CEILING_S, outcome, record["DirectorPlanPromptChars"],
+            DIRECTOR_PLAN_MEASURED_MAX_S, outcome, record["DirectorPlanPromptChars"],
             record["DirectorPlanCarryoverItems"],
             record["DirectorPlanPromptTokens"],
             record["DirectorPlanCompletionTokens"],
@@ -405,7 +467,7 @@ def _emit_plan_latency(
             "Director plan call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
             "prompt_chars=%d carryover_items=%d prompt_tokens=%d "
             "completion_tokens=%d",
-            outcome, elapsed_s, amber_s, DIRECTOR_PLAN_CEILING_S,
+            outcome, elapsed_s, amber_s, effective_ceiling_s,
             record["DirectorPlanPromptChars"],
             record["DirectorPlanCarryoverItems"],
             record["DirectorPlanPromptTokens"],
@@ -467,13 +529,22 @@ class _KrepisStructuredDirector:
     DirectorWeeklyActionPlan`` surface ``_invoke_with_retry`` expects."""
 
     #: Wall-clock one ``invoke()`` may consume, for the budget gate in
-    #: ``_invoke_with_retry``. Deliberately the STATIC ceiling rather than the
-    #: (possibly shorter) quoted timeout: a retry is funded only when the
-    #: invocation could afford a full-ceiling attempt, so an already-late run
-    #: declines instead of buying one more chance to be killed at the wall.
+    #: ``_invoke_with_retry``. This is the QUOTED per-attempt timeout the client
+    #: was actually built with, not the static ceiling.
+    #:
+    #: It was the static ceiling until 2026-08-22, which was sound only while
+    #: the ceiling WAS the per-attempt cost. Now that the ceiling is a loose
+    #: upper bound (840s) and the budget quotes the real figure, using the
+    #: ceiling here would make ``can_afford(cost + delay)`` false on the first
+    #: retry check of every invocation — silently converting a documented
+    #: two-attempt loop into one attempt for *fast* failures too, which is the
+    #: case the retry exists for (a connection reset at t=3s must still get a
+    #: second try; a call censored at its full quote must not).
     attempt_cost_s = DIRECTOR_PLAN_CEILING_S
 
-    def __init__(self, client, *, director_model: str):
+    def __init__(self, client, *, director_model: str, attempt_cost_s: float | None = None):
+        if attempt_cost_s is not None:
+            self.attempt_cost_s = attempt_cost_s
         self._client = client
         self._director_model = director_model
         #: Token usage of the most recent completed attempt, read by
@@ -651,32 +722,52 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
     # "observed p95 × 1.5" shape, now computed over samples that were allowed
     # to finish.
     #
-    # It also cannot simply be raised, for a reason outside this repo: the
-    # router edge's `proxy_read_timeout` is 360s, so any ceiling at or above it
-    # hands the deadline to the EDGE and the failure stops being attributable
-    # to this call site. 340 < 360 keeps the client owning it.
+    # It also cannot be raised alone, for a reason outside this repo: the router
+    # edge's `proxy_read_timeout` bounds every request through it, so any client
+    # deadline at or above the edge's hands the timeout to nginx and the failure
+    # stops being attributable to this call site. That edge was 360s, which is
+    # why this ceiling sat at 340 — and why raising the ceiling was blocked on a
+    # nous-ergon-ops change. Both moved in the 2026-08-22 arc: the edge is now
+    # 900s and the quote below is what the client owns.
     #
     # `max_retries=0` is not a loss of resilience — the retry moved to
     # `_invoke_with_retry`, the only loop that can see the invocation deadline.
     # See `_CLIENT_MAX_RETRIES`.
     #
-    # config#6904: 340 is now a CEILING, not the budget. The old comment here
-    # claimed one retry "bounds the worst case to 2×340s inside the Lambda's
-    # 900s budget" — but the Phase-G retro judge adds 2×120s in the same
-    # invocation, so the worst case is 920s against a 900s function timeout,
-    # before a single S3 write. The quote below derives the per-attempt budget
-    # from the time actually remaining, so a late invocation declines the call
-    # (raising BudgetExhausted, which the caller records) instead of starting
-    # one the wall will kill mid-flight with no artifact and no cause.
+    # config#6904: the literal is a CEILING, not the budget. The old comment
+    # here claimed one retry "bounds the worst case to 2×340s inside the
+    # Lambda's 900s budget" — but the Phase-G retro judge adds 2×120s in the
+    # same invocation, so the worst case was 920s against a 900s function
+    # timeout, before a single S3 write. The quote below derives the per-attempt
+    # budget from the time actually remaining, so a late invocation declines the
+    # call (raising BudgetExhausted, which the caller records) instead of
+    # starting one the wall will kill mid-flight with no artifact and no cause.
+    #
+    # I7311 (2026-08-22): `attempts=2` was how that overrun was avoided, and it
+    # halved every plan call to pay for work it never named. The retro judge's
+    # time is now an explicit `downstream_s` reservation, so the plan call is
+    # quoted as ONE attempt against everything else the invocation can afford.
+    # `_invoke_with_retry` still retries — funded by whatever is left, which is
+    # enough after a fast failure and correctly nothing after a full-quote one.
     plan_budget = budget or UNBOUNDED
+    quoted_timeout = plan_budget.quote(
+        "director-plan",
+        DIRECTOR_PLAN_CEILING_S,
+        attempts=1,
+        downstream_s=RETRO_JUDGE_RESERVE_S,
+    )
     client = LLMClient(
         spec,
         callsite_id="director-plan",
-        timeout=plan_budget.quote("director-plan", DIRECTOR_PLAN_CEILING_S, attempts=2),
+        timeout=quoted_timeout,
         max_retries=_CLIENT_MAX_RETRIES,
         **api_kwargs,
     )
-    return _KrepisStructuredDirector(client, director_model=route["deployment_id"])
+    return _KrepisStructuredDirector(
+        client,
+        director_model=route["deployment_id"],
+        attempt_cost_s=quoted_timeout,
+    )
 
 
 #: Marker the carry-over section header carries so the emitted latency record
@@ -795,6 +886,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 prompt_chars=prompt_chars,
                 carryover_items=carryover_items,
                 usage=None,
+                ceiling_s=cost,
             )
             last = e
             msg = str(e).lower()
@@ -820,6 +912,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 prompt_chars=prompt_chars,
                 carryover_items=carryover_items,
                 usage=getattr(llm, "last_usage", None),
+                ceiling_s=cost,
             )
             # Also stamp it onto the plan, which is ARCHIVED to
             # ``director/{run_date}/action_plan.json``. CloudWatch metrics age

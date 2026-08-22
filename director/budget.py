@@ -42,6 +42,16 @@ DEFAULT_RESERVE_S = 45.0
 # guarantees a timeout inside the timeout. Below the floor we decline instead.
 MIN_VIABLE_CALL_S = 30.0
 
+# Time the PLAN call must leave behind for the Phase-G retro judge, which runs
+# later in the same invocation: its per-attempt ceiling times its attempt count.
+# It lives here rather than in ``director/retro.py`` because ``director/agent.py``
+# needs it and ``retro`` imports ``agent`` — the reverse import would be a cycle.
+# ``retro`` asserts this stays equal to ``RETRO_JUDGE_CEILING_S * 2`` at import,
+# so raising the judge's ceiling without widening the plan's reservation fails
+# loudly instead of silently re-creating the 920s-against-900s arithmetic this
+# module was written to remove.
+RETRO_JUDGE_RESERVE_S = 240.0
+
 
 class InvocationBudget:
     """What this invocation can still afford, in seconds.
@@ -76,35 +86,52 @@ class InvocationBudget:
             return float("inf")
         return max(0.0, self._remaining_ms() / 1000.0 - self._reserve_s)
 
-    def call_timeout(self, ceiling: float, *, attempts: int = 2) -> float:
+    def call_timeout(
+        self, ceiling: float, *, attempts: int = 2, downstream_s: float = 0.0
+    ) -> float:
         """Per-attempt timeout for a call the client may make ``attempts`` times.
 
         The client retries internally, so the budget has to cover EVERY attempt
         — sizing a retried call by a single attempt's ceiling is how 2×340
         became a 900s wall. Returns ``ceiling`` unchanged when unbounded.
+
+        ``downstream_s`` is time this invocation still owes to LLM work that
+        runs AFTER this call — the Phase-G retro judge is the only such caller
+        today. Reserving it here is what lets the plan call be quoted as a
+        single long attempt instead of two short ones: the two-attempt divisor
+        was never a statement about retries, it was an unnamed reservation for
+        the retro judge wearing a retry's clothes, and it censored the plan
+        call at half the time the invocation could actually afford it
+        (alpha-engine-config-I7311; three consecutive 340s censored attempts
+        failed the 2026-08-22 weekly run and its first rerun).
         """
         if attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts}")
+        if downstream_s < 0:
+            raise ValueError(f"downstream_s must be >= 0, got {downstream_s}")
         available = self.remaining()
         if available == float("inf"):
             return ceiling
-        return min(ceiling, available / attempts)
+        return min(ceiling, max(0.0, available - downstream_s) / attempts)
 
     def can_afford(self, seconds: float) -> bool:
         return self.remaining() >= seconds
 
-    def quote(self, label: str, ceiling: float, *, attempts: int = 2) -> float:
+    def quote(
+        self, label: str, ceiling: float, *, attempts: int = 2, downstream_s: float = 0.0
+    ) -> float:
         """``call_timeout`` that RAISES rather than issuing a doomed call.
 
         Raises:
             BudgetExhausted: the quote is below ``MIN_VIABLE_CALL_S``.
         """
-        timeout = self.call_timeout(ceiling, attempts=attempts)
+        timeout = self.call_timeout(ceiling, attempts=attempts, downstream_s=downstream_s)
         if timeout < MIN_VIABLE_CALL_S:
             raise BudgetExhausted(
                 f"{label}: {timeout:.0f}s per attempt is all this invocation can "
                 f"afford ({self.remaining():.0f}s left after the {self._reserve_s:.0f}s "
-                f"write reserve, over {attempts} attempts) — below the "
+                f"write reserve and a {downstream_s:.0f}s downstream reservation, "
+                f"over {attempts} attempts) — below the "
                 f"{MIN_VIABLE_CALL_S:.0f}s floor. Declining rather than starting a "
                 f"call the function timeout will kill mid-flight."
             )
