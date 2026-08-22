@@ -155,16 +155,40 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
     path is unreachable when its import fails) so the gap is alarmable, not
     only a log line nothing reads.
     """
+    # alpha-engine-config-I8155: `run_date` is the SF execution's own, and it
+    # is the ONLY key grouping a run's verdicts — krepis now REQUIRES it and
+    # raises `StageCoverageContractError` (a ValueError) rather than silently
+    # falling back to the cycle date, which on a weekend put one execution's
+    # verdicts under two prefixes. That refusal is correct AT THE LIBRARY, and
+    # it must still never kill the stage it observes, so it is caught here
+    # alongside ImportError and recorded as UNMEASURED. The two are caught
+    # together deliberately: both mean "no verdict could be produced", both
+    # must be loud, and neither is a claim about the producer. A blank
+    # run_date reaching here is a defect in THIS handler's own event
+    # threading, not an environment condition — hence CRITICAL, not ERROR.
     try:
         from krepis.stage_coverage import assert_stage_coverage
         result["stage_coverage"] = assert_stage_coverage(stage, run_date=run_date, window_start=started)
-    except ImportError as exc:
-        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+    except (ImportError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            logger.critical(
+                "stage-coverage assertion REFUSED for %s: run_date=%r — the "
+                "execution identity did not reach this handler, so no verdict "
+                "can be grouped with its siblings (alpha-engine-config-I8155)",
+                stage,
+                run_date,
+            )
+        else:
+            logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         now = datetime.now(timezone.utc)
         result["stage_coverage"] = {
             "stage": stage,
             "status": _STAGE_COVERAGE_STATUS_UNMEASURED,
-            "reason": f"krepis.stage_coverage unimportable: {type(exc).__name__}: {exc}",
+            "reason": (
+                f"krepis.stage_coverage refused the verdict: {type(exc).__name__}: {exc}"
+                if isinstance(exc, ValueError)
+                else f"krepis.stage_coverage unimportable: {type(exc).__name__}: {exc}"
+            ),
             "run_date": run_date,
             "recorded_at": now.isoformat(),
             "enforce": False,

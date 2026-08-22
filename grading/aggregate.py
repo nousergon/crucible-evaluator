@@ -30,6 +30,7 @@ import logging
 import boto3
 
 from grading.artifacts import read_scorecard_inputs
+from grading.coverage import replace_evaluator_coverage
 from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
@@ -205,6 +206,22 @@ def build_report_card(
         "director_quality": build_director_quality_tile(bucket, run_date, s3_client=s3_client),
         "contribution_lift": build_contribution_lift_tile(bucket, run_date, s3_client=s3_client),
     }
+    # alpha-engine-config-I8177 — `evaluator_coverage` grades THIS card, not the
+    # legacy v1 `grading.json`.
+    #
+    # The backtester tile builds the record from `backtest/{date}/grading.json`,
+    # a 14-leaf artifact covering research/predictor/executor only. It cannot
+    # see agent, substrate, behavioral, contribution_lift, portfolio_outcome,
+    # director_quality or backtester — seven of these ten tiles. On 2026-08-22
+    # it rendered 0.857 (WATCH) while the real surface was 78/125 = 0.624,
+    # below the red-line: the metric named for the coverage cliff was
+    # structurally unable to see it.
+    #
+    # It has to happen HERE rather than inside the tile builder: the census is
+    # over every tile, and no single builder can see its siblings. The tile
+    # keeps emitting its record (so its own shape and tests stand); this
+    # substitutes the value once the full census exists.
+    replace_evaluator_coverage(tiles)
     scorecard["tiles"] = tiles
     # Handed to the handler (which persists it as its own artifact) under a
     # leading underscore, the same convention `_provenance` uses for a key that
