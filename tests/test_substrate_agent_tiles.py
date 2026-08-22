@@ -167,7 +167,7 @@ _ARNS = "arn:aws:states:us-east-1:0:stateMachine:alpha-engine-saturday-pipeline"
 _arn_counter = iter(range(10_000))
 
 
-def _run(status, days_ago, now, role="weekly"):
+def _run(status, days_ago, now, role="weekly", run_date=None):
     # Production runs carry a pipeline_role; role=None mimics an untracked
     # smoke/manual run (excluded from the rate). `days_ago` also keys the cycle
     # (one cycle = one SF + one start UTC-date), so distinct days = distinct
@@ -175,7 +175,7 @@ def _run(status, days_ago, now, role="weekly"):
     arn = f"arn:aws:states:us-east-1:0:execution:x:{next(_arn_counter)}"
     return SimpleNamespace(
         status=status, start_utc=now - timedelta(days=days_ago), pipeline_role=role,
-        execution_arn=arn,
+        execution_arn=arn, run_date=run_date,
     )
 
 
@@ -209,6 +209,97 @@ def _wire_sf(monkeypatch, runs):
         "nousergon_lib.pipeline_status.read_work_outcome",
         lambda execution_arn, client=None: outcomes[execution_arn],
     )
+
+
+class TestSfCycleKeyIsTypeStable:
+    """alpha-engine-config-I8183 — the cycle key must not split one calendar
+    day into two cycles because half its executions carry `input.run_date`.
+
+    `run_date` is a ``str`` off the summary; the fallback ``start.date()`` is a
+    ``datetime.date``. Mixed into one dict they can never collide. Measured on
+    the live SFs 2026-08-22: the weekly pipeline had 56 executions carrying a
+    run_date and 46 without, the preopen 4 with and 24 without — so this fired
+    on the common path, not an edge case, and it inflates the DENOMINATOR
+    only, silently dragging the published rate down."""
+
+    def test_same_day_mixed_run_date_presence_is_one_cycle(self, s3, monkeypatch):
+        now = datetime.now(UTC)
+        day = (now - timedelta(days=1)).date().isoformat()
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        # One trading day: a scheduled run that FAILED carrying its run_date,
+        # and a same-day recovery that SUCCEEDED without one. Two more clean
+        # days so N clears the floor.
+        _wire_sf(monkeypatch, [
+            _run("FAILED", 1, now, role="weekly", run_date=day),
+            _run("SUCCEEDED", 1, now, role="recovery", run_date=None),
+            _run("SUCCEEDED", 8, now, run_date=(now - timedelta(days=8)).date().isoformat()),
+            _run("SUCCEEDED", 15, now, run_date=(now - timedelta(days=15)).date().isoformat()),
+        ])
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        sf = _comp(tile, "sf_success_rate_4w")
+        # 3 cycles, all clean (the recovery rescues day 1). Before the fix the
+        # day-1 pair split, giving 4 cycles of which the failed half was
+        # unclean → 3/4.
+        assert sf["n_samples"] == 3, sf["status_reason"]
+        assert sf["value"] == pytest.approx(1.0)
+
+    def test_the_split_is_denominator_only_so_it_drags_the_rate_down(self, s3, monkeypatch):
+        """Pins the DIRECTION of the defect, which is what made it invisible:
+        a split never invents a clean cycle, it only invents an unclean one."""
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        runs = []
+        for d in (1, 8, 15):
+            iso = (now - timedelta(days=d)).date().isoformat()
+            runs.append(_run("FAILED", d, now, role="weekly", run_date=iso))
+            runs.append(_run("SUCCEEDED", d, now, role="recovery", run_date=None))
+        _wire_sf(monkeypatch, runs)
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        sf = _comp(tile, "sf_success_rate_4w")
+        assert sf["n_samples"] == 3      # not 6
+        assert sf["value"] == pytest.approx(1.0)   # not 0.5
+
+
+class TestSfScanTruncationIsNotPublished:
+    """alpha-engine-config-I8183 — `limit` bounds the scan by COUNT while the
+    metric's name bounds it by TIME. At the previous limit=50 the weekly SF's
+    102 in-window executions made `sf_success_rate_4w` an 18-day number
+    published as `trailing_4w`."""
+
+    def test_full_scan_still_inside_the_window_renders_na_not_a_rate(self, s3, monkeypatch):
+        from grading.tiles import substrate as S
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        monkeypatch.setattr(S, "_SF_EXEC_SCAN_LIMIT", 4)
+        # 4 executions == the limit, and the OLDEST is 2 days old — well
+        # inside the 28d window, so older executions were cut off.
+        _wire_sf(monkeypatch, [
+            _run("SUCCEEDED", 1, now), _run("SUCCEEDED", 1, now),
+            _run("SUCCEEDED", 2, now), _run("SUCCEEDED", 2, now),
+        ])
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        sf = _comp(tile, "sf_success_rate_4w")
+        assert sf["value"] is None
+        assert sf["status"] == "N/A-MISSING-INPUT"
+        assert "TRUNCATED" in sf["status_reason"]
+        # The paired supporting metric must not survive its own truncation either.
+        assert _comp(tile, "unattended_first_pass_rate")["value"] is None
+
+    def test_scan_reaching_past_the_cutoff_is_not_truncated(self, s3, monkeypatch):
+        """The guard must not fire merely because the scan filled up — only
+        when it filled up AND never reached back past the window."""
+        from grading.tiles import substrate as S
+        now = datetime.now(UTC)
+        monkeypatch.setenv("EVALUATOR_SF_ARNS", _ARNS)
+        monkeypatch.setattr(S, "_SF_EXEC_SCAN_LIMIT", 3)
+        _wire_sf(monkeypatch, [
+            _run("SUCCEEDED", 1, now), _run("SUCCEEDED", 8, now),
+            _run("SUCCEEDED", 40, now),   # older than the 28d cutoff
+        ])
+        tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=now, sfn_client=object())
+        sf = _comp(tile, "sf_success_rate_4w")
+        assert sf["value"] == pytest.approx(1.0)
+        assert "TRUNCATED" not in (sf["status_reason"] or "")
 
 
 class TestSfSuccessRate:

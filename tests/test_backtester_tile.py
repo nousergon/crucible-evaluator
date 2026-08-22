@@ -543,6 +543,45 @@ class TestBacktestVsLiveParity:
         assert m["criticality"] == "critical"
         assert m["estimator"] == "ic_delta"
 
+    def test_reliability_is_declared_low_not_defaulted_high(self, s3):
+        """alpha-engine-config-I8180 — the instrument carries two documented
+        caveats (an AMBIGUOUS cross-estimator delta and a self-declared
+        UNVALIDATED first-cut band), so the call site must say ``low``.
+
+        This is a REGRESSION test on a silence: ``build_metric`` defaults a
+        value-bearing critical to ``reliability="high"`` when the call site
+        omits it, so deleting the keyword does not fail loudly anywhere else —
+        it just quietly re-publishes a critical RED/F, with a trend arrow, as
+        a high-confidence read. Asserting the value here is what makes that
+        deletion a test failure."""
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["reliability"] == "low"
+
+    def test_reliability_low_survives_every_status_band(self, s3):
+        """The caveat is a property of the INSTRUMENT, not of this week's
+        reading — a GREEN parity number is exactly as ambiguous as a RED one,
+        so ``low`` must not be conditional on the value."""
+        for mean_ic, ic_30d in ((0.18, 0.18), (0.18, 0.15), (0.18, 0.08)):
+            self._put_manifest(s3, mean_ic=mean_ic)
+            self._put_latest(s3, ic_30d=ic_30d, rolling_n=40)
+            m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+            assert m["reliability"] == "low", (mean_ic, ic_30d, m["status"])
+
+    def test_status_reason_states_neither_leg_measures_execution(self, s3):
+        """The component's NAME asserts backtest-vs-live parity; measured
+        2026-08-22, neither leg touches an order or a fill (``ic_30d`` comes
+        from ``predictor_outcomes``). A reader who only sees the name and the
+        RED cannot tell that, so the reason string has to say it."""
+        self._put_manifest(s3, mean_ic=0.18)
+        self._put_latest(s3, ic_30d=0.08, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        reason = m["status_reason"]
+        assert "reliability LOW" in reason
+        assert "UNVALIDATED" in reason
+        assert "EXECUTION" in reason
+
     def test_live_matching_backtest_is_green(self, s3):
         # drift == target (0.0) exactly → GREEN.
         self._put_manifest(s3, mean_ic=0.18)
