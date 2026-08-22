@@ -37,7 +37,14 @@ Fail-loud posture (``[[feedback_no_silent_fails]]``):
     cron-driven and can skip days) — skipped, never an error.
   - ZERO artifacts across the whole window means the groomer stopped running
     or the writer broke → every record grades a precise N/A-MISSING-INPUT
-    naming the producer (visible degradation, never a silent GREEN).
+    naming the producer (visible degradation, never a silent GREEN) — UNLESS
+    the pause-reconcile paused-lane declaration (alpha-engine-config-I8189,
+    ``_load_paused_lanes`` / ``PAUSED_LANES_KEY``) names one of the groom
+    schedules as deliberately paused, in which case the four records render a
+    declared-off accepted-permanent-N/A naming the ruling
+    (alpha-engine-config-I6617) instead — a declared pause must not render as
+    an undeclared "did not run or its writer broke" accusation
+    (observability-policy.md §8.3).
   - A MALFORMED artifact (unparseable JSON / contract-violating shape) is a
     producer contract violation and RAISES — the artifact is written whole via
     ``aws s3 cp`` (no partial-write mode), so corruption is a genuine defect,
@@ -54,6 +61,7 @@ import logging
 import re
 
 import boto3
+from botocore.exceptions import ClientError
 
 from krepis.metrics import MetricRecord
 
@@ -88,6 +96,76 @@ _MAX_TURNS_RE = re.compile(r"max_turns|Reached maximum number of turns")
 
 class GroomArtifactError(ValueError):
     """A groom run artifact violated the schema_version-6 producer contract."""
+
+
+# The pause-reconcile paused-lane artifact (alpha-engine-config-I8189). Written
+# by nousergon-data's infrastructure/pause_reconcile.py (daily 09:50 UTC) from
+# infrastructure/automation_pause.py::paused_names() — the single declaration
+# surface for "DISABLED is the INTENDED live state" across the pause manifest.
+# A declared pause must not render as an undeclared gap (observability-policy.md
+# §8.3): DISABLED is DECLARED, never inferred, and symmetrically a declared
+# pause must not be mistaken for an inferred one either.
+PAUSED_LANES_KEY = "ops/checks/automation-pause-reconcile/paused_lanes.json"
+
+# The EventBridge Scheduler schedule names that drive the groom pipeline
+# (infrastructure/automation_pause.json ``paused.scheduler_schedules``, all
+# paused 2026-08-07 per Brian ruling alpha-engine-config-I6617). If ANY of
+# these is in the live paused-lane set, the groom is declared off — the whole
+# pipeline shares one on/off state, so partial membership still means "off".
+_GROOM_TRIGGER_NAMES = frozenset({
+    "alpha-engine-groom-lane-reconciler-5min",
+    "alpha-engine-groom-sweep-0000-daily",
+    "alpha-engine-groom-sweep-0800-daily",
+    "alpha-engine-groom-sweep-1600-daily",
+    "alpha-engine-scheduled-groom-0400-daily",
+    "alpha-engine-scheduled-groom-1200-daily",
+    "alpha-engine-scheduled-groom-2000-daily",
+    "alpha-engine-scheduled-groom-sun0900-weekly",
+})
+
+_PAUSE_RULING_REF = "alpha-engine-config-I6617"
+
+
+def _load_paused_lanes(s3, bucket: str) -> set[str] | None:
+    """The live paused-lane set, or ``None`` if it can't be read.
+
+    Never raises: an unreadable declaration is not proof of absence — it means
+    this reader could not observe the declaration, which must NOT be treated
+    as "not paused" (that would be inference in the wrong direction). Callers
+    fall back to the pre-existing N/A-MISSING-INPUT behavior when this returns
+    ``None``, exactly as if the artifact had never been added.
+    """
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=PAUSED_LANES_KEY)
+        doc = json.loads(resp["Body"].read())
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            logger.info(
+                "groom pause-declaration artifact absent at s3://%s/%s — "
+                "treating as unreadable (never as 'not paused')",
+                bucket, PAUSED_LANES_KEY,
+            )
+        else:
+            logger.warning(
+                "groom pause-declaration artifact read failed s3://%s/%s: %s",
+                bucket, PAUSED_LANES_KEY, e,
+            )
+        return None
+    except Exception:  # noqa: BLE001 — see docstring: never raise, never infer
+        logger.warning(
+            "groom pause-declaration artifact unreadable/malformed at s3://%s/%s",
+            bucket, PAUSED_LANES_KEY, exc_info=True,
+        )
+        return None
+    paused = doc.get("paused")
+    if not isinstance(paused, list):
+        logger.warning(
+            "groom pause-declaration artifact at s3://%s/%s missing list-typed "
+            "'paused' (schema_version=%r)", bucket, PAUSED_LANES_KEY,
+            doc.get("schema_version"),
+        )
+        return None
+    return {str(n) for n in paused}
 
 
 def _window_dates(run_date: str) -> list[str]:
@@ -165,10 +243,30 @@ def build_groom_components(bucket: str, run_date: str, s3_client=None) -> list[M
     src = f"s3://{bucket}/{GROOM_PREFIX}/"
 
     if not runs:
-        # Groomer stopped running or the writer broke across the WHOLE window —
-        # a loud, precise degradation on all four records (never a green/quiet
-        # card while the pipeline is dark).
+        # Zero artifacts across the whole window is ambiguous by construction:
+        # either the groomer stopped running / its writer broke, OR it was
+        # deliberately paused (alpha-engine-config-I6617, 2026-08-07). §8.3
+        # requires DISABLED be declared, never inferred — so check the
+        # declaration surface FIRST, and only fall back to the
+        # broke-or-stopped read when the declaration itself is unreadable
+        # (never silently assume "not paused").
+        paused_lanes = _load_paused_lanes(s3, bucket)
+        is_paused = bool(paused_lanes) and bool(_GROOM_TRIGGER_NAMES & paused_lanes)
+
         def _absent(name: str, metric_type, n_floor: int, hib) -> MetricRecord:
+            if is_paused:
+                return build_metric(
+                    name=name, module=MODULE, metric_type=metric_type,
+                    criticality="diagnostic", n_floor=1, band="unbanded",
+                    source_path=src,
+                    permanent_na_reason=(
+                        f"{name}: groom paused by Brian ruling {_PAUSE_RULING_REF} "
+                        f"(2026-08-07) — zero run artifacts under {src} for {span} "
+                        f"is the DECLARED, intended state, not a broken producer. "
+                        f"Un-pauses automatically once the pause-lane manifest "
+                        f"drops the groom schedules (no code change needed here)."
+                    ),
+                )
             return build_metric(
                 name=name, module=MODULE, metric_type=metric_type, criticality="supporting",
                 n_floor=n_floor, higher_is_better=hib,

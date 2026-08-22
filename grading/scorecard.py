@@ -340,6 +340,28 @@ RETIRED_COMPONENTS: dict[str, list[dict]] = {
                 "every card since 2026-07-17"
             ),
         },
+        {
+            "component": "momentum_regime_ic",
+            "lifecycle": "RETIRED",
+            # diagnostic-only — never carried a weight-table entry, so there is
+            # nothing to remove from RESEARCH_WEIGHTS; stamped here anyway so a
+            # reader of the card sees WHY it renders N/A without diffing this
+            # file (the same reason cio/sector_teams_avg are stamped).
+            "weight_was": None,
+            "retired_date": "2026-07-17",
+            "removed_from_weight_table": "2026-08-22",
+            "reference": "crucible-research e5ce507e / alpha-engine-config-I7827",
+            "ruling": "alpha-engine-config-I8184 (2026-08-22)",
+            "superseded_by": "none yet — the regime-IC question is open, not superseded",
+            "reason": (
+                "scanner_evaluations (research.db) stopped being written "
+                "2026-07-17; its only writer's last caller was removed in "
+                "crucible-research e5ce507e — measured a table that no longer "
+                "produces; the metric was frozen at n_weeks=17 and its RED could "
+                "never resolve, driving Director P1 "
+                "momentum-regime-neutralization-validate for three cycles"
+            ),
+        },
     ],
 }
 
