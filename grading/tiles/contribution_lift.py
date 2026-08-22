@@ -117,10 +117,32 @@ KNOWN_COMPONENTS: dict[str, str] = {
 # producer's ``status_reason`` carried through VERBATIM (prefixed with the
 # producer's own status string so the remap is never silently lossy).
 _STATUS_REMAP: dict[str, str] = {
-    "N/A-RETIRED": "N/A-NOT-IMPL",
-    "N/A-NOT-LIFT-SHAPED": "N/A-NOT-IMPL",
     "gap": "N/A-MISSING-INPUT",
 }
+
+# Producer statuses that are DECLARED TERMINAL STATES, not gaps
+# (alpha-engine-config-I8177).
+#
+# These two were previously in ``_STATUS_REMAP`` above, collapsed onto a bare
+# ``N/A-NOT-IMPL`` — "declared and never built". That inverted their meaning.
+# ``N/A-NOT-IMPL`` is an open gap someone is expected to close; these are the
+# producer stating, with a reason, that the component will never carry a lift
+# number. Nine components on the 2026-08-22 card sat in that state: two
+# retired with the six-team/CIO research graph, seven structurally not
+# lift-shaped (an in-tile lift, an observe-only shadow score, a pass/fail gate
+# over a whole output distribution, or observability OF the judge rather than a
+# steering input). Each was an assertion that could never pass, permanently
+# depressing ``evaluator_coverage``.
+#
+# Routing them through ``permanent_na_reason`` keeps the letter at N/A and the
+# producer's own reason verbatim, but stamps ``permanent_na: true`` on the
+# record — which is what ``grading/coverage.py`` reads to take a DECLARED
+# component out of the coverage denominator. The declaration stays visible on
+# the card; only its miscounting as an open gap goes away.
+#
+# ``observability-policy.md`` §8.3: RETIRED is DECLARED, never inferred — and,
+# symmetrically, a declared terminal state must not render as an undeclared gap.
+_STATUS_DECLARED_TERMINAL = frozenset({"N/A-RETIRED", "N/A-NOT-LIFT-SHAPED"})
 # Passed straight through — already valid StatusLiteral values.
 _STATUS_PASSTHROUGH = {"N/A-MISSING-INPUT", "N/A-LOW-N"}
 
@@ -194,6 +216,13 @@ def build_contribution_lift_tile(bucket: str, run_date: str, s3_client=None) -> 
         elif producer_status in _STATUS_PASSTHROUGH:
             kwargs["status"] = producer_status
             kwargs["reason"] = status_reason
+        elif producer_status in _STATUS_DECLARED_TERMINAL:
+            # Declared terminal state — carried as an accepted permanent N/A so
+            # it leaves the coverage denominator instead of reading as an open
+            # gap. build_metric derives N/A-NOT-IMPL + permanent_na=True from
+            # permanent_na_reason; the producer's own reason rides through
+            # verbatim, prefixed with its status so the mapping is not lossy.
+            kwargs["permanent_na_reason"] = f"{producer_status}: {status_reason}"
         elif producer_status in _STATUS_REMAP:
             kwargs["status"] = _STATUS_REMAP[producer_status]
             kwargs["reason"] = f"{producer_status}: {status_reason}"
