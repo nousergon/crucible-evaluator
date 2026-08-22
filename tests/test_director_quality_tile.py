@@ -47,7 +47,7 @@ class TestDirectorQuality:
     def test_all_components_na_when_no_trend(self, s3):
         tile = build_director_quality_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert tile["module"] == "director_quality"
-        assert tile["n_components"] == 3
+        assert tile["n_components"] == 4
         statuses = {c["status"] for c in tile["components"]}
         assert statuses == {"N/A-MISSING-INPUT"}
         # only supporting components N/A → tile stays GREEN (WATCH-only class,
@@ -64,10 +64,11 @@ class TestDirectorQuality:
         statuses = {c["status"] for c in tile["components"]}
         assert statuses == {"N/A-MISSING-INPUT"}
 
-    def test_graded_case_three_components(self, s3):
+    def test_graded_case_three_retro_components_plus_route(self, s3):
         _put_trend(s3, [_grade("2026-06-20", grounding=80, calibration=55, actionability=70)])
         tile = build_director_quality_tile(BUCKET, RUN_DATE, s3_client=s3)
-        assert tile["n_components"] == 3
+        # 3 retro grades + director_route_degraded (alpha-engine-config-I8165).
+        assert tile["n_components"] == 4
 
         g = _comp(tile, "director_grounding")
         assert g["value"] == 80

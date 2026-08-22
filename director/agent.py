@@ -60,17 +60,39 @@ logger = logging.getLogger(__name__)
 # The Director addresses a REGISTRY MODEL GROUP, never a model id. The group's
 # ordered chain (LLM_MODEL_REGISTRY.yaml) is what provides redundancy.
 #
-# Measured 2026-08-22, correcting the claim that stood here: `ultra` resolves to
-# a chain of ONE — `glm-5.2-direct` (zhipu). The other four entries carrying
-# `group: ultra` are not live in it: `kimi-k3` and `kimi-k3-direct` are
-# `deprecated`, `glm-5.2` (openrouter) is `unavailable`, and `claude-fable-5` is
-# excluded from every group by Brian's 2026-07-29 ruling. So
-# `DirectorRouteFallback` cannot be anything but 0 here, and a slow or degraded
-# zhipu is an outage for the Director rather than a fallback — which is what a
-# reader of the old comment ("deliberately spanning providers") would not have
-# expected. Whether that single-arm chain is acceptable for the fleet's
-# highest-stakes call is a ruling, tracked separately; this comment's job is
-# only to stop asserting redundancy that is not there.
+# The chain, measured 2026-08-22 AFTER alpha-engine-config-I8165 landed
+# (`krepis.router models`, `_parse_registry` fallbacks, against the registry at
+# that commit) — two live entries over TWO providers:
+#
+#     ultra-glm-5.2-direct   -> glm-5.2         (zhipu)     primary
+#     ultra-deepseek-v4-pro  -> deepseek-v4-pro (deepseek)  fallback
+#
+# The other three entries carrying `group: ultra` are not live in it: `kimi-k3`
+# and `kimi-k3-direct` are `deprecated`, and `glm-5.2` (openrouter) is
+# `unavailable` — and it would not have been a second PROVIDER anyway, being the
+# same Zhipu model reached through an aggregator (config-I6561).
+# `claude-fable-5` is excluded from every group by Brian's 2026-07-29 ruling and
+# stays excluded; I8165 declined the option that would have re-admitted it.
+#
+# THIS IS THE THIRD VERSION OF THIS COMMENT, AND THE FIRST TWO WERE BOTH WRONG.
+# It read "kimi-k3-direct -> glm-5.2-direct -> glm-5.2 -> deepseek-v4-pro-max,
+# deliberately spanning providers" while the chain was one entry long
+# (corrected in crucible-evaluator-PR248); the correction then said "a chain of
+# ONE ... DirectorRouteFallback cannot be anything but 0", true for exactly the
+# hours between PR248 and I8165. A chain comment is a claim about ANOTHER
+# repo's file, so nothing in this repo's CI can keep it true — re-measure it
+# against `krepis.router models` before trusting it, and re-write it here in the
+# same change as any registry edit that moves the group.
+#
+# WHAT THE SECOND ARM IS AND IS NOT. `deepseek-v4-pro` is admitted for
+# AVAILABILITY only (model-router-policy R33). It is a WEAKER model than
+# GLM-5.2 for this call, so a plan it serves is a DEGRADED plan, never an
+# equivalent one — which is why `_stamp_route_degradation` below marks the plan
+# artifact and the Report Card with the model that actually served. Before
+# I8165 there was nothing to fall back TO: `DirectorRouteFallback` was
+# structurally pinned at 0 and a slow or unavailable zhipu was a full outage,
+# which is what killed the 2026-08-22 weekly run and its rerun
+# (alpha-engine-config-I8151).
 #
 # Why this replaced a pinned model (config#6050 follow-on, 2026-08-01): the
 # prior code built ModelSpec(provider="openrouter", model="glm-5.2") with an
@@ -312,14 +334,27 @@ def _warn_on_degraded_route(
     # ignore the week it means something — the same failure mode as a metric
     # that never emits, arrived at from the other direction.
     #
-    # The consumer genuinely cannot know which entry served through the proxy:
-    # LiteLLM walks the fallback chain internally and the resolution contract
-    # reports the group, by design. So on this route the only degradation
-    # signal the consumer HAS is `skipped_entries` — entries the resolver
-    # itself refused before handing over. Which is the honest answer, not a
-    # weakened one: R12's "serving from a fallback is an alert" is owed by the
-    # layer that knows, and for the proxy path that is the router's own
-    # telemetry (R21), not this module.
+    # BEFORE the call, the consumer genuinely cannot know which entry will serve
+    # through the proxy: LiteLLM walks the fallback chain internally and the
+    # resolution contract reports the group, by design. So at THIS point the
+    # only degradation signal available is `skipped_entries` — entries the
+    # resolver itself refused before handing over.
+    #
+    # CORRECTED 2026-08-22 (alpha-engine-config-I8165). This comment used to end
+    # "the consumer genuinely cannot know which entry served" full stop, and
+    # concluded that R12's alert was owed only by the router's own telemetry.
+    # That is true of RESOLUTION time and false of COMPLETION time: krepis
+    # resolves the response's model field back to the billable upstream id
+    # (`krepis.llm._resolve_group_served_model`), so `result.model` names the
+    # entry that actually served — which is exactly how `plan.resolved_model`
+    # has been populated all along. The consumer had the fact and threw it away.
+    #
+    # That mattered little while `ultra` was a chain of one. I8165 gave it a
+    # second arm that is deliberately WEAKER than the primary, so a silently
+    # substituted fallback plan would now be a quality regression wearing a
+    # champion plan's clothes. `_stamp_route_degradation` closes it, after the
+    # call, where the answer exists. This function keeps its pre-call job: it is
+    # the only signal available when the call never returns at all.
     if route.get("route") == "litellm_proxy":
         degraded = bool(skipped)
     else:
@@ -358,6 +393,103 @@ def _warn_on_degraded_route(
             "Director: failed to emit %s — the fallback alarm is blind for "
             "this run", metric_name
         )
+
+
+# ── The served-model signal (alpha-engine-config-I8165) ──────────────────────
+#
+# Keys stamped onto `director/{run_date}/action_plan.json`. They are EXTRAS on
+# `DirectorWeeklyActionPlan` (`extra="allow"`), deliberately not declared
+# fields: a declared field becomes a field the LLM is ASKED to produce, and a
+# plan cannot be trusted to report its own degradation — the same reasoning
+# `director/verdict.py::stamp_plan_artifact` gives for keeping the correctness
+# verdict off the schema. `resolved_model` has been stamped this way since
+# config#1673; these three join it.
+#
+# `grading/tiles/director_quality.py` reads them back off
+# `director/latest/action_plan.json` to render the Report Card component. The
+# literals are duplicated there rather than imported: the Report Card Lambda
+# does not package `director/`, and the tile already reads its other artifact's
+# keys as literals. Change one, change both — the contract test
+# `tests/test_director_route_degradation.py::TestArtifactContract` fails if the
+# producer's keys and the consumer's keys drift apart.
+PLAN_KEY_ROUTE_DEGRADED = "route_degraded"
+PLAN_KEY_SERVED_MODEL = "served_model"
+PLAN_KEY_ROUTE_PRIMARY_MODEL = "route_primary_model"
+PLAN_KEY_DEGRADED_REASON = "route_degraded_reason"
+
+
+def _stamp_route_degradation(plan, *, served_model, primary_model) -> bool | None:
+    """Mark the plan artifact with whether a FALLBACK model produced it.
+
+    Returns the value stamped as ``route_degraded``: ``True`` (a fallback
+    served), ``False`` (the group's primary served), or ``None`` (unknowable —
+    see below). Never raises: this is telemetry stamped onto a plan that has
+    already been produced, and losing the stamp must not lose the plan.
+
+    **Why this exists.** ``ultra`` gained a second arm on 2026-08-22
+    (alpha-engine-config-I8165) and that arm — ``deepseek-v4-pro`` — is
+    deliberately WEAKER than the primary for this call. It is admitted for
+    availability (model-router-policy R33) and nothing else. So a fallback
+    plan is a **degraded** plan, and substituting one for a champion-produced
+    plan without saying so would launder a quality regression into next week's
+    baseline: every downstream reader — the console Director page, the retro
+    judge grading it, the Report Card trend — would compare a weaker model's
+    output against a stronger model's history with nothing marking the seam.
+    Recording the served model is the condition on which the second arm was
+    ruled acceptable at all, not a nicety attached to it.
+
+    **Why the comparison is against ``primary_model`` and not the deployment
+    id.** ``result.model`` is the BILLABLE UPSTREAM id
+    (``krepis.llm._resolve_group_served_model`` resolves ``ultra-{entry}`` back
+    through the registry), and ``route["primary_model"]`` is the same shape —
+    ``glm-5.2``, not ``ultra-glm-5.2-direct``. Comparing an upstream id against
+    a deployment id is the category error that pinned ``DirectorRouteFallback``
+    at 1 on every healthy run through the router (alpha-engine-config-I6185);
+    it is not repeated here.
+
+    **``None`` is a real answer and is not collapsed into ``False``.** When the
+    route declared no primary, or the response reported no model, this cannot
+    tell "the champion served" from "nobody looked" — and `principles.md` §2.7
+    is that *no data* is never rendered as green. The Report Card component
+    renders it N/A-MISSING-INPUT rather than a passing 0.
+    """
+    reason = None
+    if not primary_model or not served_model:
+        degraded = None
+        reason = (
+            "served-model unknown: "
+            f"primary_model={primary_model!r} served_model={served_model!r} — "
+            "cannot distinguish a champion-served plan from an unmeasured one"
+        )
+    else:
+        degraded = served_model != primary_model
+        if degraded:
+            reason = (
+                f"plan produced by FALLBACK model {served_model!r}, not the "
+                f"{DIRECTOR_GROUP!r} group's primary {primary_model!r} — a "
+                "weaker model served, so this plan is not comparable to a "
+                "champion-produced one"
+            )
+
+    try:
+        setattr(plan, PLAN_KEY_ROUTE_DEGRADED, degraded)
+        setattr(plan, PLAN_KEY_SERVED_MODEL, served_model)
+        setattr(plan, PLAN_KEY_ROUTE_PRIMARY_MODEL, primary_model)
+        setattr(plan, PLAN_KEY_DEGRADED_REASON, reason)
+    except Exception:
+        logger.exception(
+            "Director: failed to stamp route degradation onto the plan — the "
+            "artifact and the Report Card cannot tell which model served this "
+            "week (served=%s primary=%s)", served_model, primary_model,
+        )
+        return degraded
+
+    if degraded:
+        logger.warning("Director plan DEGRADED: %s", reason)
+    elif degraded is None:
+        logger.warning("Director plan route degradation UNKNOWN: %s", reason)
+
+    return degraded
 
 
 # ── The latency signal (alpha-engine-config-I7311) ───────────────────────────
@@ -550,11 +682,20 @@ class _KrepisStructuredDirector:
     #: second try; a call censored at its full quote must not).
     attempt_cost_s = DIRECTOR_PLAN_CEILING_S
 
-    def __init__(self, client, *, director_model: str, attempt_cost_s: float | None = None):
+    def __init__(self, client, *, director_model: str, primary_model: str | None = None,
+                 attempt_cost_s: float | None = None):
         if attempt_cost_s is not None:
             self.attempt_cost_s = attempt_cost_s
         self._client = client
         self._director_model = director_model
+        #: The group's declared primary, as the BILLABLE UPSTREAM id
+        #: (``route["primary_model"]`` — ``glm-5.2``, not
+        #: ``ultra-glm-5.2-direct``). Compared against ``result.model`` after
+        #: every call to decide whether a fallback produced the plan
+        #: (alpha-engine-config-I8165). Defaults to ``None`` so injected test
+        #: doubles and older callers keep working — and ``None`` stamps
+        #: ``route_degraded: None``, never a falsely-reassuring ``False``.
+        self._primary_model = primary_model
         #: Token usage of the most recent completed attempt, read by
         #: ``_invoke_with_retry``'s latency emitter. ``None`` until a call
         #: RETURNS — a timed-out attempt reports no tokens because none were
@@ -597,6 +738,13 @@ class _KrepisStructuredDirector:
         plan: DirectorWeeklyActionPlan = result.parsed
         plan.director_model = self._director_model
         plan.resolved_model = result.model
+        # I8165: the group has a second, deliberately weaker arm now, so which
+        # model served is a QUALITY fact about this plan and not just a cost
+        # attribution. `resolved_model` alone left every consumer to work that
+        # out by comparing against a registry it does not have.
+        _stamp_route_degradation(
+            plan, served_model=result.model, primary_model=self._primary_model,
+        )
         return plan
 
 
@@ -774,6 +922,9 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
     return _KrepisStructuredDirector(
         client,
         director_model=route["deployment_id"],
+        # The upstream id of the group's declared primary — the yardstick
+        # `_stamp_route_degradation` measures `result.model` against.
+        primary_model=route.get("primary_model"),
         attempt_cost_s=quoted_timeout,
     )
 
