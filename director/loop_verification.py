@@ -44,6 +44,7 @@ skipped, not fatal to the pass.
 from __future__ import annotations
 
 import logging
+import re
 
 from director.issue_filer import slug_issue_number_map
 from director.roadmap_pr import _gh_request
@@ -61,7 +62,7 @@ _ESCALATION_LABELS = {"gate:decision", "gate:operator"}
 
 def component_status_map(card: dict) -> dict[str, str]:
     """Flatten every tile's components into ``{name.lower(): status}`` — the
-    lookup ``evidence_still_adverse`` checks a cited evidence name against."""
+    lookup ``resolve_cited_metrics`` checks cited text against."""
     out: dict[str, str] = {}
     for tile in (card.get("tiles") or {}).values():
         for c in tile.get("components", []) or []:
@@ -69,6 +70,42 @@ def component_status_map(card: dict) -> dict[str, str]:
             if name:
                 out[str(name).strip().lower()] = str(c.get("status") or "")
     return out
+
+
+#: Identifier-shaped tokens inside a free-text citation. Component names are
+#: snake_case (``momentum_l1_ic``), and ``[a-z][a-z0-9_]*`` keeps such a name
+#: whole while splitting the prose around it — so "predictor tile
+#: momentum_l1_ic" yields ``predictor``/``tile``/``momentum_l1_ic`` and the
+#: third token matches exactly. Exact token equality, never substring
+#: containment: ``scanner`` is itself a live component name, and a substring
+#: match would fire it on every ``scanner_*`` sibling.
+_CITATION_TOKEN = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def resolve_cited_metrics(texts, status_map: dict[str, str]) -> dict[str, str]:
+    """Every card component named anywhere in ``texts`` → its current status.
+
+    **This is the fix for a measured detection blindness
+    (alpha-engine-config-I8178).** The prior implementation looked each
+    evidence string up in ``status_map`` WHOLE. The Director does not write
+    bare component names: measured against the live ledger on 2026-08-22, 26
+    of 28 rows cited their metric as prose — ``"predictor tile
+    momentum_l1_ic"``, ``"backtester tile backtest_vs_live_parity"`` — and a
+    whole-string lookup matched none of them. So 26 of 28 rows resolved to
+    ``"unverifiable"``, and since "unverifiable" deliberately never reopens,
+    the reconciliation pass was a no-op on 93% of the ledger while reporting
+    a clean run. Token resolution takes that 26 down to 4.
+
+    The blindness outranked the staleness it hid: the check existed, was
+    wired, ran, and returned an answer that was structurally incapable of
+    being anything but "can't tell"."""
+    hits: dict[str, str] = {}
+    for text in texts or []:
+        for token in _CITATION_TOKEN.findall(str(text).lower()):
+            status = status_map.get(token)
+            if status is not None:
+                hits[token] = status
+    return hits
 
 
 def evidence_still_adverse(evidence: list[str], status_map: dict[str, str]) -> str:
@@ -80,16 +117,18 @@ def evidence_still_adverse(evidence: list[str], status_map: dict[str, str]) -> s
     reopen: we only reopen on POSITIVE evidence the tile is still red, never
     on absence of evidence — reopening on "we can't tell" would be the same
     "confident prescription off a metric we can't see" failure mode
-    ARCHITECTURE.md already warns the Director's own output against."""
-    found = False
-    for name in evidence or []:
-        status = status_map.get(str(name).strip().lower())
-        if status is None:
-            continue
-        found = True
-        if status in ADVERSE_STATUSES:
-            return "adverse"
-    return "unverifiable" if not found else "recovered"
+    ARCHITECTURE.md already warns the Director's own output against.
+
+    Scope note: this reads the ``evidence`` list ONLY, never the row's title
+    or rationale, because its caller REOPENS a closed GitHub issue — a
+    mutating, human-visible action that should fire on the citation the item
+    formally staked, not on a metric its prose happened to mention.
+    ``_carryover_context``'s annotation is non-mutating and deliberately
+    reads wider."""
+    hits = resolve_cited_metrics(evidence, status_map)
+    if not hits:
+        return "unverifiable"
+    return "adverse" if any(s in ADVERSE_STATUSES for s in hits.values()) else "recovered"
 
 
 def backfill_issue_numbers(
