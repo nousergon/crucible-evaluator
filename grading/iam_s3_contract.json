@@ -21,6 +21,14 @@
     "codified policy ALSO lacked the prefix (they agreed). The missing dimension is",
     "code-referenced-prefix -> codified-grant coverage; this contract closes it.",
     "",
+    "alpha-engine-config-I8156 (2026-08-22): _freshness_monitor is READ by",
+    "krepis.stage_coverage, which loads the artifact registry mirror from",
+    "_freshness_monitor/ARTIFACT_REGISTRY.yaml before it can evaluate any stage.",
+    "Found by mechanism 3 on its first run: I8152 granted _stage_coverage and",
+    "decision_artifacts but not this, so the verdict object was WRITABLE while its",
+    "CONTENT was always UNMEASURED ('registry unreadable') -- a detector that could",
+    "not fail, in the benign-looking direction.",
+    "",
     "access modes:",
     "  read      -> s3:ListBucket (prefix condition) + s3:GetObject on <prefix>/*",
     "  readwrite -> the above + s3:PutObject on <prefix>/* (the code writes here)"
@@ -40,6 +48,7 @@
     "groom": "read",
     "experiments": "readwrite",
     "_stage_coverage": "readwrite",
-    "decision_artifacts": "readwrite"
+    "decision_artifacts": "readwrite",
+    "_freshness_monitor": "read"
   }
 }
