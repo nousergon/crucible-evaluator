@@ -228,8 +228,13 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None
     how this cycle's numbers become durable tracked work in another system, and
     an issue filed off unverified arithmetic outlives every signal that said so.
     The check lives here rather than at the call site so a future second caller
-    inherits the gate instead of having to remember it (config-I7039)."""
-    if actions_withheld(verdict_block or {}):
+    inherits the gate instead of having to remember it (config-I7039).
+
+    ``issue_filing`` is named explicitly (``alpha-engine-config-I8187``): it is a
+    member of ``MUTATING_ACTIONS``, and the gate is on that membership rather
+    than on the verdict alone, so nothing non-mutating added to this function
+    later inherits the withholding by accident."""
+    if actions_withheld(verdict_block or {}, action="issue_filing"):
         reason = withheld_reason(verdict_block or {})
         logger.error("Director: issue filing WITHHELD — %s", reason)
         return {"director_issues": "withheld", "director_issues_reason": reason}
@@ -271,38 +276,85 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
     the plan + ledger are the primary deliverables and must ship even if
     GitHub is unreachable this week.
 
-    §2.3a gate FIRST (config-I7039). This pass REOPENS issues whose cited metric
-    it judges unrecovered and ESCALATES carried-over items to Brian's Decision
-    Queue — both decided by comparing the ledger against ``card``'s numbers. If
-    those numbers are not established correct, a reopen is an accusation with no
-    evidence and an escalation puts a reserved matter in front of Brian on the
-    strength of arithmetic nothing checked."""
-    if actions_withheld(verdict_block or {}):
-        reason = withheld_reason(verdict_block or {})
-        logger.error("Director: loop verification WITHHELD — %s", reason)
-        return {"director_loop": "withheld", "director_loop_reason": reason}
+    **The §2.3a gate is on MUTATING AUTHORITY, not on this pass** (Brian ruling
+    2026-08-22, ``alpha-engine-config-I8187``). Two of the things this function
+    does REOPEN issues whose cited metric it judges unrecovered and ESCALATE
+    carried-over items to Brian's Decision Queue — both decided by comparing the
+    ledger against ``card``'s numbers. If those numbers are not established
+    correct, a reopen is an accusation with no evidence and an escalation puts a
+    reserved matter in front of Brian on the strength of arithmetic nothing
+    checked. Those two stop under a non-PASS verdict, and only those two.
+
+    Everything else here runs under every verdict:
+
+    - ``backfill_issue_numbers`` — GET-only against GitHub, writes ``issue_number``
+      onto the Director's OWN ledger rows. It mutates nothing outside this system.
+    - the reconciliation counts ``verify_and_correct`` returns — a read of the
+      ledger against the card, used to annotate.
+
+    Until this ruling the gate named the code path (``loop_verification``) rather
+    than the authority, and the backfill was inside it. That is the second-order
+    trap and the reason this is not cosmetic: ``verify_and_correct`` ``continue``s
+    past every row with no ``issue_number``, so withholding the thing that FILLS
+    ``issue_number`` does not pause the corrections — it dismantles the state they
+    need. Measured 2026-08-22: ``issue_number`` null on all 28 ledger rows
+    (``alpha-engine-config-I8179``) after three consecutive UNKNOWN cycles
+    (2026-08-13, -08-14, -08-21). The longer the attestation stayed UNKNOWN, the
+    less able the system became to correct itself when it cleared.
+
+    Ordering is load-bearing: the backfill runs BEFORE the verification pass, so
+    on the cycle the attestation clears, that cycle's corrections already see the
+    numbers this cycle recovered."""
     if not token:
         return {"director_loop": "skipped", "director_loop_reason": "no GH token"}
-    # config#6915: one check for the whole pass. backfill_issue_numbers and
-    # verify_and_correct both MUTATE (reopen an issue, set a sticky escalated
-    # flag) while iterating; being killed partway leaves GitHub and the ledger
-    # disagreeing about what this run did.
+    # config#6915: one check for the whole pass. The pass MUTATES (an issue
+    # reopened, a sticky escalated flag, a backfilled ledger row) while
+    # iterating; being killed partway leaves GitHub and the ledger disagreeing
+    # about what this run did. Checked once here rather than per-action because
+    # a half-run pass is the failure, not an expensive one.
     reason = skip_if_unaffordable(budget, "loop_verification")
     if reason:
         logger.warning("Director: loop verification skipped — %s", reason)
         return {"director_loop": "skipped", "director_loop_reason": reason}
+
+    items = ledger.get("items") or []
+    out: dict = {}
+
+    # --- runs regardless of the verdict (I8187): own-ledger write, no mutation
+    # elsewhere. Its own failure is recorded and does not sink the gated half.
     try:
-        items = ledger.get("items") or []
-        n_backfilled = backfill_issue_numbers(items, repo=DEFAULT_REPO, token=token)
+        out["director_loop_backfilled"] = backfill_issue_numbers(
+            items, repo=DEFAULT_REPO, token=token
+        )
+    except Exception as e:  # noqa: BLE001 — own-ledger repair; ledger already valid
+        logger.warning("Director loop-verification backfill failed (non-fatal): %s", e)
+        out["director_loop_backfill_error"] = str(e)
+
+    # --- gated on the verdict: reopen-if-unrecovered and carryover escalation.
+    # Named by authority. `actions_withheld` is asked about the ACTIONS, not
+    # about this function, so a future non-mutating addition here does not
+    # silently inherit the withholding that this ruling removed.
+    if actions_withheld(verdict_block or {}, action="issue_reopen"):
+        reason = withheld_reason(verdict_block or {})
+        logger.error(
+            "Director: loop verification MUTATIONS WITHHELD (%s, %s) — %s. "
+            "Backfill ran: %s row(s) filled.",
+            "issue_reopen", "carryover_escalation", reason,
+            out.get("director_loop_backfilled", 0),
+        )
+        out["director_loop"] = "mutations_withheld"
+        out["director_loop_reason"] = reason
+        return out
+
+    try:
         result = verify_and_correct(items, card, repo=DEFAULT_REPO, token=token)
-        return {
-            "director_loop": "ok",
-            "director_loop_backfilled": n_backfilled,
-            **{f"director_loop_{k}": v for k, v in result.items()},
-        }
+        out["director_loop"] = "ok"
+        out.update({f"director_loop_{k}": v for k, v in result.items()})
     except Exception as e:  # noqa: BLE001 — advisory correction pass; ledger already valid
         logger.warning("Director loop-verification failed (non-fatal): %s", e)
-        return {"director_loop": "error", "director_loop_error": str(e)}
+        out["director_loop"] = "error"
+        out["director_loop_error"] = str(e)
+    return out
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:

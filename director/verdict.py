@@ -30,11 +30,32 @@ number on a page: it becomes tracked work, a reopened issue, and a reserved
 matter on the queue — each of which outlives the cycle that produced it and
 carries no memory of having been derived from unverified inputs.
 
+Each of those four is a **mutation into a system other than this one**, which is
+the property the gate is actually about — see ``MUTATING_ACTIONS``.
+
 WHAT IT DOES
 ------------
 ``read_card_verdict`` normalizes the card's verdict onto the closed vocabulary,
-and ``actions_withheld`` says whether the Director may exercise its acting
+and ``actions_withheld`` says whether the Director may exercise its **mutating**
 authority this cycle.
+
+**What the gate withholds is authority, not the verification pass** (Brian
+ruling 2026-08-22, ``alpha-engine-config-I8187``). The withheld set is split by
+MUTATION CLASS — ``MUTATING_ACTIONS`` (file an issue, reopen an issue, escalate a
+carried item to the Decision Queue) stop; ``UNGATED_ACTIONS`` (the ledger's
+``issue_number`` backfill, the carry-over reconciliation that only annotates) run
+under every verdict. The distinction is mutates-the-world vs reads-the-world,
+never attestation-clean vs not.
+
+That split is not a softening of §2.3a; it is what §2.3a already meant. Gating a
+read on a run-quality flag buys no safety and costs self-correction: the
+``issue_number`` backfill sat inside this gate through three consecutive UNKNOWN
+cycles (2026-08-13, -08-14, -08-21), which is why ``issue_number`` is null on all
+28 ledger rows (``alpha-engine-config-I8179``) — and ``verify_and_correct``
+``continue``s past every row without one. So the withholding did not merely pause
+the corrections, it dismantled the state those corrections need, and the longer
+the attestation stayed UNKNOWN the less able the system became to correct itself
+when it cleared.
 
 **The absent case is the whole point.** A card written before the attestation
 producer existed, a card whose attestation block failed to build, and a card
@@ -52,6 +73,12 @@ a spot reclaim on the box that produced the backtest — killing the weekly
 advisory on that would trade one blindness for an outage. The plan is still
 built, still persisted, and still emailed; it is persisted and emailed **marked**,
 and the actions that create durable state elsewhere are the ones that stop.
+
+By the same argument one step further (I8187): an action that creates durable
+state *here* — a backfilled ``issue_number``, an annotation on a carried row — is
+on the same side of the line as rendering, not on the side of a reopen. Stopping
+it trades one blindness for a different one, and this module's own history is the
+evidence.
 """
 from __future__ import annotations
 
@@ -74,7 +101,8 @@ from grading.pipeline_gates import (
 logger = logging.getLogger(__name__)
 
 __all__ = [  # re-exported: the Director's callers read the key from here
-    "PIPELINE_GATES_KEY", "ATTESTATION_KEY", "GATED_ACTIONS", "actions_withheld",
+    "PIPELINE_GATES_KEY", "ATTESTATION_KEY", "GATED_ACTIONS", "MUTATING_ACTIONS",
+    "UNGATED_ACTIONS", "actions_withheld", "is_gated_action",
     "log_verdict", "read_card_verdict", "read_pipeline_gates",
     "stamp_plan_artifact", "withheld_reason", "withheld_summary",
 ]
@@ -86,18 +114,61 @@ ATTESTATION_KEY = "attestation"
 
 _VALID_VERDICTS = frozenset({PASS, FAIL, PARTIAL, UNKNOWN})
 
-#: The Director actions gated on the verdict. Each creates state that OUTLIVES
-#: this cycle in a system other than this one, which is the test for membership
-#: — rendering is not gated (a marked page is more useful than a blank one),
-#: mutating a shared tracker is.
-GATED_ACTIONS: tuple[str, ...] = ("issue_filing", "loop_verification")
+#: The Director actions gated on the verdict, split by MUTATION CLASS.
+#:
+#: Brian ruling 2026-08-22 (``alpha-engine-config-I8187``), option (c): the gate
+#: is on the AUTHORITY an action exercises, never on a global run-quality flag.
+#: The test for membership here is the one ``overseer-policy.md`` §6 applies to
+#: autonomous action — a T2 write into somebody else's system is not the same
+#: act as a T0 read that informs a human or a prompt, and one verdict flag must
+#: not govern both.
+#:
+#: Membership test: does this action create state that OUTLIVES this cycle in a
+#: system OTHER than the Director's own? A GitHub issue filed, an issue
+#: reopened, a reserved matter placed on Brian's Decision Queue — yes. A read,
+#: an annotation, a write into the Director's own ledger — no.
+#:
+#: ``loop_verification`` is deliberately absent from both tuples: it was the
+#: atom this ruling dissolved. The pass is not one authority — it is a
+#: non-mutating backfill and reconciliation carrying two mutating actions, and
+#: naming the pass rather than the actions is what withheld the backfill for
+#: three consecutive cycles (``alpha-engine-config-I8179``: ``issue_number``
+#: null on all 28 ledger rows, because the thing that fills it was inside the
+#: gate). A gate named after a code path grows to cover whatever that path
+#: later does; a gate named after an authority does not.
+MUTATING_ACTIONS: tuple[str, ...] = (
+    "issue_filing",           # files area:director-proposals issues into the fleet backlog
+    "issue_reopen",           # reopens a closed issue whose cited metric reads unrecovered
+    "carryover_escalation",   # puts a carried item on Brian's Decision Queue
+)
+
+#: The actions that RUN REGARDLESS of the verdict — non-mutating, or writing
+#: only to the Director's own ledger. Withholding these buys no safety and costs
+#: self-correction: with the backfill inside the gate, the longer the attestation
+#: stays UNKNOWN the LESS able the system becomes to correct itself when it
+#: clears. Declared as a named tuple, not left implicit, so the ran-regardless
+#: set is emitted on every surface beside the withheld set — a list that appears
+#: only when something stopped cannot be distinguished from a producer that
+#: stopped emitting.
+UNGATED_ACTIONS: tuple[str, ...] = (
+    "issue_number_backfill",    # GET-only against GitHub; writes ledger rows in place
+    "carryover_reconciliation", # annotates ledger rows against this week's card
+)
+
+#: Back-compatible name for the withheld set. Kept as an alias rather than
+#: deleted because it is re-exported and read by the plan artifact's consumers;
+#: it now means "the MUTATING actions", which is the only thing the verdict ever
+#: had grounds to withhold.
+GATED_ACTIONS: tuple[str, ...] = MUTATING_ACTIONS
 
 #: The reason string recorded against every withheld action. A skip with no
 #: recorded reason is the silent swallow the fleet's fail-loud rule forbids, and
 #: on this path it would be indistinguishable from the feature being disabled.
 WITHHELD_REASON_TEMPLATE = (
     "correctness verdict {verdict} — sf-pipeline-policy.md §2.3a: the Director "
-    "may not act on numbers whose correctness was not established. {detail}"
+    "may not MUTATE another system on numbers whose correctness was not "
+    "established. Non-mutating work (ledger backfill, reconciliation used to "
+    "annotate) is unaffected and ran. {detail}"
 )
 
 
@@ -230,8 +301,48 @@ def read_pipeline_gates(gate_state: Any, card: Any = None) -> dict:
     return read_gate_state(None)
 
 
-def actions_withheld(verdict_block: dict) -> bool:
-    """True when the Director must not exercise its acting authority.
+def is_gated_action(action: str) -> bool:
+    """Whether ``action`` is one the verdict may withhold. Raises on a name in
+    neither tuple.
+
+    Fail-loud on purpose. The two wrong defaults are both silent: returning
+    ``False`` for an unrecognised name lets a new mutating action ship ungated
+    the moment someone spells it differently, and returning ``True`` reinstates
+    exactly the over-broad withholding this split removed. A caller naming an
+    action nobody declared is a bug in the caller, and it says so.
+    """
+    if action in MUTATING_ACTIONS:
+        return True
+    if action in UNGATED_ACTIONS:
+        return False
+    raise ValueError(
+        f"unknown Director action {action!r} — declare it in MUTATING_ACTIONS or "
+        f"UNGATED_ACTIONS (director/verdict.py). Known: "
+        f"{sorted(MUTATING_ACTIONS + UNGATED_ACTIONS)}"
+    )
+
+
+def actions_withheld(verdict_block: dict, action: str | None = None) -> bool:
+    """True when the verdict withholds MUTATING AUTHORITY.
+
+    Not "true when the Director must do less". The subject of this gate is the
+    authority an action exercises, never the run's overall quality — Brian
+    ruling 2026-08-22 (``alpha-engine-config-I8187``), ``sf-pipeline-policy.md``
+    §2.3a. A non-PASS verdict says the numbers were not established correct; the
+    only thing that follows is that the Director may not turn those numbers into
+    durable state in somebody else's system. It does not follow that it may not
+    read, annotate, or repair its own ledger — and withholding those is what made
+    the outage compound rather than merely persist.
+
+    ``action=None`` answers the class question: may the Director exercise
+    mutating authority at all this cycle? That is the form the plan artifact,
+    the email banner and the SF stage output all want, and its truth value is
+    unchanged from before this split.
+
+    ``action=<name>`` answers it for one declared action, and is the form a call
+    site should use: ``UNGATED_ACTIONS`` members answer ``False`` under every
+    verdict, so a caller cannot accidentally re-gate a read by passing the
+    verdict block around.
 
     Deliberately expressed as ``not verdict_is_pass(...)`` rather than as a test
     against ``FAIL``: ``UNKNOWN`` withholds exactly as hard as ``FAIL`` does.
@@ -239,6 +350,8 @@ def actions_withheld(verdict_block: dict) -> bool:
     arithmetic moved, ``UNKNOWN`` is absence of evidence either way — and not at
     all in what the Director is permitted to do next.
     """
+    if action is not None and not is_gated_action(action):
+        return False
     return not verdict_is_pass((verdict_block or {}).get("verdict"))
 
 
@@ -266,8 +379,13 @@ def withheld_summary(verdict_block: dict) -> dict:
         "correctness_as_of": vb.get("as_of") or {},
         "director_actions_withheld": withheld,
     }
+    # alpha-engine-config-I8187: the ran-regardless set is emitted in BOTH
+    # verdict states, and unconditionally. A reader who sees only what stopped
+    # cannot tell a narrowed gate from a gate that stopped being applied, and
+    # the whole content of this ruling is which actions are on which side.
+    summary["director_actions_ungated_list"] = list(UNGATED_ACTIONS)
     if withheld:
-        summary["director_actions_withheld_list"] = list(GATED_ACTIONS)
+        summary["director_actions_withheld_list"] = list(MUTATING_ACTIONS)
         summary["correctness_verdict_reason"] = vb.get("reason")
     # alpha-engine-config-I7282 — §2.3a rule 3 on the SF stage output. Emitted
     # in BOTH polarities (a key that appears only when something is wrong cannot
@@ -307,7 +425,13 @@ def stamp_plan_artifact(plan: Any, verdict_block: dict) -> bytes:
     body["advisory_unverified"] = actions_withheld(vb)
     if body["advisory_unverified"]:
         body["advisory_unverified_reason"] = withheld_reason(vb)
-        body["actions_withheld"] = list(GATED_ACTIONS)
+        body["actions_withheld"] = list(MUTATING_ACTIONS)
+        # I8187: named beside the withheld set, on the artifact the console
+        # Director page renders. "loop_verification" used to appear in the list
+        # above and no longer does — not because it stopped being gated, but
+        # because it was never one authority. This key is what says so to a
+        # reader comparing this artifact to a pre-ruling one.
+        body["actions_ran_regardless"] = list(UNGATED_ACTIONS)
     return json.dumps(body, indent=2).encode("utf-8")
 
 
@@ -320,9 +444,10 @@ def log_verdict(verdict_block: dict, run_date: str) -> None:
     vb = verdict_block or {}
     if actions_withheld(vb):
         logger.error(
-            "Director: correctness verdict %s for %s — WITHHOLDING %s. %s",
-            vb.get("verdict", UNKNOWN), run_date, ", ".join(GATED_ACTIONS),
-            vb.get("reason", ""),
+            "Director: correctness verdict %s for %s — WITHHOLDING mutating "
+            "authority (%s); still running (%s). %s",
+            vb.get("verdict", UNKNOWN), run_date, ", ".join(MUTATING_ACTIONS),
+            ", ".join(UNGATED_ACTIONS), vb.get("reason", ""),
         )
     else:
         logger.info(
