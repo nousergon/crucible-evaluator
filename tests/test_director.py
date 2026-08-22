@@ -7,7 +7,8 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from director.agent import build_action_plan, build_messages
+from director.agent import _carryover_context, build_action_plan, build_messages
+from director.loop_verification import evidence_still_adverse, resolve_cited_metrics
 from director.carryover import load_ledger, merge_plan_into_ledger
 from director.report_card_digest import summarize_report_card
 from director.schema import ActionItem, DirectorWeeklyActionPlan
@@ -99,6 +100,18 @@ def s3():
         client = boto3.client("s3", region_name="us-east-1")
         client.create_bucket(Bucket=BUCKET)
         yield client
+
+
+#: A minimal card carrying the one component the reconciliation tests assert
+#: on. Kept separate from ``_CARD`` so widening it never perturbs the digest
+#: assertions that read ``_CARD`` verbatim.
+_CARD_FOR_RECONCILE = {
+    "_provenance": {"run_date": RUN_DATE},
+    "tiles_overall_status": "RED",
+    "tiles": {"predictor": {"components": [
+        {"name": "inference_coverage", "criticality": "critical", "status": "GREEN", "value": 1.0},
+    ]}},
+}
 
 
 class TestSchema:
@@ -194,6 +207,146 @@ class TestAgent:
         llm = _FakeLLM(_plan(), fail_times=5, exc=ValueError("bad schema"))
         with pytest.raises(ValueError):
             build_action_plan(_CARD, llm=llm)
+
+
+#: The per-row marker, distinct from the section header's mention of the word
+#: (asserting on the bare word matched the instruction line and passed
+#: vacuously — caught by these tests failing on first run).
+_MARKER = "\u26a0 CONTRADICTED BY THIS WEEK'S CARD"
+
+
+class TestCarryoverLiveCardReconciliation:
+    """alpha-engine-config-I8178 — a carry-over row is reconciled against the
+    CURRENT card before the Director reasons from it.
+
+    The 2026-08-22 case these tests pin: the ledger row
+    ``inference-coverage-critical`` was titled "Fix inference_coverage
+    collapse — predictor Lambda KeyError (#7289)". On the card the Director
+    read, ``inference_coverage`` was 1.0 / GREEN; ``#7289`` had been closed 8
+    days. It shipped as P0 #4 anyway, because nothing on the path between the
+    ledger and the model compared the row to the numbers."""
+
+    _CARD_WITH = {
+        "tiles": {
+            "predictor": {"components": [
+                {"name": "inference_coverage", "status": "GREEN"},
+                {"name": "momentum_l1_ic", "status": "RED"},
+            ]},
+            "substrate": {"components": [{"name": "sf_success_rate_4w", "status": "WATCH"}]},
+        }
+    }
+
+    def _row(self, **kw):
+        row = {"id": "x", "title": "t", "status": "carried_over",
+               "proposed_owner": "predictor", "priority": "P0",
+               "evidence": [], "rationale": ""}
+        row.update(kw)
+        return row
+
+    def test_metric_named_only_in_the_title_is_still_reconciled(self):
+        """The measured miss. The row's ``evidence`` was
+        ``["predictor tile N/A entries (...)"]`` — no metric name anywhere in
+        it. The refuted claim lived in the TITLE, which is also the only part
+        of the row the prompt had ever rendered."""
+        led = {"items": [self._row(
+            id="inference-coverage-critical",
+            title="Fix inference_coverage collapse \u2014 predictor Lambda KeyError (#7289)",
+            evidence=["predictor tile N/A entries (N/A-MISSING-INPUT\u00d72, N/A-LOW-N\u00d71)"],
+        )]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "inference_coverage=GREEN" in out
+        assert _MARKER in out
+
+    def test_prose_citation_resolves_to_the_component(self):
+        """26 of 28 live rows cited their metric as ``"<tile> tile
+        <metric>"``. A whole-string lookup matched none of them."""
+        led = {"items": [self._row(id="m", title="hold", priority="P2",
+                                   evidence=["predictor tile momentum_l1_ic"])]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "momentum_l1_ic=RED" in out
+        assert _MARKER not in out
+
+    def test_watch_is_adverse_so_a_watch_row_is_not_contradicted(self):
+        """``ADVERSE_STATUSES`` is ``{RED, WATCH}``. A row citing a WATCH
+        metric is still live work; only all-non-adverse contradicts."""
+        led = {"items": [self._row(id="s", evidence=["substrate tile sf_success_rate_4w"])]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "sf_success_rate_4w=WATCH" in out
+        assert _MARKER not in out
+
+    def test_row_naming_no_card_metric_is_marked_unverifiable_not_contradicted(self):
+        """Absence of evidence is not evidence of recovery — the same
+        asymmetry ``evidence_still_adverse`` already refuses to cross."""
+        led = {"items": [self._row(id="nothing", title="something untraceable")]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "UNVERIFIABLE" in out
+        assert _MARKER not in out
+
+    def test_contradicted_rows_are_annotated_never_dropped(self):
+        """A GREEN metric does not prove the item is finished — the row may
+        name work the metric does not cover. Suppressing it would be the
+        close-and-look-away failure loop_verification exists to stop."""
+        led = {"items": [self._row(id="inference-coverage-critical",
+                                   title="Fix inference_coverage collapse")]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "inference-coverage-critical" in out
+        assert "carry-over ledger, active items=1" in out
+
+    def test_no_card_renders_exactly_as_before(self):
+        """Back-compat: every existing caller that passes no card gets the
+        unannotated rendering, and no annotation is invented from nothing."""
+        led = {"items": [self._row(id="a", title="Fix inference_coverage collapse")]}
+        assert "live card:" not in _carryover_context(led)
+        assert _MARKER not in _carryover_context(led)
+
+    def test_build_messages_threads_the_card_into_the_annotation(self):
+        """The wiring, not just the helper — the defect was that the card and
+        the ledger were both in hand at this exact call site and were never
+        compared."""
+        led = {"items": [self._row(id="inference-coverage-critical",
+                                   title="Fix inference_coverage collapse")]}
+        human = build_messages(_CARD_FOR_RECONCILE, carryover=led)[1][1]
+        assert "inference_coverage=GREEN" in human
+        assert _MARKER in human
+
+    def test_counts_contradicted_rows_in_the_footer(self):
+        led = {"items": [
+            self._row(id="a", title="Fix inference_coverage collapse"),
+            self._row(id="b", title="hold momentum_l1_ic"),
+        ]}
+        out = _carryover_context(led, self._CARD_WITH)
+        assert "1 of 2 carry-over rows are contradicted" in out
+
+
+class TestCitedMetricResolution:
+    """The detection blindness itself (alpha-engine-config-I8178): the check
+    ran, returned an answer, and was structurally incapable of returning
+    anything but "can't tell" on 93% of the ledger."""
+
+    _MAP = {"momentum_l1_ic": "RED", "scanner": "WATCH",
+            "scanner_basket_return": "GREEN", "inference_coverage": "GREEN"}
+
+    def test_prose_citation_resolves(self):
+        assert resolve_cited_metrics(["predictor tile momentum_l1_ic"], self._MAP) == {
+            "momentum_l1_ic": "RED"}
+
+    def test_substring_does_not_match_a_sibling(self):
+        """``scanner`` IS a live component name. Substring containment would
+        fire it on every ``scanner_*`` sibling; exact token equality does not."""
+        assert resolve_cited_metrics(["research tile scanner_basket_return"], self._MAP) == {
+            "scanner_basket_return": "GREEN"}
+
+    def test_bare_name_still_resolves(self):
+        """The 2 of 28 rows that DID cite bare names must not regress."""
+        assert resolve_cited_metrics(["scanner"], self._MAP) == {"scanner": "WATCH"}
+
+    def test_unrelated_prose_resolves_to_nothing(self):
+        assert resolve_cited_metrics(["CORRECTNESS ATTESTATION tile"], self._MAP) == {}
+
+    def test_evidence_still_adverse_now_sees_prose(self):
+        assert evidence_still_adverse(["predictor tile momentum_l1_ic"], self._MAP) == "adverse"
+        assert evidence_still_adverse(["predictor tile inference_coverage"], self._MAP) == "recovered"
+        assert evidence_still_adverse(["predictor tile N/A entries"], self._MAP) == "unverifiable"
 
 
 class TestCarryover:
