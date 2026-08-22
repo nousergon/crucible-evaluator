@@ -43,6 +43,8 @@ import json
 import pytest
 
 from director.agent import (
+    CARRYOVER_PROMPT_MAX_ITEMS,
+    _carryover_omitted_count,
     DIRECTOR_PLAN_AMBER_FRACTION,
     DIRECTOR_PLAN_CEILING_S,
     DIRECTOR_PLAN_MEASURED_MAX_S,
@@ -226,12 +228,28 @@ class TestPlanLatencySignal:
         finally:
             agent.DIRECTOR_PLAN_CEILING_S = original
 
-    def test_amber_fires_below_the_ceiling_on_the_measured_regression(self):
-        """205.3s is the 2026-08-14 01:55 call that SUCCEEDED, one invocation
-        after two that did not. Amber must already be lit there — a signal that
-        only fires once the call has failed is the failure it is replacing."""
-        assert _plan_amber_threshold_s() < 205.3 < DIRECTOR_PLAN_CEILING_S
-        assert _plan_amber_threshold_s() < DIRECTOR_PLAN_MEASURED_MAX_S
+    def test_amber_fires_below_the_ceiling_and_below_the_measured_max(self):
+        """Amber must be lit BEFORE the call fails, and must not be the wall.
+
+        Re-anchored 2026-08-22, 228.0 -> 356.9 (alpha-engine-config-I8163):
+        two uncensored calls (231.4s on 08-15, 356.9s on 08-22, both
+        `outcome=ok`) exceeded the old anchor, so 0.9 x 228 = 205.2s sat below
+        every duration the call had recorded since and `DirectorPlanLatencyAmber`
+        would have pinned at 1 forever. An alarm that is always on is
+        indistinguishable from one that is stuck — the same failure this file's
+        `DirectorRouteFallback` precedent exists to prevent.
+
+        What is pinned here is the RELATIONSHIP, not either literal: amber sits
+        strictly below the slowest call known to succeed and strictly below the
+        ceiling, so a future re-anchor (alpha-engine-config-I8200) cannot
+        silently move it above the wall or onto it.
+        """
+        amber = _plan_amber_threshold_s()
+        assert amber < DIRECTOR_PLAN_MEASURED_MAX_S < DIRECTOR_PLAN_CEILING_S
+        assert amber == pytest.approx(0.9 * DIRECTOR_PLAN_MEASURED_MAX_S)
+        # 356.9s, 2026-08-22 16:04Z, outcome=ok, 32,643 completion tokens — the
+        # slowest call the Director is known to have needed. Amber is lit there.
+        assert amber < 356.9
 
     def test_healthy_call_still_publishes_a_zero(self):
         """observability-policy §9: absence of a signal is never rendered
@@ -245,12 +263,18 @@ class TestPlanLatencySignal:
         assert rec["DirectorPlanLatencySeconds"] == 90.0
 
     def test_amber_record_carries_the_quantities_that_explain_it(self):
+        # 356.9s / 48,240 chars / 32 carry-over items — the 2026-08-22 16:04Z
+        # call, read from this module's own EMF records. At the re-anchored
+        # 356.9s max this is exactly ON the measured requirement and therefore
+        # above amber.
         rec = _emit_plan_latency(
-            elapsed_s=205.3, outcome="ok", prompt_chars=21991, carryover_items=41,
+            elapsed_s=356.9, outcome="ok", prompt_chars=48240, carryover_items=32,
+            carryover_omitted=0,
         )
         assert rec["DirectorPlanLatencyAmber"] == 1
-        assert rec["DirectorPlanPromptChars"] == 21991
-        assert rec["DirectorPlanCarryoverItems"] == 41
+        assert rec["DirectorPlanPromptChars"] == 48240
+        assert rec["DirectorPlanCarryoverItems"] == 32
+        assert rec["DirectorPlanCarryoverOmitted"] == 0
 
     def test_emf_envelope_declares_every_metric_it_publishes(self, capsys):
         _emit_plan_latency(
@@ -363,8 +387,18 @@ class TestEveryAttemptIsMeasured:
 
 class TestCarryoverCount:
     def test_count_is_recoverable_from_the_prompt_text(self):
+        """The count is what the prompt CARRIES, not what the ledger holds.
+
+        Changed by alpha-engine-config-I8163: a 41-row ledger now renders 20
+        rows plus one counted elision line, so `DirectorPlanCarryoverItems`
+        reports 20 and `DirectorPlanCarryoverOmitted` reports 21. Reporting 41
+        here would name a quantity the call no longer pays for — the metric
+        exists to explain the duration.
+        """
         ledger = {"items": [_row(f"i{n}", RUN_DATE) for n in range(41)]}
-        assert _carryover_item_count(build_messages({}, carryover=ledger)) == 41
+        messages = build_messages({}, carryover=ledger)
+        assert _carryover_item_count(messages) == CARRYOVER_PROMPT_MAX_ITEMS
+        assert _carryover_omitted_count(messages) == 41 - CARRYOVER_PROMPT_MAX_ITEMS
 
     def test_absent_carryover_section_counts_zero(self):
         assert _carryover_item_count(build_messages({})) == 0

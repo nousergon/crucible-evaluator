@@ -315,7 +315,7 @@ class TestCarryoverLiveCardReconciliation:
             self._row(id="b", title="hold momentum_l1_ic"),
         ]}
         out = _carryover_context(led, self._CARD_WITH)
-        assert "1 of 2 carry-over rows are contradicted" in out
+        assert "1 of 2 carry-over rows shown are contradicted" in out
 
 
 class TestCitedMetricResolution:

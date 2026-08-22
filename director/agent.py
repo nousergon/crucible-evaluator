@@ -44,6 +44,7 @@ import os
 import time
 
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
+from director.carryover import carry_count, is_p0, order_for_prompt
 # Pure, stdlib-only helpers (no boto3, no GitHub call) — the import graph is
 # acyclic: loop_verification -> issue_filer -> roadmap_pr -> schema, and none
 # of those imports agent.
@@ -389,7 +390,38 @@ def _warn_on_degraded_route(
 # tokens, which is the regime the 2026-08-14 run was in the run BEFORE the one
 # that failed. A run that crosses it has not failed and loses nothing: it says
 # so once, with the numbers attached, while there is still a week to act.
-DIRECTOR_PLAN_MEASURED_MAX_S = 228.0
+#
+# ── Re-anchored 2026-08-22, 228.0 -> 356.9 (alpha-engine-config-I8163) ───────
+#
+# 228.0 was the slowest of five uncensored calls on 2026-08-13. Two later
+# uncensored calls have since exceeded it, read from this module's own EMF
+# records in /aws/lambda/alpha-engine-evaluator-director:
+#
+#   2026-08-15 16:43Z  231.4s  outcome=ok  41 carry-over items  22,724 completion tokens
+#   2026-08-22 16:04Z  356.9s  outcome=ok  32 carry-over items  32,643 completion tokens
+#
+# so the old value no longer describes "the slowest duration this call is known
+# to REQUIRE" — it describes a call that stopped existing a week ago. Left
+# alone it also breaks the signal in the way this file already warns about for
+# `DirectorRouteFallback`: amber at 0.9 x 228 = 205.2s is below EVERY duration
+# the call has recorded since, so `DirectorPlanLatencyAmber` would pin at 1 on
+# every run, and an alarm that is always on is indistinguishable from one that
+# is stuck.
+#
+# **This is a PRE-cap anchor and is known to be one.** The re-measurement
+# alpha-engine-config-I8163 asks for cannot be taken here: it needs uncensored
+# calls made through this Lambda AFTER the carry-over cap below is deployed,
+# and the first of those is the next weekly run. Guessing a lower number to
+# stand in for it would be the stale-anchor failure with the sign flipped.
+# Tracked for re-anchoring from post-cap runs: alpha-engine-config-I8200.
+#
+# One thing the two measurements above already establish, and which the next
+# re-anchor should be read against: duration tracks COMPLETION tokens, not
+# carry-over count. 356.9s at 32 items was slower than 231.4s at 41, and both
+# sit at 91-98 tok/s. So the cap's contribution is bounded by how much of the
+# output it removes (one `carryover_review` disposition line per elided row),
+# not by the prompt characters it saves.
+DIRECTOR_PLAN_MEASURED_MAX_S = 356.9
 DIRECTOR_PLAN_AMBER_FRACTION = 0.9
 
 
@@ -411,6 +443,7 @@ def _emit_plan_latency(
     outcome: str,
     prompt_chars: int,
     carryover_items: int,
+    carryover_omitted: int = 0,
     usage=None,
     ceiling_s: float | None = None,
 ) -> dict:
@@ -448,6 +481,12 @@ def _emit_plan_latency(
         "DirectorPlanAmberSeconds": round(amber_s, 1),
         "DirectorPlanPromptChars": int(prompt_chars),
         "DirectorPlanCarryoverItems": int(carryover_items),
+        # The count ELIDED by the prompt cap (alpha-engine-config-I8163).
+        # Published on every run, including the 0 of an uncapped run: an
+        # omission metric that only appears when something was omitted is
+        # indistinguishable from a dead emitter, which is the same
+        # `principles.md` §2.7 rule that puts the 0 on DirectorRouteFallback.
+        "DirectorPlanCarryoverOmitted": int(carryover_omitted),
         "DirectorPlanPromptTokens": int(getattr(usage, "input_tokens", 0) or 0),
         "DirectorPlanCompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
         "DirectorPlanReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
@@ -462,22 +501,27 @@ def _emit_plan_latency(
             "has not failed; it is measurably closer to the ceiling than it "
             "was. alpha-engine-config-I7311: the inputs and the output this "
             "call must produce both grow, so this number trends up on its own "
-            "while the measured baseline does not.",
+            "while the measured baseline does not. carryover_omitted=%d "
+            "(alpha-engine-config-I8163) — a non-zero omission means the cap "
+            "is already binding, so the ledger, not the prompt, is where the "
+            "next reduction has to come from.",
             elapsed_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
             DIRECTOR_PLAN_MEASURED_MAX_S, outcome, record["DirectorPlanPromptChars"],
             record["DirectorPlanCarryoverItems"],
             record["DirectorPlanPromptTokens"],
             record["DirectorPlanCompletionTokens"],
             record["DirectorPlanReasoningTokens"],
+            record["DirectorPlanCarryoverOmitted"],
         )
     else:
         logger.info(
             "Director plan call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
-            "prompt_chars=%d carryover_items=%d prompt_tokens=%d "
-            "completion_tokens=%d",
+            "prompt_chars=%d carryover_items=%d carryover_omitted=%d "
+            "prompt_tokens=%d completion_tokens=%d",
             outcome, elapsed_s, amber_s, effective_ceiling_s,
             record["DirectorPlanPromptChars"],
             record["DirectorPlanCarryoverItems"],
+            record["DirectorPlanCarryoverOmitted"],
             record["DirectorPlanPromptTokens"],
             record["DirectorPlanCompletionTokens"],
         )
@@ -494,6 +538,7 @@ def _emit_plan_latency(
                         {"Name": "DirectorPlanPromptTokens", "Unit": "Count"},
                         {"Name": "DirectorPlanCompletionTokens", "Unit": "Count"},
                         {"Name": "DirectorPlanCarryoverItems", "Unit": "Count"},
+                        {"Name": "DirectorPlanCarryoverOmitted", "Unit": "Count"},
                     ],
                 }],
             },
@@ -785,19 +830,120 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
 #: ``build_messages``' signature because ``_invoke_with_retry`` is handed
 #: MESSAGES, not the artifacts they were built from, and widening that
 #: boundary to carry telemetry would couple the retry loop to the card.
+#:
+#: Since alpha-engine-config-I8163 this counts the rows the prompt actually
+#: CARRIES, not the rows the ledger holds — the two diverge the moment the cap
+#: below bites, and a metric named ``CarryoverItems`` that reported the ledger
+#: size would report a quantity this call no longer pays for.
 _CARRYOVER_COUNT_MARKER = "carry-over ledger, active items="
+
+#: Companion marker for the rows the cap ELIDED. Publishing the carried count
+#: without it is silent truncation, which `sf-pipeline-policy.md` §2.3 forbids:
+#: a plan produced from a truncated ledger has to say it was truncated, and it
+#: has to say so on a durable surface (the EMF record is stamped onto the
+#: archived plan by ``_invoke_with_retry``), not only in a log line that ages
+#: out (alpha-engine-config-I8163).
+_CARRYOVER_OMITTED_MARKER = "omitted from this prompt="
+
+
+# ── The prompt-side bound on the carry-over ledger (alpha-engine-config-I8163) ─
+#
+# `DIRECTOR_PLAN_CEILING_S` is now derived from AWS Lambda's 900s function
+# maximum, so **there is no third raise available**. The next time this call
+# outgrows its budget the only remaining lever is less work per call, and this
+# is that lever: the ledger is the one input to this prompt that grows on its
+# own (19 → 41 active items over the ten days the call went 87s → 205s).
+#
+# `carryover.ACTIVE_LEDGER_MAX_ITEMS` (40) does not cover this. That bound is
+# applied by `merge_plan_into_ledger` AFTER the plan is built, so the ledger the
+# PROMPT reads is the pre-merge one and nothing in the read path bounds it at
+# all — a growth-limiting bound that runs strictly downstream of the thing it is
+# supposed to protect.
+#
+# The derivation:
+#
+#     20 = every P0 and P1 row the live ledger carries (6 + 12 = 18,
+#          measured 2026-08-21 on s3://alpha-engine-research/director/
+#          carryover_ledger.json), plus two rows of slack
+#        = 0.5 × carryover.ACTIVE_LEDGER_MAX_ITEMS
+#
+# — i.e. the cap is set where today's whole above-P2 backlog fits inside it, so
+# in the normal case it elides only P2/P3 tail and the model sees everything it
+# would have seen anyway. It is a real ceiling only in the case it exists for.
+#
+# What a row costs, measured 2026-08-21 by rendering the live ledger against the
+# live report card through this exact function: a rendered row block is 282
+# chars on average and 457 at the worst, and the section as a whole was 8,320
+# chars of a 33,878-char prompt at 28 rows. But the prompt cost is the smaller
+# half. Every row also buys an OUTPUT obligation — `DirectorWeeklyActionPlan`'s
+# `carryover_review` takes one disposition line per row — and output is what
+# this call actually pays for: the 2026-08-22 run drew 32,643 completion tokens
+# (25,590 of them reasoning) against 15,328 prompt tokens. A row costs ~300
+# prompt chars and a paragraph of reasoning.
+CARRYOVER_PROMPT_MAX_ITEMS = 20
+
+# A second, independent bound, because the item cap alone cannot bound the
+# section: `title` and `rationale` are model-authored free text and a single
+# pathological row could be arbitrarily long. This is the one that makes the
+# bound hold BY CONSTRUCTION rather than by an assumption about row size, and
+# it is what `tests/test_director_carryover_prompt_bound.py` pins.
+#
+#     12,000 = 437 (the header + instruction block, measured)
+#            + 20 × 457 (the largest rendered row block measured on the live
+#                        ledger, applied to every row rather than the mean)
+#            + ~300 for the elision summary
+#            = 9,877, rounded up to 12,000 for headroom
+#
+# Deliberately NOT a truncation of individual rows: a row cut mid-sentence is a
+# row the model can misread, and a half-rendered claim is worse than an elided
+# one that is counted and named. When the budget binds, whole rows move to the
+# omitted set and are reported there.
+CARRYOVER_PROMPT_CHAR_BUDGET = 12_000
+
+#: Charged against the budget before any row is, so the budget bounds the WHOLE
+#: section and not just its body. It covers the header line, the live-card
+#: instruction block (437 chars measured), the P0 carve-out notice, the
+#: contradicted-row footer and the elision summary (~700 chars) — every part of
+#: the section whose size does not depend on how many rows survive the cap.
+#: Without it a section could pass the row loop at exactly the budget and then
+#: exceed it by adding the line that reports the elision, which is the one line
+#: that is guaranteed to be present whenever the budget bound in the first
+#: place.
+_SECTION_OVERHEAD_CHARS = 1_400
+
+#: The P0 carve-out (alpha-engine-config-I8163). A P0 is never elided, even when
+#: doing so breaches BOTH bounds above. If the active P0 set alone exceeds the
+#: cap, that is a finding about the backlog rather than a prompt-sizing problem,
+#: and the section says so in the prompt and in the metric — silently dropping
+#: the Director's own highest-priority carried commitment to save tokens is the
+#: one failure this whole change would not be worth causing.
+_P0_NEVER_ELIDED = True
 
 
 def _carryover_item_count(messages: list) -> int:
     """How many active ledger rows this prompt carries; 0 when there is no
     carry-over section (first cycle, empty ledger, or an injected test
     double's hand-built messages). Never raises."""
+    return _marker_count(messages, _CARRYOVER_COUNT_MARKER)
+
+
+def _carryover_omitted_count(messages: list) -> int:
+    """How many active ledger rows the cap elided from this prompt. 0 when
+    nothing was elided AND when there is no carry-over section at all — the
+    two are distinguished by ``_carryover_item_count``, which is 0 only in the
+    second case whenever the ledger is non-empty. Never raises."""
+    return _marker_count(messages, _CARRYOVER_OMITTED_MARKER)
+
+
+def _marker_count(messages: list, marker: str) -> int:
+    """First run of digits following ``marker`` in any message; 0 if absent."""
     for _, content in messages:
-        idx = str(content).find(_CARRYOVER_COUNT_MARKER)
+        text = str(content)
+        idx = text.find(marker)
         if idx < 0:
             continue
         digits = ""
-        for ch in str(content)[idx + len(_CARRYOVER_COUNT_MARKER):]:
+        for ch in text[idx + len(marker):]:
             if not ch.isdigit():
                 break
             digits += ch
@@ -806,9 +952,116 @@ def _carryover_item_count(messages: list) -> int:
     return 0
 
 
+def select_carryover_rows(rows: list[dict]) -> tuple[list[dict], list[dict], bool]:
+    """Split active ledger rows into ``(shown, omitted, p0_over_cap)``.
+
+    Pure and total: no I/O, no exceptions on malformed rows, and the same
+    ledger always splits the same way. Separated from the renderer so the
+    SELECTION — which changes what the Director decides, and is therefore the
+    design-bearing half of alpha-engine-config-I8163 — can be tested and argued
+    about without constructing a report card.
+
+    Ordering is ``carryover.order_for_prompt`` (priority, then weeks carried,
+    then first-seen); its full rationale lives there, next to the retirement
+    ordering it deliberately differs from.
+
+    ``p0_over_cap`` is True when the active P0 set alone is at or above
+    :data:`CARRYOVER_PROMPT_MAX_ITEMS`. Every P0 is still returned in ``shown``
+    — see :data:`_P0_NEVER_ELIDED` — so the flag is a statement about the
+    BACKLOG, not a fallback the caller has to handle.
+    """
+    ordered = order_for_prompt(rows)
+    p0 = [r for r in ordered if is_p0(r)]
+    rest = [r for r in ordered if not is_p0(r)]
+    if _P0_NEVER_ELIDED and len(p0) >= CARRYOVER_PROMPT_MAX_ITEMS:
+        return p0, rest, True
+    room = CARRYOVER_PROMPT_MAX_ITEMS - len(p0)
+    shown = order_for_prompt(p0 + rest[:room])
+    return shown, rest[room:], False
+
+
+def _row_block(it: dict, status_map: dict) -> tuple[list[str], bool]:
+    """Render one ledger row (header + live-card annotation) -> (lines, contradicted)."""
+    lines = [
+        f"  - [{it.get('id')}] {it.get('title')} "
+        f"(status={it.get('status')}, owner={it.get('proposed_owner')}, priority={it.get('priority')})"
+    ]
+    if not status_map:
+        return lines, False
+    # Wider than evidence_still_adverse's evidence-only scope on purpose:
+    # the claim the model restates lives in the TITLE (that is where
+    # "#7289" and "collapse" sat), so the title and rationale are read
+    # too. Safe to widen precisely because this annotates a prompt and
+    # reopens nothing.
+    hits = resolve_cited_metrics(
+        list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
+        status_map,
+    )
+    if not hits:
+        lines.append(
+            "      live card: no metric named by this row appears on this week's card "
+            "— its claim is UNVERIFIABLE against current data, so do not restate it as fact."
+        )
+        return lines, False
+    rendered = ", ".join(f"{n}={s or 'UNKNOWN'}" for n, s in sorted(hits.items()))
+    lines.append(f"      live card: {rendered}")
+    if all(s not in ADVERSE_STATUSES for s in hits.values()):
+        lines.append(
+            "      ⚠ CONTRADICTED BY THIS WEEK'S CARD — every metric this row names "
+            "is non-adverse now. Do NOT carry it forward on its existing wording."
+        )
+        return lines, True
+    return lines, False
+
+
+def _elision_summary(
+    omitted: list[dict], *, shown: int, budget_bound: bool, cap_bound: bool
+) -> str:
+    """The single counted line that replaces the elided tail.
+
+    A bare count is a weaker artifact than it looks: a reader who is told
+    "17 items were omitted" cannot tell whether the Director dropped a month of
+    unresolved P1s or a tail of P3 monitoring notes. So the line carries the
+    priority distribution, the oldest first-seen date, and the longest
+    carry-count in the omitted set — enough to answer "should I go and look?"
+    without opening the ledger.
+    """
+    from director.carryover import _parse_run_date  # local: pure helper, no cycle
+
+    dist = {}
+    for r in omitted:
+        dist[str(r.get("priority") or "unknown")] = dist.get(str(r.get("priority") or "unknown"), 0) + 1
+    rendered_dist = ", ".join(f"{k}×{v}" for k, v in sorted(dist.items()))
+    first_seen = sorted(
+        d for d in (_parse_run_date(r.get("first_seen")) for r in omitted) if d
+    )
+    oldest = first_seen[0].isoformat() if first_seen else "unknown"
+    longest = max((carry_count(r) for r in omitted), default=0)
+    reasons = []
+    if cap_bound:
+        reasons.append(f"the {CARRYOVER_PROMPT_MAX_ITEMS}-item prompt cap")
+    if budget_bound:
+        reasons.append(
+            f"the {CARRYOVER_PROMPT_CHAR_BUDGET:,}-character section budget"
+        )
+    why = " and ".join(reasons) or "the prompt bound"
+    return (
+        f"  + {len(omitted)} further active items are NOT shown above "
+        f"({_CARRYOVER_OMITTED_MARKER}{len(omitted)}): {rendered_dist}; "
+        f"oldest first seen {oldest}, longest carried {longest} consecutive runs. "
+        f"They were elided by {why} — the {shown} shown are the highest-priority, "
+        f"longest-carried rows (alpha-engine-config-I8163). Every omitted item "
+        f"remains OPEN in the carry-over ledger and is untouched by this plan. "
+        f"Their absence here is a PROMPT BOUND, not a disposition: do not mark "
+        f"them resolved, dropped or complete, do not restate them, and scope "
+        f"`carryover_review` to the items listed above."
+    )
+
+
 def _carryover_context(carryover: dict | None, report_card: dict | None = None) -> str:
     """Render the carry-over ledger for the prompt, EACH ROW RECONCILED
-    AGAINST THIS WEEK'S CARD (alpha-engine-config-I8178).
+    AGAINST THIS WEEK'S CARD (alpha-engine-config-I8178), and BOUNDED
+    (alpha-engine-config-I8163).
 
     Until 2026-08-22 this rendered ``id``/``title``/``status``/``owner``/
     ``priority`` straight out of the ledger and nothing else. Nothing on the
@@ -839,62 +1092,103 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     as P0 #4 anyway. Three of 28 rows cited only GREEN metrics; nine cited
     nothing worse than WATCH.
 
-    Rows are annotated, never dropped or reordered. A GREEN metric does not
-    prove an item is finished — the item may name work the metric does not
-    cover, and suppressing it here would be the close-and-look-away failure
-    ``loop_verification``'s own docstring refuses. The reader is told what
-    the card says and left to weigh it; the fix for reasoning from stale text
-    is putting the current fact NEXT TO the text, not deleting the text."""
+    Shown rows are annotated, never dropped or reordered *by the annotation*.
+    A GREEN metric does not prove an item is finished — the item may name work
+    the metric does not cover, and suppressing it here would be the
+    close-and-look-away failure ``loop_verification``'s own docstring refuses.
+    The reader is told what the card says and left to weigh it; the fix for
+    reasoning from stale text is putting the current fact NEXT TO the text, not
+    deleting the text.
+
+    **The cap is a separate mechanism from the annotation and must stay that
+    way.** The annotation says a row may be wrong; the cap says a row did not
+    fit. Neither is allowed to become the other: eliding a row because the card
+    contradicts it would be exactly the suppression the paragraph above
+    refuses, so the selection in :func:`select_carryover_rows` reads only
+    ``priority`` and ``carry_count`` and never the annotation's verdict. That
+    matters here specifically because the ledger is known to contain stale rows
+    (alpha-engine-config-I8178, open) — a selection rule that assumed every row
+    were true would rank on a claim nothing has re-measured.
+
+    The rendered section is bounded by :data:`CARRYOVER_PROMPT_MAX_ITEMS` and
+    :data:`CARRYOVER_PROMPT_CHAR_BUDGET`; whatever does not fit is replaced by
+    one counted, characterised summary line (:func:`_elision_summary`) rather
+    than disappearing.
+    """
     if not carryover or not carryover.get("items"):
         return "No prior action plan on record (this is the first cycle or the ledger is empty)."
-    items = carryover.get("items", [])
+    items = list(carryover.get("items") or [])
     status_map = component_status_map(report_card or {})
-    lines = [
-        f"Last week's open action items ({_CARRYOVER_COUNT_MARKER}{len(items)}):"
-    ]
+    shown, omitted, p0_over_cap = select_carryover_rows(items)
+
+    header: list[str] = []
     if status_map:
-        lines.append(
+        header.append(
             "  Each row is annotated with THIS WEEK'S status for every card metric it "
             "names ('live card:'). Those statuses come from the card above and OVERRIDE "
             "the row's own text, which may be weeks old and is not re-measured when it "
             "is carried. Where a row is marked CONTRADICTED, do not restate its claim: "
             "either re-ground the item in what the card now says, or mark it resolved."
         )
+    if p0_over_cap:
+        header.append(
+            f"  ⚠ P0 SET EXCEEDS THE PROMPT CAP: {len(shown)} of {len(items)} active "
+            f"items are priority P0, at or above the {CARRYOVER_PROMPT_MAX_ITEMS}-item cap. "
+            "Every P0 is carried regardless of the cap — a P0 is never elided — so this "
+            "section is deliberately over its budget. A P0 set this large is itself a "
+            "finding about the backlog and belongs in top_risks."
+        )
+
+    # The char budget is applied to the ROW BLOCKS, in rank order, and a row
+    # that does not fit moves whole into the omitted set. Applied after the P0
+    # carve-out, and never to a P0: the budget yields to the carve-out, not the
+    # other way round, or the carve-out would be advisory.
+    budget_bound = False
+    body: list[str] = []
+    spilled: list[dict] = []
     n_contradicted = 0
-    for it in items:
-        lines.append(
-            f"  - [{it.get('id')}] {it.get('title')} "
-            f"(status={it.get('status')}, owner={it.get('proposed_owner')}, priority={it.get('priority')})"
-        )
-        if not status_map:
+    used = _SECTION_OVERHEAD_CHARS + sum(len(line) + 1 for line in header)
+    for it in shown:
+        block, contradicted = _row_block(it, status_map)
+        cost = sum(len(line) + 1 for line in block)
+        if spilled or (not is_p0(it) and used + cost > CARRYOVER_PROMPT_CHAR_BUDGET):
+            # Once one row has spilled, every later (lower-ranked) row spills
+            # too — otherwise a short P3 could leapfrog a long P1 and the
+            # published ordering would not describe what was actually carried.
+            spilled.append(it)
             continue
-        # Wider than evidence_still_adverse's evidence-only scope on purpose:
-        # the claim the model restates lives in the TITLE (that is where
-        # "#7289" and "collapse" sat), so the title and rationale are read
-        # too. Safe to widen precisely because this annotates a prompt and
-        # reopens nothing.
-        hits = resolve_cited_metrics(
-            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
-            status_map,
-        )
-        if not hits:
-            lines.append(
-                "      live card: no metric named by this row appears on this week's card "
-                "— its claim is UNVERIFIABLE against current data, so do not restate it as fact."
-            )
-            continue
-        rendered = ", ".join(f"{n}={s or 'UNKNOWN'}" for n, s in sorted(hits.items()))
-        lines.append(f"      live card: {rendered}")
-        if all(s not in ADVERSE_STATUSES for s in hits.values()):
-            n_contradicted += 1
-            lines.append(
-                "      \u26a0 CONTRADICTED BY THIS WEEK'S CARD — every metric this row names "
-                "is non-adverse now. Do NOT carry it forward on its existing wording."
-            )
+        used += cost
+        body.extend(block)
+        n_contradicted += 1 if contradicted else 0
+    if spilled:
+        budget_bound = True
+        omitted = spilled + omitted
+        # Identity, not equality: two ledger rows can compare equal (a dict
+        # `==` over the same fields) without being the same row, and `in` over
+        # a list of dicts would then drop the wrong one.
+        _spilled_ids = {id(r) for r in spilled}
+        shown = [it for it in shown if id(it) not in _spilled_ids]
+
+    lines = [
+        f"Last week's open action items ({_CARRYOVER_COUNT_MARKER}{len(shown)}"
+        + (f" of {len(items)}" if omitted else "")
+        + "):"
+    ]
+    lines.extend(header)
+    lines.extend(body)
     if status_map and n_contradicted:
         lines.append(
-            f"  ({n_contradicted} of {len(items)} carry-over rows are contradicted by this "
+            f"  ({n_contradicted} of {len(shown)} carry-over rows shown are contradicted by this "
             f"week's card. A carried row is a claim about the PAST; the card is the present.)"
+        )
+    if omitted:
+        lines.append(
+            _elision_summary(
+                omitted,
+                shown=len(shown),
+                budget_bound=budget_bound,
+                cap_bound=len(omitted) > len(spilled),
+            )
         )
     return "\n".join(lines)
 
@@ -957,6 +1251,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
     # (alpha-engine-config-I7311).
     prompt_chars = sum(len(c) for _, c in messages)
     carryover_items = _carryover_item_count(messages)
+    carryover_omitted = _carryover_omitted_count(messages)
     for attempt in range(1, _MAX_RETRIES + 1):
         started = time.monotonic()
         try:
@@ -971,6 +1266,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 outcome=f"error:{type(e).__name__}",
                 prompt_chars=prompt_chars,
                 carryover_items=carryover_items,
+                carryover_omitted=carryover_omitted,
                 usage=None,
                 ceiling_s=cost,
             )
@@ -997,6 +1293,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 outcome="ok",
                 prompt_chars=prompt_chars,
                 carryover_items=carryover_items,
+                carryover_omitted=carryover_omitted,
                 usage=getattr(llm, "last_usage", None),
                 ceiling_s=cost,
             )
