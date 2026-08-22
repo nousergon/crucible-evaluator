@@ -565,46 +565,33 @@ def build_research_tile(
             na_detail="calibration_diagnostics: portfolio_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
         ))
 
-    # Breadth-conditioned momentum IC (config#1140) — DIAGNOSTIC surfacing the
-    # regime mechanism behind the negative funnel edge (config#1060). Grade on
-    # low_breadth_ic (the actionable harm: short-momentum should not anti-predict
-    # even in narrow breadth); the breadth<->IC correlation + high-breadth IC
-    # ride in the reason. Diagnostic criticality — informs, does not gate.
-    mri = e2e.get("momentum_regime_ic") or {}
-    if mri.get("status") == "ok" and mri.get("low_breadth_ic") is not None:
-        lo = mri.get("low_breadth_ic")
-        hi = mri.get("high_breadth_ic")
-        corr = mri.get("breadth_ic_corr")
-        # AMBIGUOUS(config#7485): the backtester producer's estimator for
-        # `momentum_regime_ic` isn't declared in this artifact (no `estimator`
-        # kwarg is passed here, unlike the rank-IC components above) — assumed
-        # rank-IC by convention with the file's other IC-typed metrics.
-        components.append(build_metric(
-            name="momentum_regime_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
-            value=lo, n_samples=mri.get("n_weeks"), n_floor=6,
-            unit=RANK_IC,
-            higher_is_better=True, source_path=e2e_src,
-            measurement_horizon="21d",
-            reason=(
-                f"momentum_regime_ic: tech_score momentum IC = {lo:+.3f} in low-breadth weeks vs "
-                f"{('%+.3f' % hi) if hi is not None else 'n/a'} in high-breadth "
-                f"(breadth<->IC corr {('%+.3f' % corr) if corr is not None else 'n/a'}, "
-                f"{mri.get('n_weeks')} weeks). Negative low-breadth IC = short-momentum mean-reverts "
-                f"in narrow tape — the regime mechanism behind the negative funnel edge "
-                f"(config#1060); validation target for the Phase-2 neutralization (config#1142)."
-            ),
-        ))
-    else:
-        components.append(build_metric(
-            name="momentum_regime_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
-            n_floor=6, higher_is_better=True, source_path=e2e_src,
-            input_present=False,
-            na_detail=(
-                f"momentum_regime_ic: no ok block in e2e_lift this cycle "
-                f"(status={mri.get('status')!r}); needs the backtester producer (config#1140) "
-                f"+ >=4 realized weekly cohorts."
-            ),
-        ))
+    # Breadth-conditioned momentum IC (config#1140) — RETIRED (alpha-engine-
+    # config-I8184, 2026-08-22). Its input table (research.db scanner_evaluations,
+    # tech_score) stopped being written 2026-07-17 and its producer was deleted
+    # in crucible-research e5ce507e (2026-08-20, "delete the retired research
+    # graph", alpha-engine-config-I7827) — the last caller of
+    # archive/manager.py::write_scanner_evaluations. The metric was frozen at
+    # n_weeks=17 permanently: it could never reach its floor, never refute
+    # itself, and its RED (low_breadth_ic=-0.0741, below the -0.05 red-line)
+    # drove Director P1 momentum-regime-neutralization-validate for three
+    # consecutive cycles with no possible resolution. Mirrors the
+    # ``_retired_component`` convention this file already uses for
+    # sector_teams_avg/cio (config-I2993 / PR128) — unconditional, since this
+    # is an evaluator-side retirement decision, not one the producer artifact
+    # declares in-band the way ``research_graph_retired`` does.
+    components.append(build_metric(
+        name="momentum_regime_ic", module=MODULE, metric_type="ic", criticality="diagnostic",
+        n_floor=1, band="unbanded", source_path=e2e_src,
+        arm="tech_score_momentum (scanner_evaluations, retired 2026-07-17)",
+        permanent_na_reason=(
+            "retired 2026-07-17: scanner_evaluations (research.db) stopped being "
+            "written the same date its only writer's last caller was removed "
+            "(crucible-research e5ce507e, alpha-engine-config-I7827) — measured "
+            "a table that no longer produces. No replacement feed has been named; "
+            "the regime-IC question is open, not superseded "
+            "(alpha-engine-config-I8184)."
+        ),
+    ))
 
     # neutralization_live_efficacy (critical, config#1187) — does the LIVE #1142
     # score-neutralization (cut over 2026-06-22) actually recover forward edge?

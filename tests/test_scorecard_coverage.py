@@ -403,7 +403,10 @@ class TestCoverageIsPublishedAtEveryLevel:
         """
         retired = card["grading_weights"]["retired_components"]["research"]
         by_name = {d["component"]: d for d in retired}
-        assert set(by_name) == {"cio", "sector_teams_avg"}
+        # alpha-engine-config-I8184 added momentum_regime_ic — diagnostic-only,
+        # never weight-tabled (weight_was is None), stamped for the same
+        # declared-not-silently-deleted reason as cio/sector_teams_avg.
+        assert set(by_name) == {"cio", "sector_teams_avg", "momentum_regime_ic"}
         for name, weight_was in (("cio", 0.20), ("sector_teams_avg", 0.25)):
             d = by_name[name]
             assert d["lifecycle"] == "RETIRED"
@@ -413,8 +416,16 @@ class TestCoverageIsPublishedAtEveryLevel:
             assert "config-I2993" in d["reference"]
             assert "I7210" in d["ruling"]
             assert d["superseded_by"]
-        # The 45% that used to be renormalized away is stated as a number.
-        assert sum(d["weight_was"] for d in retired) == pytest.approx(0.45)
+        mri_d = by_name["momentum_regime_ic"]
+        assert mri_d["lifecycle"] == "RETIRED"
+        assert mri_d["weight_was"] is None
+        assert mri_d["retired_date"] == "2026-07-17"
+        assert "I7827" in mri_d["reference"] or "I8184" in mri_d["ruling"]
+        # The 45% that used to be renormalized away is stated as a number —
+        # summed only over weight-tabled retirees (weight_was is not None).
+        assert sum(
+            d["weight_was"] for d in retired if d["weight_was"] is not None
+        ) == pytest.approx(0.45)
 
     def test_the_retired_components_are_still_emitted_and_marked_unweighted(self, card):
         """Removing a weight is not deleting the evidence. The blocks are still
