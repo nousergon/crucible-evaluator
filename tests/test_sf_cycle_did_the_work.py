@@ -170,7 +170,11 @@ def test_the_vacuous_success_watch_rerun_counts_as_a_non_clean_cycle(monkeypatch
     assert sf["n_cycles"] == 1
     assert sf["n_cycles_clean"] == 0
     assert sf["cycle_rate"] == 0.0
-    assert "vacuous_success" in sf["scope_detail"]["2026-08-15"]
+    # scope_detail is keyed "<sf-name>:<day>" since alpha-engine-config-I8183:
+    # the dict is shared across all three SFs, so keyed on the day alone a
+    # second SF running that day overwrote the first last-write-wins, and the
+    # card showed one pipeline while claiming to describe the day.
+    assert "vacuous_success" in sf["scope_detail"]["ne-weekly-freshness-pipeline:2026-08-15"]
 
 
 def test_the_no_op_recovery_does_not_make_the_real_2026_08_15_cycle_clean(monkeypatch):
