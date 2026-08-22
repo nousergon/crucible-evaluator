@@ -208,6 +208,89 @@ class TestGroomDegradedWindows:
         assert "sweep-only" in cr["status_reason"]
 
 
+class TestGroomDeclaredPause:
+    """alpha-engine-config-I8189: a DECLARED groom pause must render as
+    declared-off, never as 'the groomer did not run or its writer broke'."""
+
+    def _put_paused_lanes(self, s3, names):
+        s3.put_object(
+            Bucket=BUCKET,
+            Key="ops/checks/automation-pause-reconcile/paused_lanes.json",
+            Body=json.dumps({
+                "schema_version": 1,
+                "generated_at": "2026-08-22T09:50:00+00:00",
+                "paused": list(names),
+            }).encode(),
+        )
+
+    def test_declared_paused_lane_renders_permanent_na_not_missing_input(self, s3):
+        self._put_paused_lanes(s3, [
+            "alpha-engine-groom-lane-reconciler-5min",
+            "alpha-engine-groom-sweep-0000-daily",
+            "alpha-engine-groom-sweep-0800-daily",
+            "alpha-engine-groom-sweep-1600-daily",
+            "alpha-engine-scheduled-groom-0400-daily",
+            "alpha-engine-scheduled-groom-1200-daily",
+            "alpha-engine-scheduled-groom-2000-daily",
+            "alpha-engine-scheduled-groom-sun0900-weekly",
+        ])
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        assert len(comps) == 4
+        for c in (c.model_dump(mode="json") for c in comps):
+            assert c["permanent_na"] is True, c["name"]
+            assert c["status"].startswith("N/A"), c["name"]
+            reason = (c.get("permanent_na_reason") or c.get("status_reason") or "")
+            assert "I6617" in reason, c["name"]
+            assert "did not run or its writer broke" not in reason, c["name"]
+            assert c["criticality"] == "diagnostic", c["name"]
+
+    def test_unrelated_paused_lanes_do_not_declare_groom_off(self, s3):
+        # A paused-lane manifest that exists but names OTHER triggers must not
+        # be mistaken for a groom pause — membership, not mere presence.
+        self._put_paused_lanes(s3, ["alpha-engine-sweep-artifact-monitor"])
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        for c in (c.model_dump(mode="json") for c in comps):
+            assert c["status"] == "N/A-MISSING-INPUT", c["name"]
+            assert "write_run_artifact" in c["status_reason"], c["name"]
+
+    def test_missing_declaration_falls_back_to_missing_input(self, s3):
+        # No paused_lanes.json at all (pre-I8189 state, or the reconciler
+        # hasn't run yet) — must fall back to the old behavior, never assume
+        # "not paused" from an artifact that was never written.
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        for c in (c.model_dump(mode="json") for c in comps):
+            assert c["status"] == "N/A-MISSING-INPUT", c["name"]
+
+    def test_malformed_declaration_falls_back_to_missing_input(self, s3):
+        s3.put_object(
+            Bucket=BUCKET,
+            Key="ops/checks/automation-pause-reconcile/paused_lanes.json",
+            Body=b"{not json",
+        )
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        for c in (c.model_dump(mode="json") for c in comps):
+            assert c["status"] == "N/A-MISSING-INPUT", c["name"]
+
+    def test_partial_lane_membership_still_declares_off(self, s3):
+        # The pipeline shares one on/off state — even one of the eight
+        # schedules being in the declared-paused set is enough.
+        self._put_paused_lanes(s3, ["alpha-engine-groom-lane-reconciler-5min"])
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        for c in (c.model_dump(mode="json") for c in comps):
+            assert c["permanent_na"] is True, c["name"]
+
+    def test_un_pausing_returns_to_live_grading_with_no_code_change(self, s3):
+        # Runs present + no declared pause -> normal live grading, exactly as
+        # if this artifact never existed. Proves the reader is pointed at the
+        # manifest, not hardcoded to a fixed off state.
+        self._put_paused_lanes(s3, [])  # reconciler ran; nothing paused
+        _put_window_fixture(s3)
+        comps = build_groom_components(BUCKET, RUN_DATE, s3_client=s3)
+        cr = _comp(comps, "groom_completion_rate")
+        assert cr["value"] is not None
+        assert cr["status"] != "N/A-MISSING-INPUT"
+
+
 class TestGroomMalformedArtifacts:
     def test_unparseable_json_raises(self, s3):
         _put_run(s3, "2026-07-09", "190001", body=b"{not json")
