@@ -38,6 +38,7 @@
     "director": "readwrite",
     "_substrate": "readwrite",
     "groom": "read",
+    "ops": "read",
     "experiments": "readwrite",
     "_stage_coverage": "readwrite",
     "decision_artifacts": "readwrite"

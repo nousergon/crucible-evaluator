@@ -125,7 +125,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     "grading/tiles/behavioral.py": 1,
     "grading/tiles/director_quality.py": 1,
     "grading/tiles/executor.py": 1,
-    "grading/tiles/groom.py": 2,
+    # alpha-engine-config-I8189: _load_paused_lanes reads the pause-reconcile
+    # paused-lane declaration (ops/checks/automation-pause-reconcile/
+    # paused_lanes.json, nousergon-data infrastructure/pause_reconcile.py) so
+    # a declared groom pause never renders as an undeclared broken-producer
+    # gap — new "ops" read prefix, declared in grading/iam_s3_contract.json.
+    "grading/tiles/groom.py": 3,
     "grading/tiles/portfolio_outcome.py": 2,
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
