@@ -762,15 +762,56 @@ def build_backtester_tile(
         # this delta has no single clean unit. RANK_IC used as the
         # best-supported reading (matches meta_l2_ic/predictor.py's rank_ic
         # convention and the cpcv side, which dominates the "expected" leg).
+        #
+        # RELIABILITY IS DECLARED LOW, EXPLICITLY (alpha-engine-config-I8180).
+        # ``build_metric`` defaults a value-bearing critical to
+        # ``reliability="high"`` when the call site says nothing. That default
+        # is the right one for a metric whose estimator is clean; it is the
+        # wrong one here, and the silence of this call site is what published
+        # it. Every caveat this component carries is already written down
+        # DIRECTLY ABOVE — the AMBIGUOUS marker (two different estimators over
+        # two different horizons, so the delta has no single clean unit), and
+        # the threshold block's own words: "This first-cut band is UNVALIDATED
+        # against real drift data". A component cannot carry both of those and
+        # ``reliability: "high"``; until 2026-08-22 it did, and the card
+        # rendered a critical RED/F with a trend arrow off an instrument its
+        # own producer had marked ambiguous.
+        #
+        # ``"low"`` is the mechanism the contract already names for exactly
+        # this ("pass 'low' explicitly for a metric with a known validity
+        # caveat ... so the digest can flag it and the Director can hedge",
+        # grading/metric_record.py). It is NOT a retirement and NOT an N/A:
+        # the component still measures something real (live out-of-sample
+        # prediction IC against the backtest's own OOS expectation, N=547 on
+        # the 2026-08-22 card) and still grades. What changes is that
+        # ``director/report_card_digest.py`` now appends "reliability LOW —
+        # verify metric validity before acting" to its digest line, which is
+        # the surface the Director reads, and which it demonstrably honours.
+        #
+        # Do NOT drop this back to the default to "clean up" the call site.
+        # Removing it silently re-asserts high confidence in the delta. It
+        # comes off when the estimator mismatch is fixed or the band is
+        # validated, not before.
         components.append(build_metric(
             name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
             estimator="ic_delta", measurement_horizon="30d_live_vs_cpcv_oos",
+            reliability="low",
             value=drift, unit=RANK_IC, n_samples=rolling_n, n_floor=10,
             source_path=bvlp_src,
             reason=(f"backtest_vs_live_parity = {drift:+.3g} (live 30d rolling IC {live_ic:.3g} "
                     f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.3g}) "
                     f"vs target 0.0 / red-line -0.05. Negative = live underperforming what the "
-                    f"leak-free backtest promised (config#1153)."),
+                    f"leak-free backtest promised (config#1153). INSTRUMENT CAVEAT "
+                    f"(reliability LOW): the two legs are different estimators over "
+                    f"different horizons \u2014 a single-window Pearson r over 30d of resolved "
+                    f"prediction outcomes minus a leak-free CPCV mean RANK IC at the 21d "
+                    f"strategy horizon \u2014 and the target/red-line band is a first-cut, "
+                    f"UNVALIDATED against real drift data. Neither leg measures live "
+                    f"EXECUTION: ic_30d is computed from predictor_outcomes "
+                    f"(crucible-backtester analysis/production_health.py), not from fills "
+                    f"or orders, so this is prediction-skill drift and not a "
+                    f"backtest-vs-live fill-parity claim. Validate the instrument before "
+                    f"acting on the level or the trend."),
             **_tr("backtest_vs_live_parity", drift),
         ))
     else:
