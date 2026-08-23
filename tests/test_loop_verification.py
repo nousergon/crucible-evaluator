@@ -193,17 +193,20 @@ def test_does_not_escalate_below_threshold():
     assert result["open"] == 1
 
 
-def test_skips_items_without_issue_number():
+def test_reports_items_without_issue_number_as_unexamined():
     gh = FakeGitHub()
     item = _item(number=None)
     result = LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
-    assert result["open"] == 0 and result["closed_unrecovered"] == 0
+    assert result["examined"] == 0
+    assert result["skipped_no_issue"] == 1
+    assert result["corrections"] == 0
     assert gh.calls == []
 
 
-def test_bad_gh_response_is_skipped_not_fatal():
+def test_bad_gh_response_is_reported_as_unexamined():
     gh = FakeGitHub(issues={})  # 404 for any lookup
     item = _item(number=999)
     result = LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
-    assert result["open"] == 0
-    assert result["closed_unrecovered"] == 0
+    assert result["examined"] == 0
+    assert result["lookup_failed"] == 1
+    assert result["corrections"] == 0

@@ -204,7 +204,7 @@ class TestWithholding:
         out = H._verify_loop_best_effort(
             {"items": []}, _card(), "tok", verdict_block=V.read_card_verdict(_card(_PASS_BLOCK))
         )
-        assert out["director_loop"] == "ok"
+        assert out["director_loop"] == "partial"
         assert out["director_loop_open"] == 3
         assert "github 502" in out["director_loop_backfill_error"]
 

@@ -348,8 +348,12 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
 
     try:
         result = verify_and_correct(items, card, repo=DEFAULT_REPO, token=token)
-        out["director_loop"] = "ok"
         out.update({f"director_loop_{k}": v for k, v in result.items()})
+        out["director_loop"] = (
+            "partial"
+            if out.get("director_loop_backfill_error") or result.get("lookup_failed")
+            else "ok"
+        )
     except Exception as e:  # noqa: BLE001 — advisory correction pass; ledger already valid
         logger.warning("Director loop-verification failed (non-fatal): %s", e)
         out["director_loop"] = "error"
