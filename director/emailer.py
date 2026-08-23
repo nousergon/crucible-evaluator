@@ -53,20 +53,23 @@ def _as_dict(plan: Any) -> dict:
 
 
 _LOOP_SUMMARY_LABELS = (
+    ("examined", "examined"),
+    ("skipped_no_issue", "skipped: no issue number"),
+    ("lookup_failed", "not examined: GitHub lookup failed"),
+    ("backfilled", "backfilled"),
+    ("corrections", "corrections"),
     ("open", "open"),
     ("closed_verified", "closed & verified"),
-    ("closed_unrecovered", "closed but UNRECOVERED (reopened)"),
+    ("closed_unrecovered", "closed but UNRECOVERED"),
     ("closed_unverifiable", "closed, unverifiable"),
     ("escalated", "escalated to Decision Queue"),
 )
 
 
 def _loop_summary_line(loop_summary: dict | None) -> str | None:
-    """One line reporting Director-loop status (config#3145 point 4): items
-    open / closed-and-verified / closed-but-unrecovered / escalated. ``None``
-    if the pass didn't run this cycle (no GH token, or an error — those cases
-    still show up in the Lambda's own summary/logs, not worth cluttering the
-    digest email over)."""
+    """One line reporting Director-loop status (config#3145 point 4). It
+    shows verification coverage, backfill, and correction counts. A skipped,
+    failed, or partial pass is rendered explicitly; no-data is never green."""
     if not loop_summary:
         return None
     status = loop_summary.get("director_loop")
@@ -76,19 +79,37 @@ def _loop_summary_line(loop_summary: dict | None) -> str | None:
         # backfill still runs, and the reader is told BOTH halves. Reporting
         # nothing here would make a narrowed gate indistinguishable from the
         # pass having stopped — the exact confusion this ruling removed.
+        backfill = (
+            "backfill FAILED"
+            if loop_summary.get("director_loop_backfill_error")
+            else (
+                "ledger backfill ran and filled "
+                f"{loop_summary.get('director_loop_backfilled', 0)} issue number(s)"
+            )
+        )
         return (
             "Director loop: mutations WITHHELD (no reopen, no Decision Queue "
-            "escalation) on an unverified correctness verdict; ledger backfill "
-            f"ran and filled {loop_summary.get('director_loop_backfilled', 0)} "
-            "issue number(s)."
+            "escalation) on an unverified correctness verdict; "
+            f"{backfill}."
         )
-    if status != "ok":
+    if status in ("skipped", "error"):
+        detail = (
+            loop_summary.get("director_loop_reason")
+            or loop_summary.get("director_loop_error")
+            or "reason unavailable"
+        )
+        state = "NOT RUN" if status == "skipped" else "ERROR"
+        return f"Director loop: {state} — {detail}"
+    if status not in ("ok", "partial"):
         return None
     parts = [
         f"{loop_summary.get(f'director_loop_{key}', 0)} {label}"
         for key, label in _LOOP_SUMMARY_LABELS
     ]
-    return "Director loop: " + ", ".join(parts)
+    if loop_summary.get("director_loop_backfill_error"):
+        parts.append("backfill FAILED")
+    prefix = "PARTIAL — " if status == "partial" else ""
+    return "Director loop: " + prefix + ", ".join(parts)
 
 
 def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:

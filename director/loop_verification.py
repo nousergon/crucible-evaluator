@@ -136,17 +136,13 @@ def backfill_issue_numbers(
 ) -> int:
     """Fill ``issue_number`` on any ledger row missing it, by matching
     ``id=<slug>`` against the live ``area:director-proposals`` issues.
-    Mutates ``ledger_items`` in place; returns the count filled. Best-effort:
-    a fetch failure leaves rows as-is (they're simply skipped by
-    ``verify_and_correct`` this cycle, same as before this ran)."""
+    Mutates ``ledger_items`` in place and returns the count filled. A fetch
+    failure propagates to the handler, which records it explicitly rather than
+    rendering a failed repair as zero backfills."""
     missing = [it for it in ledger_items if not it.get("issue_number")]
     if not missing:
         return 0
-    try:
-        slug_map = slug_issue_number_map(repo, token, gh_request=gh_request)
-    except Exception as e:  # noqa: BLE001 — best-effort backfill
-        logger.warning("loop_verification: backfill fetch failed: %s", e)
-        return 0
+    slug_map = slug_issue_number_map(repo, token, gh_request=gh_request)
     filled = 0
     for it in missing:
         number = slug_map.get(it.get("id"))
@@ -177,6 +173,7 @@ def verify_and_correct(
     api = f"https://api.github.com/repos/{repo}"
 
     counts = {
+        "examined": 0, "skipped_no_issue": 0, "lookup_failed": 0, "corrections": 0,
         "open": 0, "closed_verified": 0, "closed_unrecovered": 0,
         "closed_unverifiable": 0, "escalated": 0,
     }
@@ -186,22 +183,27 @@ def verify_and_correct(
     for item in ledger_items:
         number = item.get("issue_number")
         if not number:
+            counts["skipped_no_issue"] += 1
             continue
         try:
             status, res = gh_request("GET", f"{api}/issues/{number}", token)
         except Exception as e:  # noqa: BLE001 — one bad item must not sink the pass
             logger.warning("loop_verification: GET issue #%s failed: %s", number, e)
+            counts["lookup_failed"] += 1
             continue
         if status != 200 or not isinstance(res, dict):
             logger.warning("loop_verification: GET issue #%s -> HTTP %s", number, status)
+            counts["lookup_failed"] += 1
             continue
 
+        counts["examined"] += 1
         if res.get("state") == "closed":
             outcome = evidence_still_adverse(item.get("evidence") or [], status_map)
             if outcome == "adverse":
                 counts["closed_unrecovered"] += 1
                 if _reopen_unrecovered(api, number, item, gh_request, token):
                     reopened.append(number)
+                    counts["corrections"] += 1
             elif outcome == "recovered":
                 counts["closed_verified"] += 1
             else:
@@ -215,6 +217,7 @@ def verify_and_correct(
             if _escalate_carryover(api, number, item, carry_count, gh_request, token):
                 item["escalated"] = True
                 counts["escalated"] += 1
+                counts["corrections"] += 1
                 escalated.append(number)
 
     return {**counts, "reopened_issues": reopened, "escalated_issues": escalated}

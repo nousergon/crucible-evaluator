@@ -98,3 +98,65 @@ def test_send_director_digest_never_raises_on_bad_plan(monkeypatch):
             raise ValueError("corrupt plan")
 
     assert de.send_director_digest(_Boom(), "2026-06-26") is False
+
+
+def test_director_digest_makes_unexamined_ledger_rows_visible():
+    """A zero-action result is not a clean Director loop when rows had no issue."""
+    _, plain, _ = de.build_director_digest(
+        _plan(),
+        "2026-06-26",
+        loop_summary={
+            "director_loop": "ok",
+            "director_loop_examined": 0,
+            "director_loop_skipped_no_issue": 28,
+            "director_loop_backfilled": 0,
+            "director_loop_corrections": 0,
+        },
+    )
+    assert "0 examined" in plain
+    assert "28 skipped: no issue number" in plain
+    assert "0 backfilled" in plain
+    assert "0 corrections" in plain
+
+
+def test_director_digest_marks_skipped_loop_not_run_in_plain_and_html():
+    _, plain, html = de.build_director_digest(
+        _plan(),
+        "2026-06-26",
+        loop_summary={"director_loop": "skipped", "director_loop_reason": "budget exhausted"},
+    )
+    assert "Director loop: NOT RUN — budget exhausted" in plain
+    assert "Director loop: NOT RUN — budget exhausted" in html
+
+
+def test_director_digest_marks_backfill_failure_partial_in_plain_and_html():
+    _, plain, html = de.build_director_digest(
+        _plan(),
+        "2026-06-26",
+        loop_summary={
+            "director_loop": "partial",
+            "director_loop_examined": 0,
+            "director_loop_skipped_no_issue": 28,
+            "director_loop_backfilled": 0,
+            "director_loop_corrections": 0,
+            "director_loop_backfill_error": "GitHub unavailable",
+        },
+    )
+    assert "Director loop: PARTIAL" in plain
+    assert "backfill FAILED" in plain
+    assert "Director loop: PARTIAL" in html
+    assert "backfill FAILED" in html
+
+
+def test_director_digest_marks_withheld_backfill_failure():
+    _, plain, html = de.build_director_digest(
+        _plan(),
+        "2026-06-26",
+        loop_summary={
+            "director_loop": "mutations_withheld",
+            "director_loop_backfilled": 0,
+            "director_loop_backfill_error": "GitHub unavailable",
+        },
+    )
+    assert "backfill FAILED" in plain
+    assert "backfill FAILED" in html
