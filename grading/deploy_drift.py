@@ -43,25 +43,11 @@ from pathlib import Path
 # own re-export comment.
 from nousergon_lib.preflight import _fetch_origin_main_sha, github_get_json
 
+from grading.deploy_paths import is_deploy_relevant_path
+
 log = logging.getLogger(__name__)
 
 _EVALUATOR_REPO = "nousergon/crucible-evaluator"
-
-# Path patterns that trigger a deploy (mirrors .github/workflows/deploy.yml
-# ``push.paths``). When a commit advances main but no changed file matches
-# these patterns, the drift gate must not flag it — the deploy pipeline
-# correctly skipped it, and the Lambda image is current for all code that
-# affects the deployed artifact.
-# (config#3710: PR #153 added .github/workflows/gate-label-guard.yml — not a
-# deploy-relevant path — which exposed this gap in the preflight gate.)
-_DEPLOY_PATH_PATTERNS = [
-    "grading/",
-    "director/",
-    "requirements",
-    "Dockerfile",
-    "infrastructure/deploy.sh",
-    ".github/workflows/deploy.yml",
-]
 
 # Lambda image convention (matches nousergon_lib.preflight._DEFAULT_GIT_SHA_FILE
 # and crucible-predictor's Dockerfile `RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt`).
@@ -133,9 +119,8 @@ def _has_deploy_relevant_changes(
 
     for f in files:
         filename = f.get("filename", "")
-        for pattern in _DEPLOY_PATH_PATTERNS:
-            if filename.startswith(pattern):
-                return True
+        if is_deploy_relevant_path(filename):
+            return True
     return False
 
 
