@@ -163,7 +163,7 @@ pandas~=3.0
 # this repo's CI is red until it has published. If a different krepis PR merges
 # first, correct this literal to the version actually published rather than
 # loosening the pin -- §139 pins first-party deps, never floors them.
-krepis[flow-doctor,openai]==0.59.27  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635)
+krepis[flow-doctor,openai]==0.59.31  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
