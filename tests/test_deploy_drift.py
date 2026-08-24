@@ -196,6 +196,14 @@ def test_has_deploy_relevant_changes_false_on_non_deploy_path(filename):
         ) is False
 
 
+def test_has_deploy_relevant_changes_fail_closed_on_unclassified_path():
+    """A file no declaration classifies must never silently clear drift."""
+    with _compare_returning_files([{"filename": "scripts/new_deploy_helper.py"}]):
+        assert dd._has_deploy_relevant_changes(
+            "nousergon/crucible-evaluator", SHA_A, SHA_B,
+        ) is True
+
+
 def test_has_deploy_relevant_changes_true_on_mixed_changes():
     # One deploy-relevant file among several non-relevant ones → True
     with _compare_returning_files([
