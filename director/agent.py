@@ -282,6 +282,33 @@ _RETRYABLE = (
     "overloaded", "rate", "429", "529", "timeout", "timed out", "connection",
 )
 
+# ── Type-classified retryables (alpha-engine-config-I8378) ──────────────────
+#
+# `_RETRYABLE` above matches by SUBSTRING on `str(e).lower()`, and that is
+# fragile against exactly the exception class the streaming change
+# (alpha-engine-config-I8164) introduced for the failure this loop most needs
+# to retry. `krepis.llm.StreamIdleTimeoutError`'s message reads "...aborting
+# on the inter-chunk idle budget, not on total duration" — it contains
+# neither "timeout" nor "timed out" nor any other `_RETRYABLE` substring, so a
+# transient inter-chunk silence (the streamed equivalent of the transport
+# hiccup this loop already retries under `openai.APITimeoutError`) raised
+# immediately on attempt 1, unretried, reproducing the exact 2026-08-22
+# symptom under the new call path that shipped seven days later to fix a
+# DIFFERENT failure mode (censored-with-zero-tokens).
+#
+# Classified by TYPE rather than folded into another message string: the
+# message is written to carry diagnostic evidence for a human
+# (`partial_text`/`chunks`/`elapsed`), not to be grep-stable for a retry
+# classifier, and the two obligations already conflicted once (this module's
+# own comment above documents `openai.APITimeoutError`'s 2026-08-13 case).
+# Lazy/guarded import: krepis.llm has no top-level `openai` import today
+# (verified against origin/main), but importing defensively keeps this
+# module's collection unaffected if that ever changes.
+try:
+    from krepis.llm import StreamIdleTimeoutError as _StreamIdleTimeoutError
+except ImportError:  # pragma: no cover — krepis is a hard pinned dependency; defensive only
+    _StreamIdleTimeoutError = ()  # type: ignore[assignment]
+
 # ── The attempt multiplier (config#7126) ─────────────────────────────────────
 #
 # A single `llm.invoke()` used to be able to make FOUR timeout-bounded model
@@ -1628,7 +1655,14 @@ def _invoke_with_retry(llm, messages, *, budget=None):
             )
             last = e
             msg = str(e).lower()
-            if attempt >= _MAX_RETRIES or not any(t in msg for t in _RETRYABLE):
+            # alpha-engine-config-I8378: type-classified in addition to the
+            # message-substring set — StreamIdleTimeoutError's message names
+            # what it is NOT ("not on total duration") rather than containing
+            # a `_RETRYABLE` keyword, so it must be caught by isinstance.
+            is_retryable = isinstance(e, _StreamIdleTimeoutError) or any(
+                t in msg for t in _RETRYABLE
+            )
+            if attempt >= _MAX_RETRIES or not is_retryable:
                 raise
             delay = min(2 ** attempt, 30)
             if cost is not None and not budget.can_afford(cost + delay):
