@@ -66,6 +66,7 @@ from director.agent import (
     _warn_on_degraded_route,
 )
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
+from director.loop_verification import component_status_map, resolve_cited_metrics
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
@@ -626,13 +627,31 @@ def _prior_plan_summary(prior_plan: dict) -> str:
     return "\n".join(lines)
 
 
+def _prior_plan_pinned_components(prior_plan: dict, status_map: dict) -> set[str]:
+    """Same pinning as ``director.agent._open_carryover_pinned_components``,
+    over the PRIOR PLAN's action items rather than the ledger — the retro
+    judge grades calibration (did the risks this plan flagged materialize?),
+    which it cannot do for a cited metric that recovered to GREEN and was
+    never named on the card digest (alpha-engine-config-I8380)."""
+    if not status_map:
+        return set()
+    names: set[str] = set()
+    for it in prior_plan.get("action_items") or []:
+        names |= set(resolve_cited_metrics(
+            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
+            status_map,
+        ).keys())
+    return names
+
+
 def build_messages(prior_plan: dict, current_card: dict) -> list:
     """Assemble (system, human) messages for the retro judge call."""
+    pinned = _prior_plan_pinned_components(prior_plan, component_status_map(current_card or {}))
     human = [
         _prior_plan_summary(prior_plan),
         "",
         "CURRENT REPORT CARD (the realized outcome ~1 week later):",
-        summarize_report_card(current_card),
+        summarize_report_card(current_card, pinned_components=pinned),
         "",
         "Grade the prior plan now (grounding / calibration / actionability). "
         "Set prior_run_date to the prior plan's run_date.",

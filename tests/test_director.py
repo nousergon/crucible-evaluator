@@ -165,6 +165,41 @@ class TestDigest:
         assert "reliability LOW" in text
         assert "horizon 5d" in text
 
+    def test_unpinned_green_is_counted_not_named(self):
+        # Baseline: with no pinned_components, sharpe_ratio (GREEN) is only
+        # counted in the tile head, never named/expanded — the defect
+        # alpha-engine-config-I8380 is about.
+        text = summarize_report_card(_CARD)
+        assert "1 GREEN" in text  # portfolio_outcome tile head count
+        assert "sharpe_ratio" not in text
+
+    def test_pinned_green_component_is_named_with_value(self):
+        # alpha-engine-config-I8380 closes-when: a GREEN component named by an
+        # open carry-over item must appear, by name and value, in the digest.
+        text = summarize_report_card(_CARD, pinned_components={"sharpe_ratio"})
+        assert "sharpe_ratio" in text
+        assert "value 1.2" in text
+        assert "carryover-pinned" in text
+        # Still counted in the head alongside being named.
+        assert "1 GREEN" in text
+
+    def test_pinned_na_component_is_named(self):
+        text = summarize_report_card(_CARD, pinned_components={"dsr"})
+        assert "  - dsr " in text
+        assert "carryover-pinned" in text
+        # No longer folded into the bare N/A×1 rollup line.
+        assert "N/A-NOT-IMPL×1" not in text
+
+    def test_pinned_adverse_component_not_duplicated(self):
+        # A pinned name that is already RED/WATCH is expanded once (by the
+        # adverse loop), not twice.
+        text = summarize_report_card(_CARD, pinned_components={"information_ratio"})
+        assert text.count("information_ratio") == 1
+
+    def test_absent_from_card_note_present(self):
+        text = summarize_report_card(_CARD)
+        assert "'Not visible on this card' is true ONLY for a metric absent" in text
+
 
 class TestAgent:
     def test_build_messages_has_digest_and_carryover(self):
@@ -189,6 +224,23 @@ class TestAgent:
     def test_build_messages_omits_resolved_section_when_absent(self):
         msgs = build_messages(_CARD)
         assert "Recently INVESTIGATED & RESOLVED" not in msgs[1][1]
+
+    def test_build_messages_pins_carryover_cited_green_component(self):
+        # alpha-engine-config-I8380 — a carry-over item citing a component
+        # that has since recovered to GREEN must have that component named
+        # (not just counted) in the digest half of the human message.
+        msgs = build_messages(
+            _CARD,
+            carryover={"items": [{
+                "id": "watch-sharpe", "title": "Watch sharpe_ratio recovery",
+                "rationale": "sharpe_ratio was RED, monitor for recovery.",
+                "evidence": ["sharpe_ratio"], "status": "carried_over",
+            }]},
+        )
+        human = msgs[1][1]
+        assert "sharpe_ratio" in human
+        assert "value 1.2" in human
+        assert "carryover-pinned" in human
 
     def test_build_action_plan_injected_llm(self):
         plan = build_action_plan(_CARD, llm=_FakeLLM(_plan()))
