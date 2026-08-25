@@ -30,8 +30,13 @@ The LLM is injectable (``llm=``) so the build/validate + tests run without a
 key or krepis installed; ``_default_llm()`` lazily constructs the real client.
 The registry reaches this Lambda by S3 download at handler startup
 (``handler.py::_ensure_registry``), which sets ``LLM_MODEL_REGISTRY_PATH`` —
-krepis Tier 1. An AppConfig path is also wired and permanently shadowed by
-it; removing the dead one is alpha-engine-config-I6187.
+krepis Tier 1, and now the only path. The dead AppConfig fallback that used to
+sit permanently shadowed behind it was deleted in PR263
+(alpha-engine-config-I6187, closed); the S3 download fails loud rather than
+degrading onto a second source.
+
+The plan call is **streamed** (alpha-engine-config-I8164). See
+``DIRECTOR_PLAN_IDLE_TIMEOUT_S`` for what that bounds and what it does not.
 Migrated from claude-opus-4-8 direct Anthropic → OpenRouter 2026-07-24, then
 → krepis.router.resolve_group_structured("ultra") 2026-08-02.
 """
@@ -138,7 +143,101 @@ DIRECTOR_GROUP = "ultra"
 # proxy_read_timeout 360s -> 900s in the same arc for exactly that reason; a
 # client deadline at or above the edge's hands the timeout to nginx and it
 # stops being attributable to this call site.
+#
+# ── WHAT STREAMING DOES TO THIS NUMBER (alpha-engine-config-I8164) ───────────
+#
+# It still binds, and it binds a DIFFERENT QUANTITY. Say so here rather than
+# leaving the derivation above reading as though nothing moved.
+#
+# The quote below is still what the client is built with, and krepis still
+# hands it to the SDK as `OpenAI(timeout=...)`. A bare float there becomes
+# httpx's timeout on every phase — connect, read, write, pool — and a READ
+# timeout bounds the gap between reads, not the life of the request. On a
+# non-streamed call there is exactly one read, so read-bound and total-bound
+# were the same number and nothing here had to distinguish them. On a streamed
+# call there are thousands, so:
+#
+#   * 600s remains a hard bound on CONNECT and on any single silent read. It is
+#     the outer backstop behind DIRECTOR_PLAN_IDLE_TIMEOUT_S, which fires first
+#     at 90s and fires with evidence.
+#   * 600s no longer bounds TOTAL duration. A stream that keeps producing
+#     chunks resets the read clock with every one of them.
+#
+# The remaining total bound is the Lambda's 900s wall, minus what
+# `budget.quote(..., downstream_s=RETRO_JUDGE_RESERVE_S)` reserves — and
+# `_invoke_with_retry` enforces that only BEFORE a call, by declining to start
+# one it cannot afford. Nothing interrupts a call already in flight. That is a
+# real narrowing of what this ceiling guarantees, and it is stated rather than
+# absorbed: the correct home for a total-duration bound on a streamed call is
+# krepis (a `total_timeout` beside `idle_timeout`, bounding the accumulation
+# loop that already tracks `elapsed`), not a second deadline hand-rolled at this
+# call site next to the pump that owns one. Filed as
+# alpha-engine-config-I8348.
+#
+# The exposure that narrowing buys is small and is bounded on the other side by
+# measurement: the uncensored plan calls draw 18.2k-23.3k completion tokens at
+# 99-109 tok/s, and streaming does not change generation rate. Reaching 900s
+# would take a generation running ~4x slower than any yet observed while never
+# once falling silent for 90s. Against that: the failure this replaces has
+# already killed a weekly run and its rerun, four attempts, zero tokens.
 DIRECTOR_PLAN_CEILING_S = 600.0
+
+# ── The liveness bound (alpha-engine-config-I8164) ───────────────────────────
+#
+# The plan call streams. `DIRECTOR_PLAN_CEILING_S` above is a bound on WAITING;
+# this is a bound on SILENCE, and the difference is the whole point of the
+# change. Four consecutive 2026-08-22 attempts were censored at the then-340s
+# ceiling with ZERO completion tokens each — after ~340s of a wholly opaque
+# socket, the only fact the failure carried was its own duration. Under
+# streaming the same failure carries the partial generation, the chunk count and
+# the elapsed time on `krepis.llm.StreamIdleTimeoutError`, because the thing
+# being bounded is now a measurable quantity rather than the absence of one.
+#
+# WHY 90 AND NOT `1.5 x measured`. The measured inter-chunk silence on both
+# `ultra` arms, probed 2026-08-25 through each row's own egress-proxy path with
+# `stream_options.include_usage`:
+#
+#     glm-5.2-direct   979 chunks / 83.2s   largest silence 3.72s
+#     deepseek-v4-pro 5529 chunks / 90.0s   largest silence 1.64s
+#
+# In BOTH runs the largest silence in the whole call was the time to the FIRST
+# chunk; every gap after it is sub-millisecond at the median, and neither
+# reasoning model buffered its trace into a silent block. So the quantity this
+# constant must cover is the first-chunk wait, and `3.72 x 1.5` would be a
+# reckless reading of it: those probes used a 93- and a 166-token prompt, while
+# the Director's is ~11,212 prompt tokens (the uncensored 2026-08-13 sample set
+# below). Time-to-first-chunk is prefill-dominated, so 3.72s is a FLOOR on the
+# real first-chunk wait on this call site, not an estimate of it.
+#
+# The asymmetry decides the number. A budget set too LOOSE costs a slower
+# failure inside a bound that still exists. A budget set too TIGHT aborts a
+# healthy plan call and looks exactly like the outage it replaced. With no
+# Lambda-shaped first-chunk measurement in hand, the correct move is the loose
+# side of the unmeasured quantity:
+#
+#     90s = ~24x the largest silence measured on the ultra primary
+#         = ~1/6.7 of the 600s that is currently the effective liveness bound
+#
+# It is stated as a literal here rather than inherited from krepis'
+# `DEFAULT_STREAM_IDLE_TIMEOUT_S` — which is also 90.0 today — deliberately, and
+# for the same reason `_STRUCTURED_ATTEMPTS` is explicit: a library default is a
+# figure chosen for an unknown call site, and letting it move this call site's
+# liveness bound silently is how a knob stops meaning what its comment says. The
+# coincidence is a coincidence.
+#
+# It must stay strictly BELOW the client's transport timeout or it can never
+# fire: krepis warns on `idle_timeout >= LLMClient(timeout=...)` because the
+# transport's read deadline would bind first. The quoted timeout is derived from
+# `DIRECTOR_PLAN_CEILING_S` (600s) and floored by the budget, so 90 is safe by a
+# wide margin; `tests/test_director_streaming_plan_call.py` asserts the ordering
+# rather than trusting it.
+#
+# RE-ANCHOR TRIGGER: the first weekly run that completes a streamed plan call
+# emits its own inter-chunk distribution. `alpha-engine-config-I8200` (gated on
+# the 2026-08-29 weekly run) re-anchors `DIRECTOR_PLAN_MEASURED_MAX_S`; this
+# constant should be re-derived in the same pass, against the measured
+# Lambda-shaped first-chunk wait, and is expected to come DOWN.
+DIRECTOR_PLAN_IDLE_TIMEOUT_S = 90.0
 
 # Where this module runs, declared rather than inferred (model-router-policy
 # R29). krepis filters the fallback chain by the registry's `reachable_from`,
@@ -727,10 +826,19 @@ class _KrepisStructuredDirector:
     #: second try; a call censored at its full quote must not).
     attempt_cost_s = DIRECTOR_PLAN_CEILING_S
 
+    #: Inter-chunk silence one streamed attempt may contain — the LIVENESS
+    #: bound, as distinct from ``attempt_cost_s`` above, which is how long the
+    #: invocation budget is told to expect the attempt to take. Injectable so a
+    #: test can drive the bound without reaching into the module constant, and
+    #: defaulted so every existing caller and test double is unchanged.
+    idle_timeout_s = DIRECTOR_PLAN_IDLE_TIMEOUT_S
+
     def __init__(self, client, *, director_model: str, primary_model: str | None = None,
-                 attempt_cost_s: float | None = None):
+                 attempt_cost_s: float | None = None, idle_timeout_s: float | None = None):
         if attempt_cost_s is not None:
             self.attempt_cost_s = attempt_cost_s
+        if idle_timeout_s is not None:
+            self.idle_timeout_s = idle_timeout_s
         self._client = client
         self._director_model = director_model
         #: The group's declared primary, as the BILLABLE UPSTREAM id
@@ -778,6 +886,25 @@ class _KrepisStructuredDirector:
             # Explicit, not krepis' default of 2 — see `_STRUCTURED_ATTEMPTS`.
             # Inheriting the default silently doubled every quoted budget.
             attempts=_STRUCTURED_ATTEMPTS,
+            # alpha-engine-config-I8164. krepis re-assembles the streamed
+            # response into the same `ChatCompletion`-shaped object a
+            # non-streamed call returns, so the empty-content diagnostics, the
+            # budget-exhaustion guard, the served-model resolution and usage
+            # extraction all run unchanged — `_stamp_route_degradation` below
+            # reads `result.model` exactly as before. This is a change to how
+            # the bytes arrive, not to what this method returns.
+            #
+            # It does NOT silently degrade: a route that does not declare
+            # `capabilities.streaming` raises `StreamingUnsupportedError`
+            # rather than sending a non-streamed request, because a non-streamed
+            # request would come back as a perfectly valid completion carrying
+            # the exact opaque-deadline failure envelope this change removes.
+            # `_default_llm` therefore states the requirement at RESOLVE time
+            # (`requires=("streaming",)`), so the failure, when there is one,
+            # names the registry entry to fix instead of appearing 600s into a
+            # weekly run.
+            stream=True,
+            idle_timeout=self.idle_timeout_s,
         )
         self.last_usage = getattr(result, "usage", None)
         plan: DirectorWeeklyActionPlan = result.parsed
@@ -843,10 +970,31 @@ def _default_llm(budget=None) -> _KrepisStructuredDirector:
     # is a statement about where it is running, not about which routes it
     # wants (model-router-policy §2 layer 5, R29). `wire=openai` because this
     # call site speaks the OpenAI wire format.
+    #
+    # `requires=("streaming",)` states the REQUEST SHAPE, which is the only
+    # other thing (besides where it runs) this module is allowed to say about
+    # routing — `model-router-policy` R32: the consumer names what its shape
+    # requires, the derivation drops members that do not declare it BEFORE a
+    # primary is chosen, and a group with no such member fails at RESOLVE time
+    # naming the group, the capability and each rejected member.
+    #
+    # Declaring it is not decoration. Without it the chain would be filtered
+    # only on reachability and the first `structured(stream=True)` would raise
+    # `StreamingUnsupportedError` deep inside the call instead — the same
+    # outcome, reported later and with less to act on. With it, a registry in
+    # which `ultra`'s primary has lost `capabilities.streaming` is a named
+    # failure before any token is billed.
+    #
+    # Measured against the registry on 2026-08-25 (alpha-engine-config-I8164):
+    # before the declaration landed this call raised
+    # `CapabilityUnavailableError` from BOTH `laptop` and `lambda`; after it,
+    # both resolve `litellm_proxy` / `ultra-glm-5.2-direct` with
+    # `supports_streaming=True`. A group route declares its PRIMARY's flag.
     spec, route = resolve_group_spec(
         DIRECTOR_GROUP,
         exec_context=DIRECTOR_EXEC_CONTEXT,
         wire="openai",
+        requires=("streaming",),
     )
     _assert_routed_through_the_proxy(route)
     _warn_on_degraded_route(route)
