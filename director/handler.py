@@ -550,17 +550,18 @@ def _ensure_registry(bucket: str, s3) -> None:
     """Download LLM_MODEL_REGISTRY.yaml from S3 to /tmp and point krepis at it.
 
     The Director runs in a public-repo Lambda without ``private-docs/`` on disk,
-    and AppConfig resolution (krepis 0.26.0 Tier 2) depends on a boto3 version
-    with the ``appconfigdata`` client.  Rather than debugging that in CI-deploy
-    loops, the registry is uploaded to S3 (``director/LLM_MODEL_REGISTRY.yaml``)
-    and downloaded here — the fastest, most reliable path.  Sets
-    ``LLM_MODEL_REGISTRY_PATH`` so krepis finds it at Tier 1 (env var override).
+    so the registry is uploaded to S3 (``director/LLM_MODEL_REGISTRY.yaml``) and
+    downloaded here — the sole delivery path (alpha-engine-config-I6187 removed
+    the AppConfig Tier 2 fallback: one registry file is the source of truth,
+    model-router-policy R1). Sets ``LLM_MODEL_REGISTRY_PATH`` so krepis finds it
+    at Tier 1 (env var override).
 
     Idempotent: skips if the file already exists or the env var is already set.
-    **Best-effort** — a missing or unreachable registry produces a WARNING, never
-    raises.  The downstream ``_default_llm()`` → ``resolve_group_structured()``
-    call will fail with its own ``FileNotFoundError`` if the registry is truly
-    absent, which is a clearer error than wrapping S3 failures here.
+    **Fails loud** — a missing or unreachable registry raises. With exactly one
+    delivery path there is no legitimate fallback: silently proceeding would
+    let krepis resolve against whatever registry copy Tier 2/3 finds next
+    (model-router-policy R20), and the only prior signal was a WARNING in a
+    weekly Lambda's logs.
     """
     import os as _os
 
@@ -573,13 +574,12 @@ def _ensure_registry(bucket: str, s3) -> None:
         try:
             s3.download_file(bucket, "director/LLM_MODEL_REGISTRY.yaml", dest)
         except ClientError as exc:
-            logger.warning(
-                "Director: cannot download LLM_MODEL_REGISTRY.yaml from "
-                "s3://%s/director/ — %s. krepis will fail with its own error "
-                "if the registry is truly absent.",
-                bucket, exc,
-            )
-            return
+            raise RuntimeError(
+                f"Director: cannot download LLM_MODEL_REGISTRY.yaml from "
+                f"s3://{bucket}/director/ — {exc}. This is the only registry "
+                f"delivery path; the Director cannot resolve a model group "
+                f"without it."
+            ) from exc
     _os.environ["LLM_MODEL_REGISTRY_PATH"] = dest
     logger.info("Director registry cached from s3://%s/director/", bucket)
 
@@ -706,11 +706,11 @@ def _run(event: dict | None = None, context=None) -> dict:
     s3 = boto3.client("s3")
 
     # Ensure the model registry is resolvable before any Director LLM call.
-    # This Lambda runs in a public repo without private-docs/ on disk, and
-    # AppConfig resolution (krepis 0.26.0 Tier 2) depends on the appconfigdata
-    # boto3 client which may not be available.  The registry lives at
-    # s3://<bucket>/director/LLM_MODEL_REGISTRY.yaml — downloaded to /tmp and
-    # wired via LLM_MODEL_REGISTRY_PATH for krepis Tier 1 (env var override).
+    # This Lambda runs in a public repo without private-docs/ on disk. The
+    # registry lives at s3://<bucket>/director/LLM_MODEL_REGISTRY.yaml —
+    # downloaded to /tmp and wired via LLM_MODEL_REGISTRY_PATH for krepis
+    # Tier 1 (env var override). Sole delivery path (alpha-engine-config-I6187
+    # removed the AppConfig Tier 2 fallback) — raises if unreachable.
     _ensure_registry(bucket, s3)
 
     # Ensure the LiteLLM proxy master key is resolvable as an env var before
