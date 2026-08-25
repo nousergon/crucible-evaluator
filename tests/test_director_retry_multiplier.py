@@ -222,6 +222,84 @@ def test_a_non_retryable_error_is_not_retried():
 
 
 # ---------------------------------------------------------------------------
+# StreamIdleTimeoutError (alpha-engine-config-I8378) — type-classified,
+# because its message contains no _RETRYABLE substring
+# ---------------------------------------------------------------------------
+
+class _IdleTimeoutLLM:
+    """Raises krepis.llm.StreamIdleTimeoutError every time, counting attempts."""
+
+    def __init__(self, *, attempt_cost_s=None):
+        self.calls = 0
+        if attempt_cost_s is not None:
+            self.attempt_cost_s = attempt_cost_s
+
+    def invoke(self, messages):
+        self.calls += 1
+        from krepis.llm import StreamIdleTimeoutError
+
+        raise StreamIdleTimeoutError(
+            "provider=x model=y: the stream produced no chunk for 90s after "
+            "12 chunk(s) and 340 character(s) over 91s — aborting on the "
+            "inter-chunk idle budget, not on total duration.",
+            partial_text="partial",
+            chunks=12,
+            idle_timeout=90.0,
+            elapsed=91.0,
+        )
+
+
+def test_stream_idle_timeout_message_matches_no_retryable_substring():
+    """Confirms the gap this fix closes: the message alone would not retry."""
+    msg = (
+        "provider=x model=y: the stream produced no chunk for 90s after 12 "
+        "chunk(s) and 340 character(s) over 91s — aborting on the "
+        "inter-chunk idle budget, not on total duration."
+    ).lower()
+    assert not any(t in msg for t in _RETRYABLE), (
+        "StreamIdleTimeoutError's message now matches a _RETRYABLE substring "
+        "— the type-classification branch in _invoke_with_retry may be dead "
+        "code; keep it anyway (message shape is not a stable contract) but "
+        "update this assertion to reflect the new message."
+    )
+
+
+def test_a_stream_idle_timeout_is_retried_by_type():
+    llm = _IdleTimeoutLLM(attempt_cost_s=DIRECTOR_PLAN_CEILING_S)
+    with pytest.raises(RuntimeError):
+        _invoke_with_retry(llm, [], budget=InvocationBudget.from_context(None))
+    assert llm.calls == _MAX_RETRIES, (
+        "a StreamIdleTimeoutError must be retried like any other transient "
+        "transport failure — it is the streamed equivalent of the transport "
+        "hiccup this loop already retries under openai.APITimeoutError"
+    )
+
+
+def test_a_stream_idle_timeout_recovers_on_a_later_attempt():
+    from krepis.llm import StreamIdleTimeoutError
+
+    class _RecoveringLLM:
+        attempt_cost_s = DIRECTOR_PLAN_CEILING_S
+
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls < 2:
+                raise StreamIdleTimeoutError(
+                    "the stream produced no chunk for 90s — aborting on the "
+                    "inter-chunk idle budget, not on total duration.",
+                )
+            return "ok"
+
+    llm = _RecoveringLLM()
+    result = _invoke_with_retry(llm, [], budget=InvocationBudget.from_context(None))
+    assert result == "ok"
+    assert llm.calls == 2
+
+
+# ---------------------------------------------------------------------------
 # Both adapters declare what an attempt costs
 # ---------------------------------------------------------------------------
 
