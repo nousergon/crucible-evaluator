@@ -99,6 +99,13 @@ def s3():
     with mock_aws():
         client = boto3.client("s3", region_name="us-east-1")
         client.create_bucket(Bucket=BUCKET)
+        # alpha-engine-config-I6187: S3 is the sole registry delivery path,
+        # and `_ensure_registry` now raises when it is absent — seed a
+        # placeholder registry object so every test using this fixture
+        # reflects a healthy bucket by default. Tests exercising the failure
+        # path itself (TestEnsureRegistryFailsLoud) delete this object first.
+        client.put_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml",
+                          Body=b"groups: {}\n")
         yield client
 
 
@@ -579,6 +586,62 @@ class TestHandler:
         from director import handler as H
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET, "dry_run": True})
         assert out["status"] == "disabled"
+
+
+class TestEnsureRegistryFailsLoud:
+    """alpha-engine-config-I6187: with the AppConfig Tier 2 fallback removed,
+    S3 is the ONLY registry delivery path — a failed download must raise, not
+    warn-and-continue. Regression guard for the prior best-effort behavior
+    (`_ensure_registry` used to log a WARNING and return, leaving
+    `LLM_MODEL_REGISTRY_PATH` unset and the run to silently resolve against
+    whatever a lower tier found)."""
+
+    def test_missing_registry_object_raises(self, s3, monkeypatch):
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        s3.delete_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml")
+        # `_ensure_registry` skips the S3 round-trip entirely if
+        # /tmp/LLM_MODEL_REGISTRY.yaml already exists on disk — clear any
+        # leftover from an earlier test in this same process so the missing
+        # S3 object is actually exercised.
+        dest = __import__("pathlib").Path("/tmp/LLM_MODEL_REGISTRY.yaml")
+        dest.unlink(missing_ok=True)
+        from director import handler as H
+        # No `director/LLM_MODEL_REGISTRY.yaml` object in the bucket — the
+        # download must fail with a real ClientError (NoSuchKey), and that
+        # must now RAISE rather than log a WARNING and return.
+        with pytest.raises(RuntimeError, match="LLM_MODEL_REGISTRY.yaml"):
+            H._ensure_registry(BUCKET, s3)
+        assert "LLM_MODEL_REGISTRY_PATH" not in __import__("os").environ
+
+    def test_handler_propagates_the_registry_failure(self, s3, monkeypatch):
+        # End-to-end: a live-enabled run with a report card present but no
+        # registry object must fail the whole invocation loudly (the repo's
+        # fail-loud-by-design convention — an SF Catch, not a swallow here,
+        # is what makes this non-fatal to the weekly run).
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        s3.delete_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml")
+        dest = __import__("pathlib").Path("/tmp/LLM_MODEL_REGISTRY.yaml")
+        dest.unlink(missing_ok=True)
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        from director import handler as H
+        with pytest.raises(RuntimeError, match="LLM_MODEL_REGISTRY.yaml"):
+            H.handler({"date": RUN_DATE, "bucket": BUCKET})
+
+    def test_present_registry_object_sets_the_env_var(self, s3, monkeypatch):
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        from director import handler as H
+        # /tmp/LLM_MODEL_REGISTRY.yaml persists across tests in the same
+        # process — clear it so this test proves the download path, not a
+        # leftover file from an earlier test/run.
+        dest = __import__("pathlib").Path("/tmp/LLM_MODEL_REGISTRY.yaml")
+        dest.unlink(missing_ok=True)
+        try:
+            H._ensure_registry(BUCKET, s3)
+            assert __import__("os").environ["LLM_MODEL_REGISTRY_PATH"] == str(dest)
+        finally:
+            dest.unlink(missing_ok=True)
 
 
 # ── Stage-output coverage (config-I7214, config-I7334) ────────────────────────

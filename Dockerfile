@@ -67,12 +67,6 @@ RUN NOUSERGON_LIB_LINE="$(grep '^nousergon-lib' requirements.txt)" && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
 
-# config-I4799: the Lambda Python 3.12 base image ships boto3 1.34.x which may
-# predate the appconfigdata service (boto3>=1.34.99). krepis 0.26.0's AppConfig
-# registry resolution needs it for the Director's LLM_MODEL_REGISTRY lookup.
-# Force-upgrade so appconfigdata client is available.
-RUN pip install --no-cache-dir -U "boto3>=1.36" "botocore>=1.36"
-
 # Application code (Layer B grading + Layer C director skeleton).
 COPY grading/ ${LAMBDA_TASK_ROOT}/grading/
 COPY director/ ${LAMBDA_TASK_ROOT}/director/
@@ -86,8 +80,8 @@ COPY flow-doctor.yaml ${LAMBDA_TASK_ROOT}/
 # own handler to the same image.)
 #
 # LLM_MODEL_REGISTRY.yaml is downloaded from S3 at Lambda startup by
-# director/handler.py's _ensure_registry() rather than baked into the image.
-# config-I4799: AppConfig env var is also set as a future enabler — once
-# the AppConfig application is provisioned, the S3 download becomes redundant.
-ENV KREPIS_APPCONFIG_APPLICATION=alpha-engine
+# director/handler.py's _ensure_registry() — the sole registry delivery path
+# (alpha-engine-config-I6187 removed the AppConfig Tier 2 fallback that was
+# never reachable while the S3 download succeeds; model-router-policy R1:
+# exactly one registry file is the source of truth).
 CMD ["grading.handler.handler"]
