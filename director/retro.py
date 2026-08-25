@@ -434,8 +434,22 @@ class _KrepisStructuredJudge:
         self._client = client
         self._judge_group = judge_group
         self._judge_model = judge_model
+        #: Token usage of the most recent completed attempt, read by
+        #: ``_invoke_with_retry``'s latency emitter via ``getattr(llm,
+        #: "last_usage", None)`` — the same contract
+        #: ``_KrepisStructuredDirector`` implements. This class never set it
+        #: (measured: `AlphaEngine/Director` DirectorPlanPromptTokens /
+        #: CompletionTokens / ReasoningTokens were unconditionally 0 for
+        #: every retro/judge call, e.g. the 2026-08-21
+        #: ``director/2026-08-21/action_plan.json`` artifact's
+        #: ``plan_call_telemetry`` for the judge invocation), independent of
+        #: whether krepis itself returned usage — the retry loop's
+        #: ``getattr(llm, "last_usage", None)`` had nothing to read.
+        #: alpha-engine-config-I8164-followon.
+        self.last_usage = None
 
     def invoke(self, messages: list) -> RetroGrade:
+        self.last_usage = None
         system, user_content = _split_messages(messages)
         result = self._client.structured(
             system=system,
@@ -448,6 +462,7 @@ class _KrepisStructuredJudge:
             # lands here first.
             attempts=_STRUCTURED_ATTEMPTS,
         )
+        self.last_usage = getattr(result, "usage", None)
         grade: RetroGrade = result.parsed
         # Three provenance fields, each answering a different question, all
         # landing as extra fields — RetroGrade has extra="allow" — so they
