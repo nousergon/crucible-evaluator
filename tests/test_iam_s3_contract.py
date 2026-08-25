@@ -81,7 +81,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # declared readwrite in grading/iam_s3_contract.json and granted on the
     # role; no contract/IAM change, just a pin bump. Exactly the
     # evaluator/latest/report_card.json precedent recorded below.
-    "director/handler.py": 8,
+    # alpha-engine-config-I8332 (2026-08-25): _compute_registry_fingerprint
+    # gained a head_object call on director/LLM_MODEL_REGISTRY.yaml (the S3
+    # LastModified/VersionId half of the registry provenance stamp) --
+    # same "director" prefix, already declared readwrite; no contract/IAM
+    # change, just a pin bump. 8 -> 9.
+    "director/handler.py": 9,
     # config-I2556: write_report_card gained a second put_object (the standing
     # evaluator/latest/report_card.json pointer) alongside the existing dated
     # snapshot write -- same "evaluator" prefix, already granted readwrite;

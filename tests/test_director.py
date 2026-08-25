@@ -1,7 +1,9 @@
 """Tests for the Director agent (Layer C) — Phase E. No LLM key / langchain
 required: the LLM is injected, and the handler's plan-build is monkeypatched."""
 
+import hashlib
 import json
+from pathlib import Path
 
 import boto3
 import pytest
@@ -642,6 +644,93 @@ class TestEnsureRegistryFailsLoud:
             assert __import__("os").environ["LLM_MODEL_REGISTRY_PATH"] == str(dest)
         finally:
             dest.unlink(missing_ok=True)
+
+
+class TestRegistryProvenance:
+    """alpha-engine-config-I8332: the action plan stamps WHICH
+    LLM_MODEL_REGISTRY.yaml it was built against, alongside `attestation`."""
+
+    _REG_BODY = b"groups: {fast: {model: sonnet}}\n"
+
+    def _reset(self, monkeypatch):
+        # `_REGISTRY_FINGERPRINT` is a module global (deliberately — it survives
+        # a warm Lambda container the same way LLM_MODEL_REGISTRY_PATH does), so
+        # each test resets both it and the env var + /tmp copy to avoid leaking
+        # state across tests in this same pytest process.
+        from director import handler as H
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        monkeypatch.setattr(H, "_REGISTRY_FINGERPRINT", None)
+        Path("/tmp/LLM_MODEL_REGISTRY.yaml").unlink(missing_ok=True)
+        return H
+
+    def test_ensure_registry_captures_sha256(self, s3, monkeypatch):
+        H = self._reset(monkeypatch)
+        s3.put_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml",
+                      Body=self._REG_BODY)
+        H._ensure_registry(BUCKET, s3)
+        fp = H.registry_fingerprint()
+        assert fp["sha256"] == hashlib.sha256(self._REG_BODY).hexdigest()
+        assert fp["source_path"] == f"s3://{BUCKET}/director/LLM_MODEL_REGISTRY.yaml"
+        # moto's default bucket has no versioning enabled — VersionId is
+        # legitimately absent; LastModified is always present.
+        assert fp["as_of"] is not None
+
+    def test_fingerprint_absent_before_ensure_registry_runs(self, monkeypatch):
+        H = self._reset(monkeypatch)
+        fp = H.registry_fingerprint()
+        assert fp == {"source_path": None, "sha256": None, "as_of": None, "version_id": None}
+
+    def test_stamp_reflects_bytes_loaded_not_a_later_reread(self, s3, monkeypatch):
+        # The sha256 on the artifact must be the hash of the bytes actually
+        # used to resolve model groups this run — not whatever /tmp holds at
+        # serialization time. Mutate /tmp AND the S3 object after
+        # `_ensure_registry` returns; the captured fingerprint must not move.
+        H = self._reset(monkeypatch)
+        s3.put_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml",
+                      Body=self._REG_BODY)
+        H._ensure_registry(BUCKET, s3)
+        original_sha = H.registry_fingerprint()["sha256"]
+
+        # Mutate the local copy krepis will have already read, and the S3
+        # object, to a different body.
+        Path("/tmp/LLM_MODEL_REGISTRY.yaml").write_bytes(b"groups: {tampered: true}\n")
+        s3.put_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml",
+                      Body=b"groups: {tampered: true}\n")
+
+        fp_after = H.registry_fingerprint()
+        assert fp_after["sha256"] == original_sha
+        assert fp_after["sha256"] != hashlib.sha256(b"groups: {tampered: true}\n").hexdigest()
+
+    def test_action_plan_carries_registry_provenance_on_both_keys(self, s3, monkeypatch):
+        H = self._reset(monkeypatch)
+        # Override the fixture's placeholder registry body with a known one so
+        # the sha256 assertion below is exact.
+        s3.put_object(Bucket=BUCKET, Key="director/LLM_MODEL_REGISTRY.yaml",
+                      Body=self._REG_BODY)
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+        assert out["status"] == "ok"
+
+        expected_sha = hashlib.sha256(self._REG_BODY).hexdigest()
+        dated = json.loads(s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read())
+        latest = json.loads(s3.get_object(Bucket=BUCKET, Key=out["latest_action_plan_key"])["Body"].read())
+
+        for body in (dated, latest):
+            assert "registry_provenance" in body
+            assert body["registry_provenance"]["sha256"] == expected_sha
+            assert body["registry_provenance"]["source_path"] == \
+                f"s3://{BUCKET}/director/LLM_MODEL_REGISTRY.yaml"
+            # Sits beside `attestation`, not in place of it.
+            assert "attestation" in body
+
+        # Both keys share the exact same stamped body (registry_provenance
+        # included) — same assertion style as
+        # test_writes_latest_pointer_alongside_dated_key.
+        assert dated == latest
 
 
 # ── Stage-output coverage (config-I7214, config-I7334) ────────────────────────

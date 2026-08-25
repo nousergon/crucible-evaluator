@@ -25,6 +25,7 @@ Lambda handler reference: ``director.handler.handler``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -93,6 +94,12 @@ DEFAULT_BUCKET = "alpha-engine-research"
 # `latest` pointer is deliberately never read back by this module, same as
 # the report-card `latest` pointer is never read by the Director itself.
 LATEST_ACTION_PLAN_KEY = "director/latest/action_plan.json"
+
+#: alpha-engine-config-I8332: the action-plan body key carrying the registry
+#: provenance stamp, sibling to `director.verdict.ATTESTATION_KEY`. Both keys
+#: (the dated `plan_key` and `LATEST_ACTION_PLAN_KEY`) carry it — see the
+#: stamping call in `_run` just before the plan is written.
+REGISTRY_PROVENANCE_KEY = "registry_provenance"
 
 
 def latest_action_plan_key() -> str:
@@ -546,6 +553,67 @@ def _dry_run_probe(bucket: str, run_date: str, card: dict | None, s3) -> dict:
     return summary
 
 
+#: The key `director/LLM_MODEL_REGISTRY.yaml` is downloaded from, reused by
+#: both `_ensure_registry` (download) and `_compute_registry_fingerprint`
+#: (provenance) so the two never drift apart.
+_REGISTRY_KEY = "director/LLM_MODEL_REGISTRY.yaml"
+
+#: alpha-engine-config-I8332: the provenance stamp for the registry this
+#: container loaded, captured once by `_ensure_registry` at the moment the
+#: bytes were obtained. A module-level cache rather than re-hashing `/tmp` at
+#: stamp time — a warm Lambda container reuses this global exactly the way it
+#: reuses the `LLM_MODEL_REGISTRY_PATH` env var, so the stamp on every plan
+#: this container writes reflects the bytes actually loaded, never a later
+#: read of whatever `/tmp` happens to hold when the plan is serialized.
+_REGISTRY_FINGERPRINT: dict | None = None
+
+
+def _compute_registry_fingerprint(bucket: str, dest: str, s3) -> dict:
+    """sha256 of the registry bytes at `dest`, plus S3 object metadata.
+
+    sha256 is the load-bearing field — computed from the exact bytes just
+    written to `dest`, immediately after the download (or immediately after
+    confirming a pre-existing local copy), never re-read later. `as_of`
+    (LastModified) and `version_id` are best-effort S3 object metadata: a
+    `head_object` failure must not take down a run that already has the bytes
+    it needs, so it degrades to `None` rather than raising — unlike
+    `_ensure_registry` itself, which fails loud on the one thing that is not
+    recoverable (no bytes at all).
+    """
+    with open(dest, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    fingerprint = {
+        "source_path": f"s3://{bucket}/{_REGISTRY_KEY}",
+        "sha256": digest,
+        "as_of": None,
+        "version_id": None,
+    }
+    try:
+        head = s3.head_object(Bucket=bucket, Key=_REGISTRY_KEY)
+        last_modified = head.get("LastModified")
+        if last_modified is not None:
+            fingerprint["as_of"] = last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fingerprint["version_id"] = head.get("VersionId")
+    except Exception as exc:  # noqa: BLE001 — metadata is best-effort; see docstring
+        logger.warning(
+            "Director: registry head_object metadata unavailable (sha256 still "
+            "captured) — %s", exc,
+        )
+    return fingerprint
+
+
+def registry_fingerprint() -> dict:
+    """Return the provenance stamp for the registry `_ensure_registry` loaded.
+
+    All-``None`` fields if `_ensure_registry` has not run in this container yet
+    (should not happen on any path that reaches `build_action_plan` — this Lambda
+    calls it unconditionally before the first LLM call).
+    """
+    if _REGISTRY_FINGERPRINT is None:
+        return {"source_path": None, "sha256": None, "as_of": None, "version_id": None}
+    return dict(_REGISTRY_FINGERPRINT)
+
+
 def _ensure_registry(bucket: str, s3) -> None:
     """Download LLM_MODEL_REGISTRY.yaml from S3 to /tmp and point krepis at it.
 
@@ -562,17 +630,25 @@ def _ensure_registry(bucket: str, s3) -> None:
     let krepis resolve against whatever registry copy Tier 2/3 finds next
     (model-router-policy R20), and the only prior signal was a WARNING in a
     weekly Lambda's logs.
+
+    alpha-engine-config-I8332: also captures `_REGISTRY_FINGERPRINT` (sha256 +
+    S3 LastModified/VersionId) — see `_compute_registry_fingerprint`. On the
+    early-return (env var already set — a warm container that ensured the
+    registry on an earlier invocation) the fingerprint captured on that earlier
+    invocation is still live: it is a module global, not local state, so it
+    survives exactly as long as the env var does.
     """
+    global _REGISTRY_FINGERPRINT
     import os as _os
 
     if _os.environ.get("LLM_MODEL_REGISTRY_PATH"):
-        return  # already set — nothing to do
+        return  # already set — nothing to do (fingerprint captured when it was)
 
     dest = "/tmp/LLM_MODEL_REGISTRY.yaml"
     if not Path(dest).exists():
         from botocore.exceptions import ClientError
         try:
-            s3.download_file(bucket, "director/LLM_MODEL_REGISTRY.yaml", dest)
+            s3.download_file(bucket, _REGISTRY_KEY, dest)
         except ClientError as exc:
             raise RuntimeError(
                 f"Director: cannot download LLM_MODEL_REGISTRY.yaml from "
@@ -580,6 +656,7 @@ def _ensure_registry(bucket: str, s3) -> None:
                 f"delivery path; the Director cannot resolve a model group "
                 f"without it."
             ) from exc
+    _REGISTRY_FINGERPRINT = _compute_registry_fingerprint(bucket, dest, s3)
     _os.environ["LLM_MODEL_REGISTRY_PATH"] = dest
     logger.info("Director registry cached from s3://%s/director/", bucket)
 
@@ -783,6 +860,17 @@ def _run(event: dict | None = None, context=None) -> dict:
 
     plan_key = f"director/{run_date}/action_plan.json"
     stamped_body = stamp_plan_artifact(plan, verdict_block)
+    # alpha-engine-config-I8332: stamp WHICH registry produced this plan
+    # alongside `attestation` — that block says whether the run's numbers can
+    # be trusted, this one says which LLM_MODEL_REGISTRY.yaml the LLM calls
+    # that produced them were resolved against. Added here (not inside
+    # `stamp_plan_artifact`) because that function lives in `verdict.py`,
+    # scoped to the §2.3a verdict; the registry fingerprint is a handler-level
+    # fact (`_ensure_registry` is the sole place the bytes are obtained).
+    stamped_body = json.dumps(
+        {**json.loads(stamped_body), REGISTRY_PROVENANCE_KEY: registry_fingerprint()},
+        indent=2,
+    ).encode("utf-8")
     s3.put_object(
         Bucket=bucket, Key=plan_key,
         # §2.3a rule 3 — the plan artifact is the body the console Director page
