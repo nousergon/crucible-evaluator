@@ -12,9 +12,18 @@ krepis' provider SDKs; ``_default_llm()`` lazily constructs the real client.
 
 **Judge tier: the ``high`` group, deliberately NOT the Director's ``ultra``.**
 Grading a plan with the same model that generated it is self-grading bias
-(config#1673, judge != generator) — see ``agent.py``'s ``DIRECTOR_GROUP``, and
-``_assert_judge_is_not_the_generator``, which enforces it at call time rather
-than trusting two constants to stay distinct.
+(config#1673, judge != generator) — see ``agent.py``'s ``DIRECTOR_GROUP``.
+
+The invariant is enforced in two halves, because one is not enough:
+``_assert_judge_is_not_the_generator`` compares the two GROUPS before the call
+(all that is knowable then), and ``_assert_judge_did_not_grade_its_own_plan``
+compares the two SERVED MODELS after it. Distinct groups can resolve to the
+same model — on 2026-08-25 ``high``'s primary ``deepseek-v4-pro-max`` and
+``ultra``'s fallback ``deepseek-v4-pro`` were different registry entries for
+the same upstream ``deepseek-v4-pro``, with the registry's own disjointness
+invariant green over their entry ids (alpha-engine-config-I6052). On a
+collision the retro REFUSES to produce a grade rather than publishing a
+self-graded one.
 (This paragraph said "Sonnet" / "Opus" until 2026-08-01; both were stale from
 the 2026-07-24 migration off direct Anthropic.)
 
@@ -42,8 +51,10 @@ resolved it to) and ``resolved_model`` (what the API served).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 
 from director.agent import (
     DIRECTOR_EXEC_CONTEXT,
@@ -122,14 +133,28 @@ def _assert_judge_is_not_the_generator(group: str) -> None:
     to ``ultra`` would silently turn the retro into self-grading — a grade that
     still looks like a grade and is worth nothing.
 
-    **What this can and cannot establish** (alpha-engine-config-I6052): it
-    compares GROUPS. On the proxy route krepis reports ``registry_id`` as a
-    group handle — LiteLLM walks the fallback chain internally by design — so
-    the consumer cannot see which ENTRY served, and a fully-degraded ultra chain
-    reaching the same entry as high's primary remains undetectable from here.
-    That residual is owed by the router's own telemetry (model-router-policy
-    R21), not by this module. Asserting the half that is knowable is not a
-    weakened check; claiming the other half would be a false one.
+    **This is the PRE-call half, and it is not the whole invariant**
+    (alpha-engine-config-I6052). It compares GROUPS, which is all that is
+    knowable before the call: on the proxy route the resolution contract
+    reports ``registry_id`` as a group handle because LiteLLM walks the
+    fallback chain internally, so which ENTRY will serve is genuinely unknown
+    here. Two distinct groups can still serve the SAME MODEL — ``high``'s
+    primary and ``ultra``'s fallback both resolved to ``deepseek-v4-pro`` on
+    2026-08-25 — and this function cannot see that.
+
+    (This docstring used to end "that residual is owed by the router's own
+    telemetry (model-router-policy R21), not by this module." That was the same
+    claim ``agent._warn_on_degraded_route`` carried until
+    alpha-engine-config-I8165 corrected it, and it is wrong for the same
+    reason: it is true of RESOLUTION time and false of COMPLETION time.
+    ``krepis.llm._resolve_group_served_model`` resolves the response's model
+    field back to the entry's upstream model id, so ``result.model`` names what
+    actually served. The fact was available and this module threw it away —
+    engagement §5, a fix survives the class, and the class here is "a stale
+    unknowability claim in the Director package".)
+
+    :func:`_assert_judge_did_not_grade_its_own_plan` is the POST-call half that
+    closes it against the served model.
     """
     if group == DIRECTOR_GROUP:
         raise RuntimeError(
@@ -140,6 +165,227 @@ def _assert_judge_is_not_the_generator(group: str) -> None:
             f"a different registry group, or unset it to use "
             f"{RETRO_JUDGE_GROUP_DEFAULT!r}."
         )
+
+
+# ── The self-grading signal (alpha-engine-config-I6052) ──────────────────────
+#
+# Stamped onto ``director/{run_date}/retro.json`` as EXTRAS on ``RetroGrade``
+# (``extra="allow"``), the same mechanism ``judge_group``/``judge_model``/
+# ``resolved_model`` already use and the same reasoning ``agent.py``'s
+# ``PLAN_KEY_*`` block gives: a declared field is a field the LLM is ASKED to
+# produce, and a grade cannot be trusted to report its own bias.
+RETRO_KEY_JUDGE_VS_GENERATOR = "judge_vs_generator"
+RETRO_KEY_GRADED_PLAN_MODEL = "graded_plan_served_model"
+
+#: The three states of the served-model comparison. ``unknown`` is a real
+#: answer and is never collapsed into ``distinct`` — `principles.md` §2.7.
+JUDGE_DISTINCT = "distinct"
+JUDGE_COLLISION = "collision"
+JUDGE_UNKNOWN = "unknown"
+
+
+class SelfGradedRetroError(RuntimeError):
+    """The judge served the same model that produced the plan being graded.
+
+    A distinct type rather than a bare ``RuntimeError`` so the condition is
+    separable from "the judge was overloaded" by anything that later wants to
+    treat it differently — it is a correctness refusal, not a transport
+    failure, and the two deserve different dispositions.
+    """
+
+
+def _normalize_served_model(model: str | None) -> str | None:
+    """Reduce an upstream model id to the identity that matters here.
+
+    ``result.model`` is the entry's *upstream* model id, so the SAME WEIGHTS
+    reached through different routes carry different strings: ``high`` lists
+    ``deepseek-v4-pro-openrouter-max`` (``deepseek/deepseek-v4-pro``, via the
+    aggregator) beside ``deepseek-v4-pro-max`` (``deepseek-v4-pro``, direct).
+    Grading a plan with the same model reached through a different reseller is
+    still self-grading, so the vendor prefix is dropped before comparing.
+
+    The failure direction of a false positive is *refusing a grade*, which
+    costs one week of a best-effort telemetry signal; the failure direction of
+    a false negative is publishing a self-graded verdict that reads as a real
+    one. The comparison is deliberately biased toward the first.
+    """
+    if not model:
+        return None
+    return model.strip().rsplit("/", 1)[-1].lower() or None
+
+
+def _graded_plan_served_model(prior_plan: dict) -> str | None:
+    """Which model actually produced the plan this retro is grading.
+
+    ``served_model`` is stamped by ``agent._stamp_route_degradation``
+    (alpha-engine-config-I8165); ``resolved_model`` is the older field carrying
+    the same value and has been stamped since config#1673, so plans written
+    before I8165 are still comparable. Neither present ⇒ ``None``, which this
+    module renders as ``unknown`` rather than as "no collision".
+    """
+    if not isinstance(prior_plan, dict):
+        return None
+    for key in ("served_model", "resolved_model"):
+        value = prior_plan.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _emit_self_grade_metric(
+    *, verdict: str, judge_group: str, judge_model, plan_model
+) -> None:
+    """Emit the self-grading verdict as CloudWatch EMF, on EVERY retro.
+
+    Two metrics, both always emitted, mirroring
+    ``agent._warn_on_degraded_route``'s namespace, dimension and transport
+    (EMF log line, not ``PutMetricData`` — no ``monitoring`` interface endpoint
+    for one weekly data point):
+
+      ``RetroJudgeSelfGraded``        1 when the judge served the plan's model
+      ``RetroJudgeSelfGradeUnknown``  1 when the comparison could not be made
+
+    The second exists because a single metric cannot distinguish "checked, no
+    collision" from "nobody could check", and rendering the latter as 0 is
+    exactly the *no data as green* that `principles.md` §2.7 forbids. A
+    component emitting nothing is not healthy, it is unobserved.
+
+    Never raises. A telemetry failure must not take down a grade that is
+    otherwise sound.
+    """
+    try:
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(time.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "AlphaEngine/Director",
+                    "Dimensions": [["Group"]],
+                    "Metrics": [
+                        {"Name": "RetroJudgeSelfGraded", "Unit": "Count"},
+                        {"Name": "RetroJudgeSelfGradeUnknown", "Unit": "Count"},
+                    ],
+                }],
+            },
+            "Group": judge_group,
+            "RetroJudgeSelfGraded": 1 if verdict == JUDGE_COLLISION else 0,
+            "RetroJudgeSelfGradeUnknown": 1 if verdict == JUDGE_UNKNOWN else 0,
+            "judge_served_model": judge_model,
+            "graded_plan_served_model": plan_model,
+            "verdict": verdict,
+        }))
+    except Exception:
+        logger.exception(
+            "Director retro: failed to emit the self-grading metric — the "
+            "judge != generator alarm is blind for this run (verdict=%s)",
+            verdict,
+        )
+
+
+def _assert_judge_did_not_grade_its_own_plan(
+    grade, prior_plan: dict, *, judge_group: str
+) -> str:
+    """The POST-call half of judge != generator, against the SERVED models.
+
+    :func:`_assert_judge_is_not_the_generator` compares the two GROUPS before
+    the call. That is necessary and insufficient: the groups are distinct by
+    construction and can still resolve to the same model. Measured against the
+    live registry on 2026-08-25 — ``high`` = [``deepseek-v4-pro-max``, …] and
+    ``ultra`` = [``glm-5.2-direct``, ``deepseek-v4-pro``, ``glm-5.2``] — the
+    two named entries are DIFFERENT registry ids resolving to the SAME upstream
+    model, ``deepseek-v4-pro``. The registry's own disjointness invariant
+    (``validate_llm_model_registry.py`` invariant 15, I6066) compares entry ids
+    and is green on exactly that pair.
+
+    So this compares what the API actually served for the grade
+    (``grade.resolved_model``) against what actually served the plan being
+    graded (``agent``'s ``served_model`` stamp). Both are upstream model ids
+    resolved by ``krepis.llm._resolve_group_served_model``, so they are the
+    same shape — the comparison that pinned ``DirectorRouteFallback`` at 1 by
+    mixing shapes (alpha-engine-config-I6185) is not repeated.
+
+    **On a collision this RAISES**, before ``handler._persist_retro`` can run,
+    so no self-graded verdict is written. Re-routing the judge to a third group
+    was considered and rejected: choosing a substitute group here is the
+    layer-5 duplication this module was purged of (it would have to know that
+    ``med`` also contains ``deepseek-v4-pro``), and it spends a second full
+    judge call at the point in the invocation where the budget is most
+    exhausted — the plan call measured 491.8s against a 600s ceiling on
+    2026-08-22. Publishing the grade stamped "self-graded" was also rejected:
+    a number on the Report Card is read as a number, and the stamp is one
+    consumer away from being ignored.
+
+    **``unknown`` does not raise**, and that is a deliberate deviation from
+    fail-loud recorded per the house rule:
+      (a) failure mode: a retro whose graded plan carries no served-model stamp
+          cannot be proven un-self-graded, and is published anyway;
+      (b) why the deliverable survives: the retro is best-effort telemetry
+          about a plan that already shipped, and every plan written since
+          config#1673 carries ``resolved_model`` — refusing on a missing field
+          would destroy a real weekly signal to avoid a hypothetical one;
+      (c) recording surface: ``RetroJudgeSelfGradeUnknown`` (EMF, emitted on
+          every run, 0 when the check ran) plus ``judge_vs_generator:
+          "unknown"`` on the persisted artifact and a WARNING naming the
+          missing field. It is visible, not swallowed.
+
+    Returns the verdict it stamped.
+    """
+    judge_model = getattr(grade, "resolved_model", None)
+    plan_model = _graded_plan_served_model(prior_plan)
+
+    judge_norm = _normalize_served_model(judge_model)
+    plan_norm = _normalize_served_model(plan_model)
+
+    if judge_norm is None or plan_norm is None:
+        verdict = JUDGE_UNKNOWN
+    elif judge_norm == plan_norm:
+        verdict = JUDGE_COLLISION
+    else:
+        verdict = JUDGE_DISTINCT
+
+    # Stamped BEFORE the raise so the values are in the log line and on the
+    # object even on the refusal path.
+    try:
+        setattr(grade, RETRO_KEY_JUDGE_VS_GENERATOR, verdict)
+        setattr(grade, RETRO_KEY_GRADED_PLAN_MODEL, plan_model)
+    except Exception:
+        logger.exception(
+            "Director retro: failed to stamp the self-grading verdict onto the "
+            "grade (verdict=%s judge=%s plan=%s)",
+            verdict, judge_model, plan_model,
+        )
+
+    _emit_self_grade_metric(
+        verdict=verdict,
+        judge_group=judge_group,
+        judge_model=judge_model,
+        plan_model=plan_model,
+    )
+
+    if verdict == JUDGE_UNKNOWN:
+        logger.warning(
+            "Director retro self-grading check UNKNOWN: judge served %r, plan "
+            "%s served %r — one of the two is unstamped, so this grade cannot "
+            "be shown to be free of self-grading bias (config#1673). "
+            "Publishing it stamped %r.",
+            judge_model, prior_plan.get("run_date"), plan_model, JUDGE_UNKNOWN,
+        )
+    elif verdict == JUDGE_COLLISION:
+        raise SelfGradedRetroError(
+            f"Retro judge served {judge_model!r}, which is the model that "
+            f"produced the plan it was grading (run_date "
+            f"{prior_plan.get('run_date')!r}, served {plan_model!r}) — "
+            f"self-grading bias (config#1673). The judge group "
+            f"{judge_group!r} and the generator group {DIRECTOR_GROUP!r} are "
+            f"distinct but resolved to the same upstream model, which is the "
+            f"conditional the group-level check cannot see. Refusing to "
+            f"publish the grade: a self-graded RetroGrade reads as a real "
+            f"grade and is worth nothing. Fix the registry so the two chains "
+            f"cannot serve a common model "
+            f"(alpha-engine-config/scripts/validate_llm_model_registry.py "
+            f"invariant 15 compares entry ids, not served models)."
+        )
+
+    return verdict
 
 
 def _load_retro_prompt() -> str:
@@ -389,11 +635,23 @@ def grade_prior_plan(
     """Judge the prior week's plan against the current Report Card → RetroGrade.
 
     ``llm`` is injectable (a structured-output runnable returning a RetroGrade);
-    defaults to the real Sonnet judge.
+    defaults to the ``high``-group judge built by :func:`_default_llm`.
+
+    Raises :class:`SelfGradedRetroError` when the judge turns out to have been
+    served the same model that produced ``prior_plan`` — the grade is refused,
+    not published stamped. (This docstring said "the real Sonnet judge" until
+    2026-08-25; Sonnet has not been in this path since the 2026-07-24 migration
+    off direct Anthropic.)
     """
     llm = llm or _default_llm(budget)
     messages = build_messages(prior_plan, current_card)
     grade = _invoke_with_retry(llm, messages, budget=budget)
+    # config#1673's other half, against the SERVED models rather than the two
+    # group handles. Raises on a collision, before the caller can persist a
+    # self-graded verdict (alpha-engine-config-I6052).
+    _assert_judge_did_not_grade_its_own_plan(
+        grade, prior_plan, judge_group=_judge_group()
+    )
     # Stamp the prior run_date from the plan if the model didn't echo it.
     rd = prior_plan.get("run_date")
     if rd and not grade.prior_run_date:
