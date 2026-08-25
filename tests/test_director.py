@@ -966,6 +966,206 @@ class TestRetro:
         with pytest.raises(RuntimeError, match="judge != generator"):
             _default_llm()
 
+    # ── I6052: the SERVED-model half of judge != generator ─────────
+
+    @staticmethod
+    def _graded(judge_model):
+        """A RetroGrade shaped like one the real judge returns — the client
+        stamps `resolved_model` with what the API actually served."""
+        from director.schema import RetroGrade
+        g = RetroGrade(prior_run_date="2026-05-23", grounding=80,
+                       calibration=55, actionability=70)
+        if judge_model is not None:
+            g.resolved_model = judge_model
+        return g
+
+    def test_a_judge_served_the_graded_plans_own_model_refuses_to_publish(self):
+        """The live conditional the GROUP check cannot see
+        (alpha-engine-config-I6052).
+
+        `high` and `ultra` are distinct groups and the registry's disjointness
+        invariant compares ENTRY IDS, so `high`'s `deepseek-v4-pro-max` and
+        `ultra`'s `deepseek-v4-pro` pass it while resolving to the SAME
+        upstream model. When `ultra` falls through to that arm, the plan is
+        graded by the model that wrote it — and nothing before the call can
+        know, because LiteLLM walks the chain internally.
+
+        No grade is returned at all: `handler._persist_retro` never runs, so a
+        self-graded verdict cannot reach `director/{date}/retro.json`, the
+        retro trend ledger, or the Report Card.
+        """
+        import pytest
+        from director.retro import SelfGradedRetroError, grade_prior_plan
+
+        prior = {"run_date": "2026-05-23", "served_model": "deepseek-v4-pro"}
+        llm = _FakeLLM(self._graded("deepseek-v4-pro"))
+
+        with pytest.raises(SelfGradedRetroError) as exc:
+            grade_prior_plan(prior, _CARD, llm=llm)
+
+        assert "deepseek-v4-pro" in str(exc.value)
+        assert "2026-05-23" in str(exc.value)
+        assert "self-grading" in str(exc.value)
+
+    def test_the_same_model_through_a_different_reseller_is_still_a_collision(self):
+        """`high` carries `deepseek-v4-pro-openrouter-max`
+        (`deepseek/deepseek-v4-pro`) beside the direct entry. Same weights, one
+        aggregator apart — comparing the raw upstream ids would read them as
+        distinct models and publish the grade."""
+        import pytest
+        from director.retro import SelfGradedRetroError, grade_prior_plan
+
+        prior = {"run_date": "2026-05-23", "served_model": "deepseek-v4-pro"}
+        llm = _FakeLLM(self._graded("deepseek/deepseek-v4-pro"))
+
+        with pytest.raises(SelfGradedRetroError):
+            grade_prior_plan(prior, _CARD, llm=llm)
+
+    def test_distinct_served_models_publish_and_are_stamped(self):
+        """The healthy path still returns a grade, and says so on the
+        artifact — a check whose only output is a failure cannot be watched."""
+        from director.retro import (
+            JUDGE_DISTINCT, RETRO_KEY_GRADED_PLAN_MODEL,
+            RETRO_KEY_JUDGE_VS_GENERATOR, grade_prior_plan,
+        )
+
+        prior = {"run_date": "2026-05-23", "served_model": "glm-5.2"}
+        out = grade_prior_plan(prior, _CARD,
+                               llm=_FakeLLM(self._graded("deepseek-v4-pro")))
+
+        assert out.calibration == 55
+        dumped = out.model_dump()
+        assert dumped[RETRO_KEY_JUDGE_VS_GENERATOR] == JUDGE_DISTINCT
+        assert dumped[RETRO_KEY_GRADED_PLAN_MODEL] == "glm-5.2"
+
+    def test_an_unprovable_grade_is_published_as_unknown_never_as_clean(self):
+        """A plan with no served-model stamp cannot be shown free of bias.
+        `unknown` is a real answer and is never collapsed into `distinct` —
+        principles.md §2.7, no data is never rendered as green."""
+        from director.retro import (
+            JUDGE_UNKNOWN, RETRO_KEY_JUDGE_VS_GENERATOR, grade_prior_plan,
+        )
+
+        out = grade_prior_plan({"run_date": "2026-05-23"}, _CARD,
+                               llm=_FakeLLM(self._graded("deepseek-v4-pro")))
+        assert out.model_dump()[RETRO_KEY_JUDGE_VS_GENERATOR] == JUDGE_UNKNOWN
+
+        # ... and symmetrically when the JUDGE side is the unstamped one.
+        out2 = grade_prior_plan(
+            {"run_date": "2026-05-23", "served_model": "glm-5.2"}, _CARD,
+            llm=_FakeLLM(self._graded(None)),
+        )
+        assert out2.model_dump()[RETRO_KEY_JUDGE_VS_GENERATOR] == JUDGE_UNKNOWN
+
+    def test_a_pre_i8165_plan_is_still_comparable_via_resolved_model(self):
+        """`served_model` only exists on plans written since I8165;
+        `resolved_model` has carried the same value since config#1673. Reading
+        only the newer key would render every older plan `unknown`."""
+        import pytest
+        from director.retro import SelfGradedRetroError, grade_prior_plan
+
+        prior = {"run_date": "2026-05-23", "resolved_model": "deepseek-v4-pro"}
+        with pytest.raises(SelfGradedRetroError):
+            grade_prior_plan(prior, _CARD,
+                             llm=_FakeLLM(self._graded("deepseek-v4-pro")))
+
+    def test_every_retro_emits_the_self_grading_metric(self, capsys):
+        """Both metrics on every run, 0 on the healthy path. A metric that only
+        appears when something is wrong is indistinguishable from a dead
+        emitter (principles.md §2.7)."""
+        from director.retro import grade_prior_plan
+
+        grade_prior_plan({"run_date": "2026-05-23", "served_model": "glm-5.2"},
+                         _CARD, llm=_FakeLLM(self._graded("deepseek-v4-pro")))
+
+        emitted = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if '"RetroJudgeSelfGraded"' in line and line.startswith("{")
+        ]
+        assert len(emitted) == 1
+        row = emitted[0]
+        assert row["RetroJudgeSelfGraded"] == 0
+        assert row["RetroJudgeSelfGradeUnknown"] == 0
+        assert row["Group"] == "high"
+        assert row["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "AlphaEngine/Director"
+
+    def test_the_metric_fires_on_the_collision_before_the_refusal(self, capsys):
+        """The refusal raises, so the metric is the only surface that survives
+        the run — it must be emitted before the raise, not after it."""
+        import pytest
+        from director.retro import SelfGradedRetroError, grade_prior_plan
+
+        with pytest.raises(SelfGradedRetroError):
+            grade_prior_plan(
+                {"run_date": "2026-05-23", "served_model": "deepseek-v4-pro"},
+                _CARD, llm=_FakeLLM(self._graded("deepseek-v4-pro")),
+            )
+
+        row = next(
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("{") and '"RetroJudgeSelfGraded"' in line
+        )
+        assert row["RetroJudgeSelfGraded"] == 1
+        assert row["RetroJudgeSelfGradeUnknown"] == 0
+
+    def test_the_group_check_is_not_sufficient_and_says_so(self):
+        """Guard against the fix being reverted to the group comparison alone:
+        two distinct groups pass `_assert_judge_is_not_the_generator` and the
+        served-model check still refuses."""
+        import pytest
+        from director.retro import (
+            SelfGradedRetroError, _assert_judge_is_not_the_generator,
+            _assert_judge_did_not_grade_its_own_plan,
+        )
+
+        _assert_judge_is_not_the_generator("high")  # distinct groups: fine
+
+        with pytest.raises(SelfGradedRetroError):
+            _assert_judge_did_not_grade_its_own_plan(
+                self._graded("deepseek-v4-pro"),
+                {"run_date": "2026-05-23", "served_model": "deepseek-v4-pro"},
+                judge_group="high",
+            )
+
+    def test_handler_records_a_self_graded_refusal_without_losing_the_plan(
+        self, s3, monkeypatch
+    ):
+        """End to end: the refusal reaches the handler's best-effort wrapper as
+        `retro: error`, the plan (primary deliverable) still ships, and
+        `director/{date}/retro.json` is NOT written — there is no self-graded
+        verdict for the trend ledger or the Report Card to read."""
+        import botocore.exceptions
+
+        monkeypatch.setenv("DIRECTOR_ENABLED", "1")
+        s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
+                      Body=json.dumps(_CARD).encode())
+        prior = _plan().model_dump()
+        prior["run_date"] = "2026-05-23"
+        prior["served_model"] = "deepseek-v4-pro"
+        s3.put_object(Bucket=BUCKET, Key="director/2026-05-23/action_plan.json",
+                      Body=json.dumps(prior).encode())
+
+        from director import handler as H
+        monkeypatch.setattr(H, "build_action_plan", lambda card, **kw: _plan())
+        import director.retro as R
+        monkeypatch.setattr(
+            R, "_default_llm",
+            lambda budget=None: _FakeLLM(self._graded("deepseek-v4-pro")),
+        )
+
+        out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
+
+        assert out["status"] == "ok"  # the plan still shipped
+        assert out["retro"] == "error"
+        assert "self-grading" in out["retro_error"]
+        assert json.loads(
+            s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read()
+        )
+        with pytest.raises(botocore.exceptions.ClientError):
+            s3.get_object(Bucket=BUCKET, Key=f"director/{RUN_DATE}/retro.json")
+
     def test_grade_prior_plan_injected_llm_never_touches_real_secrets(self, monkeypatch):
         """Test-hygiene guard (bit a previous integration): the llm= injection
         point must short-circuit _default_llm() entirely, so an ambient
