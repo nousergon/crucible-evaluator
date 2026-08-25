@@ -1439,11 +1439,15 @@ class TestRetro:
                 self.name = name
                 self.input = input_
 
+        class _FakeUsage:
+            input_tokens = 4200
+            output_tokens = 380
+
         class _FakeAnthropicMessage:
             def __init__(self, content, model):
                 self.content = content
                 self.model = model
-                self.usage = None
+                self.usage = _FakeUsage()
 
         class _FakeAnthropicClient:
             def __init__(self):
@@ -1475,9 +1479,20 @@ class TestRetro:
             callsite_id="director-retro-judge",
         )
         judge = _KrepisStructuredJudge(client, judge_group="high", judge_model=_JUDGE_MODEL)
+        assert judge.last_usage is None  # unset until a call RETURNS
 
         messages = build_messages(_plan().model_dump(), _CARD)
         grade = judge.invoke(messages)
+
+        # Measured regression: this adapter never assigned `self.last_usage`,
+        # so `_invoke_with_retry`'s `getattr(llm, "last_usage", None)` always
+        # read None for the retro/judge call — every judge-call
+        # plan_call_telemetry record published DirectorPlanPromptTokens=0 /
+        # DirectorPlanCompletionTokens=0 / DirectorPlanReasoningTokens=0
+        # regardless of what krepis returned (alpha-engine-config-I8164-followon).
+        assert judge.last_usage is not None
+        assert judge.last_usage.input_tokens == 4200
+        assert judge.last_usage.output_tokens == 380
 
         assert grade.calibration == 55
         assert grade.judge_group == "high"

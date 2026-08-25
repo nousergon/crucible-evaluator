@@ -727,16 +727,52 @@ def _emit_plan_latency(
     # caller knows it (a late invocation is quoted less than the ceiling), the
     # static ceiling otherwise (tests, local runs). Published so the reader can
     # tell "the model got slower" from "this invocation had less to give".
+    #
+    # Computed BEFORE the amber threshold, which is now clamped against it —
+    # see ``amber_clamped`` below.
     effective_ceiling_s = (
         DIRECTOR_PLAN_CEILING_S if ceiling_s is None else float(ceiling_s)
     )
-    amber_s = _plan_amber_threshold_s()
+    # Measured 2026-08-21 (`director/2026-08-21/action_plan.json`,
+    # `plan_call_telemetry`): DirectorPlanAmberSeconds=205.2 published ABOVE
+    # DirectorPlanCeilingSeconds=120.0 for that attempt — a warning line
+    # sitting above the hard ceiling it is supposed to warn before, which can
+    # never fire: a call quoted a 120s budget either finishes under 120s (never
+    # reaching 205.2s to trip amber) or is killed by the ceiling first. This
+    # is not a one-off: the amber threshold is deliberately anchored to the
+    # MEASURED slowest healthy call (`_plan_amber_threshold_s`, so it does not
+    # silently go dark when the ceiling is raised — the sibling bug class this
+    # one is the mirror of), but the per-attempt ceiling is a BUDGET QUOTE that
+    # shrinks late in a run, and nothing bounded the amber line by the quote it
+    # is meant to precede. Clamped here so amber can always fire before the
+    # ceiling that ends the call, and the clamp is published
+    # (``DirectorPlanAmberClampedToCeiling``) rather than silently changing
+    # what the number means.
+    raw_amber_s = _plan_amber_threshold_s()
+    amber_clamped = raw_amber_s >= effective_ceiling_s
+    amber_s = (
+        DIRECTOR_PLAN_AMBER_FRACTION * effective_ceiling_s
+        if amber_clamped
+        else raw_amber_s
+    )
     over_amber = elapsed_s >= amber_s
+    # `usage_unknown` — krepis's own sentinel (LLMUsage.usage_unknown,
+    # alpha-engine-config-I8164) for "the provider returned NO usage block for
+    # at least one attempt", distinct from a genuine zero. A `usage=None`
+    # attempt (the error path, or an adapter that never captured it — see
+    # `director/retro.py::_KrepisStructuredJudge`, fixed alongside this) is
+    # the same unmeasured condition. Per `observability-policy` and
+    # `principles.md` §2.7, "no data" must never render as the healthy value
+    # 0: DirectorPlanPromptTokens/CompletionTokens/ReasoningTokens stay 0
+    # below (there is no number to fabricate), but this sibling flag is what a
+    # reader or alarm MUST consult before treating that 0 as "a free call".
+    tokens_unmeasured = usage is None or bool(getattr(usage, "usage_unknown", False))
     record = {
         "DirectorPlanLatencySeconds": round(elapsed_s, 3),
         "DirectorPlanLatencyAmber": 1 if over_amber else 0,
         "DirectorPlanCeilingSeconds": effective_ceiling_s,
         "DirectorPlanAmberSeconds": round(amber_s, 1),
+        "DirectorPlanAmberClampedToCeiling": 1 if amber_clamped else 0,
         "DirectorPlanPromptChars": int(prompt_chars),
         "DirectorPlanCarryoverItems": int(carryover_items),
         # The count ELIDED by the prompt cap (alpha-engine-config-I8163).
@@ -748,9 +784,28 @@ def _emit_plan_latency(
         "DirectorPlanPromptTokens": int(getattr(usage, "input_tokens", 0) or 0),
         "DirectorPlanCompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
         "DirectorPlanReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
+        "DirectorPlanTokensUnmeasured": 1 if tokens_unmeasured else 0,
         "outcome": outcome,
         "Group": DIRECTOR_GROUP,
     }
+    if amber_clamped:
+        logger.info(
+            "Director plan amber threshold clamped: measured-need amber of "
+            "%.1fs exceeds this attempt's %.1fs ceiling quote — reporting "
+            "amber at %.1fs (%.0f%% of the ceiling) instead so the warning "
+            "can still fire before the call is killed.",
+            raw_amber_s, effective_ceiling_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
+        )
+    if outcome == "ok" and tokens_unmeasured:
+        logger.error(
+            "Director plan call outcome=ok but token usage is UNMEASURED "
+            "(krepis reported no usage block for at least one attempt, or "
+            "the calling adapter never captured `last_usage`). Cost "
+            "attribution for this call is UNKNOWN, not zero — "
+            "DirectorPlanTokensUnmeasured=1 on this record; "
+            "DirectorPlan{Prompt,Completion,Reasoning}Tokens read 0 only "
+            "because there is nothing to sum, not because the call was free."
+        )
     if over_amber:
         logger.warning(
             "Director plan call AMBER: %.1fs >= %.1fs (%.0f%% of the %.0fs "
@@ -793,8 +848,10 @@ def _emit_plan_latency(
                     "Metrics": [
                         {"Name": "DirectorPlanLatencySeconds", "Unit": "Seconds"},
                         {"Name": "DirectorPlanLatencyAmber", "Unit": "Count"},
+                        {"Name": "DirectorPlanAmberClampedToCeiling", "Unit": "Count"},
                         {"Name": "DirectorPlanPromptTokens", "Unit": "Count"},
                         {"Name": "DirectorPlanCompletionTokens", "Unit": "Count"},
+                        {"Name": "DirectorPlanTokensUnmeasured", "Unit": "Count"},
                         {"Name": "DirectorPlanCarryoverItems", "Unit": "Count"},
                         {"Name": "DirectorPlanCarryoverOmitted", "Unit": "Count"},
                     ],
