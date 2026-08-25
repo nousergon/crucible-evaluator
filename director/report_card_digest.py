@@ -10,6 +10,22 @@ attention — every RED/WATCH (with its value, target/red-line, status_reason an
 trend) plus a roll-up of what's N/A and why (which producers aren't wired). A
 GREEN component with no adverse trend is summarized in one line, not expanded.
 
+**Pinned components (alpha-engine-config-I8380).** That collapse is a one-way
+ratchet for carry-over: a ledger item can only be closed on evidence the
+Director's prompt actually carries, and a metric that recovered to GREEN was
+counted but never named, so the Director could never cite the recovery. The
+caller (``director.agent.build_messages`` / ``director.retro.build_messages``)
+may pass ``pinned_components`` — the lower-cased component names cited by open
+carry-over items / the prior plan's action items, resolved against this same
+card — and every pinned name is rendered in full (name, grade, value, status)
+regardless of colour, alongside the adverse expansion. This is Design 1 of the
+two the issue offered (pin only cited names, not "always expand every GREEN
+component") because it keeps the digest bounded by the size of the *carried
+backlog*, not the size of the *card*: `DirectorPlanPromptChars` feeds the
+plan-call latency/cost telemetry a sibling issue (I8164/I8200) is separately
+re-anchoring, so an unconditional expansion of every GREEN/N-A component would
+add real cost for rows nothing is asking to close.
+
 Output is plain text (markdown-ish) so it drops straight into the prompt.
 """
 
@@ -69,8 +85,16 @@ def _chip(status) -> str:
     return str(status or "N/A")
 
 
-def summarize_report_card(card: dict) -> str:
-    """Return a compact text digest of the report card for the prompt."""
+def summarize_report_card(card: dict, *, pinned_components: set[str] | None = None) -> str:
+    """Return a compact text digest of the report card for the prompt.
+
+    ``pinned_components``: lower-cased component names to render in full
+    (name, grade, value, status) regardless of colour — components named by
+    an open carry-over item / prior-plan action item. See the module
+    docstring, "Pinned components", for why this is bounded by the carried
+    backlog rather than by the card.
+    """
+    pinned_components = pinned_components or set()
     if not card:
         return "No Report Card available for this cycle."
 
@@ -194,6 +218,20 @@ def summarize_report_card(card: dict) -> str:
     if card.get("degraded_staleness"):
         out.append("⚠ DEGRADED (staleness): stale tiles — "
                    + ", ".join(card.get("stale_tiles") or []))
+    # alpha-engine-config-I8380 — distinguish "absent from the card" from "not
+    # carried into this digest". A GREEN/N-A component that is not itemized
+    # below is COUNTED, not absent: it appears in its tile's "N GREEN, N
+    # adverse, N N/A" head, and if it is named by an open carry-over item it is
+    # additionally pinned and expanded in full further down. Only a name that
+    # appears in NEITHER a tile head count NOR a pinned/adverse line is
+    # genuinely absent from report_card.json.
+    out.append(
+        "NOTE: every component on this card is counted in its tile's "
+        "GREEN/adverse/N-A totals below, even when not itemized by name. "
+        "'Not visible on this card' is true ONLY for a metric absent from "
+        "every tile's components list AND every count — never say it about a "
+        "metric this digest merely counted instead of naming."
+    )
     out.append("")
 
     for key in TILE_ORDER:
@@ -212,14 +250,28 @@ def summarize_report_card(card: dict) -> str:
         # Expand the adverse (RED/WATCH) components — these are the issues.
         for c in adverse:
             out.append(_component_line(c))
-        # Roll up N/A by reason-kind (don't expand each).
-        if na:
+        # alpha-engine-config-I8380 — a GREEN/N-A component named by an open
+        # carry-over item is pinned into full detail regardless of colour, so
+        # the Director can cite its RECOVERY and close the item. Rendered once
+        # here (not also in the rollups below) — a pinned name is excluded
+        # from the N/A kind-count line and the drift-watch loop.
+        pinned_green = [c for c in green if str(c.get("name") or "").strip().lower() in pinned_components]
+        pinned_na = [c for c in na if str(c.get("name") or "").strip().lower() in pinned_components]
+        for c in pinned_green + pinned_na:
+            out.append(_component_line(c) + " (carryover-pinned — cite this to close the item)")
+        # Roll up N/A by reason-kind (don't expand each), excluding pinned ones
+        # already expanded above.
+        na_unpinned = [c for c in na if c not in pinned_na]
+        if na_unpinned:
             kinds: dict[str, int] = {}
-            for c in na:
+            for c in na_unpinned:
                 kinds[str(c.get("status"))] = kinds.get(str(c.get("status")), 0) + 1
             out.append("  - N/A: " + ", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())))
-        # GREEN with a downward drift is still worth a flag (drift-watch).
+        # GREEN with a downward drift is still worth a flag (drift-watch),
+        # unless already expanded above as pinned.
         for c in green:
+            if c in pinned_green:
+                continue
             if c.get("trend_decoration") in ("↓", "↓↓"):
                 out.append(f"  - {c.get('name')} GREEN but trending {c['trend_decoration']} (drift-watch)")
         out.append("")

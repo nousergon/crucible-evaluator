@@ -1519,11 +1519,37 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     return "\n".join(lines)
 
 
+def _open_carryover_pinned_components(carryover: dict | None, status_map: dict) -> set[str]:
+    """Lower-cased component names cited by any active carry-over item's
+    evidence/title/rationale, resolved against ``status_map`` (built from the
+    CURRENT card). Feeds ``summarize_report_card``'s ``pinned_components`` so a
+    carry-over item can be closed on cited evidence that has since recovered to
+    GREEN, not just on evidence that is still adverse
+    (alpha-engine-config-I8380).
+
+    Wider than :func:`evidence_still_adverse`'s evidence-only scope, on purpose
+    and for the same reason ``_row_block`` widens: the claim a ledger row
+    stakes often lives in its title/rationale prose, not a bare evidence list.
+    This never mutates or reopens anything — it only decides what the DIGEST
+    names — so the wider scope carries no risk the narrower reopen path avoids.
+    """
+    if not carryover or not carryover.get("items") or not status_map:
+        return set()
+    names: set[str] = set()
+    for it in carryover.get("items") or []:
+        names |= set(resolve_cited_metrics(
+            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
+            status_map,
+        ).keys())
+    return names
+
+
 def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_digest: str | None = None,
                    resolved_digest: str | None = None) -> list:
     """Assemble (system, human) messages for the Director call."""
+    pinned = _open_carryover_pinned_components(carryover, component_status_map(report_card or {}))
     human = [
-        summarize_report_card(report_card),
+        summarize_report_card(report_card, pinned_components=pinned),
         "",
         _carryover_context(carryover, report_card),
     ]
