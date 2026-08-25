@@ -312,6 +312,83 @@ class TestPlanLatencySignal:
         )
         assert rec["DirectorPlanCompletionTokens"] == 0
 
+    def test_amber_cannot_exceed_a_tight_ceiling_quote(self):
+        """Measured 2026-08-21 (`director/2026-08-21/action_plan.json`,
+        `plan_call_telemetry`): DirectorPlanAmberSeconds=205.2 published above
+        DirectorPlanCeilingSeconds=120.0 for that attempt — amber structurally
+        could never fire, because a call quoted 120s either finishes under
+        120s or is killed by the ceiling before reaching 205.2s. The amber
+        line must be clamped to the effective (quoted) ceiling, not just the
+        static one, and the clamp must be visible on the record."""
+        rec = _emit_plan_latency(
+            elapsed_s=100.0, outcome="ok", prompt_chars=1, carryover_items=1,
+            ceiling_s=120.0,
+        )
+        assert rec["DirectorPlanAmberSeconds"] < rec["DirectorPlanCeilingSeconds"]
+        assert rec["DirectorPlanAmberClampedToCeiling"] == 1
+
+    def test_amber_clamp_is_not_set_under_a_generous_ceiling(self):
+        rec = _emit_plan_latency(
+            elapsed_s=100.0, outcome="ok", prompt_chars=1, carryover_items=1,
+            ceiling_s=DIRECTOR_PLAN_CEILING_S,
+        )
+        assert rec["DirectorPlanAmberClampedToCeiling"] == 0
+        assert rec["DirectorPlanAmberSeconds"] == pytest.approx(
+            round(_plan_amber_threshold_s(), 1)
+        )
+
+    def test_missing_usage_is_flagged_unmeasured_not_a_silent_zero(self):
+        """`principles.md` §2.7 / observability-policy: a successful call
+        reporting 0 tokens is indistinguishable from a free call unless
+        something else says the 0 is unmeasured rather than real."""
+        rec = _emit_plan_latency(
+            elapsed_s=90.0, outcome="ok", prompt_chars=1, carryover_items=1,
+            usage=None,
+        )
+        assert rec["DirectorPlanCompletionTokens"] == 0
+        assert rec["DirectorPlanTokensUnmeasured"] == 1
+
+    def test_krepis_usage_unknown_sentinel_is_flagged_unmeasured(self):
+        """krepis's own sentinel for "the provider returned no usage block for
+        at least one attempt" (LLMUsage.usage_unknown, alpha-engine-config-
+        I8164) — zero token counts alongside it must not read as measured."""
+        class _UnknownUsage:
+            input_tokens = 0
+            output_tokens = 0
+            reasoning_tokens = 0
+            usage_unknown = True
+
+        rec = _emit_plan_latency(
+            elapsed_s=90.0, outcome="ok", prompt_chars=1, carryover_items=1,
+            usage=_UnknownUsage(),
+        )
+        assert rec["DirectorPlanTokensUnmeasured"] == 1
+
+    def test_real_usage_is_not_flagged_unmeasured(self):
+        class _Usage:
+            input_tokens = 11212
+            output_tokens = 23300
+            reasoning_tokens = 16000
+            usage_unknown = False
+
+        rec = _emit_plan_latency(
+            elapsed_s=228.0, outcome="ok", prompt_chars=1, carryover_items=1,
+            usage=_Usage(),
+        )
+        assert rec["DirectorPlanTokensUnmeasured"] == 0
+
+    def test_emf_envelope_declares_the_new_metrics_too(self, capsys):
+        _emit_plan_latency(
+            elapsed_s=90.0, outcome="ok", prompt_chars=1, carryover_items=1,
+        )
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        declared = {
+            m["Name"]
+            for m in payload["_aws"]["CloudWatchMetrics"][0]["Metrics"]
+        }
+        assert "DirectorPlanTokensUnmeasured" in declared
+        assert "DirectorPlanAmberClampedToCeiling" in declared
+
     def test_emitter_never_raises_even_when_the_record_cannot_be_encoded(self, monkeypatch):
         """A telemetry failure must not take down the weekly plan — but it is
         logged at ERROR, because a silent emitter is what this exists to end."""
