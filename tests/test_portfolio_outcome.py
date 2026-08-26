@@ -102,8 +102,11 @@ class TestBuildTileMissingInput:
         # No eod_pnl → every component N/A-MISSING-INPUT.
         statuses = {c["status"] for c in tile["components"]}
         assert statuses == {"N/A-MISSING-INPUT"}
-        # Critical N/A → tile WATCH (transparency), never a false GREEN.
-        assert tile["status"] == "WATCH"
+        # alpha-engine-config-I8177: a tile in which NOTHING graded is
+        # UNMEASURED, not measured-and-borderline. It reports the N/A
+        # class its components declare (module_agg.unmeasured_status).
+        assert tile["status"] == "N/A-MISSING-INPUT"
+        assert tile["n_graded"] == 0
         assert tile["numeric_grade"] is None
 
 

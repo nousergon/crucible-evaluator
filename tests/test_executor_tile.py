@@ -46,8 +46,11 @@ class TestMissing:
         # reconciliation_integrity is now IMPLEMENTED (config#859) — absent
         # artifact → MISSING-INPUT, not NOT-IMPL.
         assert _comp(tile, "reconciliation_integrity")["status"] == "N/A-MISSING-INPUT"
-        # Critical components N/A → WATCH (never false GREEN).
-        assert tile["status"] == "WATCH"
+        # alpha-engine-config-I8177: a tile in which NOTHING graded is
+        # UNMEASURED, not measured-and-borderline. It reports the N/A
+        # class its components declare (module_agg.unmeasured_status).
+        assert tile["status"] == "N/A-MISSING-INPUT"
+        assert tile["n_graded"] == 0
 
 
 class TestReconciliationIntegrity:

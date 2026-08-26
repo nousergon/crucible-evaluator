@@ -54,6 +54,63 @@ def bh_fdr_significant(p_values: list[float], alpha: float = 0.05) -> bool:
     return any(benjamini_hochberg(ps, alpha=alpha))
 
 
+#: Which N/A class a wholly-unmeasured tile reports, when its components do not
+#: all agree. Plurality first, this order as the tie-break: the reader is asking
+#: "why is there nothing here", and a missing input is the most actionable
+#: answer, an unbuilt component the next, and a tile that simply never produced
+#: anything the least specific. Every member is from the card's closed N/A
+#: taxonomy (``krepis.metrics.StatusLiteral``) — this introduces no new state.
+_UNMEASURED_PRECEDENCE = (
+    "N/A-MISSING-INPUT",
+    "N/A-NOT-IMPL",
+    "N/A-LOW-N",
+    "N/A-NOT-RUN",
+)
+
+
+def unmeasured_status(components: list[MetricRecord]) -> StatusLiteral | None:
+    """The N/A class for a tile in which NOTHING graded — else ``None``.
+
+    ``observability-policy.md``: *a component emitting nothing is not healthy,
+    it is unobserved*, and `principles.md` §2.7 forbids rendering *no data* as
+    a measurement of any kind. ``module_status``'s critical-gate ladder was
+    written for a tile with SOME measurement in it: a tile whose criticals are
+    all N/A landed on ``WATCH`` (letter ``C``), which is the same status a tile
+    that ran, measured every component and came out borderline gets. Measured
+    2026-08-22: the ``agent`` tile was **11 N/A of 11** — an entire tile with
+    not one number in it — and it rendered ``WATCH`` / ``C`` on the console,
+    in the Director digest, and as a ``WATCH`` vote inside ``overall_status``,
+    where two of them are enough to hold the whole card at WATCH. An
+    unmeasured tile was manufacturing a measured verdict.
+
+    The status returned is the class the components themselves declare, so a
+    reader learns *why* the tile is empty from the tile line alone rather than
+    having to open its components. It is derived from the records, never
+    hand-listed per tile.
+    """
+    if not components:
+        return None
+    if any(not c.is_na for c in components):
+        return None
+    counts = {s: 0 for s in _UNMEASURED_PRECEDENCE}
+    for c in components:
+        if c.status in counts:
+            counts[c.status] += 1
+    top = max(counts.values())
+    if not top:
+        # Every component is N/A under a class this taxonomy does not name.
+        # Loud rather than guessed: a fall-through is the thing the closed
+        # vocabulary exists to remove (`observability-policy.md` §8.3).
+        raise ValueError(
+            "unmeasured tile carries N/A statuses outside the closed taxonomy: "
+            + ", ".join(sorted({str(c.status) for c in components})),
+        )
+    for status in _UNMEASURED_PRECEDENCE:
+        if counts[status] == top:
+            return status  # type: ignore[return-value]
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def module_status(components: list[MetricRecord], *, alpha: float = 0.05) -> StatusLiteral:
     """Roll a tile's components up to a module status (RC v2 Principle 3).
 
@@ -68,9 +125,15 @@ def module_status(components: list[MetricRecord], *, alpha: float = 0.05) -> Sta
       WATCH if any critical component is N/A-* (transparency); GREEN if only
             supporting/diagnostic are N/A.
       GREEN otherwise.
+
+    Ahead of all of that: a tile in which NOTHING graded does not get a
+    measured status at all (alpha-engine-config-I8177). See
+    ``unmeasured_status``.
     """
     if not components:
         return "N/A-NOT-RUN"
+    if (unmeasured := unmeasured_status(components)) is not None:
+        return unmeasured
 
     critical = [c for c in components if c.criticality == "critical"]
     supporting = [c for c in components if c.criticality == "supporting"]
@@ -121,6 +184,20 @@ def overall_status(tiles: dict[str, StatusLiteral]) -> StatusLiteral:
     if tiles.get("portfolio_outcome") == "WATCH" or n_watch >= 2:
         return "WATCH"
     if (tiles.get("portfolio_outcome") or "N/A").startswith("N/A"):
+        return "WATCH"
+    # A cascade module that is wholly UNMEASURED cannot let the card claim
+    # GREEN either (alpha-engine-config-I8177). Before `unmeasured_status`, a
+    # tile with nothing in it voted WATCH and was counted above; now it votes
+    # N/A, and without this clause the card would get GREENER the more of
+    # itself went dark — the exact inversion `principles.md` §2.7 forbids.
+    # Only modules PRESENT in the mapping are judged: a key absent from the
+    # roll-up is a tile that is not on this card at all, which is a census
+    # question (`grading/coverage.py`), not a status one. Conflating the two
+    # would make this function's verdict depend on how complete its caller's
+    # dict happened to be.
+    if any(
+        str(tiles[m]).startswith("N/A") for m in _CASCADE_MODULES if m in tiles
+    ):
         return "WATCH"
     return "GREEN"
 
@@ -210,6 +287,10 @@ def build_tile(
         "letter": derive_letter(status),
         "numeric_grade": numeric_grade(components),
         "n_components": len(components),
+        # The denominator behind this tile's status, on the tile line itself.
+        # A reader (and the card census) can see "11 components, 0 graded"
+        # without opening the component list (alpha-engine-config-I8177).
+        "n_graded": sum(1 for c in components if not c.is_na),
         "as_of": as_of,
         "source_artifact_dates": source_artifact_dates,
         "components": dumped,
