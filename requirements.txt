@@ -164,6 +164,18 @@ pandas~=3.0
 # first, correct this literal to the version actually published rather than
 # loosening the pin -- §139 pins first-party deps, never floors them.
 #
+# Raised to 0.59.39 (krepis-PR192, alpha-engine-config-I8348/-I8408): the
+# FIRST published krepis carrying `LLMClient.structured(total_timeout=...)` /
+# `LLMClient(stream_total_timeout=...)` and `krepis.llm.StreamTotalTimeoutError`
+# — a TOTAL wall-clock bound on a streamed call, distinct from
+# `idle_timeout`/`StreamIdleTimeoutError` (inter-chunk silence). Default OFF
+# (unset `total_timeout` stays unbounded), so no earlier consumer silently
+# acquired a ceiling on this bump alone. `director/agent.py` arms it on the
+# Director's streamed plan call (I8164, crucible-evaluator-PR267): a stream
+# that keeps emitting chunks never trips the idle budget, and the Director's
+# SF Catch is terminal (config#6408), so an unbounded stream hangs the whole
+# four-hour weekly run rather than degrading it.
+#
 # Raised to 0.59.35 (krepis-PR188, alpha-engine-config-I8164): the FIRST
 # published krepis carrying `LLMClient.structured(stream=True, idle_timeout=...)`
 # and the `streaming` routable capability. LOAD-BEARING here, not opportunistic:
@@ -178,7 +190,7 @@ pandas~=3.0
 # `krepis/model_registry.py`. A merged publish workflow is not a published
 # package, and this fleet has shipped a green "Publish to PyPI" that served
 # unchanged metadata.
-krepis[flow-doctor,openai]==0.59.35  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it
+krepis[flow-doctor,openai]==0.59.39  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; alpha-engine-config-I8408 arms `total_timeout` on the Director's streamed plan call
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
