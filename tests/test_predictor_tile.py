@@ -74,8 +74,11 @@ class TestMissing:
     def test_both_absent_watch(self, s3):
         tile = build_predictor_tile(BUCKET, s3_client=s3)
         assert tile["module"] == "predictor"
-        # Single critical N/A-MISSING-INPUT component → tile WATCH (not false GREEN).
-        assert tile["status"] == "WATCH"
+        # alpha-engine-config-I8177: a tile in which NOTHING graded is
+        # UNMEASURED, not measured-and-borderline. It reports the N/A
+        # class its components declare (module_agg.unmeasured_status).
+        assert tile["status"] == "N/A-MISSING-INPUT"
+        assert tile["n_graded"] == 0
 
 
 class TestFeatureDriftKS:

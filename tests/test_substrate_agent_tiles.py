@@ -427,8 +427,12 @@ class TestAgent:
         assert tile["module"] == "agent"
         statuses = {c["status"] for c in tile["components"]}
         assert statuses <= {"N/A-NOT-IMPL", "N/A-MISSING-INPUT"}
-        # critical N/A → tile WATCH (transparency, never a false GREEN).
-        assert tile["status"] == "WATCH"
+        # alpha-engine-config-I8177: a tile in which NOTHING graded is
+        # UNMEASURED, not measured-and-borderline. It reports the N/A
+        # class its components declare (module_agg.unmeasured_status).
+        # The live 2026-08-22 case: 11 N/A of 11, rendered WATCH / C.
+        assert tile["status"] == "N/A-MISSING-INPUT"
+        assert tile["n_graded"] == 0
         assert tile["numeric_grade"] is None
 
     def test_producer_components_missing_input_name_producer(self, s3):

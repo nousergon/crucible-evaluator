@@ -30,7 +30,7 @@ import logging
 import boto3
 
 from grading.artifacts import read_scorecard_inputs
-from grading.coverage import replace_evaluator_coverage
+from grading.coverage import replace_evaluator_coverage, stamp_composite_scope
 from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
@@ -222,6 +222,13 @@ def build_report_card(
     # keeps emitting its record (so its own shape and tests stand); this
     # substitutes the value once the full census exists.
     replace_evaluator_coverage(tiles)
+    # Same defect, one level up (alpha-engine-config-I8177): the v1 `overall`
+    # block reported `components_declared: 3` / `qualifier: COMPLETE` on a card
+    # carrying 125 leaf components, 47 of them N/A, and `tiles_overall_status:
+    # RED`. True of its three modules, false of the card it ships on. This
+    # stamps what it covers and demotes the qualifier; it does not touch the
+    # grade, whose weights are a Brian ruling (`alpha-engine-config-I7210`).
+    stamp_composite_scope(scorecard, tiles)
     scorecard["tiles"] = tiles
     # Handed to the handler (which persists it as its own artifact) under a
     # leading underscore, the same convention `_provenance` uses for a key that
@@ -235,6 +242,18 @@ def build_report_card(
     scorecard["tiles_overall_status"] = overall_status(
         {name: t["status"] for name, t in tiles.items()}
     )
+    # alpha-engine-config-I8177 — tiles in which NOTHING graded, named at the
+    # top of the card rather than inferable only by opening every component
+    # list. Zero-length is a VALUE here: an empty list asserts every tile
+    # carried at least one real measurement, which is what makes a non-empty
+    # one readable as the finding it is. Measured 2026-08-22: `agent` was 11
+    # N/A of 11 and rendered WATCH/C, indistinguishable from a tile that
+    # measured everything and came out borderline.
+    scorecard["tiles_unmeasured"] = {
+        name: t["status"]
+        for name, t in sorted(tiles.items())
+        if str(t.get("status", "")).startswith("N/A")
+    }
 
     # config#2885: top-level degraded_staleness flag — true when ANY tile
     # reports a stale artifact (detected by scanning tile components' na_detail

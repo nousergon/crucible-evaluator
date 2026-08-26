@@ -277,3 +277,130 @@ def coverage_reason(census: dict[str, Any]) -> str:
         f"graded, non-N/A, across every tile on this card) vs target 95% / "
         f"red-line 80%.{worst}{out_note}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The same defect, one level UP: the v1 composite's own coverage block
+# ---------------------------------------------------------------------------
+#
+# `evaluator_coverage` measured a 14-leaf legacy artifact and called it the
+# card's coverage. The card's headline `overall` block does the identical
+# thing with the identical shape, and had not been swept: it is the v1/v2
+# composite over `research` / `predictor` / `executor` ONLY, and it reported
+#
+#     overall.coverage = {components_declared: 3, components_present: 3,
+#                         qualifier: "COMPLETE"}
+#
+# on the 2026-08-22 card — the same card carrying `tiles_overall_status: RED`
+# and 47 N/A across 125 leaf components. "COMPLETE" was TRUE of the three
+# modules it declared and FALSE of the card it shipped on: seven of the ten
+# tiles, portfolio_outcome (the product-outcome tile) among them, carry no
+# weight in that composite at all.
+#
+# `engagement-protocol-policy.md` §5 — a fix survives the CLASS, not the
+# instance. Fixing `evaluator_coverage` and leaving this is fixing one call
+# site of a systemic defect.
+#
+# The composite's ARITHMETIC is not touched here. Its weights are a scoring
+# rule Brian ruled on (`alpha-engine-config-I7210`), and re-weighting the
+# headline grade over ten tiles is a scoring decision, not a reporting one —
+# filed, not assumed. What is fixed is the claim the block makes ABOUT ITSELF:
+# a coverage qualifier may not read COMPLETE while the artifact it is stamped
+# on carries a component surface the composite cannot see.
+
+#: Coverage qualifier for a composite that is complete over its own declared
+#: scope while that scope is a strict subset of the card. Distinct from
+#: ``PARTIAL`` on purpose: ``PARTIAL`` means declared weight went missing this
+#: cycle (a run-quality fact that varies week to week), whereas this is a
+#: standing structural fact about what the composite covers at all. Collapsing
+#: them would make a scope gap look like a bad week and disappear the moment
+#: every declared module happened to report.
+PARTIAL_SCOPE = "PARTIAL-SCOPE"
+
+
+def stamp_composite_scope(
+    scorecard: dict[str, Any], tiles: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Declare, on the v1 ``overall`` block, what it does and does not cover.
+
+    Adds ``overall.coverage.census_scope`` — the tiles inside the composite,
+    the tiles outside it **with their statuses**, and the card-wide leaf
+    census — and demotes a ``COMPLETE`` qualifier to ``PARTIAL-SCOPE`` while
+    any tile sits outside. Rewrites ``overall.display`` so no surface renders
+    the bare letter.
+
+    Everything is DERIVED: in-scope is read from ``grading_weights.overall``
+    (the composite's own declaration) and out-of-scope from the tiles actually
+    on the card, so a tile added tomorrow lands in the out-of-scope list
+    without anyone editing this file. There is no list of tile names here, for
+    the same reason ``card_component_census`` carries no list of components.
+
+    Never raises, for the reason in ``replace_evaluator_coverage``: a defect in
+    a block that DESCRIBES the grade must not destroy the card carrying it.
+    Returns the scope block, or ``None`` when it could not be built.
+    """
+    try:
+        return _stamp_composite_scope(scorecard, tiles)
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.exception(
+            "composite scope stamp failed; overall.coverage retains its "
+            "own-scope qualifier, which describes the three v1 modules and "
+            "NOT this card's ten tiles — treat a COMPLETE there as unverified "
+            "(alpha-engine-config-I8177)",
+        )
+        return None
+
+
+def _stamp_composite_scope(
+    scorecard: dict[str, Any], tiles: dict[str, Any],
+) -> dict[str, Any] | None:
+    from grading.scorecard import _display
+
+    overall = scorecard.get("overall")
+    if not isinstance(overall, dict):
+        return None
+    coverage = overall.get("coverage")
+    if not isinstance(coverage, dict):
+        return None
+
+    declared = (scorecard.get("grading_weights") or {}).get("overall") or {}
+    in_scope = sorted(name for name in tiles if name in declared)
+    out_of_scope = sorted(name for name in tiles if name not in declared)
+
+    census = card_component_census(tiles)
+    in_leaves = sum(
+        counts["total"] for name, counts in (census["per_tile"] or {}).items()
+        if name in declared
+    )
+
+    scope = {
+        # What the composite grades.
+        "tiles_in_scope": in_scope,
+        # What it does not — with each one's verdict, so the omission is
+        # readable as the finding it is rather than as a list of names
+        # (`observability-policy.md` §7.2a: name the members).
+        "tiles_out_of_scope": {
+            name: (tiles[name] or {}).get("status") for name in out_of_scope
+        },
+        "tiles_on_card": len(tiles),
+        # Leaf counts, so the "3 declared components" in this block cannot be
+        # mistaken for the card's component surface again.
+        "leaf_components_in_scope": in_leaves,
+        "leaf_components_on_card": census["total"],
+        "card_leaf_coverage": census["coverage"],
+        "card_leaf_graded": census["graded"],
+        "note": (
+            "This composite grades "
+            f"{len(in_scope)} of {len(tiles)} tiles on this card. Its "
+            "coverage fields describe that scope ONLY; the card-wide "
+            "component census is `tiles.backtester.components[] "
+            "evaluator_coverage.coverage_census`, and the card-wide verdict "
+            "is `tiles_overall_status` (alpha-engine-config-I8177)."
+        ),
+    }
+    coverage["census_scope"] = scope
+
+    if out_of_scope and coverage.get("qualifier") == "COMPLETE":
+        coverage["qualifier"] = PARTIAL_SCOPE
+    overall["display"] = _display(overall.get("letter", "?"), coverage)
+    return scope

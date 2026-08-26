@@ -50,9 +50,13 @@ class TestDirectorQuality:
         assert tile["n_components"] == 4
         statuses = {c["status"] for c in tile["components"]}
         assert statuses == {"N/A-MISSING-INPUT"}
-        # only supporting components N/A → tile stays GREEN (WATCH-only class,
-        # never a critical N/A) per module_agg.module_status.
-        assert tile["status"] == "GREEN"
+        # alpha-engine-config-I8177: previously GREEN — a tile with four
+        # components and not one number in it rendered as the healthiest state
+        # on the card, because the critical-gate ladder only downgrades on a
+        # CRITICAL N/A and these are all supporting. Nothing graded ⇒ N/A.
+        assert tile["status"] == "N/A-MISSING-INPUT"
+        assert tile["letter"] == "N/A"
+        assert tile["n_graded"] == 0
         assert tile["numeric_grade"] is None
         for name in ("director_grounding", "director_calibration", "director_actionability"):
             c = _comp(tile, name)

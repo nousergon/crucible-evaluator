@@ -754,6 +754,21 @@ def _display(letter: str, coverage: dict | None) -> str:
         return letter
     if q == "UNGRADED":
         return "N/A (no component contributed)"
+    if q == "PARTIAL-SCOPE":
+        # Complete over its own declared scope, which is a strict SUBSET of the
+        # card (alpha-engine-config-I8177). The percentage below would read
+        # 100% here and is not the honest number to lead with; the scope is.
+        scope = coverage.get("census_scope") or {}
+        n_in = len(scope.get("tiles_in_scope") or [])
+        n_all = scope.get("tiles_on_card") or "?"
+        out = scope.get("tiles_out_of_scope") or {}
+        cov = scope.get("card_leaf_coverage")
+        cov_s = f"{cov:.0%}" if isinstance(cov, (int, float)) else "?"
+        return (
+            f"{letter} (PARTIAL SCOPE — grades {n_in} of {n_all} tiles; "
+            f"not covered: {', '.join(sorted(out))}. Card-wide leaf coverage "
+            f"{cov_s}; card-wide verdict is tiles_overall_status)"
+        )
     pct = coverage.get("weight_present_effective")
     pct_s = f"{pct:.0%}" if isinstance(pct, (int, float)) else "?"
     if q == "PARTIAL-FAILURE-SCORED-ZERO":
