@@ -180,7 +180,40 @@ DIRECTOR_GROUP = "ultra"
 # would take a generation running ~4x slower than any yet observed while never
 # once falling silent for 90s. Against that: the failure this replaces has
 # already killed a weekly run and its rerun, four attempts, zero tokens.
+#
+# alpha-engine-config-I8408 (2026-08-25) closes the narrowing above: krepis
+# 0.59.39 (krepis-PR192) ships `total_timeout`/`stream_total_timeout`, a
+# TOTAL wall-clock bound distinct from `idle_timeout`, default OFF. This
+# constant IS that bound (`DIRECTOR_PLAN_TOTAL_TIMEOUT_S` below is just its
+# name at the call site) — 600s is not a new number invented for this: it is
+# the same client budget `evaluator.md`'s declared chain already committed to
+# (`600 = 900 function - 240 retro reserve - 45 write reserve`), so arming
+# `total_timeout` at this value enforces a ceiling the system already agreed
+# to rather than introducing a second one. `alpha-engine-config-I8200`
+# separately re-anchors `DIRECTOR_PLAN_MEASURED_MAX_S` from post-cap weekly
+# runs, gated on `gate:weekly-sf:2026-08-29` — that measurement does not yet
+# exist, and waiting for it would leave the plan call unbounded through the
+# 2026-08-29 run this issue exists to protect. An approximately-right bound
+# derived from an already-committed number, in place now, is worth more than
+# a precisely-right one that arrives after the run it needed to cover.
 DIRECTOR_PLAN_CEILING_S = 600.0
+
+#: The TOTAL wall-clock bound passed as `total_timeout=` to the streamed plan
+#: call — see the comment above `DIRECTOR_PLAN_CEILING_S`. Deliberately a
+#: SEPARATE named constant rather than reusing the per-attempt quote
+#: (`_KrepisStructuredDirector.attempt_cost_s`, which `budget.quote()` can
+#: shrink as low as `director.budget.MIN_VIABLE_CALL_S` = 30s under a
+#: degraded invocation): krepis raises `ValueError` when `total_timeout <=
+#: idle_timeout` (90s here), so a total bound that tracked the shrinking
+#: per-attempt quote would turn a degraded-but-viable invocation into a hard
+#: crash instead of the shorter, cleaner failure the quote already produces.
+#: Anchoring on the static 600s ceiling instead keeps `total_timeout >
+#: idle_timeout` true by construction — the same ordering
+#: `tests/test_director_streaming_plan_call.py::TestIdleBudgetOrdering`
+#: already asserts for the ceiling vs. the idle bound — and costs nothing in
+#: the degraded case: the transport `timeout=` (the shrunk quote) and the
+#: Lambda's own wall already bind tighter than 600s there.
+DIRECTOR_PLAN_TOTAL_TIMEOUT_S = DIRECTOR_PLAN_CEILING_S
 
 # ── The liveness bound (alpha-engine-config-I8164) ───────────────────────────
 #
@@ -308,6 +341,41 @@ try:
     from krepis.llm import StreamIdleTimeoutError as _StreamIdleTimeoutError
 except ImportError:  # pragma: no cover — krepis is a hard pinned dependency; defensive only
     _StreamIdleTimeoutError = ()  # type: ignore[assignment]
+
+# ── `StreamTotalTimeoutError` is classified NOT-retryable (alpha-engine-config-
+# I8408) ──────────────────────────────────────────────────────────────────────
+#
+# krepis 0.59.39 raises this when a stream keeps producing chunks past
+# `total_timeout` — the sibling of `StreamIdleTimeoutError` above, deliberately
+# a DIFFERENT type so a consumer's classifier can treat them differently. This
+# one is treated differently: it is excluded from `_RETRYABLE`'s substring
+# match (its message contains "...past its total_timeout=600s...", which
+# matches the bare "timeout" substring already in `_RETRYABLE` — without this
+# explicit exclusion it would silently retry, which is the wrong default) and
+# is never added to the isinstance allow-list `_StreamIdleTimeoutError` is on.
+#
+# The judgment call, stated rather than left implicit: `StreamIdleTimeoutError`
+# means the route went briefly silent — a transport hiccup, the same shape as
+# the `openai.APITimeoutError` this loop already retries — and a retry is
+# likely to succeed. `StreamTotalTimeoutError` means the model was still
+# actively generating and simply took longer than the invocation could afford
+# the WHOLE call to take. Retrying does not address that: the retried attempt
+# gets the SAME prompt (this loop never trims it) and the SAME
+# `total_timeout`, so it is expected to reproduce the same overrun rather than
+# recover from a transient condition. Meanwhile every retry here is funded
+# from the SAME invocation budget the first attempt already spent most of
+# (`budget.can_afford(cost + delay)` gates it, but `cost` is
+# `attempt_cost_s` — the per-attempt quote — not `0`, so a retry after a
+# near-full-quote overrun is exactly the case `can_afford` is likeliest to
+# decline), and the Phase-G retro judge's reserve sits downstream of
+# whatever a retry burns. Failing fast surfaces one clear, attributable
+# error with the partial generation and chunk count attached instead of
+# spending a second ~600s window on a call already shown not to fit in one.
+# `tests/test_director_streaming_plan_call.py` covers this classification.
+try:
+    from krepis.llm import StreamTotalTimeoutError as _StreamTotalTimeoutError
+except ImportError:  # pragma: no cover — krepis is a hard pinned dependency; defensive only
+    _StreamTotalTimeoutError = ()  # type: ignore[assignment]
 
 # ── The attempt multiplier (config#7126) ─────────────────────────────────────
 #
@@ -917,12 +985,22 @@ class _KrepisStructuredDirector:
     #: defaulted so every existing caller and test double is unchanged.
     idle_timeout_s = DIRECTOR_PLAN_IDLE_TIMEOUT_S
 
+    #: TOTAL wall-clock bound passed as `total_timeout=` — see
+    #: `DIRECTOR_PLAN_TOTAL_TIMEOUT_S`. Injectable for the same reason
+    #: `idle_timeout_s` is: a test can drive the bound without reaching into
+    #: the module constant, and every existing caller/test double keeps
+    #: working unchanged.
+    total_timeout_s = DIRECTOR_PLAN_TOTAL_TIMEOUT_S
+
     def __init__(self, client, *, director_model: str, primary_model: str | None = None,
-                 attempt_cost_s: float | None = None, idle_timeout_s: float | None = None):
+                 attempt_cost_s: float | None = None, idle_timeout_s: float | None = None,
+                 total_timeout_s: float | None = None):
         if attempt_cost_s is not None:
             self.attempt_cost_s = attempt_cost_s
         if idle_timeout_s is not None:
             self.idle_timeout_s = idle_timeout_s
+        if total_timeout_s is not None:
+            self.total_timeout_s = total_timeout_s
         self._client = client
         self._director_model = director_model
         #: The group's declared primary, as the BILLABLE UPSTREAM id
@@ -989,6 +1067,14 @@ class _KrepisStructuredDirector:
             # weekly run.
             stream=True,
             idle_timeout=self.idle_timeout_s,
+            # alpha-engine-config-I8408. Bounds TOTAL accumulated stream
+            # duration, independent of `idle_timeout` above — a stream that
+            # keeps emitting chunks never trips the idle budget, and the
+            # Director's SF Catch is terminal (config#6408), so an unbounded
+            # stream hangs the four-hour weekly run rather than degrading it.
+            # See `DIRECTOR_PLAN_TOTAL_TIMEOUT_S` for why this is a fixed
+            # 600s rather than the per-attempt budget quote.
+            total_timeout=self.total_timeout_s,
         )
         self.last_usage = getattr(result, "usage", None)
         plan: DirectorWeeklyActionPlan = result.parsed
@@ -1685,8 +1771,17 @@ def _invoke_with_retry(llm, messages, *, budget=None):
             # message-substring set — StreamIdleTimeoutError's message names
             # what it is NOT ("not on total duration") rather than containing
             # a `_RETRYABLE` keyword, so it must be caught by isinstance.
-            is_retryable = isinstance(e, _StreamIdleTimeoutError) or any(
-                t in msg for t in _RETRYABLE
+            # alpha-engine-config-I8408: `StreamTotalTimeoutError` is excluded
+            # FIRST and unconditionally — its message contains "total_timeout="
+            # and therefore matches the bare "timeout" substring in
+            # `_RETRYABLE` below, so without this explicit exclusion it would
+            # retry by accident. See the classification comment above
+            # `_StreamTotalTimeoutError`'s import for why fail-fast is correct
+            # here (as opposed to `StreamIdleTimeoutError`, which IS retried).
+            is_retryable = not isinstance(e, _StreamTotalTimeoutError) and (
+                isinstance(e, _StreamIdleTimeoutError) or any(
+                    t in msg for t in _RETRYABLE
+                )
             )
             if attempt >= _MAX_RETRIES or not is_retryable:
                 raise

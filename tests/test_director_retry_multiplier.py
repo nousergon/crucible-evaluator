@@ -300,6 +300,85 @@ def test_a_stream_idle_timeout_recovers_on_a_later_attempt():
 
 
 # ---------------------------------------------------------------------------
+# StreamTotalTimeoutError (alpha-engine-config-I8408) — type-classified as
+# NOT-retryable, deliberately the opposite of StreamIdleTimeoutError above.
+#
+# Its message contains "total_timeout=", which DOES match the bare "timeout"
+# substring in _RETRYABLE — unlike StreamIdleTimeoutError's message, this one
+# would retry by accident without the explicit exclusion. A total-timeout
+# means the model was still actively generating and simply took longer than
+# the invocation could afford the whole call to take; the retried attempt gets
+# the same prompt and the same total_timeout, so it is expected to reproduce
+# the same overrun rather than recover from a transient condition.
+# ---------------------------------------------------------------------------
+
+class _TotalTimeoutLLM:
+    """Raises krepis.llm.StreamTotalTimeoutError every time, counting attempts."""
+
+    def __init__(self, *, attempt_cost_s=None):
+        self.calls = 0
+        if attempt_cost_s is not None:
+            self.attempt_cost_s = attempt_cost_s
+
+    def invoke(self, messages):
+        self.calls += 1
+        from krepis.llm import StreamTotalTimeoutError
+
+        raise StreamTotalTimeoutError(
+            "provider=x model=y: the stream ran for 600s, past its "
+            "total_timeout=600s bound, after 4021 chunk(s) and 41332 "
+            "character(s) — aborting on the total-duration budget, not on "
+            "inter-chunk silence.",
+            partial_text="partial",
+            chunks=4021,
+            total_timeout=600.0,
+            elapsed=600.4,
+        )
+
+
+def test_stream_total_timeout_message_matches_a_retryable_substring():
+    """Confirms the trap this fix closes: the bare substring match WOULD retry.
+
+    Unlike StreamIdleTimeoutError's message (asserted NOT to match above),
+    this one contains "total_timeout=", and "timeout" is in _RETRYABLE — so
+    without the explicit isinstance exclusion in _invoke_with_retry, this
+    error would be retried by the substring branch even though the type
+    check says it must not be.
+    """
+    msg = (
+        "provider=x model=y: the stream ran for 600s, past its "
+        "total_timeout=600s bound, after 4021 chunk(s) and 41332 "
+        "character(s) — aborting on the total-duration budget, not on "
+        "inter-chunk silence."
+    ).lower()
+    assert any(t in msg for t in _RETRYABLE), (
+        "StreamTotalTimeoutError's message no longer matches a _RETRYABLE "
+        "substring — the explicit isinstance exclusion in _invoke_with_retry "
+        "is no longer covering a real trap, but keep it anyway (message shape "
+        "is not a stable contract); update this assertion to reflect the new "
+        "message."
+    )
+
+
+def test_a_stream_total_timeout_is_never_retried():
+    llm = _TotalTimeoutLLM(attempt_cost_s=DIRECTOR_PLAN_CEILING_S)
+    with pytest.raises(Exception) as excinfo:
+        _invoke_with_retry(llm, [], budget=InvocationBudget.from_context(None))
+    from krepis.llm import StreamTotalTimeoutError
+
+    assert isinstance(excinfo.value, StreamTotalTimeoutError), (
+        "a StreamTotalTimeoutError must propagate on the FIRST attempt, not "
+        "be wrapped in the loop's own RuntimeError after exhausting retries "
+        "— fail-fast means one attempt, not _MAX_RETRIES of them"
+    )
+    assert llm.calls == 1, (
+        "a StreamTotalTimeoutError must fail fast: retrying a call that "
+        "already exhausted its wall-clock budget spends the same budget "
+        "again rather than recovering from a transient condition"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Both adapters declare what an attempt costs
 # ---------------------------------------------------------------------------
 

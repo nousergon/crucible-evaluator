@@ -29,6 +29,7 @@ from director import agent as agent_mod
 from director.agent import (
     DIRECTOR_PLAN_CEILING_S,
     DIRECTOR_PLAN_IDLE_TIMEOUT_S,
+    DIRECTOR_PLAN_TOTAL_TIMEOUT_S,
     _KrepisStructuredDirector,
 )
 from director.schema import DirectorWeeklyActionPlan
@@ -135,6 +136,29 @@ class TestStreamingIsRequested:
         assert plan.resolved_model == "deepseek-v4-pro"
         assert getattr(plan, agent_mod.PLAN_KEY_ROUTE_DEGRADED) is True
 
+    def test_a_total_timeout_is_always_passed_explicitly(self):
+        """alpha-engine-config-I8408. A stream that keeps emitting chunks never
+        trips the idle budget, and the Director's SF Catch is terminal
+        (config#6408) — an unbounded total duration hangs the four-hour
+        weekly run rather than degrading it."""
+        client = _RecordingClient()
+        llm = _KrepisStructuredDirector(
+            client, director_model="ultra-glm-5.2-direct", primary_model=PRIMARY,
+        )
+        llm.invoke(MESSAGES)
+
+        assert client.calls[0]["total_timeout"] == DIRECTOR_PLAN_TOTAL_TIMEOUT_S
+
+    def test_the_total_timeout_is_injectable_without_touching_the_constant(self):
+        client = _RecordingClient()
+        llm = _KrepisStructuredDirector(
+            client, director_model="ultra-glm-5.2-direct",
+            primary_model=PRIMARY, total_timeout_s=250.0,
+        )
+        llm.invoke(MESSAGES)
+
+        assert client.calls[0]["total_timeout"] == 250.0
+
     def test_the_single_attempt_multiplier_survives(self):
         """`attempts` stays at 1 alongside the new kwargs.
 
@@ -182,6 +206,35 @@ class TestIdleBudgetOrdering:
         """
         measured_largest_silence_s = 3.72
         assert DIRECTOR_PLAN_IDLE_TIMEOUT_S >= 20 * measured_largest_silence_s
+
+    def test_total_timeout_is_fixed_rather_than_the_budget_quote(self):
+        """alpha-engine-config-I8408.
+
+        `DIRECTOR_PLAN_TOTAL_TIMEOUT_S` is anchored to the STATIC
+        `DIRECTOR_PLAN_CEILING_S`, not to the dynamically budget-quoted
+        per-attempt timeout (`_KrepisStructuredDirector.attempt_cost_s`,
+        which `director.budget.InvocationBudget.quote()` can shrink as low
+        as `director.budget.MIN_VIABLE_CALL_S` = 30s under a degraded
+        invocation). krepis raises `ValueError` when
+        `total_timeout <= idle_timeout`, so tracking the shrinking quote
+        would turn a degraded-but-viable invocation into a hard crash
+        instead of the shorter, cleaner failure the quote already produces.
+        """
+        from director.budget import MIN_VIABLE_CALL_S
+
+        assert DIRECTOR_PLAN_TOTAL_TIMEOUT_S == DIRECTOR_PLAN_CEILING_S
+        assert MIN_VIABLE_CALL_S < DIRECTOR_PLAN_IDLE_TIMEOUT_S, (
+            "the budget-quoted per-attempt timeout can legitimately fall "
+            "below the idle timeout — which is exactly why total_timeout "
+            "must NOT track that quote"
+        )
+
+    def test_total_timeout_exceeds_idle_timeout(self):
+        """krepis raises ValueError when total_timeout <= idle_timeout — at or
+        below it, the total bound always trips before the idle bound could,
+        making idle_timeout dead code. Asserted here rather than trusted,
+        the same reason the idle-vs-ceiling ordering above is asserted."""
+        assert DIRECTOR_PLAN_TOTAL_TIMEOUT_S > DIRECTOR_PLAN_IDLE_TIMEOUT_S
 
 
 # ── the requirement is declared at resolve time ──────────────────────────────
@@ -260,6 +313,63 @@ def _install_fake_krepis(monkeypatch, resolve_fn):
     monkeypatch.setitem(sys.modules, "krepis", krepis_pkg)
     monkeypatch.setitem(sys.modules, "krepis.router", router)
     monkeypatch.setitem(sys.modules, "krepis.llm", llm)
+
+
+# ── the Phase-G retro judge call does NOT stream (alpha-engine-config-I8408) ──
+#
+# The deliverable asked to check, not assume, whether `director/retro.py`'s
+# judge call also streams — because if it did, it would need the same
+# `total_timeout` treatment as the plan call above. It does not: verified
+# against `director/retro.py::_KrepisStructuredJudge.invoke`, whose
+# `self._client.structured(...)` call passes no `stream=` kwarg at all (it
+# defaults to krepis' `stream=False`). This is a regression guard, not a
+# design assertion — if a future change puts the judge call on the streaming
+# path, this test starts failing and is the signal to apply the same
+# `total_timeout` treatment there.
+
+
+class TestRetroJudgeDoesNotStream:
+    def test_the_judge_call_passes_no_stream_kwarg(self):
+        from director.retro import _KrepisStructuredJudge
+
+        class _RecordingJudgeClient:
+            def __init__(self):
+                self.calls: list[dict] = []
+
+            def structured(self, **kwargs):
+                self.calls.append(kwargs)
+
+                class _R:
+                    model = "deepseek-v4-pro"
+                    parsed = _fake_retro_grade()
+                    usage = None
+
+                return _R()
+
+        client = _RecordingJudgeClient()
+        judge = _KrepisStructuredJudge(
+            client, judge_group="high", judge_model="ultra-deepseek-v4-pro",
+        )
+        judge.invoke(MESSAGES)
+
+        assert "stream" not in client.calls[0], (
+            "director/retro.py's judge call now streams — it needs the same "
+            "total_timeout treatment as director/agent.py's plan call "
+            "(alpha-engine-config-I8408) — this is not automatically covered"
+        )
+        assert "total_timeout" not in client.calls[0]
+
+
+def _fake_retro_grade():
+    from director.schema import RetroGrade
+
+    return RetroGrade(
+        prior_run_date=RUN_DATE,
+        grounding=80,
+        calibration=75,
+        actionability=90,
+        notes="a rationale",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
