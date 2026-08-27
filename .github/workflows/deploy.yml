@@ -57,7 +57,7 @@ jobs:
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2
 
       # deploy.sh's canary steps run `python3 -m krepis.aws invoke-canary`
       # directly on THIS runner (not inside the Lambda's Docker image) —
@@ -123,5 +123,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@75d5536e83926217c9f47590c31e1895eeb9eb5f
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5363e60b9343e270be9a44d41e85516068b4226e
     secrets: inherit
