@@ -60,6 +60,17 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
+# Tripwire statuses that carry a usable measurement (alpha-engine-config-I8752).
+#
+# Mirrors crucible-executor/executor/turnover_tripwire.py's vocabulary. Held as
+# a literal rather than imported for the same reason champion.py holds
+# CHALLENGER_SELECTION_LATEST_KEY as one: the S3 artifact's field vocabulary is
+# the shared contract, and a non-optional cross-repo package import is not
+# worth taking for six strings. `tests/` pins the two sides together so a drift
+# fails here rather than silently N/A-ing the component.
+_TRIPWIRE_MEASURED_STATUSES = frozenset({"ok", "breach_daily", "breach_rolling"})
+
+
 def _latest_shadow_tripwire(s3, bucket: str, run_date: str) -> tuple[dict | None, str | None]:
     """Most recent optimizer_shadow turnover_tripwire block at/before run_date.
 
@@ -109,8 +120,24 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
         return f"{name}: component status={sub.get('status', 'missing')} this cycle."
 
     # 1. turnover (diagnostic) — L4515 tripwire, surfaced not recomputed.
+    #
+    # A BREACH is a measurement, not an absence (alpha-engine-config-I8752).
+    # This gated on `status == "ok"` while the executor's `status` was a
+    # hardcoded literal that never changed, so the distinction had no teeth.
+    # Now that the tripwire derives its status, `== "ok"` would have blanked
+    # this component to N/A on exactly the weeks the turnover number matters —
+    # reporting "no ok tripwire block" for a tripwire that had a number and was
+    # shouting about it.
+    #
+    # `_TRIPWIRE_MEASURED_STATUSES` is the set that carries a usable
+    # `rolling_sum`. `disabled`, `no_turnover_metric` and `error` genuinely
+    # have no measurement and still fall through to N/A.
     trip, trip_src = _latest_shadow_tripwire(s3, bucket, run_date)
-    if trip and trip.get("status") == "ok" and trip.get("rolling_sum") is not None:
+    if (
+        trip
+        and trip.get("status") in _TRIPWIRE_MEASURED_STATUSES
+        and trip.get("rolling_sum") is not None
+    ):
         band = trip.get("rolling_band")
         components.append(build_metric(
             name="turnover", module=MODULE, metric_type="ratio", criticality="diagnostic",
@@ -128,9 +155,10 @@ def build_behavioral_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             name="turnover", module=MODULE, metric_type="ratio", criticality="diagnostic",
             estimator="l4515_tripwire_rolling_sum", measurement_horizon="5d_rolling",
             n_floor=1, band="unbanded", source_path=trip_src or f"s3://{bucket}/{_SHADOW_PREFIX}/", input_present=False,
-            na_detail=("turnover: no optimizer_shadow artifact with an ok tripwire block in the "
-                       f"trailing {_SHADOW_LOOKBACK_DAYS}d (status="
-                       f"{(trip or {}).get('status', 'absent')})."),
+            na_detail=("turnover: no optimizer_shadow artifact with a MEASURED tripwire block "
+                       f"in the trailing {_SHADOW_LOOKBACK_DAYS}d (status="
+                       f"{(trip or {}).get('status', 'absent')}; measured statuses are "
+                       f"{sorted(_TRIPWIRE_MEASURED_STATUSES)})."),
         ))
 
     # 2. decision_reversal (supporting) — lower is better (target < red_line).
