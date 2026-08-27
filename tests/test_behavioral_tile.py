@@ -121,3 +121,92 @@ class TestShadowWalkback:
         comp = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
         assert comp["status"] == "N/A-MISSING-INPUT"
         assert "disabled" in (comp.get("na_detail") or comp.get("status_reason") or "")
+
+
+# ── a BREACH is a measurement, not an absence (alpha-engine-config-I8752) ──
+#
+# This tile gated on `status == "ok"` while crucible-executor's tripwire
+# `status` was a hardcoded literal that never changed — so the distinction had
+# no teeth and the component always graded. Now that the executor derives its
+# status (`breach_daily` / `breach_rolling`), the old gate would have blanked
+# this component to N/A on exactly the weeks the turnover number matters:
+# reporting "no ok tripwire block" about a tripwire that had a number and was
+# paging about it.
+#
+# Live shape it would have hidden, measured 2026-08-27: eight consecutive
+# sessions with rolling_sum 0.69..0.95 against a 0.60 band.
+
+BREACH_ROLLING_TRIPWIRE = {
+    "status": "breach_rolling", "turnover_one_way": 0.170, "daily_band": 0.25,
+    "daily_breach": False, "rolling_days": 5, "n_days_used": 5,
+    "rolling_sum": 0.921, "rolling_band": 0.60, "rolling_breach": True,
+}
+
+BREACH_DAILY_TRIPWIRE = {
+    "status": "breach_daily", "turnover_one_way": 0.30, "daily_band": 0.25,
+    "daily_breach": True, "rolling_days": 5, "n_days_used": 5,
+    "rolling_sum": 0.95, "rolling_band": 0.60, "rolling_breach": True,
+}
+
+
+class TestBreachIsAMeasurement:
+    def test_rolling_breach_still_grades_the_component(self, s3):
+        _put_ba(s3, FULL_BA)
+        _put_shadow(s3, RUN_DATE, BREACH_ROLLING_TRIPWIRE)
+
+        comp = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
+
+        assert comp["status"] != "N/A-MISSING-INPUT", comp
+        assert comp["value"] == 0.921
+        # The breach is stated, not merely survived.
+        blob = " ".join(str(v) for v in comp.values() if isinstance(v, str))
+        assert "rolling_breach=True" in blob, comp
+
+    def test_daily_breach_still_grades_the_component(self, s3):
+        _put_ba(s3, FULL_BA)
+        _put_shadow(s3, RUN_DATE, BREACH_DAILY_TRIPWIRE)
+
+        comp = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
+
+        assert comp["status"] != "N/A-MISSING-INPUT", comp
+        assert comp["value"] == 0.95
+
+    def test_a_breach_grades_worse_than_a_quiet_week(self, s3):
+        """The point of surfacing it: 0.921 is past the 0.60 red line, so the
+        component must not read the same as a 0.18 week."""
+        _put_ba(s3, FULL_BA)
+        _put_shadow(s3, RUN_DATE, OK_TRIPWIRE)
+        quiet = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
+
+        _put_shadow(s3, RUN_DATE, BREACH_ROLLING_TRIPWIRE)
+        breaching = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
+
+        assert quiet["status"] != breaching["status"], (quiet, breaching)
+
+    def test_statuses_with_no_measurement_are_still_na(self, s3):
+        """`disabled`, `no_turnover_metric` and `error` genuinely carry no
+        number and must keep falling through."""
+        for status in ("disabled", "no_turnover_metric", "error"):
+            _put_shadow(s3, RUN_DATE, {"status": status})
+            comp = _comp(build_behavioral_tile(BUCKET, RUN_DATE, s3_client=s3), "turnover")
+            assert comp["status"] == "N/A-MISSING-INPUT", (status, comp)
+
+    def test_the_measured_vocabulary_matches_the_executors(self):
+        """Cross-repo contract pin.
+
+        The executor owns this vocabulary
+        (crucible-executor/executor/turnover_tripwire.py::TRIPWIRE_STATUSES).
+        It is held here as a literal rather than imported — the S3 artifact's
+        field vocabulary is the shared contract and a non-optional cross-repo
+        package import is not worth taking for six strings — so drift has to
+        fail HERE instead of silently N/A-ing the component.
+
+        If this fails, the executor changed its vocabulary: reconcile the two
+        rather than widening this set to make the test pass.
+        """
+        from grading.tiles.behavioral import _TRIPWIRE_MEASURED_STATUSES
+
+        assert _TRIPWIRE_MEASURED_STATUSES == {"ok", "breach_daily", "breach_rolling"}
+        # The complement, stated so a new executor status cannot quietly join
+        # either side without this assertion being revisited.
+        assert not (_TRIPWIRE_MEASURED_STATUSES & {"disabled", "no_turnover_metric", "error"})
