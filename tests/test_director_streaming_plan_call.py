@@ -328,8 +328,16 @@ def _install_fake_krepis(monkeypatch, resolve_fn):
 # `total_timeout` treatment there.
 
 
-class TestRetroJudgeDoesNotStream:
-    def test_the_judge_call_passes_no_stream_kwarg(self):
+class TestRetroJudgeStreamsToo:
+    """alpha-engine-config-I8164, swept to the Director's OTHER model call.
+
+    This class replaces `TestRetroJudgeDoesNotStream`, which pinned the gap
+    and carried the tripwire message "it needs the same total_timeout
+    treatment as director/agent.py's plan call ... this is not automatically
+    covered". It is now covered, and these are the assertions that keep it so.
+    """
+
+    def _judge(self, **kw):
         from director.retro import _KrepisStructuredJudge
 
         class _RecordingJudgeClient:
@@ -349,15 +357,97 @@ class TestRetroJudgeDoesNotStream:
         client = _RecordingJudgeClient()
         judge = _KrepisStructuredJudge(
             client, judge_group="high", judge_model="ultra-deepseek-v4-pro",
+            **kw,
         )
         judge.invoke(MESSAGES)
+        return client.calls[0]
 
-        assert "stream" not in client.calls[0], (
-            "director/retro.py's judge call now streams — it needs the same "
-            "total_timeout treatment as director/agent.py's plan call "
-            "(alpha-engine-config-I8408) — this is not automatically covered"
+    def test_the_judge_call_streams(self):
+        assert self._judge()["stream"] is True
+
+    def test_the_judge_call_carries_both_bounds(self):
+        """`stream=True` without an idle bound is strictly worse than not
+        streaming — it removes the transport deadline's meaning without
+        putting anything in its place."""
+        from director import retro
+
+        call = self._judge()
+        assert call["idle_timeout"] == retro.RETRO_JUDGE_IDLE_TIMEOUT_S
+        assert call["total_timeout"] == retro.RETRO_JUDGE_TOTAL_TIMEOUT_S
+
+    def test_bounds_are_injectable_without_touching_module_globals(self):
+        call = self._judge(idle_timeout_s=7.0, total_timeout_s=11.0)
+        assert call["idle_timeout"] == 7.0
+        assert call["total_timeout"] == 11.0
+
+    def test_streaming_does_not_change_what_invoke_returns(self):
+        """krepis re-assembles a streamed response into the same
+        ChatCompletion-shaped object, so the provenance stamping below the
+        call must be untouched."""
+        from director.retro import _KrepisStructuredJudge
+
+        class _C:
+            def structured(self, **kwargs):
+                class _R:
+                    model = "deepseek-v4-pro"
+                    parsed = _fake_retro_grade()
+                    usage = None
+
+                return _R()
+
+        grade = _KrepisStructuredJudge(
+            _C(), judge_group="high", judge_model="ultra-deepseek-v4-pro",
+        ).invoke(MESSAGES)
+        assert grade.judge_group == "high"
+        assert grade.judge_model == "ultra-deepseek-v4-pro"
+        assert grade.resolved_model == "deepseek-v4-pro"
+
+
+class TestRetroJudgeBudgetOrdering:
+    """Both orderings are load-bearing and neither is obvious from the
+    literals — retro.py asserts them at import, and these pin the reasons."""
+
+    def test_idle_is_below_the_budgets_minimum_quote(self):
+        """`_default_llm` builds the client with
+        `timeout=judge_budget.quote(...)`, which the budget may shrink to
+        MIN_VIABLE_CALL_S. krepis warns when idle_timeout >= that, because the
+        transport read deadline binds first — so the idle bound could never
+        fire in exactly the case it exists for: the tail of an invocation that
+        has already overrun."""
+        from director import retro
+        from director.budget import MIN_VIABLE_CALL_S
+
+        assert retro.RETRO_JUDGE_IDLE_TIMEOUT_S < MIN_VIABLE_CALL_S
+
+    def test_idle_is_strictly_below_total(self):
+        """krepis raises ValueError on total_timeout <= idle_timeout."""
+        from director import retro
+
+        assert retro.RETRO_JUDGE_IDLE_TIMEOUT_S < retro.RETRO_JUDGE_TOTAL_TIMEOUT_S
+
+    def test_total_is_anchored_to_the_static_ceiling_not_the_quote(self):
+        """Anchoring on the per-attempt quote would let a degraded budget
+        shrink total_timeout under idle_timeout and turn a bound into a
+        ValueError — the same reasoning as DIRECTOR_PLAN_TOTAL_TIMEOUT_S."""
+        from director import retro
+
+        assert retro.RETRO_JUDGE_TOTAL_TIMEOUT_S == retro.RETRO_JUDGE_CEILING_S
+
+
+class TestRetroJudgeRequiresStreamingAtResolveTime:
+    def test_default_llm_states_the_requirement(self):
+        """Without it the chain is filtered on reachability alone and the
+        first structured(stream=True) raises deep inside the call instead —
+        the same outcome, reported later and with less to act on."""
+        import inspect
+
+        from director import retro
+
+        src = inspect.getsource(retro._default_llm)
+        assert 'requires=("streaming",)' in src, (
+            "the retro judge must state its request shape at resolve time, "
+            "mirroring agent._default_llm"
         )
-        assert "total_timeout" not in client.calls[0]
 
 
 def _fake_retro_grade():
