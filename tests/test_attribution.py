@@ -350,6 +350,129 @@ class TestArtifactContract:
         assert p["input_closure"]["bound_nav_bps"] == INPUT_CLOSURE_NAV_BPS
         assert isinstance(p["input_closure"]["breaches"], list)
 
+    def _bucket_consistent(self, n_sessions=40):
+        """Like ``_bucket``, except ``daily_return_pct`` is the ACTUAL
+        ``nav_change_usd / prior_nav`` for each session rather than a flat
+        literal. ``_bucket`` hardcodes ``daily_return_pct="0.07"`` on every
+        row while NAV grows $700/session, so its own two chains disagree by
+        design (700 / growing_prior_nav shrinks below 0.07% over the window)
+        — real absent-external-flows data never does that (I9025 measured
+        delta = 0.0 exactly on every live session carrying both fields). This
+        fixture is internally consistent the way the live book is.
+        """
+        objects = {}
+        art = {"adjustment_basis": "dividend_adjusted", "closes": []}
+        from grading.sectors import SECTOR_TO_ETF
+        dates = [f"2026-06-{d:02d}" for d in range(1, n_sessions + 2)]
+        for etf in SECTOR_TO_ETF.values():
+            closes = [[d, 100.0 * (1.001 ** i)] for i, d in enumerate(dates)]
+            objects[f"market_data/close_history/{etf}.json"] = json.dumps(
+                {**art, "closes": closes}).encode()
+        objects["market_data/sectors/latest.json"] = json.dumps({
+            "as_of": "2026-08-27",
+            "spy_sector_weights": {"Technology": 0.6, "Healthcare": 0.4},
+        }).encode()
+        rows = []
+        nav = 1_000_000.0
+        prior_nav = None
+        for i, d in enumerate(dates):
+            snap = {"AAA": _pos("Technology", nav * 0.5, 500.0 if i else 0.0),
+                    "BBB": _pos("Healthcare", nav * 0.3, 200.0 if i else 0.0)}
+            pct = (700.0 / prior_nav * 100.0) if prior_nav else 0.0
+            rows.append(_row(
+                d, nav, snap,
+                nav_change_usd="700" if i else "",
+                daily_return_pct=f"{pct:.10f}", spy_return_pct="0.10",
+            ))
+            prior_nav = nav
+            nav += 700.0
+        header = list(rows[0])
+        csv_text = ",".join(header) + "\n" + "\n".join(
+            ",".join('"' + str(r[h]).replace('"', '""') + '"' for h in header)
+            for r in rows
+        )
+        objects["trades/eod_pnl.csv"] = csv_text.encode()
+        return _S3(objects)
+
+    def test_return_chain_basis_gap_is_clean_when_input_closes(self):
+        """alpha-engine-config-I9025: stored_return_chain (the daily_return_pct
+        chain) and portfolio_total_return (the BF-attributed groups chain) are
+        built from the SAME session set by construction — a session is only
+        appended to either after the closure-bound check passes. When every
+        session's named P&L lines fully account for nav_change_usd (the
+        fixture's ``interest_usd``/``rotation_realized_usd``/etc are all "0"
+        and ``daily_return_pct`` is truthfully ``nav_change_usd / prior_nav``),
+        the two chains must agree to floating-point precision — this is the
+        regression guard for the day-set-mismatch and closure-residual causes
+        I9025 measured and ruled out for the current live data."""
+        p = build_attribution("b", s3_client=self._bucket_consistent())
+        act = p["active_return"]
+        assert act["return_chain_basis_gap"] == pytest.approx(0.0, abs=1e-6)
+        assert act["stored_return_chain"] == pytest.approx(
+            act["portfolio_total_return"], abs=1e-6
+        )
+
+    def _bucket_with_closure_breach(self, n_sessions=40, break_at=15):
+        """Same fixture as ``_bucket``, except one session's positions_snapshot
+        carries a named position P&L that does NOT sum to that session's
+        nav_change_usd — an input_closure_usd breach, built directly rather
+        than by round-tripping the CSV text so the perturbation can't be lost
+        to quoting/escaping.
+        """
+        objects = {}
+        art = {"adjustment_basis": "dividend_adjusted", "closes": []}
+        from grading.sectors import SECTOR_TO_ETF
+        dates = [f"2026-06-{d:02d}" for d in range(1, n_sessions + 2)]
+        for etf in SECTOR_TO_ETF.values():
+            closes = [[d, 100.0 * (1.001 ** i)] for i, d in enumerate(dates)]
+            objects[f"market_data/close_history/{etf}.json"] = json.dumps(
+                {**art, "closes": closes}).encode()
+        objects["market_data/sectors/latest.json"] = json.dumps({
+            "as_of": "2026-08-27",
+            "spy_sector_weights": {"Technology": 0.6, "Healthcare": 0.4},
+        }).encode()
+        rows = []
+        nav = 1_000_000.0
+        prior_nav = None
+        for i, d in enumerate(dates):
+            aaa_pnl = 500.0 if i else 0.0
+            if i == break_at:
+                # The named position P&L no longer sums to nav_change_usd —
+                # $50,000 unattributed, far past INPUT_CLOSURE_NAV_BPS.
+                aaa_pnl += 50_000.0
+            snap = {"AAA": _pos("Technology", nav * 0.5, aaa_pnl),
+                    "BBB": _pos("Healthcare", nav * 0.3, 200.0 if i else 0.0)}
+            pct = (700.0 / prior_nav * 100.0) if prior_nav else 0.0
+            rows.append(_row(
+                d, nav, snap,
+                nav_change_usd="700" if i else "",
+                daily_return_pct=f"{pct:.10f}", spy_return_pct="0.10",
+            ))
+            prior_nav = nav
+            nav += 700.0
+        header = list(rows[0])
+        csv_text = ",".join(header) + "\n" + "\n".join(
+            ",".join('"' + str(r[h]).replace('"', '""') + '"' for h in header)
+            for r in rows
+        )
+        objects["trades/eod_pnl.csv"] = csv_text.encode()
+        return _S3(objects)
+
+    def test_a_closure_breaching_session_is_excluded_from_both_chains(self):
+        """A session whose named lines do NOT account for nav_change_usd
+        (input_closure_usd past the bound) is skipped entirely — from
+        ``periods`` (portfolio_total_return) AND ``port_daily``
+        (stored_return_chain) together, in the same loop iteration — so it
+        can never register as return_chain_basis_gap drift (I9025)."""
+        p = build_attribution("b", s3_client=self._bucket_with_closure_breach())
+        assert p["status"] == "ok", p.get("reason")
+        assert p["sessions_skipped"].get("input did not close", 0) == 1
+        act = p["active_return"]
+        assert act["return_chain_basis_gap"] == pytest.approx(0.0, abs=1e-6), (
+            "the breaching session must be excluded from BOTH chains, not "
+            "leak into one of them as drift"
+        )
+
     def test_write_lands_the_pointer_and_the_dated_copy(self):
         from grading.attribution import ATTRIBUTION_LATEST_KEY, write_attribution
         s3 = self._bucket()
