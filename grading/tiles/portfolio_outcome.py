@@ -38,6 +38,8 @@ from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wil
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
+from grading.power import annotate_power_all
 from grading.units import (
     ANNUALIZED_RATIO,
     DAYS,
@@ -450,6 +452,66 @@ def _compute_regime_weighted_alpha(
 # tile builder
 # ---------------------------------------------------------------------------
 
+_ATTR_NA = (
+    "attribution not built this cycle: {reason}. The Brinson-Fachler "
+    "decomposition, the SPY carve-out and the beta-adjusted benchmark all read "
+    "the same inputs, so all four are absent together."
+)
+
+
+def _build_attribution_components(bucket: str, s3_client=None) -> tuple[list, dict]:
+    """Deliverables 6-7 as graded components.
+
+    A failure to BUILD the attribution renders as N/A-MISSING-INPUT with the
+    producer's own reason — never as a zero effect, which would read as "no
+    allocation bet and no selection skill" on exactly the cycles where nothing
+    was measured at all.
+    """
+    src = f"s3://{bucket}/{ATTRIBUTION_LATEST_KEY}"
+    try:
+        attr = build_attribution(bucket, s3_client=s3_client)
+    except Exception as e:  # noqa: BLE001
+        # (a) swallowed: any attribution build error. (b) the tile's other 14
+        # components are the primary deliverable and must still render.
+        # (c) recording surface: the four N/A components below carry the
+        # exception text, and it is logged at ERROR.
+        logger.error("attribution build failed: %s", e)
+        attr = {"status": "missing_input", "reason": str(e)}
+
+    ok = attr.get("status") == "ok"
+    reason = None if ok else _ATTR_NA.format(reason=attr.get("reason", "unknown"))
+    n = attr.get("sessions_used") or 0
+    bf = attr.get("brinson_fachler") or {}
+    act = attr.get("active_return") or {}
+
+    def _m(name, value, metric_type, unit, criticality, estimator):
+        return build_metric(
+            name=name, module=MODULE, metric_type=metric_type,
+            criticality=criticality, estimator=estimator,
+            measurement_horizon="since_inception",
+            value=value if ok else None, unit=unit,
+            n_samples=n if ok else None, n_floor=20, source_path=src,
+            input_present=ok, na_detail=reason,
+        )
+
+    resid = bf.get("residual_pct_of_active")
+    return ([
+        # Deliverable 6's own closes-when: the decomposition must reconcile to
+        # active return with a residual under 1% of it.
+        _m("attribution_residual_pct_of_active", resid, "pct", PCT,
+           "diagnostic", "brinson_fachler_carino_linked"),
+        _m("bf_selection_effect", bf.get("selection"), "ratio", FRACTION,
+           "supporting", "brinson_fachler_carino_linked"),
+        # Deliverable 7: the book holds SPY and is benchmarked against SPY, so
+        # the headline active return is diluted by a sleeve whose active return
+        # is ~0 by construction. This is the active sleeve alone.
+        _m("active_return_ex_index_sleeve", act.get("active_return_ex_index_sleeve"),
+           "ratio", FRACTION, "supporting", "cumulative_active_return_ex_benchmark_sleeve"),
+        _m("beta_adjusted_alpha", act.get("beta_adjusted_alpha"),
+           "ratio", FRACTION, "supporting", "ols_beta_adjusted_cumulative_alpha"),
+    ], attr)
+
+
 def build_portfolio_outcome_tile(
     bucket: str, s3_client=None, *, n_trials: int | None = None,
     history: CardHistory | None = None,
@@ -500,6 +562,7 @@ def build_portfolio_outcome_tile(
             miss("cvar_95_daily", "ratio", "supporting", 60, -0.01, -0.04),
             miss("alpha_trend", "pct", "diagnostic", _ALPHA_TREND_N_FLOOR, 0.0, None, "ols_slope_newey_west_hac"),
         ]
+        annotate_power_all(components)
         return build_tile(MODULE, components)
 
     n = series.n
@@ -673,7 +736,29 @@ def build_portfolio_outcome_tile(
     # 14. Alpha trend (diagnostic) — is daily alpha statistically improving?
     components.append(_build_alpha_trend([a * 100.0 for a in active], src))
 
+    # 15-18. Benchmark-relative attribution (I8188 deliverables 6-7).
+    #        Built from the same eod_pnl.csv plus SPY's published sector weights
+    #        and the eleven SPDR sector ETFs' dividend-adjusted closes — no new
+    #        producer. `grading/attribution.py` carries the math, the exact
+    #        Cariño-linked reconciliation, and the stated approximations.
+    _attr_components, _attr_payload = _build_attribution_components(
+        bucket, s3_client=s3_client,
+    )
+    components.extend(_attr_components)
+
+    # ── Statistical power (alpha-engine-config-I8188 deliverable 8) ─────────
+    # Publish n_required + target_inside_ci beside EVERY component, and
+    # downgrade a RED that the CI's width produced rather than the evidence.
+    # Applied here, once, after every component is built and BEFORE the tile
+    # rolls them up — module_agg's critical-gate + BH-FDR pass must see the
+    # corrected statuses, or a power-limited RED still cascades to the card.
+    annotate_power_all(components)
+
     tile = build_tile(MODULE, components)
+    # The full decomposition rides on the tile so the report-card writer can
+    # persist it as its own artifact (evaluator/{run_date}/attribution.json)
+    # without recomputing it — one build per cycle, one number everywhere.
+    tile["attribution"] = _attr_payload
     # config#2885: surface silently-dropped CSV rows so the report card
     # shows data-integrity issues (unparseable portfolio_nav/daily_return_pct).
     if series is not None:
