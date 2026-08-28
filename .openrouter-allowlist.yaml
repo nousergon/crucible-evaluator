@@ -69,3 +69,9 @@ entries:
       Historical/test prose describing the direct-OpenRouter class this guard exists to catch (comment, docstring, or a test asserting the literal's ABSENCE) — not a live call site. Baseline sweep for alpha-engine-config-I7864.
     expires: "2026-11-18"
     tracking: alpha-engine-config-I7864
+  - path: tests/test_director.py
+    pattern: provider_comparison
+    reason: >-
+      Test fixtures asserting the resolved spec's provider is NOT "openrouter" (a guard assertion, not a call site) and parameterizing a route-name fixture over "openrouter" as one of several route shapes under test — same historical/test-prose class as this file's already-allowlisted env_key/provider_literal entries (alpha-engine-config-I9092 widened the guard's patterns to also catch runtime equality comparisons).
+    expires: "2027-08-28"
+    tracking: alpha-engine-config-I9092
