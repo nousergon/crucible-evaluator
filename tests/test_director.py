@@ -1449,12 +1449,48 @@ class TestRetro:
                 self.model = model
                 self.usage = _FakeUsage()
 
+        # ── streamed shape (alpha-engine-config-I9016) ──────────────────
+        #
+        # The judge now sends `stream=True`, so krepis drains an Anthropic
+        # EVENT stream (`_accumulate_anthropic_stream`) instead of reading a
+        # Message. A forced-tool structured call arrives as
+        # `input_json_delta` fragments that only become a JSON object once the
+        # stream ends — so the tool input is deliberately split across two
+        # deltas here rather than emitted whole. A single-fragment double
+        # would pass without ever exercising the reassembly.
+        class _Ev:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        def _stream_events():
+            tool_json = json.dumps({
+                "prior_run_date": "2026-05-23",
+                "grounding": 80,
+                "calibration": 55,
+                "actionability": 70,
+                "notes": "Flagged risks mostly materialized.",
+            })
+            split = len(tool_json) // 2
+            yield _Ev(type="message_start",
+                      message=_Ev(model="claude-sonnet-4-6-20260115",
+                                  usage=_FakeUsage()))
+            yield _Ev(type="content_block_start", index=0,
+                      content_block=_Ev(type="tool_use", name="RetroGrade", id="t1"))
+            yield _Ev(type="content_block_delta", index=0,
+                      delta=_Ev(partial_json=tool_json[:split]))
+            yield _Ev(type="content_block_delta", index=0,
+                      delta=_Ev(partial_json=tool_json[split:]))
+            yield _Ev(type="message_delta", delta=_Ev(stop_reason="tool_use"),
+                      usage=_Ev(output_tokens=380))
+
         class _FakeAnthropicClient:
             def __init__(self):
                 self.messages = self
 
             def create(self, **payload):
                 assert payload["model"] == _JUDGE_MODEL
+                if payload.get("stream"):
+                    return _stream_events()
                 tool_input = {
                     "prior_run_date": "2026-05-23",
                     "grounding": 80,

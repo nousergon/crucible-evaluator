@@ -65,6 +65,9 @@ from director.agent import (
     _invoke_with_retry,
     _warn_on_degraded_route,
 )
+from director.budget import (
+    MIN_VIABLE_CALL_S as _BUDGET_MIN_VIABLE_CALL_S,
+)
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
 from director.loop_verification import component_status_map, resolve_cited_metrics
 from director.report_card_digest import summarize_report_card
@@ -86,6 +89,77 @@ assert RETRO_JUDGE_RESERVE_S == RETRO_JUDGE_CEILING_S * 2, (
     f"{RETRO_JUDGE_RESERVE_S}s for this judge but its ceiling is now "
     f"{RETRO_JUDGE_CEILING_S}s × 2 attempts. Update RETRO_JUDGE_RESERVE_S in "
     f"director/budget.py in the same change."
+)
+
+# ── streaming bounds (alpha-engine-config-I8164, swept to the judge) ────────
+#
+# The plan call was moved onto a streamed request with an inter-chunk silence
+# bound on 2026-08-25 (`agent.DIRECTOR_PLAN_IDLE_TIMEOUT_S`,
+# `-I8408`'s `total_timeout`). This judge — the Director's OTHER model call,
+# in the same Lambda invocation, through the same `krepis.llm.LLMClient` — was
+# left on the unstreamed path, so it still fails the way the plan call used
+# to: an opaque `APITimeoutError` at the client's transport deadline that
+# discards a generation which was probably nearly complete and reports nothing
+# about how far it got.
+#
+# That is the same defect, not a similar one, and `engagement-protocol-policy`
+# §5 asks a fix to survive the CLASS. This module has been the site of exactly
+# this miss before: `_default_llm`'s own docstring records that
+# `_assert_routed_through_the_proxy` "was added to `agent.py` in this same
+# package and never swept here", leaving the judge egressing straight to
+# openrouter.ai. Sweeping the second half of I8164 here is that lesson applied
+# rather than re-learned.
+#
+# WHY THE JUDGE'S NUMBERS ARE NOT THE PLAN'S. The plan call anchors
+# `total_timeout` to its static 600s ceiling so `total > idle` holds by
+# construction even when `budget.quote()` shrinks the per-attempt allowance;
+# the same reasoning applies here against this judge's own static ceiling.
+# The idle bound is where the two legitimately differ: the plan's ~11,212-token
+# prompt makes time-to-first-chunk prefill-dominated and pushed that constant
+# to a deliberately loose 90s, whereas this judge sends a ~2k-token grade.
+RETRO_JUDGE_TOTAL_TIMEOUT_S = RETRO_JUDGE_CEILING_S
+
+#: Inter-chunk silence bound for the streamed judge call.
+#:
+#: Chosen strictly BELOW `budget.MIN_VIABLE_CALL_S` (30s) rather than merely
+#: below this judge's ceiling. `_default_llm` builds the client with
+#: `timeout=judge_budget.quote(...)`, which the budget may shrink to that
+#: floor on a degraded invocation — and krepis warns on
+#: `idle_timeout >= LLMClient(timeout=...)` because the transport's read
+#: deadline binds first, meaning the idle bound could never fire in exactly
+#: the case it is most needed: the tail of an invocation that has already
+#: overrun. Anchoring below the FLOOR keeps the bound enforceable under every
+#: budget state, not only generous ones.
+#:
+#: The looseness argument that set the plan's 90s does not transfer. There, a
+#: too-tight bound aborts a healthy call and an unfired bound is harmless
+#: because 600s of transport deadline still sits behind it. Here the ceiling
+#: is 120s and the quote may be 30s, so there is no wide margin to spend, and
+#: the value of the bound is not the abort — the client timeout would abort
+#: anyway — it is that `StreamIdleTimeoutError` is a TYPED, retryable failure
+#: naming how much arrived (`agent._RETRYABLE` / `-I8378`), where
+#: `APITimeoutError` names nothing.
+#:
+#: RE-ANCHOR TRIGGER: the same pass that re-anchors
+#: `agent.DIRECTOR_PLAN_MEASURED_MAX_S` from post-cap weekly runs
+#: (`alpha-engine-config-I8200`) should re-derive this from the judge's own
+#: measured first-chunk wait, which no run has yet emitted.
+RETRO_JUDGE_IDLE_TIMEOUT_S = 25.0
+
+# krepis raises `ValueError` when `total_timeout <= idle_timeout`, and the
+# whole point of the constant above is that it sits under the budget floor.
+# Both orderings are load-bearing and neither is obvious from the literals, so
+# they fail at import rather than 120s into a weekly run.
+assert RETRO_JUDGE_IDLE_TIMEOUT_S < _BUDGET_MIN_VIABLE_CALL_S, (
+    f"retro judge idle bound {RETRO_JUDGE_IDLE_TIMEOUT_S}s is not below the "
+    f"budget's minimum quote {_BUDGET_MIN_VIABLE_CALL_S}s — on a degraded "
+    f"invocation the transport read deadline would bind first and the idle "
+    f"bound could never fire."
+)
+assert RETRO_JUDGE_IDLE_TIMEOUT_S < RETRO_JUDGE_TOTAL_TIMEOUT_S, (
+    f"retro judge idle bound {RETRO_JUDGE_IDLE_TIMEOUT_S}s must be strictly "
+    f"below its total bound {RETRO_JUDGE_TOTAL_TIMEOUT_S}s — krepis raises "
+    f"ValueError otherwise."
 )
 
 # Retro judge capability tier — a GROUP HANDLE resolved through
@@ -431,7 +505,23 @@ class _KrepisStructuredJudge:
     #: shares `_invoke_with_retry`, so it shares the budget gate.
     attempt_cost_s = RETRO_JUDGE_CEILING_S
 
-    def __init__(self, client, *, judge_group: str, judge_model: str):
+    #: Inter-chunk silence bound passed as `idle_timeout=`. Injectable for the
+    #: same reason `_KrepisStructuredDirector.idle_timeout_s` is: a test can
+    #: drive the bound without reaching into module globals.
+    idle_timeout_s = RETRO_JUDGE_IDLE_TIMEOUT_S
+
+    #: TOTAL wall-clock bound passed as `total_timeout=` — see
+    #: `RETRO_JUDGE_TOTAL_TIMEOUT_S` for why this is the static ceiling rather
+    #: than the per-attempt budget quote.
+    total_timeout_s = RETRO_JUDGE_TOTAL_TIMEOUT_S
+
+    def __init__(self, client, *, judge_group: str, judge_model: str,
+                 idle_timeout_s: float | None = None,
+                 total_timeout_s: float | None = None):
+        if idle_timeout_s is not None:
+            self.idle_timeout_s = idle_timeout_s
+        if total_timeout_s is not None:
+            self.total_timeout_s = total_timeout_s
         self._client = client
         self._judge_group = judge_group
         self._judge_model = judge_model
@@ -462,6 +552,23 @@ class _KrepisStructuredJudge:
             # whatever budget the plan left, so an inherited hidden doubling
             # lands here first.
             attempts=_STRUCTURED_ATTEMPTS,
+            # alpha-engine-config-I8164, swept from the plan call. krepis
+            # re-assembles the streamed response into the same
+            # `ChatCompletion`-shaped object a non-streamed call returns, so
+            # `result.parsed`, `result.model` and `result.usage` below all
+            # read exactly as before — this changes how the bytes arrive, not
+            # what this method returns.
+            #
+            # It does NOT silently degrade: `_default_llm` states
+            # `requires=("streaming",)` at RESOLVE time, so a `high` group
+            # whose members do not declare the capability fails naming the
+            # group and each rejected member, before a token is billed —
+            # rather than sending a non-streamed request that would come back
+            # as a perfectly valid completion carrying the opaque deadline
+            # this change exists to remove.
+            stream=True,
+            idle_timeout=self.idle_timeout_s,
+            total_timeout=self.total_timeout_s,
         )
         self.last_usage = getattr(result, "usage", None)
         grade: RetroGrade = result.parsed
@@ -527,10 +634,24 @@ def _default_llm(budget=None) -> _KrepisStructuredJudge:
     # because both run in the same Lambda invocation — a judge that resolved
     # from a different execution context than the generator it grades would be
     # describing a process that does not exist.
+    # `requires=("streaming",)` states the REQUEST SHAPE — the only thing
+    # besides `exec_context` this module is allowed to say about routing
+    # (model-router-policy R32). Mirrors `agent._default_llm` exactly: the
+    # derivation drops members that do not declare the capability BEFORE a
+    # primary is chosen, so a registry in which `high`'s primary lacks
+    # `capabilities.streaming` is a named failure at resolve time rather than
+    # a `StreamingUnsupportedError` raised deep inside the call.
+    #
+    # PRECONDITION, and it is not hypothetical: `deepseek-v4-pro-max` is
+    # `high`'s only live member and declared NO streaming capability until
+    # `alpha-engine-config-PR9011` — measured true through its own route
+    # 2026-08-28 and declared there. Without that PR merged first, this
+    # resolve refuses and the retro is skipped every week.
     spec, route = resolve_group_spec(
         judge_group,
         exec_context=DIRECTOR_EXEC_CONTEXT,
         wire="openai",
+        requires=("streaming",),
     )
     _assert_routed_through_the_proxy(route)
     _warn_on_degraded_route(
