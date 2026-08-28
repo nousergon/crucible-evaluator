@@ -223,9 +223,13 @@ metrics:
     position_sizing_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
     risk_guard_contribution_lift: {target: null, red_line: 0.0, higher_is_better: true, n_floor_declared: 60}
   portfolio_outcome:
+    active_return_ex_index_sleeve: {target: 0.0, red_line: -0.05, n_floor_declared: 20}
     alpha_trend: {target: 0.0, red_line: null, n_floor_declared: 60}
     alpha_vs_spy: {target: 0.0, red_line: -0.05, n_floor_declared: 60}
+    attribution_residual_pct_of_active: {target: 0.1, red_line: 1.0, higher_is_better: false, n_floor_declared: 20}
+    beta_adjusted_alpha: {target: 0.0, red_line: -0.05, n_floor_declared: 20}
     beta_vs_spy: {target: null, red_line: null, n_floor_declared: 60}
+    bf_selection_effect: {target: 0.0, red_line: -0.03, n_floor_declared: 20}
     calmar_ratio: {target: 1.0, red_line: 0.0, n_floor_declared: 90}
     cvar_95_daily: {target: -0.01, red_line: -0.04, n_floor_declared: 60}
     dsr: {target: 0.95, red_line: 0.5, n_floor_declared: 60}

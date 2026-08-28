@@ -473,6 +473,28 @@ def write_report_card(
     )
     logger.info("Wrote report card to s3://%s/%s (latest)", bucket, latest_key)
 
+    # ── Attribution artifact (alpha-engine-config-I8188 deliverables 6-7) ──
+    # The Brinson-Fachler decomposition rides on the portfolio tile; persist it
+    # as its own artifact so a consumer can read the per-sector, per-session
+    # detail without parsing the whole card. Best-effort: (a) swallowed — a
+    # write failure for the SECONDARY artifact; (b) the report card itself is
+    # the primary deliverable and is already written above; (c) recording
+    # surface — the ERROR log here plus the tile's own components, which carry
+    # the same headline numbers and their status.
+    try:
+        attribution = (scorecard.get("tiles") or {}).get(
+            "portfolio_outcome", {}
+        ).get("attribution")
+        if attribution:
+            from grading.attribution import write_attribution
+
+            write_attribution(
+                attribution, bucket=bucket,
+                run_date=run_date if snapshot else None, s3_client=s3,
+            )
+    except Exception as e:  # noqa: BLE001 — secondary artifact, see above
+        logger.error("attribution artifact write failed for %s: %s", run_date, e)
+
     dated_key = None
     if snapshot:
         dated_key = report_card_key(run_date)

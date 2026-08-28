@@ -29,6 +29,14 @@
     "CONTENT was always UNMEASURED ('registry unreadable') -- a detector that could",
     "not fail, in the benign-looking direction.",
     "",
+    "alpha-engine-config-I8188 (2026-08-28): market_data is READ by",
+    "grading/attribution.py -- market_data/sectors/latest.json carries SPY's own",
+    "sector weights (the benchmark leg's weights) and",
+    "market_data/close_history/{XLK..XLC}.json carries the eleven SPDR sector",
+    "ETFs' dividend-adjusted closes (the benchmark leg's returns). Both are",
+    "written by nousergon-data's metron_market_data collector; the evaluator only",
+    "reads them.",
+    "",
     "access modes:",
     "  read      -> s3:ListBucket (prefix condition) + s3:GetObject on <prefix>/*",
     "  readwrite -> the above + s3:PutObject on <prefix>/* (the code writes here)"
@@ -50,6 +58,7 @@
     "experiments": "readwrite",
     "_stage_coverage": "readwrite",
     "decision_artifacts": "readwrite",
-    "_freshness_monitor": "read"
+    "_freshness_monitor": "read",
+    "market_data": "read"
   }
 }

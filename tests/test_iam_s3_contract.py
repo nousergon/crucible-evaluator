@@ -104,6 +104,16 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # same reader, not because nothing was added; both live under the "backtest"
     # prefix, already declared `read` in the contract, so no contract/IAM change.
     "grading/attestation.py": 1,
+    # alpha-engine-config-I8188 deliverables 6-7 (2026-08-28): the
+    # Brinson-Fachler attribution producer. THREE sites -- `_get_json`'s
+    # get_object (market_data/sectors/latest.json and the eleven
+    # market_data/close_history/{ETF}.json), `read_eod_pnl_rows`' get_object
+    # (trades/eod_pnl.csv, already granted) and `write_attribution`'s
+    # put_object (evaluator/, already granted readwrite). "market_data" is a
+    # NEW prefix and is granted by nous-ergon-ops-PR909 -- that PR merges
+    # FIRST, or the evaluator Lambda gets the 403-not-404 AccessDenied this
+    # contract exists to prevent.
+    "grading/attribution.py": 3,
     # config#3104: grading/artifacts.py S3 access moved to nousergon_lib.artifact_resolution SSoT;
     # the contract pin for the library-side access sites lives in nousergon-lib, not here.
     # config#3077: experiment_record writes dated + latest JSON pointers
