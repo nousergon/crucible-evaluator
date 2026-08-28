@@ -583,14 +583,35 @@ def build_attribution(
         # ── Deliverable 7 ───────────────────────────────────────────────────
         "active_return": {
             # BF-consistent legs: the portfolio return is the one the
-            # decomposition compounds (nav_change / prior_nav, Cariño-linked),
-            # so `active = bf_active + proxy_tracking` holds EXACTLY.
+            # decomposition compounds (Cariño-linked per-session BF totals,
+            # each session's total = Σ w_p,i · r_p,i over the SAME named
+            # groups — sectors, Cash, Index sleeve — that feed allocation /
+            # selection / interaction), so `active = bf_active +
+            # proxy_tracking` holds EXACTLY.
+            #
+            # This is NOT the same quantity as chain-linked
+            # nav_change_usd / prior_nav (corrected alpha-engine-config-I9025;
+            # was miswritten as "nav_change / prior_nav, Cariño-linked" and
+            # attributed below to I8188 defect 4, which is a different pair
+            # entirely — daily_return_pct vs the NAV RATIO, gated by
+            # executor/pnl_integrity.py::verify_twr_closes). The two diverge
+            # by exactly `input_closure_usd`: the per-session dollars
+            # `session_portfolio_groups` cannot attribute to a named group.
+            # That residual is independently bounded at
+            # INPUT_CLOSURE_NAV_BPS and a breaching session is excluded from
+            # this window entirely (see `skipped["input did not close"]`), so
+            # this leg and `stored_return_chain` below are computed over an
+            # IDENTICAL session set by construction — the gap the field below
+            # publishes is what the WITHIN-BOUND closure residual costs when
+            # compounded across the window, not a day-set mismatch (that
+            # mismatch is the separate, executor-side defect I9025 measured
+            # and gated at the SOURCE eod_pnl.csv: verify_nav_change_basis_
+            # closes, alpha-engine-config-I9025).
             "portfolio_total_return": linked.portfolio_return,
             "active_return_vs_spy": linked.portfolio_return - cum_spy,
-            # The SAME window measured from the STORED daily_return_pct chain.
-            # These are identically equal absent external flows; the gap is the
-            # TWR-closure question (I8188 defect 4) aggregated over the window,
-            # published rather than reconciled away.
+            # The SAME window and SAME session set (see above), measured from
+            # the STORED daily_return_pct chain instead of the BF-attributed
+            # groups sum.
             "stored_return_chain": cum_port,
             "return_chain_basis_gap": cum_port - linked.portfolio_return,
             "portfolio_return_ex_index_sleeve": cum_ex,
