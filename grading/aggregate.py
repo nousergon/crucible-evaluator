@@ -86,6 +86,7 @@ def build_report_card(
     self_test: dict | None = None,
     gate_state: dict | None = None,
     dry_run: bool = False,
+    run_scope: dict | None = None,
 ) -> dict:
     """Read artifacts → grade → attach provenance. Pure of writes.
 
@@ -99,16 +100,28 @@ def build_report_card(
     flagged partial rerun — the exact scenario (a recovery rerun that skips
     the producer stage) that makes a consumer-side gate load-bearing.
     """
-    # dry_run threads to the preflight ONLY (alpha-engine-config-I7392): on the
-    # Friday shell run every producer ran --preflight-only and wrote nothing, so
-    # the gate records UNMEASURED instead of raising. The real run is untouched
-    # — see assert_input_freshness for why that does not weaken the 2026-07-20
-    # ruling, and for what still raises on the dry path.
+    # dry_run threads to the freshness preflight AND to build_run_attestation
+    # (alpha-engine-config-I7392): on the Friday shell run every producer ran
+    # --preflight-only and wrote nothing, so the gate records UNMEASURED instead
+    # of raising and the attestation marks the halves whose artifact is absent
+    # NOT_IN_SCOPE instead of UNKNOWN. The real run is untouched — see
+    # assert_input_freshness for why that does not weaken the 2026-07-20 ruling
+    # and for what still raises on the dry path, and
+    # _mark_rehearsal_out_of_scope for the three ways the attestation half is
+    # deliberately narrow.
+    #
+    # Threading it to the preflight ALONE is what left the rehearsal paging: the
+    # card stopped hard-failing and started logging
+    # "report card attestation UNKNOWN ... the producer never ran this cycle"
+    # every Friday instead, most recently at 2026-08-29T01:44Z from execution
+    # offcycle-shell-20260829-004717 — a run in which nothing failed.
     freshness_provenance = assert_input_freshness(
         bucket, run_date, s3_client=s3_client, dry_run=dry_run,
     )
 
-    inputs, report = read_scorecard_inputs(bucket, run_date, s3_client=s3_client)
+    inputs, report = read_scorecard_inputs(
+        bucket, run_date, s3_client=s3_client, run_scope_payload=run_scope,
+    )
     scorecard = compute_scorecard(**inputs)
 
     # Cross-cycle trend history (config#1836): prior weekly CARDS are the SSOT
@@ -289,9 +302,14 @@ def build_report_card(
     # scope artifact can tell a stage that was switched off from one that died
     # (config-I7620 follow-up). Read here, rendered onto the card lower down
     # where the denominator belongs — one read, two consumers.
+    # The scope arrives IN-BAND with the run (the ReportCard Task's `run_scope`
+    # payload key, threaded from $.run_scope_result.Payload) and falls back to
+    # the S3 artifact — see artifacts._read_run_scope for why that order was
+    # inverted (alpha-engine-config-I7392).
     scope_block = read_run_scope(report.run_scope)
     attestation = build_run_attestation(
         bucket, run_date, s3_client=s3_client, run_scope=scope_block,
+        dry_run=dry_run,
     )
     scorecard["attestation"] = attestation
     scorecard["degraded_attestation"] = not verdict_is_pass(attestation["verdict"])

@@ -366,9 +366,17 @@ def _run(event: dict | None = None, context=None) -> dict:
     gate_block = read_gate_state(event.get("gate_state"))
     log_gate_state(gate_block, run_date)
 
+    # `run_scope` (alpha-engine-config-I7620, delivery fixed by I7392): the
+    # run's own scope, threaded IN-BAND on this Task's payload from
+    # $.run_scope_result.Payload. It was previously delivered only as
+    # backtest/{date}/run_scope.json — a path a rehearsal is forbidden to write,
+    # so on every Friday shell run the RunScope stage derived the correct answer
+    # and the card could not read it. S3 remains the fallback for a manual or
+    # snapshot rebuild with no SF payload behind it.
     card = build_report_card(bucket, run_date, self_test=self_test,
                              gate_state=event.get("gate_state"),
-                             dry_run=dry_run)
+                             dry_run=dry_run,
+                             run_scope=event.get("run_scope"))
 
     tiles = card.get("tiles", {})
     tile_status = {name: t.get("status") for name, t in tiles.items()}

@@ -183,6 +183,16 @@ ARTIFACT_MAP: dict[str, str] = {
 _METRICS_NON_OVERALL_KEYS = {"run_date", "status", "report_card"}
 
 
+#: Where the run's own scope came from, recorded on the artifact report so a
+#: reader can tell an in-band scope from an S3 one from none at all
+#: (``alpha-engine-config-I7392``). Both polarities, always: a provenance field
+#: that only appears on the fallback path cannot be distinguished from a
+#: producer that stopped emitting it.
+RUN_SCOPE_SOURCE_PAYLOAD = "payload (in-band, SF ReportCard Task)"
+RUN_SCOPE_SOURCE_S3 = "run_scope.json (S3 fallback)"
+RUN_SCOPE_SOURCE_ABSENT = "absent"
+
+
 @dataclass
 class ArtifactReport:
     """Provenance for one report-card build: what was read, what was absent."""
@@ -205,6 +215,9 @@ class ArtifactReport:
     # contribution_lift. run_scope is not a grader input; it is the denominator
     # the grades are rendered against.
     run_scope: dict | None = None
+    #: Which delivery path answered — see RUN_SCOPE_SOURCE_* above
+    #: (alpha-engine-config-I7392).
+    run_scope_source: str = RUN_SCOPE_SOURCE_ABSENT
 
     def as_dict(self) -> dict:
         return {
@@ -216,6 +229,7 @@ class ArtifactReport:
             "n_read": len(self.read),
             "n_missing": len(self.missing),
             "signal_quality_source": self.signal_quality_source,
+            "run_scope_source": self.run_scope_source,
         }
 
 
@@ -252,26 +266,62 @@ def _read_signal_quality(s3, bucket: str, prefix: str) -> tuple[dict | None, str
     return {"status": metrics.get("status"), "overall": overall}, "metrics.json (reconstructed fallback)"
 
 
-def _read_run_scope(s3, bucket: str, prefix: str) -> dict | None:
-    """Read ``run_scope.json`` — which stages this run dispatched.
+def _read_run_scope(
+    s3, bucket: str, prefix: str, payload: dict | None = None,
+) -> tuple[dict | None, str]:
+    """Resolve ``run_scope`` — which stages this run dispatched.
 
     Produced by ``nousergon-data``'s ``RunScope`` SF state
-    (``alpha-engine-config-I7620``). Read as its own artifact rather than
-    threaded through the SF payload so the two repos are not coupled through
-    payload shape.
+    (``alpha-engine-config-I7620``). Returns ``(block_or_None, source)``.
 
-    ``None`` on absence, and absence is meaningful: the consumer resolves it to
-    "scope unknown, grade nothing", never to "everything ran". A card that
-    grades the full stage list against a run that dispatched three of them is
-    confidently wrong; one that says it does not know is merely uninformative.
+    **The run's own scope travels IN-BAND with the run** (``payload``, the
+    ``run_scope`` key on the ReportCard Task's Payload, threaded from
+    ``$.run_scope_result.Payload``); the S3 artifact is the FALLBACK, for a
+    manual/CLI build or a snapshot rebuild that has no SF payload behind it.
+
+    Why the order was inverted (``alpha-engine-config-I7392``, live instance
+    2026-08-29): the S3 artifact was the ONLY delivery path, and a rehearsal is
+    forbidden to write it — the ``RunScope`` Lambda returns the derived scope
+    and skips the ``put_object`` when ``dry_run`` is true. On the
+    2026-08-29T00:47Z Friday shell run the ``RunScope`` stage derived the right
+    answer (``Parity: DISABLED`` — ``CheckSkipParity`` took its skip branch),
+    the card could not read it, ``contamination_scope`` resolved to
+    ``scope_unknown`` and the contamination half went UNKNOWN. The whole
+    ``NOT_IN_SCOPE`` mechanism built for exactly that case was defeated by the
+    DELIVERY PATH, not by the logic: the correct answer existed in memory and
+    was discarded on the way to its consumer.
+
+    ``None`` on absence from both paths, and absence is meaningful: the consumer
+    resolves it to "scope unknown, grade nothing", never to "everything ran". A
+    card that grades the full stage list against a run that dispatched three of
+    them is confidently wrong; one that says it does not know is merely
+    uninformative.
     """
-    return get_json(s3, bucket, f"{prefix}/run_scope.json")
+    if isinstance(payload, dict) and payload:
+        return payload, RUN_SCOPE_SOURCE_PAYLOAD
+    if payload is not None and not isinstance(payload, dict):
+        # Never silently swallowed: a payload of the wrong SHAPE is a contract
+        # breach between two repos, and falling through to S3 without saying so
+        # would make it invisible. Recorded here; the resolved source below
+        # still says which path actually answered.
+        logger.error(
+            "run_scope payload is %s, not a JSON object — the in-band scope is "
+            "unusable and the card falls back to the S3 artifact. Cross-repo "
+            "contract: nousergon-data step_function.json ReportCard "
+            "Payload.run_scope <- $.run_scope_result.Payload.",
+            type(payload).__name__,
+        )
+    block = get_json(s3, bucket, f"{prefix}/run_scope.json")
+    if block is None:
+        return None, RUN_SCOPE_SOURCE_ABSENT
+    return block, RUN_SCOPE_SOURCE_S3
 
 
 def read_scorecard_inputs(
     bucket: str,
     run_date: str,
     s3_client=None,
+    run_scope_payload: dict | None = None,
 ) -> tuple[dict, ArtifactReport]:
     """Assemble the ``compute_scorecard`` kwargs from S3 artifacts.
 
@@ -306,16 +356,23 @@ def read_scorecard_inputs(
     # `inputs` — those keys feed straight into `compute_scorecard(**inputs)` as
     # grader parameters, and an unconsumed key raises TypeError the first time
     # the artifact exists in S3 (the trap ARTIFACT_MAP's own note records).
-    report.run_scope = _read_run_scope(s3, bucket, prefix)
+    report.run_scope, report.run_scope_source = _read_run_scope(
+        s3, bucket, prefix, payload=run_scope_payload,
+    )
     if report.run_scope is None:
         report.missing.append("run_scope.json")
         logger.warning(
-            "Artifact absent: s3://%s/%s/run_scope.json — the card cannot state "
-            "which stages this run dispatched, so its grades carry no known "
-            "denominator", bucket, prefix,
+            "run scope UNRESOLVED — no in-band run_scope on the ReportCard "
+            "payload and no artifact at s3://%s/%s/run_scope.json. The card "
+            "cannot state which stages this run dispatched, so its grades carry "
+            "no known denominator", bucket, prefix,
         )
     else:
+        # The artifact NAME stays the ledger entry (a stable key every existing
+        # reader of `artifacts_read` matches on); the delivery path is recorded
+        # separately as `run_scope_source`.
         report.read.append("run_scope.json")
+        logger.info("run scope resolved from %s", report.run_scope_source)
 
     for param, filename in ARTIFACT_MAP.items():
         data = get_json(s3, bucket, f"{prefix}/{filename}")

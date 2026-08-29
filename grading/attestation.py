@@ -94,9 +94,16 @@ _VALID_VERDICTS = frozenset({PASS, FAIL, PARTIAL, UNKNOWN})
 #:
 #: Deliberately OUTSIDE ``_VALID_VERDICTS``: no producer may ever write this
 #: value, and :func:`_normalize_verdict` can never yield it. It is assigned by
-#: this module alone, and only when the run-scope artifact — derived from the
-#: state machine definition and the execution history, which cannot disagree
-#: with reality — says the stage that writes the evidence took its skip branch.
+#: this module alone, on exactly TWO grounds, and each is a fact about DISPATCH
+#: rather than about the evidence:
+#:
+#: 1. the run-scope block — derived from the state machine definition and the
+#:    execution history, which cannot disagree with reality — says the stage
+#:    that writes the evidence took its skip branch; or
+#: 2. this is a declared dry run (``dry_run=True``, the Friday-evening shell
+#:    rehearsal), on which every producer is dispatched ``--preflight-only`` and
+#:    writes no attestation by design, and the object was genuinely ABSENT
+#:    (``alpha-engine-config-I7392`` — see :func:`_mark_rehearsal_out_of_scope`).
 #:
 #: It is NOT a pass. :func:`verdict_is_pass` still returns False for it, so
 #: ``degraded_contamination`` stays True and no surface claims the run was
@@ -484,11 +491,17 @@ def _read_verdict_artifact(
             base["as_of"] = last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
+        absent = code in ("NoSuchKey", "404")
         reason = (f"{label} attestation absent at {source_path} — the producer never ran "
-                  "this cycle." if code in ("NoSuchKey", "404")
+                  "this cycle." if absent
                   else f"{label} attestation unreadable ({code}).")
         logger.warning("attestation: %s", reason)
-        return {**base, "verdict": UNKNOWN, "reason": reason}
+        # `absent` is carried, not merely stated in prose: a half that is
+        # UNKNOWN because the OBJECT IS NOT THERE is the only one a declared
+        # rehearsal may re-classify as NOT_IN_SCOPE, and a reader deciding that
+        # by substring-matching the reason string is a reader that will get it
+        # wrong (alpha-engine-config-I7392).
+        return {**base, "verdict": UNKNOWN, "reason": reason, "absent": absent}
     except Exception as exc:  # noqa: BLE001 — see CONTRACT: never raises
         reason = f"{label} attestation read failed ({type(exc).__name__}: {exc})."
         logger.error("attestation: %s", reason)
@@ -747,8 +760,83 @@ def contamination_scope(run_scope: Any) -> dict:
     }
 
 
+#: The halves whose PRODUCER is dispatched with ``--preflight-only`` on the
+#: Friday-evening shell (dry) run and therefore writes no verdict artifact BY
+#: DESIGN. ``evaluator`` is deliberately absent from this tuple: it is the
+#: in-process known-answer battery over THIS image's quant primitives, it runs
+#: identically on a rehearsal, and a rehearsal that could not fail on it would
+#: be a rehearsal of nothing.
+REHEARSAL_OUT_OF_SCOPE_HALVES: tuple[str, ...] = (
+    "backtester", "evaluator_stage", "contamination",
+)
+
+
+#: The one sentence explaining the dry-run ground, held once rather than
+#: interpolated per half: three halves go out of scope together on a rehearsal,
+#: and three copies of the same paragraph in one ``reason`` is a surface nobody
+#: finishes reading.
+REHEARSAL_GROUND = (
+    "This is a declared DRY RUN (the Friday-evening shell rehearsal), on which "
+    "every producer is dispatched --preflight-only and writes no attestation BY "
+    "DESIGN, so its silence is a decision and not an absence of evidence. This "
+    "is NOT a pass: those numbers are not established correct, they are "
+    "unmeasured on purpose (alpha-engine-config-I7392)."
+)
+
+
+def _mark_rehearsal_out_of_scope(half: dict, label: str) -> bool:
+    """On a declared dry run, re-classify a half whose artifact is ABSENT.
+
+    ``alpha-engine-config-I7392``. The Friday shell run dispatches every
+    producer with ``--preflight-only``; none of them writes its attestation, and
+    the pre-fix card read that guaranteed absence as "the producer never ran
+    this cycle" and logged ERROR — a structural false alarm, every week, from a
+    run in which nothing failed. Measured instance: the ERROR page at
+    2026-08-29T01:44Z from execution ``offcycle-shell-20260829-004717``, naming
+    ``backtester=UNKNOWN, evaluator_stage=UNKNOWN, contamination=UNKNOWN``.
+
+    **Narrow on purpose, in three ways, because the whole risk here is a
+    rehearsal flag that quietly buys a guarantee:**
+
+    1. Only on an explicit ``dry_run``. A real Saturday is untouched.
+    2. Only when the half is ``UNKNOWN`` **and** the object was genuinely
+       ABSENT. A half that read a real artifact keeps its real verdict — so a
+       dry run over a date a real run already wrote still surfaces that run's
+       ``FAIL``, and an unreadable/corrupt/mis-stamped body stays UNKNOWN and
+       still pages.
+    3. ``NOT_IN_SCOPE`` is not a pass. :func:`verdict_is_pass` returns False for
+       it, so no surface gains a guarantee it did not earn; what it changes is
+       that the half is excluded from the combined worst-of rather than dragging
+       it to UNKNOWN.
+
+    Returns True if the half was re-classified.
+    """
+    if half.get("verdict") != UNKNOWN or not half.get("absent"):
+        return False
+    half["verdict"] = NOT_IN_SCOPE
+    half["reason"] = f"{label} NOT IN SCOPE this run. {REHEARSAL_GROUND}"
+    half["out_of_scope_because"] = "dry_run"
+    return True
+
+
+def _worst_in_scope(*verdicts: str) -> str:
+    """:func:`_worst` over the halves that were IN SCOPE.
+
+    ``NOT_IN_SCOPE`` is excluded rather than folded in — passing it through
+    :func:`_worst` would map it to UNKNOWN, since it is deliberately outside
+    ``_VALID_VERDICTS``, and dragging the whole block down is exactly the
+    behaviour this vocabulary exists to stop. With nothing left in scope the
+    answer is UNKNOWN, never PASS: an empty numerator is an absence of
+    evidence. (Unreachable today — the ``evaluator`` half is always in scope —
+    and written this way so it stays correct if that ever changes.)
+    """
+    in_scope = [v for v in verdicts if v != NOT_IN_SCOPE]
+    return _worst(*in_scope) if in_scope else UNKNOWN
+
+
 def build_run_attestation(
     bucket: str, run_date: str, s3_client=None, *, run_scope: Any = None,
+    dry_run: bool = False,
 ) -> dict:
     """The combined block the Report Card carries at ``report_card["attestation"]``.
 
@@ -782,9 +870,17 @@ def build_run_attestation(
     separately as well as the combined ``verdict``, because a reader asks about
     them separately and a single boolean cannot answer both.
 
-    Never raises; the worst half wins. Any half UNKNOWN withholds the guarantee,
-    because a card whose numbers are only three-quarters attested is not a
-    verified card — §2.3a rule 2 admits no partial pass.
+    Never raises; the worst IN-SCOPE half wins. Any in-scope half UNKNOWN
+    withholds the guarantee, because a card whose numbers are only
+    three-quarters attested is not a verified card — §2.3a rule 2 admits no
+    partial pass.
+
+    ``run_scope`` and ``dry_run`` are the two things that can put a half OUT of
+    scope, and neither is a pass — see :data:`NOT_IN_SCOPE`. ``dry_run`` is the
+    ReportCard Task's ``$.research_dry`` (the canonical shell-run signal),
+    threaded from ``grading/handler.py``; it reaches here and NOT only the
+    freshness preflight, which is the half ``alpha-engine-config-I7392`` fixed
+    first and the half that left this one paging ERROR every Friday.
     """
     evaluator = run_evaluator_attestation()
     backtester = read_backtester_attestation(bucket, run_date, s3_client=s3_client)
@@ -802,8 +898,25 @@ def build_run_attestation(
     if not scope["in_scope"]:
         contamination["verdict"] = NOT_IN_SCOPE
         contamination["reason"] = scope["reason"]
+        contamination["out_of_scope_because"] = "run_scope"
 
-    arithmetic_verdict = _worst(
+    # alpha-engine-config-I7392 — the SECOND way a producer can be legitimately
+    # silent: not switched off, but dispatched `--preflight-only` by a declared
+    # rehearsal. The scope artifact above cannot answer this one; it reports the
+    # stage as ENABLED_COMPLETED, which is TRUE (the Backtester stage did run —
+    # it ran the preflight) and does not mean an attestation exists. So the
+    # rehearsal flag is asked, and only it, and only about halves whose object
+    # was genuinely absent. See _mark_rehearsal_out_of_scope for the three ways
+    # this is deliberately narrow.
+    if dry_run:
+        for label, half in (
+            ("backtester", backtester),
+            ("evaluator stage", evaluator_stage),
+            ("contamination", contamination),
+        ):
+            _mark_rehearsal_out_of_scope(half, label)
+
+    arithmetic_verdict = _worst_in_scope(
         evaluator["verdict"], backtester["verdict"], evaluator_stage["verdict"],
     )
     contamination_verdict = contamination["verdict"]
@@ -815,25 +928,41 @@ def build_run_attestation(
     # correct"; `contamination_verdict` continues to answer, separately and
     # honestly, "did we measure contamination at all" — and NOT_IN_SCOPE is
     # never a pass there.
-    verdict = (
-        arithmetic_verdict if not scope["in_scope"]
-        else _worst(arithmetic_verdict, contamination_verdict)
-    )
+    verdict = _worst_in_scope(arithmetic_verdict, contamination_verdict)
 
+    _halves = (
+        ("evaluator", evaluator),
+        ("backtester", backtester),
+        ("evaluator_stage", evaluator_stage),
+        ("contamination", contamination),
+    )
+    # BOTH SIDES, always (sf-pipeline-policy.md §2.3a rule 4, second obligation):
+    # what was withheld AND what was never asked. A list that appears only when
+    # something stopped cannot be distinguished from a producer that stopped
+    # emitting — principles.md §2.7.
     withheld = [
-        f"{name}={half['verdict']}"
-        for name, half in (
-            ("evaluator", evaluator),
-            ("backtester", backtester),
-            ("evaluator_stage", evaluator_stage),
-            ("contamination", contamination),
-        )
-        if half["verdict"] != PASS
+        f"{name}={half['verdict']}" for name, half in _halves
+        if half["verdict"] not in (PASS, NOT_IN_SCOPE)
     ]
+    not_in_scope = [name for name, half in _halves
+                    if half["verdict"] == NOT_IN_SCOPE]
+    # One sentence per distinct GROUND, not per half. Three halves leave scope
+    # together on a rehearsal and they leave it for the same reason; repeating
+    # it three times is how a surface stops being read.
+    _grounds: list[str] = []
+    for _name, _half in _halves:
+        if _half["verdict"] != NOT_IN_SCOPE:
+            continue
+        _sentence = (REHEARSAL_GROUND
+                     if _half.get("out_of_scope_because") == "dry_run"
+                     else _half.get("reason", ""))
+        if _sentence and _sentence not in _grounds:
+            _grounds.append(_sentence)
+    not_in_scope_reasons = " ".join(_grounds).strip()
     reasons = " ".join(
         half.get("reason", "")
         for half in (backtester, evaluator_stage, contamination)
-        if half["verdict"] != PASS
+        if half["verdict"] not in (PASS, NOT_IN_SCOPE)
     ).strip()
     block = {
         "schema": SCHEMA,
@@ -855,7 +984,12 @@ def build_run_attestation(
         "backtester": backtester,
         "evaluator_stage": evaluator_stage,
         "contamination": contamination,
-        "contamination_in_scope": scope["in_scope"],
+        "contamination_in_scope": contamination_verdict != NOT_IN_SCOPE,
+        # The named halves this run never asked for, beside the withheld set —
+        # never one without the other (§2.3a rule 4).
+        "not_in_scope_halves": not_in_scope,
+        "withheld_halves": withheld,
+        "dry_run": bool(dry_run),
         "promotion_withheld": bool(evaluator_stage.get("promotion_withheld")),
         # config-I7620 follow-up: an out-of-scope contamination half gets its own
         # sentence. Rendering it under the four-halves-attested line would claim
@@ -866,22 +1000,30 @@ def build_run_attestation(
             "engine, and the Evaluator stage's ranking metrics each agreed with their "
             "hand-derived known answers, and the point-in-time replay found no "
             "material look-ahead contamination over the full window."
-            if verdict == PASS and scope["in_scope"] else
-            "Arithmetic attested over the stages this run dispatched. "
-            f"CONTAMINATION NOT MEASURED: {scope['reason']}"
+            if verdict == PASS and not not_in_scope else
+            "Attested over the halves this run dispatched. "
+            f"{', '.join(n.upper() + ' NOT MEASURED' for n in not_in_scope)}: "
+            f"{not_in_scope_reasons}".strip()
             if verdict == PASS else
             f"Correctness guarantee WITHHELD: {', '.join(withheld)}. {reasons}".strip()
         ),
     }
+    # Both polarities, and the SEVERITY is the polarity a pager reads.
+    #
+    # A non-PASS verdict now means an IN-SCOPE half withheld the guarantee —
+    # something the run was asked to measure did not answer — so it stays
+    # ERROR, on a real Saturday and on a rehearsal alike: a genuinely dead
+    # producer, an unreadable body, or a failing known-answer battery pages
+    # either way. What no longer pages is a half nobody asked for
+    # (alpha-engine-config-I7392): that is a WARNING, which still renders, still
+    # names every out-of-scope half and why, and still is not a pass.
     if verdict != PASS:
         logger.error("report card attestation %s for %s: %s", verdict, run_date, block["reason"])
-    elif not scope["in_scope"]:
-        # Both polarities, always. A block that logs only the failing case is
-        # indistinguishable from a producer that stopped running, and "PASS with
-        # one half never measured" is precisely the state that must not slip past
-        # a reader scanning for ERROR lines.
+    elif not_in_scope:
         logger.warning(
-            "report card attestation PASS for %s with contamination NOT MEASURED: %s",
-            run_date, scope["reason"],
+            "report card attestation PASS for %s: %s", run_date, block["reason"],
         )
+    else:
+        logger.info("report card attestation PASS for %s — all four halves attested.",
+                    run_date)
     return block
