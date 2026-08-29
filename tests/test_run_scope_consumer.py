@@ -227,3 +227,204 @@ def test_the_digest_names_the_flag_so_the_director_stops_guessing():
     ))})
     text = _digest(card)
     assert "disabled by skip_parity" in text
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Delivery: in-band first, S3 as the fallback (alpha-engine-config-I7392)
+#
+# The S3 artifact was the ONLY delivery path, and it is the one path a
+# REHEARSAL is forbidden to use: nousergon-data's RunScope Lambda derives the
+# scope and skips its put_object when dry_run is true
+# (infrastructure/lambdas/weekly-run-scope/index.py). So on the
+# 2026-08-29T00:47Z Friday shell run the RunScope stage derived exactly the
+# right answer — Parity: DISABLED, "CheckSkipParity was entered and took its
+# skip branch" — the card could not read it, contamination_scope() hit
+# scope_unknown, "absence is never out-of-scope" left the half IN scope, and it
+# resolved to UNKNOWN. The whole NOT_IN_SCOPE mechanism built for exactly that
+# case (config-I7620) was defeated by the DELIVERY PATH, not by the logic: the
+# correct answer existed in memory and was discarded on the way to its consumer.
+#
+# The run's own scope now travels IN-BAND with the run — the ReportCard Task's
+# `run_scope` payload key, threaded from $.run_scope_result.Payload
+# (nousergon-data infrastructure/step_function.json). S3 is the FALLBACK, not
+# the removal: a manual/CLI card build or a snapshot rebuild has no SF payload
+# behind it.
+# ════════════════════════════════════════════════════════════════════════════
+
+import logging as _logging
+import pytest
+from botocore.exceptions import ClientError
+
+import grading.artifacts as _artifacts
+from grading.artifacts import (
+    RUN_SCOPE_SOURCE_ABSENT,
+    RUN_SCOPE_SOURCE_PAYLOAD,
+    RUN_SCOPE_SOURCE_S3,
+    _read_run_scope,
+)
+
+_IN_BAND = {"schema": "run_scope-1.0.0", "run_date": "2026-08-28",
+            "stages": {"Parity": {"disposition": "DISABLED",
+                                  "disabled_by": "skip_parity"}}}
+_FROM_S3 = {"schema": "run_scope-1.0.0", "run_date": "2026-08-28", "stages": {}}
+
+
+def _no_s3(monkeypatch, body=None):
+    monkeypatch.setattr(_artifacts, "get_json", lambda *a, **k: body)
+
+
+def test_the_in_band_payload_is_preferred(monkeypatch):
+    """S3 is never consulted when the run carried its own scope."""
+    calls = []
+    monkeypatch.setattr(_artifacts, "get_json",
+                        lambda *a, **k: calls.append(a) or _FROM_S3)
+    block, source = _read_run_scope(None, "b", "backtest/2026-08-28",
+                                    payload=_IN_BAND)
+    assert block == _IN_BAND
+    assert source == RUN_SCOPE_SOURCE_PAYLOAD
+    assert calls == []
+
+
+def test_s3_remains_the_fallback_not_the_removal(monkeypatch):
+    """A manual/CLI build or a snapshot rebuild has no SF payload behind it."""
+    _no_s3(monkeypatch, _FROM_S3)
+    for payload in (None, {}):
+        block, source = _read_run_scope(None, "b", "backtest/2026-08-28",
+                                        payload=payload)
+        assert block == _FROM_S3
+        assert source == RUN_SCOPE_SOURCE_S3
+
+
+def test_absent_from_both_paths_is_absent(monkeypatch):
+    """And absence stays meaningful — read_run_scope resolves None to UNKNOWN
+    with an empty graded set, never to 'everything ran'."""
+    _no_s3(monkeypatch, None)
+    block, source = _read_run_scope(None, "b", "backtest/2026-08-28", payload=None)
+    assert block is None
+    assert source == RUN_SCOPE_SOURCE_ABSENT
+    assert read_run_scope(block)["verdict"] == "UNKNOWN"
+    assert read_run_scope(block)["graded_stages"] == []
+
+
+def test_a_payload_of_the_wrong_shape_is_loud(monkeypatch, caplog):
+    """No silent swallow: a payload of the wrong SHAPE is a cross-repo contract
+    breach, and falling through to S3 without saying so makes it invisible."""
+    _no_s3(monkeypatch, _FROM_S3)
+    with caplog.at_level(_logging.DEBUG, logger="grading.artifacts"):
+        block, source = _read_run_scope(None, "b", "backtest/2026-08-28",
+                                        payload="run_scope-1.0.0")
+    assert block == _FROM_S3
+    assert source == RUN_SCOPE_SOURCE_S3
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= _logging.ERROR]
+    assert len(errors) == 1
+    assert "run_scope payload is str" in errors[0]
+
+
+def test_build_report_card_hands_the_in_band_scope_to_both_consumers(monkeypatch):
+    """The two hops the fix depends on, asserted at the seam rather than
+    through a full card build: ``build_report_card`` must pass the event's
+    ``run_scope`` down to the artifact reader, and must pass the NORMALIZED
+    block plus ``dry_run`` on to the attestation. Break either and the fix is
+    inert while every other test still passes."""
+    import grading.aggregate as aggregate
+    from grading.attestation import NOT_IN_SCOPE
+
+    seen = {}
+
+    def _fake_reader(bucket, run_date, s3_client=None, run_scope_payload=None):
+        seen["payload"] = run_scope_payload
+        return {}, _StubReport(run_scope=run_scope_payload)
+
+    def _fake_attestation(bucket, run_date, s3_client=None, *, run_scope=None,
+                          dry_run=False):
+        seen["run_scope"] = run_scope
+        seen["dry_run"] = dry_run
+        raise _Stop
+
+    monkeypatch.setattr(aggregate, "assert_input_freshness", lambda *a, **k: {})
+    monkeypatch.setattr(aggregate, "read_scorecard_inputs", _fake_reader)
+    monkeypatch.setattr(aggregate, "build_run_attestation", _fake_attestation)
+    monkeypatch.setattr(aggregate, "compute_scorecard", lambda **k: {"tiles": {}})
+    monkeypatch.setattr(aggregate, "load_card_history", lambda *a, **k: None)
+    monkeypatch.setattr(aggregate, "build_leaderboard", lambda *a, **k: None)
+    # The ten tiles sit BETWEEN the two seams under test and each reads its own
+    # artifacts (one reaches Step Functions through nousergon_lib). They are
+    # graded by their own tests; stubbed here so this test fails for exactly one
+    # reason.
+    for _tile in ("portfolio_outcome", "predictor", "research", "executor",
+                  "backtester", "substrate", "agent", "behavioral",
+                  "director_quality", "contribution_lift"):
+        monkeypatch.setattr(aggregate, f"build_{_tile}_tile",
+                            lambda *a, **k: {"status": "GREEN", "components": []})
+
+    with pytest.raises(_Stop):
+        aggregate.build_report_card("b", "2026-08-28", s3_client=_AbsentS3(),
+                                    dry_run=True, run_scope=_IN_BAND)
+
+    assert seen["payload"] == _IN_BAND
+    assert seen["dry_run"] is True
+    assert seen["run_scope"]["verdict"] == "MEASURED"
+    assert seen["run_scope"]["disabled_stages"] == ["Parity"]
+    assert seen["run_scope"]["disabled_by"] == ["skip_parity"]
+    assert NOT_IN_SCOPE  # the vocabulary the normalized block feeds
+
+
+def test_the_handler_forwards_the_events_run_scope(monkeypatch):
+    """The SF hands it in on the ReportCard Task's Payload; the handler must
+    not drop it on the floor between the event and the build."""
+    import grading.handler as handler
+
+    seen = {}
+
+    def _fake_build(bucket, run_date, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(handler, "build_report_card", _fake_build)
+    monkeypatch.setattr(handler, "run_self_test", lambda **k: {"verdict": "PASS"})
+    with pytest.raises(_Stop):
+        handler.handler({"date": "2026-08-28", "dry_run": True, "write": False,
+                         "run_scope": _IN_BAND})
+    assert seen["run_scope"] == _IN_BAND
+    assert seen["dry_run"] is True
+
+
+class _AbsentS3:
+    """Everything absent — the rehearsal's actual S3 state. Enough surface for
+    the tile reads that sit between the two seams under test."""
+
+    def get_object(self, **_kw):
+        raise ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}}, "GetObject",
+        )
+
+    def head_object(self, **_kw):
+        raise ClientError(
+            {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject",
+        )
+
+    def list_objects_v2(self, **_kw):
+        return {"KeyCount": 0, "Contents": []}
+
+    def get_paginator(self, _name):
+        return self
+
+    def paginate(self, **_kw):
+        return iter(())
+
+
+class _Stop(Exception):
+    """Stops the build at the seam under test — everything after it needs a
+    real S3 and is covered by the card-build tests."""
+
+
+class _StubReport:
+    def __init__(self, run_scope=None):
+        self.run_scope = run_scope
+        self.run_scope_source = RUN_SCOPE_SOURCE_PAYLOAD
+        self.read: list[str] = []
+        self.missing: list[str] = []
+        self.signal_quality_source = None
+
+    def as_dict(self) -> dict:
+        return {"artifacts_read": [], "artifacts_missing": []}
