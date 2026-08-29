@@ -35,6 +35,19 @@ SAFE_NON_DEPLOY_PATH_PATTERNS: tuple[str, ...] = (
     "SECURITY.md",
     "AGENTS.md",
     "CLAUDE.md",
+    # alpha-engine-config#9168. Input to the openrouter direct-linkage guard,
+    # a CI job — it is not COPYed by the Dockerfile and no runtime code reads
+    # it, so a change to it cannot make the deployed image stale.
+    #
+    # Default-deny worked exactly as designed here and that is why this entry
+    # is the fix rather than a relaxation: PR #280 changed ONLY this file, the
+    # deploy workflow's paths filter correctly skipped a rebuild, and the drift
+    # probe correctly refused to call an unclassified root file benign — so both
+    # gates reported has_drift=true and the 2026-08-29 09:00 UTC scheduled run
+    # would have terminated FAILED ~30s in, before WeeklyPreflight and before
+    # any spot spend. The gap was a genuinely CI-only surface that nobody had
+    # classified, not a wrong rule.
+    ".openrouter-allowlist.yaml",
 )
 
 
