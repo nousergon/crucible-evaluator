@@ -75,8 +75,22 @@ class TestCiOnlySurfacesCannotArmTheDriftGate:
         assert not deploy_paths.is_deploy_relevant_path(".openrouter-allowlist.yaml")
 
     def test_it_is_never_copied_into_the_image(self):
-        """The classification is only true while the file stays out of the image."""
-        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        """The classification is only true while the file stays out of the image.
+
+        Skipped when the Dockerfile is absent, which is the case in the
+        docker-image-tests job — that job runs this suite INSIDE the built image,
+        where only what the Dockerfile COPYs exists. The Dockerfile's own absence
+        there is corroboration of the claim rather than a gap in it, and the
+        sibling `test_workflow_path_filter_is_exact_projection_of_deploy_path_contract`
+        skips for the same reason.
+        """
+        dockerfile_path = REPO_ROOT / "Dockerfile"
+        if not dockerfile_path.is_file():
+            pytest.skip(
+                "running inside the built image — the Dockerfile is not COPYed "
+                "into it, which is itself the property under test"
+            )
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
         copied = [
             line.strip()
             for line in dockerfile.splitlines()
