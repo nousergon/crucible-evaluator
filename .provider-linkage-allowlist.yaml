@@ -1,0 +1,99 @@
+# .provider-linkage-allowlist.yaml — pre-cleared direct-provider-linkage
+# matches (alpha-engine-config-I9295, wiring the fleet-wide provider guard,
+# spine I9294). Schema: nousergon-lib scripts/provider_linkage_guard.py
+# ::load_allowlist. Replaces .openrouter-allowlist.yaml (deleted in this PR
+# along with the old per-vendor openrouter-guard.yml it backed).
+schema_version: 1
+entries:
+  - path: director/agent.py
+    pattern: "openrouter:base_url"
+    reason: >-
+      Comments/docstrings narrating the alpha-engine-config-I6183 incident
+      (a direct openrouter.ai egress that was later fixed) — historical
+      prose, not a live call site. Same class as this file's prior
+      openrouter-allowlist.yaml entries.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: director/agent.py
+    pattern: "anthropic:sdk_client"
+    reason: >-
+      Docstring recording the migration history of this call site
+      (`Migrated from ChatAnthropic(...) -> krepis.llm(...) ->
+      krepis.router.resolve_group_structured(...)`) — prose naming a
+      retired construction, not a live SDK client construction. The
+      module's live path routes exclusively through krepis (see
+      `_assert_routed_through_the_proxy`).
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: director/agent.py
+    pattern: "openrouter:env_key"
+    reason: >-
+      Comment describing the LiteLLM in-process Router path this module
+      explicitly guards against (`_assert_routed_through_the_proxy`) —
+      names OPENROUTER_API_KEY as the credential a direct-egress shortcut
+      would read, not a live env-var read in this file.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: director/handler.py
+    pattern: "anthropic:env_key"
+    reason: >-
+      Docstrings/comments naming ANTHROPIC_API_KEY as the SSM parameter
+      the Lambda's IAM grant covers (ReadAnthropicSecret) and as the local
+      manual-invocation env var in `main()`'s docstring — prose describing
+      the SSM-fetch path, not a raw env-var read in application code.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: director/retro.py
+    pattern: "openrouter:base_url"
+    reason: >-
+      Comment/docstring narrating the alpha-engine-config-I8164 incident
+      (a judge call that egressed straight to openrouter.ai before the
+      proxy assertion was swept into this module) — historical prose, not
+      a live call site.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: director/retro.py
+    pattern: "openrouter:env_key"
+    reason: >-
+      Docstring describing the PREVIOUS (already-replaced) call-site body
+      that fetched OPENROUTER_API_KEY from SSM by hand — prose naming the
+      defect this module's current code no longer has.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: infrastructure/deploy.sh
+    pattern: "openrouter:base_url"
+    reason: >-
+      Comment narrating the alpha-engine-config-I6183 stranded-alias
+      incident (an image that still carried the `exclude_route
+      ="litellm_proxy"` shortcut) — historical prose, not a live deploy
+      step.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: tests/test_deploy_sh_authority.py
+    pattern: "openrouter:base_url"
+    reason: >-
+      Docstring narrating the same alpha-engine-config-I6183 incident as
+      infrastructure/deploy.sh's entry above — historical prose in a test
+      module doc comment, not a call site.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: tests/test_director.py
+    pattern: "openrouter:env_key"
+    reason: >-
+      Test fixtures that deliberately SET a fake OPENROUTER_API_KEY to
+      assert it can never leak into a hermetic path (`monkeypatch.setenv`
+      guarded by a raising `krepis.secrets.get_secret` stub), or DELETE it
+      to assert absence (`monkeypatch.delenv`) — guard assertions, not
+      linkage.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
+  - path: tests/test_director.py
+    pattern: "openrouter:base_url"
+    reason: >-
+      Test fixtures/docstrings asserting the router-resolved spec's
+      provider/base-url fields as parameterized route-shape data (`provider:
+      "openrouter"`, `api_base_url: "https://openrouter.ai"`), and
+      docstrings narrating the I6183 incident this test class regression-
+      guards — not a live call site.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
