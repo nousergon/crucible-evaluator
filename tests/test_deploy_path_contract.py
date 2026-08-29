@@ -154,6 +154,12 @@ def test_every_dockerfile_copy_source_is_a_declared_deploy_path():
 
 def test_dockerfile_copy_source_parser_ignores_build_stage_copies():
     """A ``COPY --from=builder`` source is a stage path, not a repo path."""
+    if not DOCKERFILE.is_file():
+        # docker-image-tests runs this suite INSIDE the built image, where
+        # /var/task holds only what the Dockerfile COPYed — not the Dockerfile.
+        # The sibling test above already carries this guard; omitting it here
+        # made the image job red while every local run passed.
+        pytest.skip("Dockerfile is intentionally absent from the Lambda image")
     sources = _dockerfile_copy_sources()
     assert sources, "parser found no COPY sources at all"
     assert not any(s.startswith("--") for s in sources)
