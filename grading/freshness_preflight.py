@@ -218,6 +218,25 @@ def _check_e2e_lift(s3, bucket: str, run_date: _date) -> _CheckOutcome:
     return _CheckOutcome("e2e_lift_json", instance_date.isoformat(), f"week of {_week_start(run_date).isoformat()}")
 
 
+def _incumbent_retained_this_week(s3, bucket: str, run_date: _date) -> bool:
+    """True when model-zoo ran this cycle and deliberately kept the incumbent.
+
+    When ``ModelZooSelect`` promotes nothing, ``predictor/weights/meta/manifest.json``
+    is unchanged and its ``date`` field legitimately predates this ISO week.
+    The promotion record is the authoritative signal that the stale-looking
+    manifest is the intended serving bundle (alpha-engine-config-I9255).
+    """
+    promo_key = f"predictor/model_zoo/promotions/{run_date.isoformat()}.json"
+    promo = _get_json_body(s3, bucket, promo_key)
+    if promo is None:
+        return False
+    if promo.get("promoted") is not None:
+        return False
+    prior = promo.get("prior_champion_version_id")
+    after = promo.get("champion_version_id_after")
+    return bool(prior and after and prior == after)
+
+
 def _check_predictor_manifest(s3, bucket: str, run_date: _date) -> _CheckOutcome:
     """``predictor/weights/meta/manifest.json`` — the model-zoo promotion
     record the Predictor tile grades leak-free CPCV IC from
@@ -241,6 +260,16 @@ def _check_predictor_manifest(s3, bucket: str, run_date: _date) -> _CheckOutcome
             "training_date/run_date/date field — cannot verify freshness."
         )
     if not _in_run_week(content_date, run_date):
+        if _incumbent_retained_this_week(s3, bucket, run_date):
+            window = (
+                f"incumbent retained (model-zoo promotions/{run_date.isoformat()}.json "
+                f"promoted=null, champion unchanged)"
+            )
+            return _CheckOutcome(
+                "predictor_meta_weights_manifest",
+                content_date.isoformat(),
+                window,
+            )
         raise StaleInputArtifactError(
             f"predictor manifest is stale: content date={content_date.isoformat()} is "
             f"outside this week's window [{_week_start(run_date).isoformat()}, "

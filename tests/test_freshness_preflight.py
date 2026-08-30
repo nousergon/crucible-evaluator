@@ -64,6 +64,26 @@ def _seed_manifest(s3, training_date):
     )
 
 
+def _seed_promotion_record(
+    s3,
+    run_date: str,
+    *,
+    promoted=None,
+    prior_champion="v3.0-meta-2026-08-14-119e069b",
+    champion_after="v3.0-meta-2026-08-14-119e069b",
+):
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"predictor/model_zoo/promotions/{run_date}.json",
+        Body=json.dumps({
+            "run_date": run_date,
+            "promoted": promoted,
+            "prior_champion_version_id": prior_champion,
+            "champion_version_id_after": champion_after,
+        }).encode(),
+    )
+
+
 def _seed_signals(s3, date):
     s3.put_object(
         Bucket=BUCKET, Key=f"signals/{date}/signals.json",
@@ -166,6 +186,23 @@ class TestStaleInputsRaise:
         _seed_eod_pnl(s3, [RUN_DATE])
         with pytest.raises(StaleInputArtifactError, match="predictor manifest is stale"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    def test_incumbent_retained_manifest_outside_week_passes(self, s3):
+        # Model-zoo ran and promoted nothing — manifest date predates the week
+        # but the promotion record proves the incumbent is the intended bundle.
+        _seed_metrics(s3)
+        _seed_e2e_lift(s3, RUN_DATE)
+        _seed_manifest(s3, "2026-08-14")
+        _seed_promotion_record(s3, RUN_DATE)
+        _seed_signals(s3, RUN_DATE)
+        _seed_eod_pnl(s3, [RUN_DATE])
+        result = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+        manifest = next(
+            c for c in result["checks"]
+            if c["artifact_id"] == "predictor_meta_weights_manifest"
+        )
+        assert manifest["content_date"] == "2026-08-14"
+        assert "incumbent retained" in manifest["window"]
 
     def test_stale_signals_raises_named_error(self, s3):
         _seed_metrics(s3)
