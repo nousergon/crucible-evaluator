@@ -6,16 +6,26 @@ on:
     paths:
       # Only rebuild + redeploy when code/infra that actually lands in the
       # Docker image changes. Docs, tests, CI, and IAM/example files do not.
-      # WARNING: the Saturday pipeline (ne-weekly-freshness-pipeline) DOES
-      # check evaluator + director deploy-drift via EvaluatorDeployDriftGate
-      # and EvaluatorDirectorDeployDriftGate (config#2348, 2026-07-13). A
-      # CI-only push to main that doesn't match this paths filter WILL cause
-      # the next Saturday run to fail on sha_mismatch — the Lambdas are still
-      # stamped with the prior deploy SHA while main HEAD advanced. Remedy:
-      # after merging a CI-only PR, trigger a manual deploy via
-      # workflow_dispatch (the Actions UI tab) to re-stamp the Lambdas.
+      #
+      # THIS LIST IS ALSO THE DRIFT PREDICATE (alpha-engine-config-I9168).
+      # The Saturday pipeline (ne-weekly-freshness-pipeline) hard-fails at
+      # EvaluatorDeployDriftGate / EvaluatorDirectorDeployDriftGate on
+      # has_drift (config#2348, 2026-07-13). That gate now calls a SHA
+      # mismatch drift only when a commit in baked..HEAD touched a path
+      # BELOW, via grading/deploy_paths.py::is_deploy_relevant_path — which
+      # tests/test_deploy_path_contract.py pins to be this exact list. So a
+      # merge this filter skips is provably not drift and needs NO manual
+      # deploy: the previous "remedy: trigger a workflow_dispatch by hand"
+      # was a post-merge step nothing failed when it never ran, and on
+      # 2026-08-28 it did not run and armed both Lambdas to kill the next
+      # weekly run.
+      #
+      # Adding a source to the image means adding it HERE. The contract test
+      # asserts every Dockerfile COPY source is covered by this list, so a
+      # new surface fails on its own PR rather than shipping un-deployed.
       - 'grading/**'
       - 'director/**'
+      - 'flow-doctor.yaml'
       - 'requirements*.txt'
       - 'Dockerfile*'
       - 'infrastructure/deploy.sh'

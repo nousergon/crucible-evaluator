@@ -196,12 +196,33 @@ def test_has_deploy_relevant_changes_false_on_non_deploy_path(filename):
         ) is False
 
 
-def test_has_deploy_relevant_changes_fail_closed_on_unclassified_path():
-    """A file no declaration classifies must never silently clear drift."""
-    with _compare_returning_files([{"filename": "scripts/new_deploy_helper.py"}]):
+@pytest.mark.parametrize("filename", [
+    "scripts/new_deploy_helper.py",
+    ".openrouter-allowlist.yaml",
+    "brand_new_root_file.yaml",
+])
+def test_a_path_the_deploy_filter_skips_is_not_drift(filename):
+    """alpha-engine-config-I9168 — this assertion is the INVERSE of the one it
+    replaced, deliberately.
+
+    The old test pinned a fail-closed default: a path classified by neither of
+    two lists kept a SHA mismatch blocking. That default asserted something
+    provably false. ``deploy.yml``'s ``paths:`` filter did not fire on the
+    commit, so no deploy ran and none could have: the image at ``baked_sha``
+    is byte-identical to what a deploy of ``upstream_sha`` would produce.
+    On 2026-08-28 ``.openrouter-allowlist.yaml`` (#280) fell in that hole and
+    armed BOTH evaluator Lambdas to hard-fail the 2026-08-29 09:00 UTC weekly
+    run at ``EvaluatorDeployDriftGate``, ~30s in, before any spend.
+
+    The real concern the default encoded — a new image surface missing from
+    the deploy filter — is a DEPLOY-FILTER COMPLETENESS defect, and it now
+    fails on its own PR: ``tests/test_deploy_path_contract.py::
+    test_every_dockerfile_copy_source_is_a_declared_deploy_path``.
+    """
+    with _compare_returning_files([{"filename": filename}]):
         assert dd._has_deploy_relevant_changes(
             "nousergon/crucible-evaluator", SHA_A, SHA_B,
-        ) is True
+        ) is False
 
 
 def test_has_deploy_relevant_changes_true_on_mixed_changes():
