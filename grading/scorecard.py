@@ -754,6 +754,15 @@ def _display(letter: str, coverage: dict | None) -> str:
         return letter
     if q == "UNGRADED":
         return "N/A (no component contributed)"
+    if q == "SCOPE-UNKNOWN":
+        # The scope stamp itself failed (alpha-engine-config-I8193 sweep). The
+        # one qualifier that must never fall through to the PARTIAL branch
+        # below, whose percentage is over the composite's OWN three modules and
+        # would read like a complete measurement of the card.
+        return (
+            f"{letter} (SCOPE UNKNOWN — what this grade covers could not be "
+            f"determined this cycle; card-wide verdict is tiles_overall_status)"
+        )
     if q == "PARTIAL-SCOPE":
         # Complete over its own declared scope, which is a strict SUBSET of the
         # card (alpha-engine-config-I8177). The percentage below would read
