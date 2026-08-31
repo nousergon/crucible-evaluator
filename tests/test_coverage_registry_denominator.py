@@ -287,3 +287,53 @@ class TestOnAnAssembledCard:
         assert card["degraded_component_census"] is expected
         if expected:
             assert card["component_census_unreported"] == census["unreported"]
+
+
+# ---------------------------------------------------------------------------
+# Every exclusion carries its written reason, where the number points
+# ---------------------------------------------------------------------------
+
+def test_every_exclusion_publishes_its_written_reason() -> None:
+    """alpha-engine-config-I8177's closes-when, in its DERIVED form.
+
+    The issue asked for `grading_weights.retired_components` to carry all 18
+    retirements with a reason each. That register is hand-listed and means
+    something narrower — components removed from a WEIGHT TABLE, three rows —
+    while the live card excludes 23 components from the coverage denominator.
+    `coverage_reason` pointed readers at the three-row register for all 23:
+    two readers of one namespace, disagreeing.
+
+    The register is now DERIVED from the records themselves, so it cannot
+    drift from the exclusion set it describes: one entry per excluded
+    component, carrying the `permanent_na_reason` that record declares.
+    """
+    tiles = _full_card()
+    retired = tiles["alpha"]["components"][0]
+    retired["permanent_na"] = True
+    retired["status"] = "N/A-NOT-IMPL"
+    retired["permanent_na_reason"] = "producer retired 2026-07-12 (config#1580)"
+
+    census = card_component_census(tiles)
+    assert census["declared_out"] == [f"alpha.{retired['name']}"]
+    assert census["declared_out_detail"] == [{
+        "component": f"alpha.{retired['name']}",
+        "status": "N/A-NOT-IMPL",
+        "reason": "producer retired 2026-07-12 (config#1580)",
+    }]
+
+
+def test_the_reason_points_at_the_register_it_publishes() -> None:
+    tiles = _full_card()
+    tiles["alpha"]["components"][0]["permanent_na"] = True
+    reason = coverage_reason(card_component_census(tiles))
+    assert "coverage_census.declared_out_detail" in reason
+    assert "retired_components" not in reason
+
+
+def test_an_exclusion_with_no_written_reason_is_visible_as_such() -> None:
+    """A NULL reason is rendered, never omitted — the row still owes one."""
+    tiles = _full_card()
+    tiles["alpha"]["components"][0]["permanent_na"] = True
+    detail = card_component_census(tiles)["declared_out_detail"]
+    assert len(detail) == 1
+    assert detail[0]["reason"] is None

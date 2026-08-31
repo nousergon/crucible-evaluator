@@ -220,6 +220,7 @@ def card_component_census(
     total = 0
     graded = 0
     declared_out: list[str] = []
+    declared_out_detail: list[dict[str, Any]] = []
     ungraded: list[str] = []
     unreported: list[str] = []
     per_tile: dict[str, dict[str, int]] = {}
@@ -244,6 +245,15 @@ def card_component_census(
         qualified = f"{tile_name}.{name}"
         if _is_declared_out(component):
             declared_out.append(qualified)
+            # Every exclusion carries its WRITTEN reason on the artifact, not
+            # just its name. A denominator that shrinks by 23 rows owes the
+            # reader 23 reasons in the place the number points at, or the
+            # exclusion set is a claim nobody can check.
+            declared_out_detail.append({
+                "component": qualified,
+                "status": component.get("status"),
+                "reason": component.get("permanent_na_reason"),
+            })
             continue
         total += 1
         is_graded = _is_graded(component)
@@ -258,6 +268,9 @@ def card_component_census(
         "graded": graded,
         "total": total,
         "declared_out": sorted(declared_out),
+        "declared_out_detail": sorted(
+            declared_out_detail, key=lambda d: d["component"],
+        ),
         "ungraded": sorted(ungraded),
         "per_tile": per_tile,
         # I8193 attribution. `declared_total` is the roster size the
@@ -474,6 +487,13 @@ def _replace_evaluator_coverage(
         "total": census["total"],
         "per_tile": census["per_tile"],
         "declared_out": census["declared_out"],
+        # alpha-engine-config-I8177 closes-when, in its DERIVED form: every
+        # excluded component with the reason its own record declares.
+        # `grading_weights.retired_components` is a hand-listed register of
+        # components removed from a WEIGHT TABLE — three rows, a narrower
+        # thing — and `coverage_reason` used to point readers at it for all 23
+        # exclusions. Two readers of one namespace, disagreeing.
+        "declared_out_detail": census["declared_out_detail"],
         "ungraded": census["ungraded"],
         # alpha-engine-config-I8193 — the denominator's provenance. `total` is
         # built from `declared_total` (the threshold registry roster), not from
@@ -520,8 +540,9 @@ def coverage_reason(census: dict[str, Any]) -> str:
             )
     n_out = len(census.get("declared_out") or [])
     out_note = (
-        f" {n_out} component(s) excluded as declared-permanent-N/A "
-        f"(see grading_weights.retired_components)." if n_out else ""
+        f" {n_out} component(s) excluded as declared-permanent-N/A, each "
+        f"with its written reason in coverage_census.declared_out_detail."
+        if n_out else ""
     )
     # A registered component that rendered nothing is the failure this
     # denominator exists to make visible — name it first, and name the members
