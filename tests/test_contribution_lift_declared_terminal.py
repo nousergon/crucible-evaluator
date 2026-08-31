@@ -169,7 +169,15 @@ def test_the_nine_live_declared_components_all_leave_the_denominator(s3_with) ->
 
     from grading.coverage import card_component_census
 
-    census = card_component_census({"contribution_lift": tile})
+    # Roster injected as the tile's own component set: this test pins the
+    # DECLARED-TERMINAL exclusion, not the live threshold registry's contents
+    # (alpha-engine-config-I8193 makes the production denominator the registry,
+    # pinned in test_coverage_registry_denominator.py).
+    census = card_component_census(
+        {"contribution_lift": tile},
+        declared={c["name"] for c in tile["components"]},
+        declared_modules={},
+    )
     assert census["total"] == 0, (
         f"all nine must be declared out, still counted: {census['ungraded']}"
     )

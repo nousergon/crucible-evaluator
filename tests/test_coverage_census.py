@@ -36,6 +36,31 @@ def _tiles(**tiles):
     return {k: {"components": v} for k, v in tiles.items()}
 
 
+def _roster(tiles):
+    """The declared roster for a SYNTHETIC card: exactly what it renders.
+
+    Production reads ``grading/thresholds/registry.yaml`` (alpha-engine-config
+    -I8193); those rules are pinned in ``test_coverage_registry_denominator``.
+    These tests pin the COUNTING rules, so the roster is injected as the
+    fixture's own component set — nothing unreported, nothing unregistered.
+    """
+    return {
+        c["name"]
+        for tile in tiles.values()
+        for c in (tile.get("components") or [])
+    }
+
+
+def _census(tiles):
+    return card_component_census(tiles, declared=_roster(tiles), declared_modules={})
+
+
+def _replace(tiles):
+    return replace_evaluator_coverage(
+        tiles, declared=_roster(tiles), declared_modules={},
+    )
+
+
 # --------------------------------------------------------------------------
 # The census rule
 # --------------------------------------------------------------------------
@@ -48,7 +73,7 @@ def test_counts_every_tile_not_just_three() -> None:
         substrate=[_c("e")],
         contribution_lift=[_c("f", "N/A-NOT-IMPL")],
     )
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert census["total"] == 6
     assert census["graded"] == 2
     assert census["coverage"] == pytest.approx(2 / 6)
@@ -61,7 +86,7 @@ def test_every_na_flavour_counts_as_ungraded() -> None:
         _c("b", "N/A-NOT-IMPL"),
         _c("c", "N/A-LOW-N"),
     ])
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert (census["graded"], census["total"]) == (1, 4)
 
 
@@ -72,7 +97,7 @@ def test_low_n_stays_in_the_denominator() -> None:
     failure this metric exists to catch (``principles.md`` §2.7).
     """
     tiles = _tiles(t=[_c("ok"), _c("acc", "N/A-LOW-N")])
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert census["total"] == 2
     assert "t.acc [N/A-LOW-N]" in census["ungraded"]
 
@@ -80,12 +105,12 @@ def test_low_n_stays_in_the_denominator() -> None:
 def test_red_and_watch_count_as_graded() -> None:
     """Coverage measures whether we MEASURED it, not whether it passed."""
     tiles = _tiles(t=[_c("a", "RED"), _c("b", "WATCH"), _c("c", "GREEN")])
-    assert card_component_census(tiles)["coverage"] == 1.0
+    assert _census(tiles)["coverage"] == 1.0
 
 
 def test_coverage_record_never_counts_itself() -> None:
     tiles = _tiles(backtester=[_c("evaluator_coverage"), _c("other")])
-    assert card_component_census(tiles)["total"] == 1
+    assert _census(tiles)["total"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +122,7 @@ def test_declared_permanent_na_leaves_the_denominator() -> None:
         _c("live"),
         _c("retired", "N/A-NOT-IMPL", permanent_na=True),
     ])
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert census["total"] == 1
     assert census["declared_out"] == ["t.retired"]
 
@@ -128,7 +153,7 @@ def test_module_carries_no_component_list() -> None:
 def test_an_undeclared_na_is_never_silently_excluded() -> None:
     """Only `permanent_na` excuses a row. A bare N/A always counts against us."""
     tiles = _tiles(t=[_c("a", "N/A-NOT-IMPL", permanent_na=False)])
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert census["total"] == 1
     assert census["coverage"] == 0.0
     assert census["declared_out"] == []
@@ -143,7 +168,7 @@ def test_reason_names_the_worst_tile() -> None:
         good=[_c("a"), _c("b")],
         agent=[_c("c", "N/A-MISSING-INPUT"), _c("d", "N/A-MISSING-INPUT")],
     )
-    reason = coverage_reason(card_component_census(tiles))
+    reason = coverage_reason(_census(tiles))
     assert "agent" in reason
     assert "0/2" in reason
 
@@ -151,19 +176,19 @@ def test_reason_names_the_worst_tile() -> None:
 def test_reason_notes_declared_exclusions() -> None:
     tiles = _tiles(t=[_c("a"), _c("r", "N/A-NOT-IMPL", permanent_na=True)])
     assert "excluded as declared-permanent-N/A" in coverage_reason(
-        card_component_census(tiles)
+        _census(tiles)
     )
 
 
 def test_census_lists_which_components_are_ungraded() -> None:
     tiles = _tiles(agent=[_c("cost_per_signal", "N/A-MISSING-INPUT")])
-    census = card_component_census(tiles)
+    census = _census(tiles)
     assert census["ungraded"] == ["agent.cost_per_signal [N/A-MISSING-INPUT]"]
 
 
 def test_per_tile_breakdown_is_populated() -> None:
     tiles = _tiles(a=[_c("x"), _c("y", "RED")], b=[_c("z", "N/A-LOW-N")])
-    per_tile = card_component_census(tiles)["per_tile"]
+    per_tile = _census(tiles)["per_tile"]
     assert per_tile == {"a": {"graded": 2, "total": 2}, "b": {"graded": 0, "total": 1}}
 
 
@@ -211,7 +236,7 @@ def _card_with_legacy_coverage():
 
 def test_replacement_reports_the_card_not_the_legacy_artifact() -> None:
     tiles = _card_with_legacy_coverage()
-    census = replace_evaluator_coverage(tiles)
+    census = _replace(tiles)
     record = tiles["backtester"]["components"][0]
     assert record["name"] == "evaluator_coverage"
     # 1 graded (grading_freshness) of 11 gradable — NOT 12/14.
@@ -223,7 +248,7 @@ def test_replacement_reports_the_card_not_the_legacy_artifact() -> None:
 def test_replacement_preserves_the_legacy_number_for_audit() -> None:
     """Never silently drop the number a prior card reported."""
     tiles = _card_with_legacy_coverage()
-    replace_evaluator_coverage(tiles)
+    _replace(tiles)
     audit = tiles["backtester"]["components"][0]["coverage_census"]
     assert audit["legacy_grading_json_value"] == 0.857
     assert audit["legacy_grading_json_n"] == 14
@@ -231,20 +256,20 @@ def test_replacement_preserves_the_legacy_number_for_audit() -> None:
 
 def test_replacement_repoints_the_source_path() -> None:
     tiles = _card_with_legacy_coverage()
-    replace_evaluator_coverage(tiles)
+    _replace(tiles)
     assert "grading.json" not in tiles["backtester"]["components"][0]["source_path"]
 
 
 def test_replacement_redrives_the_tile_status() -> None:
     """`evaluator_coverage` is critical — a collapse must move the tile."""
     tiles = _card_with_legacy_coverage()
-    replace_evaluator_coverage(tiles)
+    _replace(tiles)
     assert tiles["backtester"]["status"] in {"RED", "WATCH"}
 
 
 def test_replacement_is_a_noop_without_the_record() -> None:
     tiles = {"backtester": {"components": [_c("other")]}}
-    assert replace_evaluator_coverage(tiles) is None
+    assert _replace(tiles) is None
 
 
 def test_replacement_never_raises_on_a_malformed_card(caplog) -> None:
@@ -252,15 +277,44 @@ def test_replacement_never_raises_on_a_malformed_card(caplog) -> None:
     tiles = _card_with_legacy_coverage()
     # A sibling record the rollup rebuild cannot revalidate.
     tiles["backtester"]["components"].append({"name": "broken", "status": "GREEN"})
-    assert replace_evaluator_coverage(tiles) is None
+    assert _replace(tiles) is None
     assert any("evaluator_coverage recomputation" in r.message for r in caplog.records)
-    # And the legacy record survives untouched rather than the card losing it.
-    assert tiles["backtester"]["components"][0]["value"] == 0.857
+    # The card survives — but it does NOT keep rendering the legacy number.
+    assert tiles["backtester"]["components"][0]["value"] is None
+
+
+def test_a_failed_census_renders_na_not_the_legacy_number(caplog) -> None:
+    """The failure path must not fail OPEN (alpha-engine-config-I8193 sweep).
+
+    Keeping the 14-leaf ``grading.json`` value on the card when the census
+    could not be computed IS this issue's original defect, re-entered through
+    the error path: a true number about a smaller world, on a card that no
+    longer says which world. A missing measurement is NULL and visible.
+    """
+    from grading.coverage import CENSUS_UNKNOWN_MARKER
+
+    tiles = _card_with_legacy_coverage()
+    tiles["backtester"]["components"].append({"name": "broken", "status": "GREEN"})
+    assert _replace(tiles) is None
+
+    record = tiles["backtester"]["components"][0]
+    assert record["name"] == "evaluator_coverage"
+    assert record["value"] is None
+    assert record["n_samples"] is None
+    assert record["status"].startswith("N/A")
+    assert "UNMEASURED" in record["status_reason"]
+    # The number it replaced is preserved for audit, labelled as the legacy
+    # surface it measures — never silently dropped, never silently rendered.
+    audit = record["coverage_census"]
+    assert audit["legacy_grading_json_value"] == 0.857
+    assert audit["legacy_grading_json_n"] == 14
+    assert CENSUS_UNKNOWN_MARKER in audit["error"]
+    assert any(CENSUS_UNKNOWN_MARKER in r.getMessage() for r in caplog.records)
 
 
 def test_empty_card_grades_a_transparent_na() -> None:
     tiles = {"backtester": {"components": [_legacy_coverage_record()]}}
-    replace_evaluator_coverage(tiles)
+    _replace(tiles)
     record = tiles["backtester"]["components"][0]
     assert record["status"].startswith("N/A")
     assert record["value"] is None
