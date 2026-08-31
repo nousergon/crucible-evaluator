@@ -115,6 +115,14 @@ def _stub_halves(monkeypatch, contamination_verdict=UNKNOWN):
         "verdict": contamination_verdict,
         "as_of": None,
         "reason": "the producer never ran this cycle.",
+        # `absent` is what the real reader stamps on a NoSuchKey, and it is the
+        # ONLY ground on which a run-scope claim may re-classify this half
+        # (alpha-engine-config-I8811). Omitting it here simulated a state
+        # `_read_verdict_artifact` never produces: an UNKNOWN whose object was
+        # nevertheless READ. Carried explicitly so these fixtures pin the real
+        # contract rather than a laxer one.
+        "absent": contamination_verdict == UNKNOWN,
+        "source_path": "s3://b/backtest/2026-08-22/pit_parity.json",
     })
 
 

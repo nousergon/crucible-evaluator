@@ -819,6 +819,81 @@ def _mark_rehearsal_out_of_scope(half: dict, label: str) -> bool:
     return True
 
 
+def _mark_scope_out_of_scope(half: dict, label: str, scope: dict) -> bool:
+    """Re-classify a half the run-scope block says was never dispatched.
+
+    ``alpha-engine-config-I8811``. This is the run-scope twin of
+    :func:`_mark_rehearsal_out_of_scope`, and it exists because the two grants
+    of the SAME value were not held to the same standard. The rehearsal grant
+    has always required the object to be genuinely **ABSENT**; the run-scope
+    grant required nothing at all, and simply overwrote whatever verdict had
+    been read.
+
+    **That asymmetry is a fail-open, and it is reachable.** The scope artifact
+    is written by whichever execution ran the ``RunScope`` stage LAST for a
+    given ``run_date`` — not by the execution that produced the numbers being
+    attested. Both scope artifacts on S3 when this was written were authored by
+    skip-flagged recovery reruns rather than by the scheduled run:
+    ``backtest/2026-08-22/run_scope.json`` by ``watch-rerun-2026-08-22-3`` and
+    ``backtest/2026-08-28/run_scope.json`` by ``watch-rerun-2026-08-28-13``,
+    the latter written 2026-08-30T18:47Z — a day and a half AFTER the scheduled
+    run had written ``backtest/2026-08-28/attestation.json``. Each reports
+    ``Backtester: DISABLED`` for a cycle whose backtester artifacts demonstrably
+    exist, so each is describing a different execution than the one this block
+    is attesting.
+
+    Compose that with a rerun that enters ``CheckSkipParity`` and takes its skip
+    branch, over a scheduled run whose parity pass had actually reported
+    ``FAIL``, and the pre-fix code path replaced a **measured look-ahead
+    contamination failure** with ``NOT_IN_SCOPE`` and then dropped it from
+    :func:`_worst_in_scope` — publishing a combined ``PASS`` for a week the
+    system had itself found contaminated. A claim about DISPATCH must never
+    overwrite EVIDENCE.
+
+    So this grant is narrow in the same three ways the rehearsal grant is, and
+    for the same reason:
+
+    1. Only when the scope block says the producer was not dispatched.
+    2. Only when the half is ``UNKNOWN`` **and** the object was genuinely
+       ABSENT. A half that read a real artifact keeps its real verdict — an
+       unreadable, corrupt or mis-stamped body stays ``UNKNOWN`` and still
+       pages, and a real ``FAIL`` survives.
+    3. ``NOT_IN_SCOPE`` is not a pass (:func:`verdict_is_pass` returns False).
+
+    When the scope and the evidence DISAGREE, the disagreement is recorded on
+    the half and logged at ERROR rather than resolved silently in either
+    direction: a scope block contradicted by the artifacts is grounds to
+    distrust the scope, never grounds to excuse the half. ``principles.md``
+    §2.7 — the conflict is emitted, not swallowed.
+
+    Returns True if the half was re-classified.
+    """
+    if half.get("verdict") != UNKNOWN or not half.get("absent"):
+        conflict = {
+            "scope_says": "not dispatched",
+            "scope_reason": scope.get("reason"),
+            "disabled_stages": list(scope.get("disabled_stages") or ()),
+            "evidence_verdict": half.get("verdict"),
+            "evidence_absent": bool(half.get("absent")),
+            "source_path": half.get("source_path"),
+        }
+        half["scope_conflict"] = conflict
+        logger.error(
+            "attestation: run scope says the %s producer was not dispatched (%s), "
+            "but its artifact at %s was READ and returned %s. The scope block "
+            "describes a different execution than the one being attested "
+            "(alpha-engine-config-I8811). Keeping the evidence verdict: a claim "
+            "about dispatch never overwrites a measured result.",
+            label, ", ".join(conflict["disabled_stages"]) or "no stage named",
+            half.get("source_path"), half.get("verdict"),
+        )
+        return False
+    half["verdict"] = NOT_IN_SCOPE
+    half["reason"] = scope["reason"]
+    half["out_of_scope_because"] = "run_scope"
+    return True
+
+
 def _worst_in_scope(*verdicts: str) -> str:
     """:func:`_worst` over the halves that were IN SCOPE.
 
@@ -896,9 +971,7 @@ def build_run_attestation(
     scope = contamination_scope(run_scope)
     contamination["scope"] = scope
     if not scope["in_scope"]:
-        contamination["verdict"] = NOT_IN_SCOPE
-        contamination["reason"] = scope["reason"]
-        contamination["out_of_scope_because"] = "run_scope"
+        _mark_scope_out_of_scope(contamination, "contamination", scope)
 
     # alpha-engine-config-I7392 — the SECOND way a producer can be legitimately
     # silent: not switched off, but dispatched `--preflight-only` by a declared
