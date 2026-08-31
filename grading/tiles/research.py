@@ -28,7 +28,12 @@ from botocore.exceptions import ClientError
 from nousergon_lib import contracts
 from nousergon_lib.quant.stats.intervals import wilson_score_interval
 
-from grading.artifacts import RESEARCH_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
+from grading.artifacts import (
+    RESEARCH_ARTIFACT_MAX_AGE_DAYS,
+    agent_quality_na_reason,
+    artifact_is_stale,
+    get_json_windowed,
+)
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.thresholds.registry import resolve as resolve_band
@@ -732,7 +737,7 @@ def build_research_tile(
         components.append(build_metric(
             name="judge_rubric_pass_rate", module=MODULE, metric_type="pct", criticality="supporting",
             n_floor=10, source_path=aq_src, input_present=False,
-            na_detail="judge_rubric_pass_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=agent_quality_na_reason(aq, "judge_rubric_pass_rate"),
         ))
 
     # 8. pillar_emit_coverage (supporting) — % of universe entries carrying a
@@ -750,7 +755,7 @@ def build_research_tile(
         components.append(build_metric(
             name="pillar_emit_coverage", module=MODULE, metric_type="pct", criticality="supporting",
             n_floor=10, source_path=aq_src, input_present=False,
-            na_detail="pillar_emit_coverage: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=agent_quality_na_reason(aq, "pillar_emit_coverage"),
         ))
 
     # 9. signal_volume_adequacy (diagnostic) — count of finalized signals vs the
@@ -768,7 +773,7 @@ def build_research_tile(
         components.append(build_metric(
             name="signal_volume_adequacy", module=MODULE, metric_type="count", criticality="diagnostic",
             n_floor=1, source_path=aq_src, input_present=False,
-            na_detail="signal_volume_adequacy: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            na_detail=agent_quality_na_reason(aq, "signal_volume_adequacy"),
         ))
 
     # 10-12. Attractiveness-evaluation components (config#1389/#1392/#1398).
