@@ -67,12 +67,52 @@ DISPOSITIONS = frozenset({DISABLED, ENABLED_COMPLETED, ENABLED_FAILED, NOT_REACH
 GRADED_DISPOSITIONS = frozenset({ENABLED_COMPLETED, ENABLED_FAILED})
 
 
+#: Keys present on a NORMALIZED block and on no raw artifact. Idempotence is
+#: keyed on these rather than on any single field, because the one field a
+#: previous version keyed on — ``graded_stages`` — is emitted by BOTH shapes
+#: with different meanings, and that collision silently disabled the whole
+#: contamination-scope mechanism in production. See :func:`read_run_scope`.
+_NORMALIZED_MARKERS = ("verdict", "present", "disabled_stages")
+
+
+def is_normalized(block: Any) -> bool:
+    """True when ``block`` is already this function's own output.
+
+    The raw ``run_scope.json`` artifact and the normalized block OVERLAP on
+    ``run_date``, ``statement`` and — the one that caused the incident —
+    ``graded_stages``. Only the three markers above are exclusive to the
+    normalized shape, and all three are written together by
+    :func:`read_run_scope` on every path including its ``_unknown`` one, so
+    testing for them cannot half-match.
+    """
+    return isinstance(block, dict) and all(k in block for k in _NORMALIZED_MARKERS)
+
+
 def read_run_scope(block: Any) -> dict:
-    """Normalize the run-scope artifact for the card. Never raises.
+    """Normalize the run-scope artifact for the card. Never raises. IDEMPOTENT.
 
     Returns ``verdict`` (MEASURED / UNKNOWN), ``graded_stages``, ``disabled``,
     ``not_reached``, ``failed``, the counts, and a human-readable ``statement``.
+
+    **Idempotent by construction** (alpha-engine-config-I9001, 2026-08-31).
+    Callers receive the run scope from two places — the ReportCard Task's
+    in-band ``run_scope`` payload and the S3 artifact — and one consumer,
+    ``attestation.contamination_scope``, used to decide for itself whether the
+    value was already normalized, with the test ``"graded_stages" in block``.
+    The raw artifact carries a top-level ``graded_stages`` too. So the
+    discriminator matched the RAW body, normalization was skipped, the derived
+    ``disabled_stages`` key was never produced, ``contamination_scope`` read
+    ``None`` for it, and every run resolved ``in_scope=True`` → contamination
+    ``UNKNOWN`` → the correctness guarantee WITHHELD — the exact outcome the
+    NOT_IN_SCOPE mechanism was built to prevent, for the entire time it was
+    deployed. The unit tests passed throughout because their raw fixture had
+    no ``graded_stages``; only the real producer emits one.
+
+    Making this function idempotent removes the decision from the caller
+    entirely: there is now one way to normalize and no shape to guess.
     """
+    if is_normalized(block):
+        return block
     if not isinstance(block, dict):
         return _unknown(
             "no run_scope artifact was supplied to the card — which stages this "
@@ -125,6 +165,16 @@ def read_run_scope(block: Any) -> dict:
             row.get("disabled_by") for row in stages.values()
             if isinstance(row, dict) and row.get("disabled_by")
         }),
+        # Per-stage, not just the run-wide set. A consumer asking "why is THIS
+        # stage disabled" (contamination_scope does) cannot answer from the
+        # union without attributing every other stage's flag to it — which is
+        # what the reason string did the first run the mechanism worked.
+        "disabled_by_stage": {
+            name: row.get("disabled_by")
+            for name, row in sorted(stages.items())
+            if isinstance(row, dict) and row.get("disposition") == DISABLED
+            and row.get("disabled_by")
+        },
     }
     result["statement"] = _statement(result)
     return result
