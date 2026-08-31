@@ -13,6 +13,15 @@ a 14-leaf legacy artifact, swept over the two remaining call sites:
 import pytest
 
 from grading.coverage import PARTIAL_SCOPE, stamp_composite_scope
+
+
+def _roster(tiles):
+    """The declared roster for a SYNTHETIC card: exactly what it renders."""
+    return {
+        c["name"]
+        for tile in tiles.values()
+        for c in (tile.get("components") or [])
+    }
 from grading.module_agg import build_tile, module_status, overall_status, unmeasured_status
 from grading.metric_record import build_metric
 from grading.scorecard import _display
@@ -136,7 +145,7 @@ class TestCompositeScope:
 
     def test_complete_is_demoted_while_tiles_sit_outside_the_composite(self):
         card = _card()
-        scope = stamp_composite_scope(card, self._tiles())
+        scope = stamp_composite_scope(card, self._tiles(), declared=_roster(self._tiles()), declared_modules={})
         assert card["overall"]["coverage"]["qualifier"] == PARTIAL_SCOPE
         assert scope["tiles_in_scope"] == ["executor", "predictor", "research"]
         assert set(scope["tiles_out_of_scope"]) == {"agent", "portfolio_outcome"}
@@ -145,14 +154,20 @@ class TestCompositeScope:
 
     def test_leaf_counts_name_both_worlds(self):
         card = _card()
-        scope = stamp_composite_scope(card, self._tiles())
+        tiles = self._tiles()
+        # The roster is injected as the fixture's own component set: this test
+        # pins the SCOPE arithmetic, not the live threshold registry's contents
+        # (the registry-backed denominator is alpha-engine-config-I8193, pinned
+        # in test_coverage_registry_denominator.py).
+        scope = stamp_composite_scope(card, tiles, declared=_roster(tiles),
+                                      declared_modules={})
         assert scope["leaf_components_in_scope"] == 4
         assert scope["leaf_components_on_card"] == 6
         assert scope["card_leaf_graded"] == 4
 
     def test_display_never_renders_the_bare_letter(self):
         card = _card()
-        stamp_composite_scope(card, self._tiles())
+        stamp_composite_scope(card, self._tiles(), declared=_roster(self._tiles()), declared_modules={})
         display = card["overall"]["display"]
         assert display != "C+"
         assert "PARTIAL SCOPE" in display
@@ -163,19 +178,19 @@ class TestCompositeScope:
         card = _card()
         tiles = {k: v for k, v in self._tiles().items()
                  if k in ("research", "predictor", "executor")}
-        stamp_composite_scope(card, tiles)
+        stamp_composite_scope(card, tiles, declared=_roster(tiles), declared_modules={})
         assert card["overall"]["coverage"]["qualifier"] == "COMPLETE"
         assert card["overall"]["display"] == "C+"
 
     def test_an_already_partial_qualifier_is_left_alone(self):
         card = _card(qualifier="PARTIAL-FAILURE-SCORED-ZERO")
-        stamp_composite_scope(card, self._tiles())
+        stamp_composite_scope(card, self._tiles(), declared=_roster(self._tiles()), declared_modules={})
         assert card["overall"]["coverage"]["qualifier"] == "PARTIAL-FAILURE-SCORED-ZERO"
         assert card["overall"]["coverage"]["census_scope"]["tiles_on_card"] == 5
 
     def test_never_raises_on_a_malformed_card(self):
-        assert stamp_composite_scope({}, self._tiles()) is None
-        assert stamp_composite_scope({"overall": {}}, self._tiles()) is None
+        assert stamp_composite_scope({}, self._tiles(), declared=frozenset(), declared_modules={}) is None
+        assert stamp_composite_scope({"overall": {}}, self._tiles(), declared=frozenset(), declared_modules={}) is None
 
     def test_carries_no_hardcoded_tile_list(self):
         """Scope is DERIVED from grading_weights + the tiles actually present.

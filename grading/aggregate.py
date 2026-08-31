@@ -30,7 +30,11 @@ import logging
 import boto3
 
 from grading.artifacts import read_scorecard_inputs
-from grading.coverage import replace_evaluator_coverage, stamp_composite_scope
+from grading.coverage import (
+    CENSUS_UNKNOWN_MARKER,
+    replace_evaluator_coverage,
+    stamp_composite_scope,
+)
 from grading.attestation import build_run_attestation, verdict_is_pass
 from grading.freshness_preflight import assert_input_freshness
 from grading.history import load_card_history
@@ -234,7 +238,15 @@ def build_report_card(
     # over every tile, and no single builder can see its siblings. The tile
     # keeps emitting its record (so its own shape and tests stand); this
     # substitutes the value once the full census exists.
-    replace_evaluator_coverage(tiles)
+    #
+    # I8193: the denominator is the THRESHOLD REGISTRY roster, not the set of
+    # components that happened to render. A tile deleted from the dict above,
+    # or a builder that silently returns fewer records, now shows up as N
+    # UNREPORTED components inside the denominator — coverage falls. Counting
+    # what rendered made the number rise when a tile vanished, which is the
+    # same "true number about a smaller world" this metric was repointed to
+    # escape.
+    census = replace_evaluator_coverage(tiles)
     # Same defect, one level up (alpha-engine-config-I8177): the v1 `overall`
     # block reported `components_declared: 3` / `qualifier: COMPLETE` on a card
     # carrying 125 leaf components, 47 of them N/A, and `tiles_overall_status:
@@ -262,6 +274,23 @@ def build_report_card(
     # one readable as the finding it is. Measured 2026-08-22: `agent` was 11
     # N/A of 11 and rendered WATCH/C, indistinguishable from a tile that
     # measured everything and came out borderline.
+    # alpha-engine-config-I8193 — the census's OWN health, at the top of the
+    # card. A coverage number is only as good as its denominator, so the two
+    # ways that denominator can be wrong get a surface of their own rather
+    # than living inside a component's `coverage_census` sub-object: a
+    # registered component that rendered nothing (`unreported`), and a graded
+    # component with no registry row (`unregistered`). `false` is a VALUE —
+    # it asserts the roster and the card agreed this cycle.
+    if census is None:
+        scorecard["degraded_component_census"] = True
+        scorecard["component_census_error"] = CENSUS_UNKNOWN_MARKER
+    else:
+        missing = list(census["unreported"]) + list(census["unregistered"])
+        scorecard["degraded_component_census"] = bool(missing)
+        if missing:
+            scorecard["component_census_unreported"] = census["unreported"]
+            scorecard["component_census_unregistered"] = census["unregistered"]
+
     scorecard["tiles_unmeasured"] = {
         name: t["status"]
         for name, t in sorted(tiles.items())
