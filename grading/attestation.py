@@ -722,8 +722,13 @@ def contamination_scope(run_scope: Any) -> dict:
     """
     from grading.run_scope import read_run_scope, scope_unknown
 
-    block = run_scope if isinstance(run_scope, dict) and "graded_stages" in run_scope \
-        else read_run_scope(run_scope)
+    # Unconditional: `read_run_scope` is idempotent, so an already-normalized
+    # block passes through untouched and a raw artifact is normalized. The
+    # previous in-line discriminator tested `"graded_stages" in run_scope`,
+    # a key BOTH shapes carry — it matched the raw artifact, skipped
+    # normalization, and left `disabled_stages` unset, which silently disabled
+    # this entire function in production (alpha-engine-config-I9001).
+    block = read_run_scope(run_scope)
     if scope_unknown(block):
         return {
             "in_scope": True,
@@ -743,7 +748,14 @@ def contamination_scope(run_scope: Any) -> dict:
             "disabled_by": [],
             "reason": "the contamination producer was dispatched this run.",
         }
-    flags = sorted(block.get("disabled_by") or ()) or ["an operator skip flag"]
+    # The flags that disabled THESE stages — not the run-wide union, which
+    # would attribute every other skipped stage's flag to the parity family
+    # and print `disabled by skip_backtester, skip_challenger_shadow, ...`
+    # under a sentence about the look-ahead check.
+    by_stage = block.get("disabled_by_stage") or {}
+    flags = sorted({by_stage[s] for s in disabled if by_stage.get(s)})
+    if not flags:
+        flags = sorted(block.get("disabled_by") or ()) or ["an operator skip flag"]
     return {
         "in_scope": False,
         "disabled_stages": disabled,
