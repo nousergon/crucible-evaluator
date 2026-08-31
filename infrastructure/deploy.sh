@@ -12,7 +12,7 @@ set -euo pipefail
 FUNCTION="alpha-engine-evaluator"
 HANDLER_CMD='["grading.handler.handler"]'
 REGION="${AWS_REGION:-us-east-1}"
-TIMEOUT=300
+TIMEOUT=660
 # The Director Lambda gets its own budget: one invoke carries the ultra-group
 # plan call (client timeout 340s × 2 attempts, director/agent.py) plus the
 # retro judge (120s × 2, director/retro.py) plus S3/registry overhead. 300s
