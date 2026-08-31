@@ -74,6 +74,58 @@ def artifact_is_stale(age_days: int | None, max_age_days: int) -> bool:
     return age_days > max_age_days
 
 
+def agent_quality_na_reason(aq: dict | None, key: str) -> str:
+    """Precise N/A reason for one ``agent_quality.json``-sourced component.
+
+    The prior reason string on every one of these 8 components (5 in
+    ``grading/tiles/agent.py``, 3 in ``grading/tiles/research.py``) was the
+    literal disjunction ``"agent_quality.json absent or no value this
+    cycle"`` — a reader could not tell "the artifact itself never landed
+    this cycle" from "the artifact landed but this one field was never
+    computed" from "the artifact landed with a non-ok status". Those are
+    different failure modes at different layers (S3 write vs. one
+    producer sub-block vs. the whole run) and call for different follow-up.
+    Resolves the disjunction into the actual observed state
+    (alpha-engine-config-I9616). Never used when the artifact is merely
+    stale — callers check ``artifact_is_stale`` first and use a dedicated
+    stale-input reason instead.
+    """
+    if aq is None:
+        return (
+            f"{key}: agent_quality.json artifact absent this cycle "
+            f"(research agent-quality producer, config#1149)."
+        )
+    status = aq.get("status")
+    if status != "ok":
+        return (
+            f"{key}: agent_quality.json present but status={status!r} "
+            f"(not gradeable this cycle; research agent-quality producer, "
+            f"config#1149)."
+        )
+    if key not in aq:
+        return (
+            f"{key}: agent_quality.json present (status=ok) but this field "
+            f"was not computed this cycle — the producer wrote no block for "
+            f"it (research agent-quality producer, config#1149; "
+            f"alpha-engine-config-I9616)."
+        )
+    blk = aq.get(key)
+    if not isinstance(blk, dict) or blk.get("value") is None:
+        return (
+            f"{key}: agent_quality.json present (status=ok) with a {key} "
+            f"block, but its value carries no data this cycle (research "
+            f"agent-quality producer, config#1149; alpha-engine-config-I9616)."
+        )
+    # Reached only if a caller invokes this after already confirming a
+    # present, non-null block — not a real N/A path, but kept honest rather
+    # than raising on a caller bug.
+    return (
+        f"{key}: agent_quality.json present and {key} carries a value, but "
+        f"the caller routed here as N/A anyway (research agent-quality "
+        f"producer, config#1149)."
+    )
+
+
 @dataclass
 class StalenessRecord:
     """Per-artifact staleness provenance for one tile's input."""

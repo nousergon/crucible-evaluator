@@ -45,7 +45,12 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-from grading.artifacts import AGENT_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
+from grading.artifacts import (
+    AGENT_ARTIFACT_MAX_AGE_DAYS,
+    agent_quality_na_reason,
+    artifact_is_stale,
+    get_json_windowed,
+)
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.tiles.groom import build_groom_components
@@ -126,7 +131,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=50, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("agent_validation_failure_rate") if aq_stale
-            else "agent_validation_failure_rate: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            else agent_quality_na_reason(aq, "agent_validation_failure_rate"),
         ))
 
     # 2. cost_per_signal (supporting) — total run LLM $ / finalized signal (lower
@@ -145,7 +150,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=5, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("cost_per_signal") if aq_stale
-            else "cost_per_signal: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            else agent_quality_na_reason(aq, "cost_per_signal"),
         ))
 
     # 3. retry_storm_count (supporting) — # of agents that reached their per-type
@@ -165,7 +170,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=1, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("retry_storm_count") if aq_stale
-            else "retry_storm_count: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            else agent_quality_na_reason(aq, "retry_storm_count"),
         ))
 
     # 4. agent_latency_p95 (diagnostic) — per-agent-type p95 wall-clock (ms,
@@ -185,7 +190,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=1, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("agent_latency_p95") if aq_stale
-            else "agent_latency_p95: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            else agent_quality_na_reason(aq, "agent_latency_p95"),
         ))
 
     # 5. judge_rubric_distribution (diagnostic) — modal-score concentration of
@@ -206,7 +211,7 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             n_floor=10, higher_is_better=False,
             source_path=aq_src, input_present=False,
             na_detail=_stale_na("judge_rubric_distribution") if aq_stale
-            else "judge_rubric_distribution: agent_quality.json absent or no value this cycle (research agent-quality producer, config#1149).",
+            else agent_quality_na_reason(aq, "judge_rubric_distribution"),
         ))
 
     # 6. stance_source_provenance (diagnostic) — pick-provenance coverage; lands
