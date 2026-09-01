@@ -83,6 +83,91 @@ LATEST_REPORT_CARD_KEY = f"{REPORT_CARD_PREFIX}/latest/{REPORT_CARD_FILENAME}"
 GRADER_SOURCE = "alpha-engine-evaluator/grading/scorecard.py (ported from backtester @f46e7e6)"
 
 
+#: Why the outcome tile did not vote, phrased so ``scorecard._skip_class``
+#: lands each case in the right ``SKIP_CLASSES`` bucket. Keyed on the tile's own
+#: N/A status (``grading/module_agg.py``'s closed four-value vocabulary), NOT on
+#: a guess: an unmapped status must not silently read as "absent".
+#:
+#: None of these is a FAILURE class, deliberately. A failure would score the
+#: outcome 0.0 at full weight under the I7210 rule; these are all "the
+#: measurement did not happen", which renormalizes away. A tile build that
+#: genuinely fails raises out of ``build_report_card`` instead of arriving here.
+_OUTCOME_NA_REASONS = {
+    "N/A-MISSING-INPUT": (
+        "no trades/eod_pnl.csv this cycle — the EOD reconciliation export the "
+        "portfolio_outcome tile grades was not present"
+    ),
+    "N/A-NOT-RUN": (
+        "no portfolio_outcome grade this cycle — the tile produced no scorable "
+        "component"
+    ),
+    "N/A-LOW-N": (
+        "insufficient sample — every scorable portfolio_outcome component is "
+        "below its declared n_floor"
+    ),
+    "N/A-NOT-IMPL": (
+        "not implemented — the portfolio_outcome tile has no implemented "
+        "scorable component"
+    ),
+}
+
+
+def _outcome_voter(tile: dict | None) -> dict:
+    """The product-outcome grade block the ``overall`` composite votes with.
+
+    alpha-engine-config-I9005. Translates Tile 0 into the ``{"grade", "letter",
+    "reason"}`` shape every other composite voter uses, so
+    ``scorecard._resolve_components`` classifies it through the SAME single
+    pass rather than a special case beside it.
+
+    The grade is the tile's own ``numeric_grade`` — no second grader, and no
+    threshold read or authored here. ``letter`` is carried as the tile's own
+    STATUS-derived letter, which is not the same mapping as
+    ``scorecard._letter`` over the numeric grade; both are on the card and a
+    reader must be able to see that they differ rather than have one silently
+    overwrite the other.
+
+    A tile with no numeric grade returns a block whose ``reason`` names WHY,
+    from the tile's own status. An unrecognised status is reported verbatim and
+    lands in ``skip_class: unknown`` — loud, and never mistaken for a measured
+    zero.
+    """
+    if not isinstance(tile, dict):
+        return {
+            "grade": None,
+            "letter": "N/A",
+            "reason": (
+                "no portfolio_outcome tile this cycle — Tile 0 was not built "
+                "for this card"
+            ),
+        }
+    grade = tile.get("numeric_grade")
+    status = str(tile.get("status") or "")
+    block: dict = {
+        "grade": grade,
+        "letter": tile.get("letter", "N/A"),
+        "tile_status": status,
+        "n_components": tile.get("n_components"),
+        "n_graded": tile.get("n_graded"),
+        "source": "tiles.portfolio_outcome.numeric_grade",
+    }
+    # The outcome voter's OWN leaf coverage, so the overall coverage block can
+    # report it recursively the way it already does for research / predictor /
+    # executor. Without it the outcome would default to "1.0 effective" — a
+    # claim that every component behind the grade measured, which is exactly
+    # the reading `weight_present_effective` exists to prevent (config-I7202).
+    n_all, n_ok = tile.get("n_components"), tile.get("n_graded")
+    if isinstance(n_all, int) and isinstance(n_ok, int) and n_all > 0:
+        block["effective_coverage"] = n_ok / n_all
+    if grade is None:
+        block["reason"] = _OUTCOME_NA_REASONS.get(
+            status,
+            f"portfolio_outcome tile produced no numeric grade "
+            f"(tile status {status or 'absent'})",
+        )
+    return block
+
+
 def build_report_card(
     bucket: str,
     run_date: str,
@@ -126,7 +211,6 @@ def build_report_card(
     inputs, report = read_scorecard_inputs(
         bucket, run_date, s3_client=s3_client, run_scope_payload=run_scope,
     )
-    scorecard = compute_scorecard(**inputs)
 
     # Cross-cycle trend history (config#1836): prior weekly CARDS are the SSOT
     # for graded values — the tiles thread trend_4w/trend_13w from these into
@@ -177,6 +261,35 @@ def build_report_card(
             "report N/A this cycle): %s", exc,
         )
 
+    # ── The product-outcome voter (alpha-engine-config-I9005) ──────────────
+    #
+    # Tile 0 is built HERE, before the v1 scorecard, because its grade is one
+    # of the composite's four declared voters. Until 2026-08-31 the composite
+    # was research / predictor / executor only: the one tile measuring what the
+    # system PRODUCES was computed every cycle, published on the card, and then
+    # excluded from the headline. The 2026-08-31 card read `C+ (PARTIAL — 93%
+    # of declared weight)` and `tiles_overall_status: RED` at the same time,
+    # with `census_scope.tiles_out_of_scope` naming `portfolio_outcome: RED`.
+    #
+    # It votes with the tile's OWN `numeric_grade` — the 0-100 number
+    # `grading/module_agg.py::numeric_grade` already computes from the same
+    # MetricRecords the tile publishes. No second grader, and no threshold
+    # touched: every `target` / `red_line` / `n_floor` behind those records
+    # still comes from `grading/thresholds/registry.yaml`.
+    #
+    # NOT wrapped in a try/except. A tile build that raises must fail the card
+    # (the handler is fail-loud by design); swallowing it here would drop the
+    # outcome voter out of the denominator and RAISE the headline grade because
+    # the outcome measurement broke, which is the exact inversion the I7210
+    # failure-scores-zero rule exists to prevent.
+    portfolio_outcome_tile = build_portfolio_outcome_tile(
+        bucket, s3_client=s3_client, history=history, n_trials=n_trials,
+    )
+    scorecard = compute_scorecard(
+        **inputs,
+        portfolio_outcome=_outcome_voter(portfolio_outcome_tile),
+    )
+
     # RC v2 MetricRecord tiles (value + CI + N + status), nested under "tiles".
     # These read their own sources independently of the backtest/{date}/
     # artifacts and land alongside the v1 raw-dict scorecard (research /
@@ -206,9 +319,11 @@ def build_report_card(
     # is no Tile 8. This dict is the membership source of truth (pinned by
     # tests/test_aggregate.py + test_handler.py).
     tiles = {
-        "portfolio_outcome": build_portfolio_outcome_tile(
-            bucket, s3_client=s3_client, history=history, n_trials=n_trials,
-        ),
+        # Built ABOVE, before compute_scorecard, because its grade is now a
+        # voter in the v1 composite (alpha-engine-config-I9005). Built once and
+        # reused here: two builds would be two reads of eod_pnl.csv and two
+        # chances for the voting number and the published tile to disagree.
+        "portfolio_outcome": portfolio_outcome_tile,
         "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
         "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),

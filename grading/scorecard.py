@@ -265,7 +265,7 @@ def _weighted_avg(components: list[tuple[float, float | None]]) -> float | None:
 #
 # Each table must sum to 1.0 — asserted by tests/test_scorecard.py.
 
-WEIGHT_TABLE_VERSION = "2026-08-18"
+WEIGHT_TABLE_VERSION = "2026-08-31"
 
 #: Research weights AFTER the 2026-08-18 ruling on ``alpha-engine-config-I7210``
 #: (Brian, decision 1 = option (a)): ``cio`` (0.20) and ``sector_teams_avg``
@@ -380,10 +380,58 @@ EXECUTOR_WEIGHTS: dict[str, float] = {
     "action_entropy": 0.10,
 }
 
-OVERALL_WEIGHTS: dict[str, float] = {
+#: Weight of the PRODUCT-OUTCOME tile in the system composite
+#: (``alpha-engine-config-I9005``, this PR). Until 2026-08-31 the composite
+#: graded ``research`` / ``predictor`` / ``executor`` only, so the one tile that
+#: measures what the system PRODUCES — paper-portfolio P&L versus SPY — was
+#: computed every cycle, published on the card, and then EXCLUDED from the
+#: number every surface reads. The 2026-08-31 card carried
+#: ``tiles.portfolio_outcome.status = "RED"`` and a headline of ``C+``
+#: simultaneously.
+#:
+#: This is a CONCEALMENT fix, not a new measurement and not a new bar
+#: (``principles.md`` §2.1 Transparency, §2.7 Measurability: a component
+#: emitting nothing is unobserved, not healthy — and a component emitting a RED
+#: nobody's headline can see is the same defect one layer up). Every threshold
+#: this tile grades against (``target``, ``red_line``, ``n_floor``) already
+#: lives in ``grading/thresholds/registry.yaml`` and is UNCHANGED by this
+#: commit. What changes is whether the already-measured verdict votes.
+#:
+#: 0.50 — outcome and process as equal halves. Not an invented ranking: two
+#: places in this repo ALREADY declare the outcome tile the objective rather
+#: than a peer, and this makes the composite agree with them instead of
+#: contradicting them.
+#:   * ``grading/module_agg.py::overall_status`` — "portfolio outcome leads";
+#:     a RED here fails the card's ``tiles_overall_status`` on its own.
+#:   * ``grading/thresholds/cohort.py::OBJECTIVE_TILE = "portfolio_outcome"``.
+#: The remaining 0.50 is split over ``research`` / ``predictor`` / ``executor``
+#: in EXACTLY the ratios Brian ruled on 2026-08-18
+#: (``alpha-engine-config-I7210``): 0.40 / 0.25 / 0.35 of the process half. No
+#: process module's weight moves RELATIVE to another — this commit adds a
+#: voter, it does not re-opine on a ruled table.
+#:
+#: A consequence worth stating, because it is what makes the split safe: when
+#: the outcome tile does not grade (``eod_pnl.csv`` absent), the I7210 rule
+#: renormalizes its weight away and the surviving three rescale to exactly
+#: 0.40 / 0.25 / 0.35 — the pre-2026-08-31 composite, to the last digit. The
+#: only cards whose headline moves are the ones where the outcome IS measured.
+PORTFOLIO_OUTCOME_WEIGHT = 0.50
+
+#: Process-module weights, ruled 2026-08-18 (``alpha-engine-config-I7210``).
+#: Kept as their own table so the ratios Brian ruled on are readable here
+#: rather than only recoverable by dividing four numbers below.
+PROCESS_WEIGHTS: dict[str, float] = {
     "research": 0.40,
     "predictor": 0.25,
     "executor": 0.35,
+}
+
+OVERALL_WEIGHTS: dict[str, float] = {
+    "portfolio_outcome": PORTFOLIO_OUTCOME_WEIGHT,
+    **{
+        name: w * (1.0 - PORTFOLIO_OUTCOME_WEIGHT)
+        for name, w in PROCESS_WEIGHTS.items()
+    },
 }
 
 #: The scoring rule, stamped onto the artifact in words. A reader reproducing
@@ -393,7 +441,20 @@ OVERALL_WEIGHTS: dict[str, float] = {
 #: longer renormalized away, so calling the whole rule "renormalization" would
 #: be false for exactly the case that matters most.
 RENORMALIZATION_RULE = (
-    "Scoring rule v2026-08-18 (alpha-engine-config-I7210, Brian 2026-08-18). "
+    "Scoring rule v2026-08-31 (alpha-engine-config-I9005, extending "
+    "alpha-engine-config-I7210, Brian 2026-08-18). "
+    "SCOPE — the composite grades FOUR declared voters: the product-outcome "
+    "tile portfolio_outcome at 0.50, and the three process modules research / "
+    "predictor / executor sharing the remaining 0.50 in the ruled I7210 ratios "
+    "(0.40 / 0.25 / 0.35 of that half = 0.20 / 0.125 / 0.175 of the whole). "
+    "Before v2026-08-31 portfolio_outcome was computed, published on the card, "
+    "and excluded from this number; a card could and did read headline C+ and "
+    "tiles_overall_status RED at the same time. portfolio_outcome votes with "
+    "its tile numeric_grade (grading/module_agg.py::numeric_grade), the same "
+    "0-100 scale as the process modules; no threshold, target or red_line was "
+    "changed to make it vote. When it does not grade, the NON-FAILURE ABSENCE "
+    "case below renormalizes its weight away and the three process modules "
+    "rescale to exactly 0.40 / 0.25 / 0.35 — the pre-v2026-08-31 composite. "
     "TWO cases, decided by coverage.skip_classes. (1) FAILURE — a component "
     "whose skip_class is 'failed' or 'failed_timeout' SCORES 0.0 and STAYS in "
     "the denominator at its full declared weight. It is NOT renormalized away: "
@@ -1961,6 +2022,7 @@ def compute_scorecard(
     calibration_diagnostics: dict | None = None,
     action_entropy: dict | None = None,
     excursion_summary: dict | None = None,
+    portfolio_outcome: dict | None = None,
 ) -> dict:
     """Compute the unified system scorecard.
 
@@ -1970,6 +2032,21 @@ def compute_scorecard(
         research: {grade, letter, components: {...}}
         predictor: {grade, letter, components: {...}}
         executor: {grade, letter, components: {...}}
+
+    ``portfolio_outcome`` (alpha-engine-config-I9005) is the PRODUCT-OUTCOME
+    voter in the ``overall`` composite: a grade block ``{"grade": float|None,
+    "letter": str, "reason": str|None}`` built by the caller from the already-
+    computed Tile 0 (``grading/tiles/portfolio_outcome.py`` →
+    ``grading/module_agg.py::numeric_grade``). This module does NOT read
+    ``trades/eod_pnl.csv`` — the tile owns that, and re-reading it here would be
+    a second implementation of the one number the card publishes.
+
+    Passing ``None`` (every standalone caller and every v1 test) resolves to a
+    non-failure absence, whose declared weight the I7210 rule renormalizes away
+    — leaving research / predictor / executor at exactly 0.40 / 0.25 / 0.35 and
+    the composite bit-identical to the pre-I9005 number. Absence therefore
+    never silently ADDS an outcome grade of zero, which would be a bar this
+    layer has no authority to set.
     """
     # -----------------------------------------------------------------------
     # Research components
@@ -2123,18 +2200,47 @@ def compute_scorecard(
     # -----------------------------------------------------------------------
     # Overall
     # -----------------------------------------------------------------------
+    # The outcome voter (alpha-engine-config-I9005). Handed in by the caller
+    # already graded; normalized to the same {"grade", "reason"} block shape
+    # every other voter uses so `_resolve_components` classifies it through the
+    # one classification pass rather than a special case.
+    outcome_block: dict[str, Any]
+    if isinstance(portfolio_outcome, dict):
+        outcome_block = dict(portfolio_outcome)
+    else:
+        outcome_block = {
+            "grade": None,
+            "letter": "N/A",
+            # Phrased so `_skip_class` lands it in `input_absent` — a
+            # non-failure absence, renormalized away. It is NOT scored 0: the
+            # outcome tile not being handed to this layer is a plumbing fact,
+            # and turning it into a zero would publish a bar nobody set.
+            "reason": (
+                "no portfolio_outcome tile this cycle — the outcome grade was "
+                "not handed to compute_scorecard (standalone/v1 caller, or the "
+                "Tile 0 build did not run)"
+            ),
+        }
+    outcome_block.setdefault("letter", _letter(outcome_block.get("grade")))
+
     graded_overall = {
+        "portfolio_outcome": outcome_block,
         "research": {"grade": research_grade},
         "predictor": {"grade": predictor_grade},
         "executor": {"grade": executor_grade},
     }
     overall_grade = _composite(OVERALL_WEIGHTS, graded_overall)
 
-    # Determine status
-    graded_count = sum(1 for g in [research_grade, predictor_grade, executor_grade] if g is not None)
+    # Determine status. Derived from the DECLARED table rather than a hand-
+    # listed trio, so adding a voter above cannot leave this counting three
+    # (alpha-engine-config-I9005).
+    graded_count = sum(
+        1 for name in OVERALL_WEIGHTS
+        if (graded_overall.get(name) or {}).get("grade") is not None
+    )
     if graded_count == 0:
         status = "insufficient_data"
-    elif graded_count < 3:
+    elif graded_count < len(OVERALL_WEIGHTS):
         status = "partial"
     else:
         status = "ok"
@@ -2142,6 +2248,12 @@ def compute_scorecard(
     card = {
         "status": status,
         "overall": {"grade": overall_grade, "letter": _letter(overall_grade)},
+        # The outcome voter's contribution, on the card, beside the three
+        # process voters. `tiles.portfolio_outcome` carries the full component
+        # list; this is the one number that actually voted, so the published
+        # grade is recomputable from the card alone (alpha-engine-config-I9005,
+        # the same reason `grading_weights` is stamped).
+        "portfolio_outcome": dict(outcome_block),
         "research": research,
         "predictor": predictor,
         "executor": executor,
@@ -2174,6 +2286,14 @@ def compute_scorecard(
             OVERALL_WEIGHTS,
             graded_overall,
             effective={
+                # The outcome tile's own leaf coverage, supplied by the caller
+                # (grading/aggregate.py::_outcome_voter). Absent → 1.0, the
+                # same default every other unmapped child gets.
+                "portfolio_outcome": (
+                    outcome_block.get("effective_coverage")
+                    if isinstance(outcome_block.get("effective_coverage"), (int, float))
+                    else 1.0
+                ),
                 "research": research_cov["weight_present_effective"],
                 "predictor": predictor_cov["weight_present_effective"],
                 "executor": executor_cov["weight_present_effective"],
@@ -2202,6 +2322,11 @@ def compute_scorecard(
             "version": WEIGHT_TABLE_VERSION,
             "rule": RENORMALIZATION_RULE,
             "overall": dict(OVERALL_WEIGHTS),
+            # The ruled I7210 ratios the process half of `overall` is derived
+            # from, stamped so a reader can see that I9005 added a voter
+            # without moving any process module RELATIVE to another.
+            "process_half": dict(PROCESS_WEIGHTS),
+            "portfolio_outcome_weight": PORTFOLIO_OUTCOME_WEIGHT,
             "research": dict(RESEARCH_WEIGHTS),
             "predictor": dict(PREDICTOR_WEIGHTS),
             "executor": dict(EXECUTOR_WEIGHTS),

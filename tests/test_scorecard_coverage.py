@@ -57,6 +57,16 @@ FIXTURE = Path(__file__).parent / "fixtures" / "report_card_2026-08-07.json"
 #: the stamped rule describes the failure-scores-zero regime.
 FIXTURE_POST = Path(__file__).parent / "fixtures" / "report_card_post_i7210.json"
 
+#: The CURRENT artifact shape (alpha-engine-config-I9005, 2026-08-31): the
+#: composite declares FOUR voters, the product-outcome tile among them, and the
+#: card carries the outcome grade that voted.
+#:
+#: A NEW file rather than a regenerated ``FIXTURE_POST``. ``FIXTURE_POST`` is
+#: the frozen evidence for the I7210 ruling's continuity claim — regenerating
+#: it would delete the only record of the regime that claim is about, and the
+#: test below would then be comparing the producer to itself.
+FIXTURE_I9005 = Path(__file__).parent / "fixtures" / "report_card_post_i9005.json"
+
 # ---------------------------------------------------------------------------
 # The reader-side recomputation. Imports nothing from the producer on purpose.
 # ---------------------------------------------------------------------------
@@ -103,11 +113,23 @@ def _recompute_section(card: dict, section: str) -> float | None:
 
 
 def _recompute_overall(card: dict) -> float | None:
-    """Reproduce ``card['overall']['grade']`` from the card's own JSON."""
-    section_grades = {s: _recompute_section(card, s) for s in _SECTIONS}
+    """Reproduce ``card['overall']['grade']`` from the card's own JSON.
+
+    Four voters since alpha-engine-config-I9005: the three v1 sections, each
+    recomputed from its own component block, plus the product-outcome grade the
+    card carries at ``card['portfolio_outcome']['grade']``. A pre-I9005 card
+    has no such key and no ``portfolio_outcome`` entry in its stamped weight
+    table, so it recomputes exactly as it always did — which is what keeps the
+    verbatim 2026-08-07 fixture a live check rather than a rewritten one.
+    """
+    grades = {s: _recompute_section(card, s) for s in _SECTIONS}
+    outcome = card.get("portfolio_outcome")
+    grades["portfolio_outcome"] = (
+        outcome.get("grade") if isinstance(outcome, dict) else None
+    )
     skip_classes = (card["overall"].get("coverage") or {}).get("skip_classes") or {}
     return _recompute_level(
-        card["grading_weights"]["overall"], section_grades, skip_classes,
+        card["grading_weights"]["overall"], grades, skip_classes,
     )
 
 
@@ -204,6 +226,15 @@ def _full_inputs() -> dict:
         "excursion_summary": {
             "status": "ok", "mean_mfe_mae_ratio": 1.6, "pct_high_quality": 0.45,
             "median_mfe_mae_ratio": 1.4, "pct_mfe_gt_mae": 0.6, "n": 120,
+        },
+        # The product-outcome voter (alpha-engine-config-I9005). Handed in
+        # already graded by grading/aggregate.py::_outcome_voter from Tile 0;
+        # `compute_scorecard` never reads eod_pnl.csv itself. A "complete" card
+        # is one where all FOUR declared voters graded, so it belongs here.
+        "portfolio_outcome": {
+            "grade": 39.0, "letter": "F", "tile_status": "RED",
+            "n_components": 18, "n_graded": 18, "effective_coverage": 1.0,
+            "source": "tiles.portfolio_outcome.numeric_grade",
         },
     }
 
@@ -336,7 +367,7 @@ class TestRecomputeFromCardAlone:
         assert "STAYS in the denominator" in rule
         assert "NOT renormalized away" in rule
         # And the regime is dated, so two cards can be told apart.
-        assert card["grading_weights"]["version"] == "2026-08-18"
+        assert card["grading_weights"]["version"] == "2026-08-31"
 
     def test_the_weight_table_version_advances_with_the_published_grade(self):
         """A reader comparing two cards must see the TABLE changed, not the
@@ -453,8 +484,15 @@ class TestCoverageIsPublishedAtEveryLevel:
         assert cov["weight_present"] == pytest.approx(1.0)
         # Research is now fully covered (the retired pair no longer declares
         # weight); the executor's two never-persisted producers still are not.
+        # Four declared voters since alpha-engine-config-I9005: the outcome
+        # tile at 0.50 with its own leaf coverage, and the three process
+        # modules over the remaining 0.50 in the ruled I7210 ratios.
+        w = OVERALL_WEIGHTS
         assert cov["weight_present_effective"] == pytest.approx(
-            0.40 * 1.0 + 0.25 * 1.0 + 0.35 * 0.75,
+            w["portfolio_outcome"] * 1.0
+            + w["research"] * 1.0
+            + w["predictor"] * 1.0
+            + w["executor"] * 0.75,
         )
         assert cov["weight_present_effective"] < 1.0
 
@@ -669,7 +707,9 @@ class TestFailureIsNeverJustCoverage:
         cov = card["overall"]["coverage"]
         assert cov["qualifier"] == "PARTIAL-FAILURE-SCORED-ZERO"
         assert "exit_rules" in cov["components_failed"]
-        assert cov["weight_failed"] == pytest.approx(0.35 * 0.15)
+        assert cov["weight_failed"] == pytest.approx(
+            OVERALL_WEIGHTS["executor"] * EXECUTOR_WEIGHTS["exit_rules"],
+        )
         assert "SCORED ZERO ON FAILURE" in card["overall"]["display"]
 
     def test_a_retirement_is_not_a_failure(self):
@@ -751,12 +791,13 @@ class TestContinuityAcrossTheRuling:
             _recompute_overall(card), abs=1e-9,
         )
 
-    def test_the_post_ruling_fixture_is_the_shape_the_producer_emits(self):
+    def test_the_current_fixture_is_the_shape_the_producer_emits(self):
         """Guards the fixture against drifting from the producer — a stale
         fixture asserting a regime nobody publishes any more is worse than
-        none."""
+        none. Points at the CURRENT regime (I9005); ``FIXTURE_POST`` stays
+        frozen as the I7210 evidence the test above reads."""
         live = _roundtrip(compute_scorecard(**_today_inputs()))
-        fixture = json.loads(FIXTURE_POST.read_text())
+        fixture = json.loads(FIXTURE_I9005.read_text())
         assert fixture["grading_weights"]["research"] == live["grading_weights"]["research"]
         assert fixture["grading_weights"]["rule"] == live["grading_weights"]["rule"]
         assert (
@@ -809,3 +850,117 @@ class TestCoverageCannotFailTheRun:
         assert card["overall"]["grade"] is None
         assert card["overall"]["coverage"]["qualifier"] == "UNGRADED"
         assert card["overall"]["coverage"]["weight_present"] == 0.0
+
+
+class TestTheProductOutcomeVotes:
+    """alpha-engine-config-I9005 — the concealment this closes.
+
+    Until 2026-08-31 the composite graded ``research`` / ``predictor`` /
+    ``executor`` only. The one tile measuring what the system PRODUCES was
+    computed every cycle, published on the card, and then excluded from the
+    number every surface reads: the live 2026-08-31 card carried
+    ``overall.display = "C+ (PARTIAL — 93% of declared weight)"`` and
+    ``tiles_overall_status = "RED"`` simultaneously, with
+    ``overall.coverage.census_scope.tiles_out_of_scope`` naming
+    ``portfolio_outcome: "RED"`` (all four read from
+    ``s3://alpha-engine-research/evaluator/latest/report_card.json``,
+    2026-08-31).
+
+    No threshold moves here. Every ``target`` / ``red_line`` / ``n_floor``
+    behind the outcome tile still comes from
+    ``grading/thresholds/registry.yaml``; what changes is whether the
+    already-measured verdict is allowed to vote.
+    """
+
+    def test_the_outcome_tile_carries_declared_weight(self):
+        assert "portfolio_outcome" in OVERALL_WEIGHTS
+        assert OVERALL_WEIGHTS["portfolio_outcome"] == pytest.approx(0.50)
+
+    def test_the_process_modules_keep_their_ruled_RATIOS(self):
+        """I9005 adds a voter; it does not re-opine on the I7210 table.
+
+        The three process weights must stay in exactly the 0.40 / 0.25 / 0.35
+        proportion Brian ruled on 2026-08-18. If someone later re-weights them
+        on judgement while adding a voter, this fails and the change has to be
+        argued as the re-ruling it is.
+        """
+        process = {k: OVERALL_WEIGHTS[k] for k in _SECTIONS}
+        total = sum(process.values())
+        assert total == pytest.approx(1.0 - OVERALL_WEIGHTS["portfolio_outcome"])
+        for name, ruled in (("research", 0.40), ("predictor", 0.25), ("executor", 0.35)):
+            assert process[name] / total == pytest.approx(ruled, abs=1e-9), name
+
+    def test_a_RED_outcome_lowers_the_headline(self):
+        """The property the exclusion removed. Same process inputs, two outcome
+        grades: the worse outcome must produce the worse headline."""
+        good = dict(_today_inputs())
+        good["portfolio_outcome"] = {"grade": 90.0, "letter": "A"}
+        bad = dict(_today_inputs())
+        bad["portfolio_outcome"] = {"grade": 39.0, "letter": "F"}
+
+        g = _roundtrip(compute_scorecard(**good))
+        b = _roundtrip(compute_scorecard(**bad))
+
+        assert b["overall"]["grade"] < g["overall"]["grade"]
+        assert b["overall"]["grade"] == pytest.approx(
+            g["overall"]["grade"] - OVERALL_WEIGHTS["portfolio_outcome"] * (90.0 - 39.0),
+            abs=1e-9,
+        )
+        # ... and it is recomputable from the card alone, both times.
+        for card in (g, b):
+            assert card["overall"]["grade"] == pytest.approx(
+                _recompute_overall(card), abs=1e-9,
+            )
+
+    def test_the_voting_grade_is_on_the_card(self):
+        """A published number whose inputs live only in source is not
+        verifiable — the same reason ``grading_weights`` is stamped."""
+        card = _roundtrip(compute_scorecard(**_today_inputs()))
+        block = card["portfolio_outcome"]
+        assert block["grade"] == pytest.approx(39.0)
+        assert block["source"] == "tiles.portfolio_outcome.numeric_grade"
+        assert card["grading_weights"]["portfolio_outcome_weight"] == pytest.approx(0.50)
+        assert card["grading_weights"]["process_half"] == {
+            "research": 0.40, "predictor": 0.25, "executor": 0.35,
+        }
+
+    def test_an_ABSENT_outcome_reproduces_the_pre_I9005_composite_EXACTLY(self):
+        """Why the proportional split is the safe one.
+
+        When the outcome does not grade, the I7210 non-failure-absence rule
+        renormalizes its weight away and the three survivors rescale to exactly
+        0.40 / 0.25 / 0.35 — the pre-I9005 table. So a cycle with no
+        ``eod_pnl.csv`` publishes the number it always did, and the only cards
+        whose headline moves are the ones where the outcome IS measured.
+        """
+        inputs = dict(_today_inputs())
+        del inputs["portfolio_outcome"]
+        card = _roundtrip(compute_scorecard(**inputs))
+
+        comps = {s: _recompute_section(card, s) for s in _SECTIONS}
+        pre_i9005 = sum(
+            w * comps[name]
+            for name, w in (("research", 0.40), ("predictor", 0.25), ("executor", 0.35))
+        )
+        assert card["overall"]["grade"] == pytest.approx(pre_i9005, abs=1e-9)
+
+    def test_an_ABSENT_outcome_is_NOT_scored_zero(self):
+        """A missing measurement must never be published as a measured zero —
+        that would be a bar this layer has no authority to set."""
+        inputs = dict(_today_inputs())
+        del inputs["portfolio_outcome"]
+        card = _roundtrip(compute_scorecard(**inputs))
+        cov = card["overall"]["coverage"]
+        assert cov["skip_classes"]["portfolio_outcome"] == "input_absent"
+        assert "portfolio_outcome" not in cov["components_failed"]
+        assert cov["weight_scored_zero"] == 0.0
+        # And the loss of half the declared weight is LOUD, not silent.
+        assert cov["weight_present"] == pytest.approx(0.50)
+        assert card["overall"]["display"] != card["overall"]["letter"]
+
+    def test_status_counts_the_outcome_voter(self):
+        """`ok` may not mean "three of four declared voters graded"."""
+        inputs = dict(_today_inputs())
+        del inputs["portfolio_outcome"]
+        assert _roundtrip(compute_scorecard(**inputs))["status"] == "partial"
+        assert _roundtrip(compute_scorecard(**_full_inputs()))["status"] == "ok"

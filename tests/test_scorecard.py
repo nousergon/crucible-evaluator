@@ -206,6 +206,10 @@ class TestComputeScorecard:
                 "summary": {"avg_capture_ratio": 0.62, "avg_realized_return": 1.8},
                 "diagnosis": "exits_could_improve",
             },
+            # The fourth declared voter (alpha-engine-config-I9005). "Full
+            # data" means all four graded; without it the card is honestly
+            # `partial`, which is asserted by its own test below.
+            portfolio_outcome={"grade": 39.0, "letter": "F", "tile_status": "RED"},
         )
 
         assert result["status"] == "ok"
