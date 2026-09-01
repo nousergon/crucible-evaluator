@@ -146,7 +146,7 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # a declared groom pause never renders as an undeclared broken-producer
     # gap — new "ops" read prefix, declared in grading/iam_s3_contract.json.
     "grading/tiles/groom.py": 3,
-    "grading/tiles/portfolio_outcome.py": 2,
+    "grading/tiles/portfolio_outcome.py": 3,  # +1 I9684: predictor/model_zoo/leaderboard (pbo)
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
     "grading/tiles/substrate.py": 1,
