@@ -31,10 +31,16 @@ from nousergon_lib.quant.stats.multiple_testing import benjamini_hochberg
 # re-declared so the tile line and `grading/coverage.py` can never disagree
 # about what an unreported component is called.
 from grading.coverage import UNREPORTED_STATUS
-from grading.thresholds.registry import tile_roster
+from grading.thresholds.registry import card_spec, tile_roster
 
 # Modules whose RED cascades to an overall RED (RC v2 module→overall rule).
-_CASCADE_MODULES = ("research", "predictor", "executor", "substrate")
+#
+# DECLARED at ``grading/thresholds/registry.yaml#card.tiles.<tile>.cascades``
+# since ``alpha-engine-config-I9734``, not listed here. Same four modules; what
+# changes is that this can no longer name a module the card does not have, or
+# miss one it does — ``parse_registry`` reconciles the declared tiles against
+# the tile set derived from the metric rows at load.
+_CASCADE_MODULES: tuple[str, ...] = card_spec().cascade_modules
 
 # Per-tile freshness stamps (config-I2556). Every component already threads a
 # real S3 `source_path` (and a `last_updated_utc` construction timestamp)

@@ -109,18 +109,26 @@ class TestHandler:
         # additive on the summary.
         assert out["latest_key"] == "evaluator/latest/report_card.json"
         assert out["snapshot"] is True
-        # all 9 tiles present in the per-tile status map.
-        assert set(out["tile_status"]) == {
-            "portfolio_outcome", "predictor", "research", "executor",
-            "backtester", "substrate", "agent", "behavioral", "director_quality",
-            "contribution_lift",
-        }
         assert out["tiles_overall_status"] in ("GREEN", "WATCH", "RED", "N/A-NOT-RUN")
         # both written objects round-trip.
+        #
+        # alpha-engine-config-I9734: the ten-name literal that stood here is
+        # GONE — it was the card's third hand-maintained membership
+        # declaration. The property that actually matters is asserted against
+        # the PUBLISHED artifact instead: the summary's per-tile status map
+        # names every tile the written card carries and invents none. That
+        # holds whatever the registry declares, and it is what breaks if the
+        # summary ever drops a tile the card published.
+        assert out["tile_status"], "the summary reported no tiles at all"
         for key in (out["report_card_key"], out["latest_key"]):
             obj = s3.get_object(Bucket=BUCKET, Key=key)
             card = json.loads(obj["Body"].read())
             assert card["tiles_overall_status"] == out["tiles_overall_status"]
+            assert set(out["tile_status"]) == set(card["tiles"])
+            assert all(
+                out["tile_status"][name] == card["tiles"][name]["status"]
+                for name in card["tiles"]
+            )
 
     def test_handler_publishes_the_self_test_and_carries_its_verdict(self, s3):
         """End-to-end: the artifact Brian asked for actually lands, every cycle.

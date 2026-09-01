@@ -28,6 +28,8 @@ the single home.
 import logging
 from typing import Any
 
+from grading.thresholds.registry import card_spec
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,18 +37,15 @@ logger = logging.getLogger(__name__)
 # Grade bands
 # ---------------------------------------------------------------------------
 
-GRADE_BANDS = [
-    (90, "A"),
-    (80, "A-"),
-    (73, "B+"),
-    (65, "B"),
-    (58, "B-"),
-    (50, "C+"),
-    (42, "C"),
-    (35, "C-"),
-    (28, "D+"),
-    (20, "D"),
-    (0, "F"),
+#: The 0-100 → letter ladder, DECLARED in
+#: ``grading/thresholds/registry.yaml#card.grade_bands`` rather than as a
+#: literal here (``alpha-engine-config-I9734``). It sits beside the
+#: ``target``/``red_line`` bands it combines with: a cutoff is a grading
+#: declaration, and the card had four separate populations declaring themselves
+#: in four files precisely because some of them lived in source.
+#: Values UNCHANGED by that move — same eleven bands, same cutoffs.
+GRADE_BANDS: list[tuple[float, str]] = [
+    (float(minimum), letter) for minimum, letter in card_spec().grade_bands
 ]
 
 
@@ -265,7 +264,7 @@ def _weighted_avg(components: list[tuple[float, float | None]]) -> float | None:
 #
 # Each table must sum to 1.0 — asserted by tests/test_scorecard.py.
 
-WEIGHT_TABLE_VERSION = "2026-08-31"
+WEIGHT_TABLE_VERSION: str = card_spec().weight_table_version
 
 #: Research weights AFTER the 2026-08-18 ruling on ``alpha-engine-config-I7210``
 #: (Brian, decision 1 = option (a)): ``cio`` (0.20) and ``sector_teams_avg``
@@ -288,12 +287,10 @@ WEIGHT_TABLE_VERSION = "2026-08-31"
 #: 0.364 / 0.273): those sum to 1.001, and ``tests/test_scorecard.py`` requires
 #: every table to sum to 1.0 within 1e-9. The exact rationals are the same
 #: number without the rounding error.
-RESEARCH_WEIGHTS: dict[str, float] = {
-    "scanner": 2 / 11,
-    "macro_agent": 2 / 11,
-    "composite_scoring": 4 / 11,
-    "calibration_diagnostics": 3 / 11,
-}
+#: Declared at ``registry.yaml#card.component_weights.research`` since
+#: alpha-engine-config-I9734 — the same four numbers, as the exact doubles the
+#: rationals above round to.
+RESEARCH_WEIGHTS: dict[str, float] = dict(card_spec().component_weights["research"])
 
 #: Components REMOVED from a weight table because their producer was retired —
 #: declared, not silently deleted (``observability-policy.md`` §8.3's
@@ -365,20 +362,9 @@ RETIRED_COMPONENTS: dict[str, list[dict]] = {
     ],
 }
 
-PREDICTOR_WEIGHTS: dict[str, float] = {
-    "meta_model": 0.55,
-    "veto_gate": 0.45,
-}
+PREDICTOR_WEIGHTS: dict[str, float] = dict(card_spec().component_weights["predictor"])
 
-EXECUTOR_WEIGHTS: dict[str, float] = {
-    "entry_triggers": 0.10,
-    "risk_guard": 0.15,
-    "exit_rules": 0.15,
-    "position_sizing": 0.10,
-    "portfolio": 0.25,
-    "excursion": 0.15,
-    "action_entropy": 0.10,
-}
+EXECUTOR_WEIGHTS: dict[str, float] = dict(card_spec().component_weights["executor"])
 
 #: Weight of the PRODUCT-OUTCOME tile in the system composite
 #: (``alpha-engine-config-I9005``, this PR). Until 2026-08-31 the composite
@@ -415,24 +401,18 @@ EXECUTOR_WEIGHTS: dict[str, float] = {
 #: renormalizes its weight away and the surviving three rescale to exactly
 #: 0.40 / 0.25 / 0.35 — the pre-2026-08-31 composite, to the last digit. The
 #: only cards whose headline moves are the ones where the outcome IS measured.
-PORTFOLIO_OUTCOME_WEIGHT = 0.50
+PORTFOLIO_OUTCOME_WEIGHT: float = card_spec().portfolio_outcome_weight
 
 #: Process-module weights, ruled 2026-08-18 (``alpha-engine-config-I7210``).
 #: Kept as their own table so the ratios Brian ruled on are readable here
 #: rather than only recoverable by dividing four numbers below.
-PROCESS_WEIGHTS: dict[str, float] = {
-    "research": 0.40,
-    "predictor": 0.25,
-    "executor": 0.35,
-}
+PROCESS_WEIGHTS: dict[str, float] = dict(card_spec().process_weights)
 
-OVERALL_WEIGHTS: dict[str, float] = {
-    "portfolio_outcome": PORTFOLIO_OUTCOME_WEIGHT,
-    **{
-        name: w * (1.0 - PORTFOLIO_OUTCOME_WEIGHT)
-        for name, w in PROCESS_WEIGHTS.items()
-    },
-}
+#: The headline composite's declared voters. Derived by ``CardSpec`` with the
+#: identical arithmetic this was a literal expression for: the outcome tile at
+#: its declared ``headline_weight``, each process module at its share of the
+#: remaining half.
+OVERALL_WEIGHTS: dict[str, float] = card_spec().overall_weights
 
 #: The scoring rule, stamped onto the artifact in words. A reader reproducing
 #: the grade needs the rule as much as the numbers — and the words must describe

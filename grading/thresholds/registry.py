@@ -110,10 +110,50 @@ class SlotSpec:
 
 
 @dataclass(frozen=True)
+class CardSpec:
+    """The report card's DECLARED population and the tables it grades with.
+
+    ``alpha-engine-config-I9734``. The card used to declare its membership in
+    four places that nothing reconciled — this file's ``metrics`` modules, a
+    hardcoded tile list in ``grading/aggregate.py``, ``module_agg``'s cascade
+    tuple, and the keys of the Python weight tables in ``grading/scorecard.py``.
+    They are one declaration now, and ``parse_registry`` raises when the
+    declared tile order and the tile set DERIVED from the rows' ``surface_tile``
+    disagree, so the two can no longer drift apart silently.
+
+    ``tiles`` declares ORDER and per-tile ROLE. It cannot declare membership:
+    that comes from the rows.
+    """
+
+    weight_table_version: str
+    grade_bands: tuple[tuple[float, str], ...]
+    tiles: tuple[str, ...]
+    cascade_modules: tuple[str, ...]
+    portfolio_outcome_weight: float
+    process_weights: dict[str, float]
+    component_weights: dict[str, dict[str, float]]
+
+    @property
+    def overall_weights(self) -> dict[str, float]:
+        """The headline composite's declared voters and their weights.
+
+        The outcome tile at its declared ``headline_weight``, and each process
+        module at its share of the remaining half — the same arithmetic
+        ``scorecard.OVERALL_WEIGHTS`` performed as a Python literal expression.
+        """
+        rest = 1.0 - self.portfolio_outcome_weight
+        return {
+            "portfolio_outcome": self.portfolio_outcome_weight,
+            **{name: w * rest for name, w in self.process_weights.items()},
+        }
+
+
+@dataclass(frozen=True)
 class ThresholdRegistry:
     slot: SlotSpec
     shared_bands: dict[str, tuple[float | None, float | None]]
     rows: dict[tuple[str, str], dict[str, Any]]
+    card: CardSpec
 
     def resolve(self, module: str, name: str, band: str = DEFAULT_BAND) -> Band:
         try:
@@ -198,6 +238,152 @@ _REQUIRED_SCORING_KEYS = ("metric", "label", "estimator", "cohort_max_cards",
 _ALLOWED_ROW_KEYS = frozenset({"target", "red_line", "higher_is_better",
                                "n_floor_declared", "dynamic", "note",
                                "surface_tile"})
+
+
+_ALLOWED_TILE_KEYS = frozenset({"cascades", "process_weight", "headline_weight"})
+
+
+def _check_sums_to_one(table: dict[str, float], what: str) -> None:
+    total = sum(table.values())
+    if abs(total - 1.0) > 1e-9:
+        raise ThresholdRegistrySchemaError(
+            f"{what} sums to {total!r}, not 1.0 — a weight table that does not "
+            f"sum to 1 publishes a grade nobody can reproduce from the card"
+        )
+
+
+def parse_card(doc: dict[str, Any], derived_tiles: frozenset[str]) -> CardSpec:
+    """Validate + structure ``registry.card`` against the DERIVED tile set.
+
+    ``derived_tiles`` is every distinct ``surface_tile`` across the rows — the
+    card's real population. ``card.tiles`` may order and annotate it; a
+    disagreement in either direction raises here, at load, rather than
+    surfacing as a module graded on one path and invisible on another
+    (``alpha-engine-config-I9734``).
+    """
+    card_doc = doc.get("card")
+    if not isinstance(card_doc, dict):
+        raise ThresholdRegistrySchemaError("registry.card must be a mapping")
+
+    version = card_doc.get("weight_table_version")
+    if not isinstance(version, str) or not version:
+        raise ThresholdRegistrySchemaError(
+            "registry.card.weight_table_version must be a non-empty string — it is "
+            "stamped onto every published card as grading_weights.version"
+        )
+
+    bands_doc = card_doc.get("grade_bands")
+    if not isinstance(bands_doc, list) or not bands_doc:
+        raise ThresholdRegistrySchemaError("registry.card.grade_bands must be a non-empty list")
+    bands: list[tuple[float, str]] = []
+    for entry in bands_doc:
+        if (not isinstance(entry, dict) or set(entry) != {"min", "letter"}
+                or not isinstance(entry["letter"], str)):
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.grade_bands entry {entry!r} must be {{min, letter}}"
+            )
+        bands.append((float(entry["min"]), entry["letter"]))
+    if [b[0] for b in bands] != sorted((b[0] for b in bands), reverse=True):
+        raise ThresholdRegistrySchemaError(
+            "registry.card.grade_bands must be ordered high to low — the ladder is "
+            "read first-match-wins, so an out-of-order band silently swallows the "
+            "ones below it"
+        )
+    if bands[-1][0] != 0:
+        raise ThresholdRegistrySchemaError(
+            "registry.card.grade_bands must end at min: 0 — a ladder with a floor "
+            "above 0 has scores it maps to no letter at all"
+        )
+
+    tiles_doc = card_doc.get("tiles")
+    if not isinstance(tiles_doc, dict) or not tiles_doc:
+        raise ThresholdRegistrySchemaError("registry.card.tiles must be a non-empty mapping")
+
+    declared = tuple(tiles_doc)
+    # THE reconciliation, enforced at load rather than left to a convention.
+    missing = sorted(derived_tiles - set(declared))
+    extra = sorted(set(declared) - derived_tiles)
+    if missing or extra:
+        raise ThresholdRegistrySchemaError(
+            f"registry.card.tiles disagrees with the tile set derived from the metric "
+            f"rows (alpha-engine-config-I9734): rows surface on {missing!r} which "
+            f"card.tiles does not declare; card.tiles declares {extra!r} which no row "
+            f"surfaces on. card.tiles orders and annotates the card's population — the "
+            f"rows (and their `surface_tile`) define it."
+        )
+
+    cascade: list[str] = []
+    process: dict[str, float] = {}
+    outcome_weight: float | None = None
+    for tile, spec in tiles_doc.items():
+        spec = spec or {}
+        if not isinstance(spec, dict):
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.tiles.{tile} must be a mapping (use {{}} for a tile "
+                f"that only renders)"
+            )
+        unknown = set(spec) - _ALLOWED_TILE_KEYS
+        if unknown:
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.tiles.{tile} has unknown keys {sorted(unknown)}"
+            )
+        if "process_weight" in spec and "headline_weight" in spec:
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.tiles.{tile} declares both process_weight and "
+                f"headline_weight — a tile votes in the composite once"
+            )
+        if spec.get("cascades"):
+            cascade.append(tile)
+        if "process_weight" in spec:
+            process[tile] = float(spec["process_weight"])
+        if "headline_weight" in spec:
+            if outcome_weight is not None:
+                raise ThresholdRegistrySchemaError(
+                    "registry.card.tiles declares headline_weight on more than one "
+                    "tile — the process half is shared via process_weight"
+                )
+            outcome_weight = float(spec["headline_weight"])
+
+    if outcome_weight is None:
+        raise ThresholdRegistrySchemaError(
+            "registry.card.tiles declares no headline_weight — the composite needs "
+            "the product-outcome voter's share (alpha-engine-config-I9005)"
+        )
+    if not process:
+        raise ThresholdRegistrySchemaError(
+            "registry.card.tiles declares no process_weight on any tile"
+        )
+    _check_sums_to_one(process, "registry.card process_weight over the process tiles")
+
+    weights_doc = card_doc.get("component_weights")
+    if not isinstance(weights_doc, dict) or not weights_doc:
+        raise ThresholdRegistrySchemaError(
+            "registry.card.component_weights must be a non-empty mapping"
+        )
+    component_weights: dict[str, dict[str, float]] = {}
+    for tile, table in weights_doc.items():
+        if tile not in declared:
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.component_weights.{tile} is not a declared card tile "
+                f"— known tiles: {sorted(declared)}"
+            )
+        if not isinstance(table, dict) or not table:
+            raise ThresholdRegistrySchemaError(
+                f"registry.card.component_weights.{tile} must be a non-empty mapping"
+            )
+        parsed = {name: float(w) for name, w in table.items()}
+        _check_sums_to_one(parsed, f"registry.card.component_weights.{tile}")
+        component_weights[tile] = parsed
+
+    return CardSpec(
+        weight_table_version=version,
+        grade_bands=tuple(bands),
+        tiles=declared,
+        cascade_modules=tuple(cascade),
+        portfolio_outcome_weight=outcome_weight,
+        process_weights=process,
+        component_weights=component_weights,
+    )
 
 
 def parse_registry(doc: dict[str, Any]) -> ThresholdRegistry:
@@ -308,7 +494,17 @@ def parse_registry(doc: dict[str, Any]) -> ThresholdRegistry:
                 )
             rows[(module, name)] = row
 
-    return ThresholdRegistry(slot=slot, shared_bands=shared, rows=rows)
+    derived_tiles = frozenset(
+        row.get("surface_tile") or module for (module, _), row in rows.items()
+    )
+    card = parse_card(doc, derived_tiles)
+
+    # NOTE: `card.component_weights` keys are the v1 composite's SECTION names
+    # (`meta_model`, `scanner`, ...), a different namespace from a v2 tile's
+    # component roster — so they are deliberately NOT checked against the rows.
+    # The reconciliation that matters is on the TILES, above.
+
+    return ThresholdRegistry(slot=slot, shared_bands=shared, rows=rows, card=card)
 
 
 @functools.cache
@@ -343,3 +539,18 @@ def tile_roster(tile: str) -> frozenset[str]:
             f"{REGISTRY_PATH.name}, or declare `surface_tile: {tile}` on the "
             f"rows that render there."
         ) from None
+
+
+def card_spec() -> CardSpec:
+    """The committed card declaration — population, order, bands and weights."""
+    return load_registry().card
+
+
+def declared_tiles() -> tuple[str, ...]:
+    """Every card tile, in declared build/publication order.
+
+    ``grading/aggregate.py`` builds exactly these, and
+    ``grading/module_agg.py``/``grading/scorecard.py`` draw their cascade set
+    and weight tables from the same declaration (alpha-engine-config-I9734).
+    """
+    return load_registry().card.tiles
