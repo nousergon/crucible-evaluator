@@ -99,8 +99,12 @@ class TestBuildTileMissingInput:
     def test_all_components_na_missing_input(self, s3):
         tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
         assert tile["module"] == "portfolio_outcome"
-        # No eod_pnl → every component N/A-MISSING-INPUT.
-        statuses = {c["status"] for c in tile["components"]}
+        # No eod_pnl → every component the builder EMITTED is
+        # N/A-MISSING-INPUT. alpha-engine-config-I9612: any declared roster
+        # member the builder did not emit at all is additionally rendered
+        # N/A-UNREPORTED, which is a different fact and says so.
+        statuses = {c["status"] for c in tile["components"]
+                    if not c.get("unreported")}
         assert statuses == {"N/A-MISSING-INPUT"}
         # alpha-engine-config-I8177: a tile in which NOTHING graded is
         # UNMEASURED, not measured-and-borderline. It reports the N/A

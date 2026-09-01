@@ -20,10 +20,18 @@ Authoritative: ``system-report-card-revamp-260522.md`` §"Aggregation methodolog
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from krepis.metrics import MetricRecord, StatusLiteral
 from nousergon_lib.quant.stats.multiple_testing import benjamini_hochberg
+
+# Same literal, same meaning as the card census's — imported rather than
+# re-declared so the tile line and `grading/coverage.py` can never disagree
+# about what an unreported component is called.
+from grading.coverage import UNREPORTED_STATUS
+from grading.thresholds.registry import tile_roster
 
 # Modules whose RED cascades to an overall RED (RC v2 module→overall rule).
 _CASCADE_MODULES = ("research", "predictor", "executor", "substrate")
@@ -41,6 +49,91 @@ _CASCADE_MODULES = ("research", "predictor", "executor", "substrate")
 # ``signals/latest.json``) contributes no date — that is an honest gap in
 # per-artifact dating, not an omission on our part.
 _ARTIFACT_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+@dataclass(frozen=True)
+class UnreportedComponent:
+    """A roster member whose tile builder produced no record for it.
+
+    ``alpha-engine-config-I9612``. ``build_tile`` used to derive a tile's
+    status, letter, grade and ``n_components`` from the list its builder
+    HANDED it — the "denominator is whatever reported" shape ``I8193`` removed
+    one level up, at the card census. A builder that silently omitted a record
+    (a conditional append, an artifact read that returned nothing) produced a
+    tile with fewer components, and because the critical-gate ladder is
+    worst-of over the records PRESENT, a dropped **critical** component could
+    not turn its tile RED: the tile rendered GREEN/WATCH over the survivors,
+    with ``n_components`` quietly one smaller and nothing saying so.
+
+    A missing record is now materialised as one of these, from the tile's
+    declared roster (``grading/thresholds/registry.py::tile_roster``). It is
+    deliberately NOT a ``MetricRecord``: that contract requires a
+    ``source_path``, a ``status_reason``, a ``last_updated_utc`` and a status
+    from the closed ``StatusLiteral`` taxonomy — all things a component that
+    produced nothing has not got. Inventing them would be the fabrication the
+    record contract exists to prevent. It duck-types the attributes the
+    aggregation functions in this module read, and nothing else.
+
+    **Criticality is ``critical``, always.** The registry declares bands, not
+    criticality — that lives at the tile call site, which is exactly the code
+    that failed to run. So the criticality of an absent component is
+    genuinely unknown, and the fail-loud reading of an unknown is the one that
+    cannot flatter the tile: an unmeasured critical holds the tile at WATCH
+    and can never let it claim GREEN (``principles.md`` §2.7 — *no data* is
+    never rendered as green).
+    """
+
+    name: str
+    module: str
+    status: str = UNREPORTED_STATUS
+    criticality: str = "critical"
+    value: None = None
+    target: None = None
+    red_line: None = None
+    bh_fdr_adjusted_p: None = None
+
+    @property
+    def is_na(self) -> bool:
+        return True
+
+    def model_dump(self, mode: str = "json") -> dict:
+        """Render on the tile the way every other component does.
+
+        ``unreported: True`` is the flag ``grading/coverage.py`` reads to keep
+        the CARD census counting this component as declared-but-not-rendered
+        (where ``I8193`` put it) rather than as a rendered record — the two
+        surfaces must report the same fact once, not twice.
+        """
+        return {
+            "name": self.name,
+            "module": self.module,
+            "status": self.status,
+            "criticality": self.criticality,
+            # Explicit nulls, not omissions: every renderer of a tile's
+            # component list gets the same shape, and "there is no value" is
+            # said rather than left to a missing key.
+            "value": None,
+            "unit": None,
+            "n_samples": None,
+            "n_floor": None,
+            "ci_low": None,
+            "ci_high": None,
+            "target": None,
+            "red_line": None,
+            "trend_4w": None,
+            "trend_13w": None,
+            "derived_letter": "N/A",
+            "unreported": True,
+            "status_reason": (
+                f"{self.name}: declared on the {self.module!r} tile's roster "
+                f"(grading/thresholds/registry.yaml) but its tile builder "
+                f"produced no record this cycle — the component did not report, "
+                f"which is not the same as having nothing to report "
+                f"(alpha-engine-config-I9612)."
+            ),
+            "na_detail": "declared component produced no record this cycle",
+            "source_path": None,
+            "last_updated_utc": None,
+        }
 
 
 def bh_fdr_significant(p_values: list[float], alpha: float = 0.05) -> bool:
@@ -92,8 +185,19 @@ def unmeasured_status(components: list[MetricRecord]) -> StatusLiteral | None:
         return None
     if any(not c.is_na for c in components):
         return None
+    # An unreported roster member is not a DECLARATION by anyone — nothing ran
+    # to say why it is absent. So it does not vote on which N/A class the tile
+    # reports; the components that did declare a class own that answer, and
+    # UNREPORTED is the residual when there are no such components at all.
+    # Without this, one honest `N/A-MISSING-INPUT` sentinel on a tile whose
+    # builder short-circuits (the predictor tile's both-inputs-absent path)
+    # would be outvoted by the roster members its own short circuit produced,
+    # and the tile would stop naming the reason it already knew.
+    declared = [c for c in components if c.status != UNREPORTED_STATUS]
+    if not declared:
+        return UNREPORTED_STATUS  # type: ignore[return-value]
     counts = {s: 0 for s in _UNMEASURED_PRECEDENCE}
-    for c in components:
+    for c in declared:
         if c.status in counts:
             counts[c.status] += 1
     top = max(counts.values())
@@ -103,7 +207,7 @@ def unmeasured_status(components: list[MetricRecord]) -> StatusLiteral | None:
         # vocabulary exists to remove (`observability-policy.md` §8.3).
         raise ValueError(
             "unmeasured tile carries N/A statuses outside the closed taxonomy: "
-            + ", ".join(sorted({str(c.status) for c in components})),
+            + ", ".join(sorted({str(c.status) for c in declared})),
         )
     for status in _UNMEASURED_PRECEDENCE:
         if counts[status] == top:
@@ -247,8 +351,30 @@ def build_tile(
     module: str, components: list[MetricRecord], *,
     alpha: float = 0.05,
     staleness: dict | None = None,
+    roster: Iterable[str] | None = None,
 ) -> dict:
-    """Assemble a tile summary from its components.
+    """Assemble a tile summary, graded against the tile's DECLARED roster.
+
+    ``alpha-engine-config-I9612``. The roster is
+    ``grading/thresholds/registry.py::tile_roster(module)`` — the same
+    committed rows ``grading/coverage.py`` uses as the card-level denominator,
+    partitioned by each row's ``surface_tile`` (its owning module unless the
+    row declares otherwise, which is how the ``*_contribution_lift`` family
+    surfaces on its own tile). No second registry, and nothing hand-listed
+    per tile: a component the card can grade must have a row, because
+    ``build_metric`` raises without one.
+
+    Every roster member with no record among ``components`` is materialised as
+    an ``UnreportedComponent`` — counted in ``n_components``, named on the
+    tile, and treated by the critical gate as an unmeasured critical. So a
+    builder that drops a record can no longer shrink its own denominator, and
+    a dropped critical can no longer leave the tile GREEN over the survivors.
+
+    ``roster`` overrides the registry lookup. It exists for tests that pin the
+    grading rules against synthetic components without also pinning the live
+    registry's contents; production passes nothing. Passing an explicit empty
+    roster is the one way to get the pre-I9612 "grade whatever was handed in"
+    behaviour, and it is deliberately something a caller has to write down.
 
     Adds the RC v2 per-tile freshness stamps (config-I2556):
       - ``as_of``: ISO UTC time this tile finished computing — the max of its
@@ -269,8 +395,16 @@ def build_tile(
     """
     from krepis.metrics import derive_letter
 
-    status = module_status(components, alpha=alpha)
-    dumped = [c.model_dump(mode="json") for c in components]
+    declared = frozenset(roster) if roster is not None else tile_roster(module)
+    present = {c.name for c in components}
+    unreported = [
+        UnreportedComponent(name=name, module=module)
+        for name in sorted(declared - present)
+    ]
+    graded_against = [*components, *unreported]
+
+    status = module_status(graded_against, alpha=alpha)
+    dumped = [c.model_dump(mode="json") for c in graded_against]
 
     stamps = [d for c in dumped if (d := c.get("last_updated_utc"))]
     as_of = max(stamps) if stamps else datetime.now(UTC).isoformat()
@@ -285,12 +419,18 @@ def build_tile(
         "module": module,
         "status": status,
         "letter": derive_letter(status),
-        "numeric_grade": numeric_grade(components),
-        "n_components": len(components),
+        "numeric_grade": numeric_grade(graded_against),
+        # The tile's DECLARED roster size, not the length of the list its
+        # builder handed in (alpha-engine-config-I9612). These differ exactly
+        # when a component went unreported, and `unreported` below names which.
+        "n_components": len(graded_against),
         # The denominator behind this tile's status, on the tile line itself.
         # A reader (and the card census) can see "11 components, 0 graded"
         # without opening the component list (alpha-engine-config-I8177).
-        "n_graded": sum(1 for c in components if not c.is_na),
+        "n_graded": sum(1 for c in graded_against if not c.is_na),
+        # Named, never merely counted: a denominator a reader cannot
+        # reconstruct is how the previous number survived unquestioned.
+        "unreported": [c.name for c in unreported],
         "as_of": as_of,
         "source_artifact_dates": source_artifact_dates,
         "components": dumped,

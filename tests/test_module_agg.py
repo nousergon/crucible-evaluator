@@ -108,7 +108,12 @@ class TestNumericGrade:
 class TestBuildTile:
     def test_shape(self):
         # supporting RED → module WATCH (a supporting WATCH would NOT escalate).
-        tile = build_tile("portfolio_outcome", [_crit("GREEN"), _sup("RED")])
+        # Roster injected as the fixture's own component set: this test pins the
+        # critical-gate arithmetic, not the live registry's roster for this tile
+        # (that is alpha-engine-config-I9612, pinned in test_tile_roster_denominator.py).
+        components = [_crit("GREEN"), _sup("RED")]
+        tile = build_tile("portfolio_outcome", components,
+                          roster=[c.name for c in components])
         assert tile["module"] == "portfolio_outcome"
         assert tile["status"] == "WATCH"
         assert tile["letter"] == "C"
@@ -133,7 +138,7 @@ class TestBuildTileFreshnessStamps:
         older = _crit("GREEN")
         older.last_updated_utc = older.last_updated_utc.replace(year=2020)
         newer = _sup("GREEN")
-        tile = build_tile("m", [older, newer])
+        tile = build_tile("m", [older, newer], roster=[older.name, newer.name])
         # as_of reflects the freshest (newer) component, not the older one.
         assert tile["as_of"] == newer.last_updated_utc.isoformat().replace("+00:00", "Z")
 

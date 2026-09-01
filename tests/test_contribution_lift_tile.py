@@ -111,7 +111,12 @@ class TestFullArtifact:
     def test_ok_component_shape(self, s3):
         _put(s3, FULL_DOC)
         tile = build_contribution_lift_tile(BUCKET, RUN_DATE, s3_client=s3)
-        assert tile["n_components"] == 4
+        # alpha-engine-config-I9612: the tile grades against its DECLARED
+        # roster, so an artifact carrying only 4 of the 26 declared rows
+        # renders 26 components — 22 of them N/A-UNREPORTED and named —
+        # rather than a 4-component tile that says nothing went missing.
+        assert tile["n_components"] == len(KNOWN_COMPONENTS)
+        assert len(tile["unreported"]) == len(KNOWN_COMPONENTS) - 4
         c = _comp(tile, "risk_guard_contribution_lift")
         assert c["module"] == "executor"
         assert c["metric_type"] == "contribution_lift"
@@ -160,6 +165,8 @@ class TestContractShape:
         _put(s3, FULL_DOC)
         tile = build_contribution_lift_tile(BUCKET, RUN_DATE, s3_client=s3)
         for c in tile["components"]:
+            if c.get("unreported"):
+                continue  # a roster member with no record has no bands to carry
             if c["value"] is not None:
                 assert c["unit"] == "log_alpha_21d"
             assert c["red_line"] == 0.0
