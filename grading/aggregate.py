@@ -45,7 +45,8 @@ from grading.pipeline_gates import gates_unmeasured, read_gate_state
 from grading.run_scope import RUN_SCOPE_KEY, log_run_scope, read_run_scope, scope_unknown
 from grading.self_test import run_self_test
 from grading.self_test import verdict_is_pass as self_test_is_pass
-from grading.module_agg import overall_status
+from grading.module_agg import build_tile, overall_status
+from grading.thresholds.registry import declared_tiles
 from grading.thresholds.scoring import build_leaderboard
 from nousergon_lib.quant.stats.trial_accumulator import read_cumulative_trial_count
 from grading.tiles.agent import build_agent_tile
@@ -183,6 +184,45 @@ def _outcome_voter(tile: dict | None) -> dict:
             f"(tile status {status or 'absent'})",
         )
     return block
+
+
+def _undeclared_tile_builder(name: str):
+    """The builder for a card tile the registry declares and Python does not.
+
+    ``alpha-engine-config-I9734``. A module added to
+    ``registry.yaml#card.tiles`` (with its metric rows) appears on the card
+    IMMEDIATELY, with no Python edit — rendered as its full declared roster,
+    every component ``UNREPORTED``. That is the honest state of a declared-but-
+    unbuilt tile and it is the point: absence shows up as an unreported
+    denominator that drags coverage down, never as a tile that quietly is not
+    there. Wiring a real ``grading/tiles/<name>.py`` then replaces the shell.
+    """
+    return lambda: build_tile(name, [])
+
+
+def resolve_tile_builders(builders: dict[str, object]) -> list[tuple[str, object]]:
+    """``registry.yaml#card.tiles`` order → ``(tile, builder)``, reconciled.
+
+    The card's membership is DECLARED (``alpha-engine-config-I9734``), not
+    hardcoded here. This module contributes builders; the registry decides who
+    is on the card and in what order. A builder for a tile the registry does not
+    declare raises — it would compute a tile no roster grades, and no census
+    could see it.
+    """
+    declared = declared_tiles()
+    undeclared = sorted(set(builders) - set(declared))
+    if undeclared:
+        raise ValueError(
+            f"grading/aggregate.py has tile builders {undeclared} that "
+            f"grading/thresholds/registry.yaml#card.tiles does not declare. The "
+            f"registry is the card's membership declaration "
+            f"(alpha-engine-config-I9734): add the tile's metric rows and its "
+            f"card.tiles entry, or drop the builder."
+        )
+    return [
+        (name, builders.get(name) or _undeclared_tile_builder(name))
+        for name in declared
+    ]
 
 
 def build_report_card(
@@ -325,24 +365,25 @@ def build_report_card(
     # the exact inversion the I7210 failure-scores-zero rule exists to prevent
     # (see the portfolio_outcome note below). The pool changes WHEN work runs,
     # never what a failure means.
-    _tile_builders: list[tuple[str, object]] = [
-        ("portfolio_outcome", lambda: build_portfolio_outcome_tile(
+    _builders: dict[str, object] = {
+        "portfolio_outcome": lambda: build_portfolio_outcome_tile(
             bucket, s3_client=s3_client, history=history, n_trials=n_trials,
-        )),
-        ("predictor", lambda: build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history)),
-        ("research", lambda: build_research_tile(bucket, run_date, s3_client=s3_client, history=history)),
-        ("executor", lambda: build_executor_tile(bucket, run_date, s3_client=s3_client)),
-        ("backtester", lambda: build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history)),
-        ("substrate", lambda: build_substrate_tile(
+        ),
+        "predictor": lambda: build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
+        "research": lambda: build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
+        "executor": lambda: build_executor_tile(bucket, run_date, s3_client=s3_client),
+        "backtester": lambda: build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history),
+        "substrate": lambda: build_substrate_tile(
             bucket, run_date, s3_client=s3_client,
             threshold_leaderboard=threshold_leaderboard,
             threshold_leaderboard_error=threshold_leaderboard_error,
-        )),
-        ("agent", lambda: build_agent_tile(bucket, run_date, s3_client=s3_client)),
-        ("behavioral", lambda: build_behavioral_tile(bucket, run_date, s3_client=s3_client)),
-        ("director_quality", lambda: build_director_quality_tile(bucket, run_date, s3_client=s3_client)),
-        ("contribution_lift", lambda: build_contribution_lift_tile(bucket, run_date, s3_client=s3_client)),
-    ]
+        ),
+        "agent": lambda: build_agent_tile(bucket, run_date, s3_client=s3_client),
+        "behavioral": lambda: build_behavioral_tile(bucket, run_date, s3_client=s3_client),
+        "director_quality": lambda: build_director_quality_tile(bucket, run_date, s3_client=s3_client),
+        "contribution_lift": lambda: build_contribution_lift_tile(bucket, run_date, s3_client=s3_client),
+    }
+    _tile_builders: list[tuple[str, object]] = resolve_tile_builders(_builders)
     with ThreadPoolExecutor(
         max_workers=_TILE_POOL_WORKERS, thread_name_prefix="tile",
     ) as pool:
@@ -389,10 +430,13 @@ def build_report_card(
     #     (research/predictor/executor/behavioral) so it renders beside that
     #     component on any surface grouping by a record's own `.module`.
     # TEN tiles total; the historical numbering skips 8 (0–7, 9, 10) — there
-    # is no Tile 8. `_tile_builders` above is the membership source of truth
-    # (pinned by tests/test_aggregate.py + test_handler.py); this dict is its
-    # projection, so membership cannot drift between what is BUILT and what is
-    # PUBLISHED (I9702 — before the pool, the two were two separate literals).
+    # is no Tile 8. That TEN is not asserted here and is not a literal anywhere
+    # in this module: `resolve_tile_builders` takes it from
+    # `registry.yaml#card.tiles`, whose membership `parse_registry` reconciles
+    # against the tile set derived from the metric rows themselves
+    # (alpha-engine-config-I9734). This dict is a projection of that same
+    # ordered list, so membership cannot drift between what is DECLARED, what is
+    # BUILT and what is PUBLISHED.
     tiles = {name: built_tiles[name] for name, _ in _tile_builders}
     # alpha-engine-config-I8177 — `evaluator_coverage` grades THIS card, not the
     # legacy v1 `grading.json`.
