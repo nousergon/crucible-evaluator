@@ -16,6 +16,9 @@ detector with no coverage, not a passing test).
 
 from __future__ import annotations
 
+import pytest
+
+import grading.artifact_registry as artifact_registry_module
 import grading.metric_record as metric_record_module
 
 _seen: list[tuple[str, str, float | None, str | None]] = []
@@ -43,3 +46,39 @@ def unit_contract_sweep_results() -> list[tuple[str, str, float | None, str | No
     filename, under pytest's default alphabetical collection) so it sees every
     ``build_metric`` call made by the rest of the suite."""
     return list(_seen)
+
+
+# ── The declared artifact registry (alpha-engine-config-I9731) ──────────────
+#
+# `grading/freshness_preflight.py` reads its predicates from the published
+# ARTIFACT_REGISTRY.yaml mirror at run time instead of a hardcoded table, so
+# every test that reaches `build_report_card` needs that document to exist.
+# Installing the double here rather than seeding it in each module's own
+# `_seed_freshness_inputs` keeps the change to one file and means a test module
+# added later inherits it.
+#
+# `tests/test_freshness_preflight.py` marks itself `real_artifact_registry` and
+# seeds the mirror into its own moto bucket instead: the S3 read path, the
+# unreadable-registry failures and the dropped-row failures are that module's
+# subject, and a suite-wide double would hide all three.
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_artifact_registry: read the ARTIFACT_REGISTRY mirror from S3 for "
+        "real instead of the suite-wide test double",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _declared_artifact_registry(request, monkeypatch):
+    if request.node.get_closest_marker("real_artifact_registry"):
+        return
+    from tests.artifact_registry_fixture import registry_document
+
+    monkeypatch.setattr(
+        artifact_registry_module,
+        "load_registry",
+        lambda *_args, **_kwargs: registry_document(),
+    )

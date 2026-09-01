@@ -17,19 +17,45 @@ as opposed to an artifact that is simply absent.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import boto3
 import pytest
+import yaml
 from moto import mock_aws
 
+from grading import freshness_preflight
+
+from grading.artifact_registry import (
+    REGISTRY_BUCKET,
+    REGISTRY_KEY,
+    RegistryRowMissingError,
+    RegistryUnavailableError,
+)
 from grading.freshness_preflight import (
+    GATED_ARTIFACT_IDS,
     MissingInputArtifactError,
     StaleInputArtifactError,
     assert_input_freshness,
 )
+from grading.freshness_preflight import _CHECK_FNS  # noqa: PLC2701 — structural invariant test
+from tests.artifact_registry_fixture import REGISTRY_FIXTURE
+
+#: This module's subject IS the registry read path — the suite-wide test
+#: double (tests/conftest.py) is opted out of so the real S3 load runs.
+pytestmark = pytest.mark.real_artifact_registry
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-07-18"  # a Saturday, mirrors the incident's own run_date
+
+def _seed_registry(s3, body: str = REGISTRY_FIXTURE):
+    """Publish the registry mirror the preflight reads its predicates from.
+
+    Seeded by the fixture rather than per-test: an unreadable registry is not a
+    per-test variable, it is a precondition — and the tests that DO exercise
+    its absence say so explicitly (TestRegistryIsNotOptional, below).
+    """
+    s3.put_object(Bucket=BUCKET, Key=REGISTRY_KEY, Body=body.encode())
 
 
 @pytest.fixture
@@ -37,6 +63,7 @@ def s3():
     with mock_aws():
         client = boto3.client("s3", region_name="us-east-1")
         client.create_bucket(Bucket=BUCKET)
+        _seed_registry(client)
         yield client
 
 
@@ -60,26 +87,6 @@ def _seed_manifest(s3, training_date):
         Body=json.dumps({
             "training_date": training_date,
             "meta_model_oos_ic_cpcv": {"status": "ok", "mean_ic": 0.1},
-        }).encode(),
-    )
-
-
-def _seed_promotion_record(
-    s3,
-    run_date: str,
-    *,
-    promoted=None,
-    prior_champion="v3.0-meta-2026-08-14-119e069b",
-    champion_after="v3.0-meta-2026-08-14-119e069b",
-):
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=f"predictor/model_zoo/promotions/{run_date}.json",
-        Body=json.dumps({
-            "run_date": run_date,
-            "promoted": promoted,
-            "prior_champion_version_id": prior_champion,
-            "champion_version_id_after": champion_after,
         }).encode(),
     )
 
@@ -116,8 +123,12 @@ class TestFreshInputsPass:
         result = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
         assert result["run_date"] == RUN_DATE
         ids = {c["artifact_id"] for c in result["checks"]}
-        assert ids == {
-            "metrics_json", "e2e_lift_json", "predictor_meta_weights_manifest",
+        assert ids == set(GATED_ARTIFACT_IDS) == {
+            # The ARTIFACT_REGISTRY.yaml `artifact_id`s themselves since
+            # alpha-engine-config-I9731 — the provenance a card carries is now
+            # directly greppable against the registry.
+            "backtest_metrics", "backtest_e2e_lift",
+            "predictor_meta_weights_manifest",
             "research_signals", "eod_reconcile_pnl",
         }
 
@@ -131,7 +142,7 @@ class TestFreshInputsPass:
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
         result = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
-        e2e = next(c for c in result["checks"] if c["artifact_id"] == "e2e_lift_json")
+        e2e = next(c for c in result["checks"] if c["artifact_id"] == "backtest_e2e_lift")
         assert e2e["content_date"] == "2026-07-15"
 
     def test_eod_pnl_one_trading_day_behind_passes(self, s3):
@@ -160,7 +171,7 @@ class TestStaleInputsRaise:
         _seed_manifest(s3, RUN_DATE)
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(StaleInputArtifactError, match="e2e_lift.json is stale"):
+        with pytest.raises(StaleInputArtifactError, match="backtest_e2e_lift is stale"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
     def test_stale_metrics_json_raises_named_error(self, s3):
@@ -175,25 +186,26 @@ class TestStaleInputsRaise:
         _seed_manifest(s3, RUN_DATE)
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(StaleInputArtifactError, match="metrics.json is stale"):
+        with pytest.raises(StaleInputArtifactError, match="backtest_metrics is stale"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
-    def test_stale_predictor_manifest_raises_named_error(self, s3):
-        _seed_metrics(s3)
-        _seed_e2e_lift(s3, RUN_DATE)
-        _seed_manifest(s3, "2026-06-20")  # weeks stale
-        _seed_signals(s3, RUN_DATE)
-        _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(StaleInputArtifactError, match="predictor manifest is stale"):
-            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+    def test_event_driven_manifest_is_not_aged_out(self, s3):
+        """`predictor_meta_weights_manifest` declares `cadence: event_driven`
+        (alpha-engine-config-I9018): `promote_to_champion` is its sole writer,
+        a week with no promotion is the expected case, and its producer
+        liveness rides the separately-monitored `model_zoo_leaderboard_latest`
+        anchor. So an old manifest is NOT stale here — and the window label
+        must say so, naming the anchor, rather than reading like a plain pass.
 
-    def test_incumbent_retained_manifest_outside_week_passes(self, s3):
-        # Model-zoo ran and promoted nothing — manifest date predates the week
-        # but the promotion record proves the incumbent is the intended bundle.
+        This replaces alpha-engine-config-I9255's hand-rolled
+        `_incumbent_retained_this_week` carve-out (a second S3 read of the
+        promotion record, to prove a stale-looking manifest was an intentional
+        no-promotion week). It was a subset of exactly what `event_driven`
+        declares, on the one row that declares it.
+        """
         _seed_metrics(s3)
         _seed_e2e_lift(s3, RUN_DATE)
-        _seed_manifest(s3, "2026-08-14")
-        _seed_promotion_record(s3, RUN_DATE)
+        _seed_manifest(s3, "2026-06-20")  # weeks older than the run week
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
         result = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
@@ -201,8 +213,27 @@ class TestStaleInputsRaise:
             c for c in result["checks"]
             if c["artifact_id"] == "predictor_meta_weights_manifest"
         )
-        assert manifest["content_date"] == "2026-08-14"
-        assert "incumbent retained" in manifest["window"]
+        assert manifest["content_date"] == "2026-06-20"
+        assert "event_driven" in manifest["window"]
+        assert "model_zoo_leaderboard_latest" in manifest["window"]
+
+    def test_a_re_cadenced_manifest_row_IS_aged_out_again(self, s3):
+        """The other polarity, and the one proving the window is READ rather
+        than hardcoded: publish the same registry with the manifest row back on
+        `saturday_sf`, change nothing else, and the identical old manifest must
+        now raise. Without this, `event_driven` and "we quietly stopped
+        checking" are indistinguishable."""
+        _seed_registry(s3, REGISTRY_FIXTURE.replace(
+            "    cadence: event_driven\n    liveness_via: model_zoo_leaderboard_latest\n",
+            "    cadence: saturday_sf\n",
+        ))
+        _seed_metrics(s3)
+        _seed_e2e_lift(s3, RUN_DATE)
+        _seed_manifest(s3, "2026-06-20")
+        _seed_signals(s3, RUN_DATE)
+        _seed_eod_pnl(s3, [RUN_DATE])
+        with pytest.raises(StaleInputArtifactError, match="predictor_meta_weights_manifest is stale"):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
     def test_stale_signals_raises_named_error(self, s3):
         _seed_metrics(s3)
@@ -210,7 +241,7 @@ class TestStaleInputsRaise:
         _seed_manifest(s3, RUN_DATE)
         _seed_signals(s3, "2026-07-08")  # prior week, within the 10-day walk-back window
         _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(StaleInputArtifactError, match="signals.json is stale"):
+        with pytest.raises(StaleInputArtifactError, match="research_signals is stale"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
     def test_stale_eod_pnl_raises_named_error(self, s3):
@@ -219,7 +250,7 @@ class TestStaleInputsRaise:
         _seed_manifest(s3, RUN_DATE)
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, ["2026-07-01"])  # over a week of trading days stale
-        with pytest.raises(StaleInputArtifactError, match="eod_pnl.csv is stale"):
+        with pytest.raises(StaleInputArtifactError, match="eod_reconcile_pnl is stale"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
 
@@ -249,7 +280,7 @@ class TestMissingInputsRaiseNotSkip:
         _seed_e2e_lift(s3, RUN_DATE)
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(MissingInputArtifactError, match="predictor manifest"):
+        with pytest.raises(MissingInputArtifactError, match="predictor_meta_weights_manifest"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
     def test_missing_signals_raises(self, s3):
@@ -284,22 +315,36 @@ class TestMissingInputsRaiseNotSkip:
         )
         _seed_signals(s3, RUN_DATE)
         _seed_eod_pnl(s3, [RUN_DATE])
-        with pytest.raises(MissingInputArtifactError, match="predictor manifest"):
+        with pytest.raises(MissingInputArtifactError, match="predictor_meta_weights_manifest"):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+
+def _deny_every_read_but_the_registry(s3):
+    """Make every artifact GetObject AccessDenied while the registry mirror
+    still reads. Registry-unreadable and artifact-unreadable are DIFFERENT
+    failures with different owners, so a test for one must not silently be
+    exercising the other (alpha-engine-config-I9731)."""
+    from botocore.exceptions import ClientError
+
+    real_get = s3.get_object
+
+    def _selective(**kwargs):
+        if kwargs.get("Key") == REGISTRY_KEY:
+            return real_get(**kwargs)
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject",
+        )
+
+    return _selective
 
 
 class TestOtherS3ErrorsPropagate:
     def test_non_404_client_error_raises_unchanged(self, s3, monkeypatch):
-        from unittest.mock import MagicMock
-
         from botocore.exceptions import ClientError
 
-        broken = MagicMock()
-        broken.get_object.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject"
-        )
+        monkeypatch.setattr(s3, "get_object", _deny_every_read_but_the_registry(s3))
         with pytest.raises(ClientError):
-            assert_input_freshness(BUCKET, RUN_DATE, s3_client=broken)
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
 
 
 class TestBadRunDate:
@@ -379,12 +424,7 @@ class TestDryPathIsMeasuredNotSkipped:
         """
         from botocore.exceptions import ClientError
 
-        def _denied(*_args, **_kwargs):
-            raise ClientError(
-                {"Error": {"Code": "AccessDenied", "Message": "denied"}}, "GetObject",
-            )
-
-        monkeypatch.setattr(s3, "get_object", _denied)
+        monkeypatch.setattr(s3, "get_object", _deny_every_read_but_the_registry(s3))
 
         with pytest.raises(ClientError) as exc:
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
@@ -410,3 +450,141 @@ class TestDryPathIsMeasuredNotSkipped:
         # ...and the real run still refuses it.
         with pytest.raises(StaleInputArtifactError):
             assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=False)
+
+
+# ── The registry is not optional (alpha-engine-config-I9731) ────────────────
+
+
+class TestRegistryIsNotOptional:
+    """The predicates this gate grades against are READ, not compiled in. That
+    only holds if an unreadable or incomplete registry FAILS — a preflight that
+    cannot load its rules and reports clean is strictly worse than one that
+    fails, because it publishes a Report Card that looks graded and gated
+    nothing. There is no fallback table by design: a fallback IS the drift this
+    change removes.
+    """
+
+    def test_missing_registry_raises_on_the_real_path(self, s3):
+        s3.delete_object(Bucket=BUCKET, Key=REGISTRY_KEY)
+        with pytest.raises(RegistryUnavailableError, match="could not load"):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    def test_missing_registry_raises_on_the_DRY_path_too(self, s3):
+        """The dry path absorbs "an input artifact is absent" — a finding about
+        the fleet a rehearsal may record. It must NOT absorb "I could not load
+        the predicates I grade against", which is a defect in the grader. If
+        this ever passes, the rehearsal has stopped being evidence."""
+        s3.delete_object(Bucket=BUCKET, Key=REGISTRY_KEY)
+        _seed_all_fresh(s3)
+        with pytest.raises(RegistryUnavailableError):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3, dry_run=True)
+
+    def test_empty_registry_raises_rather_than_gating_nothing(self, s3):
+        """Zero rows is a sync failure, never a fleet with nothing to gate. The
+        benign-looking direction is the dangerous one here: an empty document
+        parses fine and would gate exactly nothing."""
+        _seed_registry(s3, "artifacts: []\n")
+        _seed_all_fresh(s3)
+        with pytest.raises(RegistryUnavailableError, match="ZERO artifact rows"):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    def test_unparseable_registry_raises(self, s3):
+        _seed_registry(s3, "artifacts: [ this is not: valid: yaml\n")
+        with pytest.raises(RegistryUnavailableError, match="could not load"):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    @pytest.mark.parametrize("dropped", GATED_ARTIFACT_IDS)
+    def test_a_dropped_or_renamed_row_fails_never_skips(self, s3, dropped):
+        """Deliverable 3 of alpha-engine-config-I9731, per gated artifact: a row
+        that is renamed or deleted upstream must FAIL this gate, never be
+        skipped. Skipping is how a dropped row silently becomes an ungated
+        input — the same benign-looking direction as the empty registry."""
+        rows = yaml.safe_load(REGISTRY_FIXTURE)
+        rows["artifacts"] = [
+            r for r in rows["artifacts"] if r["artifact_id"] != dropped
+        ]
+        _seed_registry(s3, yaml.safe_dump(rows))
+        _seed_all_fresh(s3)
+        with pytest.raises(RegistryRowMissingError, match=dropped):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+    def test_the_error_names_EVERY_absent_row_not_just_the_first(self, s3):
+        """A renamed row and a registry outage look identical one id at a time.
+        The operator needs the whole set to tell them apart."""
+        rows = yaml.safe_load(REGISTRY_FIXTURE)
+        rows["artifacts"] = [
+            r for r in rows["artifacts"]
+            if r["artifact_id"] not in ("backtest_metrics", "research_signals")
+        ]
+        _seed_registry(s3, yaml.safe_dump(rows))
+        with pytest.raises(RegistryRowMissingError) as exc:
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+        assert "backtest_metrics" in str(exc.value)
+        assert "research_signals" in str(exc.value)
+
+    def test_an_unrecognised_cadence_raises_rather_than_grading_fresh(self, s3):
+        """A cadence this preflight has no window rule for is a registry change
+        the grader has not been taught to read. Defaulting it to "fresh" is how
+        a re-cadenced row becomes an ungated input; defaulting it to "stale"
+        would page on correct behaviour. It raises."""
+        _seed_registry(s3, REGISTRY_FIXTURE.replace(
+            '    s3_key_template: "trades/eod_pnl.csv"\n    cadence: eod_sf\n',
+            '    s3_key_template: "trades/eod_pnl.csv"\n'
+            "    cadence: continuous\n    interval_minutes: 1440\n"
+            "    run_calendar: trading_days\n",
+        ))
+        _seed_all_fresh(s3)
+        with pytest.raises(RegistryUnavailableError, match="no\n?\\s*freshness-window rule|freshness-window rule"):
+            assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+
+
+class TestTheGateIsDeclaredNotTranscribed:
+    """Structural invariants of the gate's own declaration."""
+
+    def test_every_gated_id_has_a_content_date_recovery_function(self):
+        assert set(GATED_ARTIFACT_IDS) == set(_CHECK_FNS), (
+            "GATED_ARTIFACT_IDS and _CHECK_FNS disagree — an id with no "
+            "recovery function would KeyError at run time, and a recovery "
+            "function with no id would never run"
+        )
+        assert len(GATED_ARTIFACT_IDS) == len(set(GATED_ARTIFACT_IDS))
+
+    def test_no_s3_key_literal_survives_in_the_preflight(self):
+        """The hardcoded table is gone and must stay gone. Every key this gate
+        probes now comes from the registry's `s3_key_template`, so no artifact
+        key literal may reappear in the module — that is what drifts."""
+        source = (
+            pathlib.Path(freshness_preflight.__file__).read_text(encoding="utf-8")
+        )
+        code = "\n".join(
+            line for line in source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        # The module docstring names artifacts in prose; strip it before
+        # scanning, since prose is not a key the code probes.
+        body = code.split('"""', 2)[-1]
+        for literal in (
+            '"backtest/',
+            "'backtest/",
+            '"signals/',
+            "'signals/",
+            '"trades/',
+            "'trades/",
+            '"predictor/',
+            "'predictor/",
+        ):
+            assert literal not in body, (
+                f"{literal} reappeared as an S3 key literal in "
+                "grading/freshness_preflight.py — keys come from the registry's "
+                "declared s3_key_template (alpha-engine-config-I9731)"
+            )
+
+    def test_provenance_names_the_document_the_predicates_came_from(self, s3):
+        """Mirrors grading/coverage.py's `denominator_source`: a card must be
+        traceable to the registry it was graded against without reading this
+        module."""
+        _seed_all_fresh(s3)
+        prov = assert_input_freshness(BUCKET, RUN_DATE, s3_client=s3)
+        assert prov["predicate_source"] == (
+            f"s3://{REGISTRY_BUCKET}/{REGISTRY_KEY}#artifacts"
+        )
