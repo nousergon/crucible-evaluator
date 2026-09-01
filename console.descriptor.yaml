@@ -227,6 +227,70 @@ metrics:
           tiles_overall_status:
             path: tiles_overall_status
             render: text
+          # ── The economic surface (alpha-engine-config-I9005) ──────────────
+          #
+          # The gap this closes. The `s3-records` binding below already fans
+          # `tiles.*.components` out into one Signal per (tile, component), so
+          # the eighteen `portfolio_outcome` components — alpha_vs_spy,
+          # sharpe_ratio, information_ratio, dsr, hit_rate_daily, … — have been
+          # on the console with their own value / target / red_line / n_samples
+          # / status. What was NOT on any surface is the ROLL-UP: the outcome
+          # tile's own verdict, and the headline grade it now feeds. A reader
+          # could see eighteen economic dots and not the answer to "is the
+          # product working".
+          #
+          # Every field here is READ from the artifact. Nothing is asserted,
+          # nothing is thresholded, and no number is authored: the targets and
+          # red-lines behind these verdicts live in
+          # `grading/thresholds/registry.yaml` and are untouched
+          # (`alpha-engine-config#9005` reserves the BAR to Brian).
+          #
+          # `render: text` on the letters and statuses, plain `value` on the
+          # numerics, so a status the console has never seen renders as itself
+          # rather than being coerced (console-policy.md §5.8).
+          portfolio_outcome_status:
+            path: tiles.portfolio_outcome.status
+            render: text
+          portfolio_outcome_letter:
+            path: tiles.portfolio_outcome.letter
+            render: text
+          portfolio_outcome_grade:
+            path: tiles.portfolio_outcome.numeric_grade
+          # The denominator behind the verdict, on the same row. A tile status
+          # with no component count is a dot that cannot say how much it
+          # measured (observability-policy.md §8; the same reason `n_graded`
+          # was put on the tile line in alpha-engine-config-I8177).
+          portfolio_outcome_components:
+            path: tiles.portfolio_outcome.n_components
+            render: count
+          portfolio_outcome_graded:
+            path: tiles.portfolio_outcome.n_graded
+            render: count
+          # When this tile last actually measured, from the tile's own stamp
+          # rather than the card's build time — the tiles legitimately update on
+          # different cadences (grading/module_agg.py::build_tile).
+          portfolio_outcome_as_of:
+            path: tiles.portfolio_outcome.as_of
+            render: text
+          # ── The headline the outcome now votes in ─────────────────────────
+          #
+          # `overall.display`, not `overall.letter`: `grading/scorecard.py`
+          # deliberately never renders the bare letter on a partial or
+          # partial-scope card, and a console binding that took the letter
+          # would undo that on the one surface most people read
+          # (config-I7202 deliverable 3).
+          system_grade_display:
+            path: overall.display
+            render: text
+          system_grade:
+            path: overall.grade
+          # What the headline covers, so "which tiles does this grade grade?"
+          # is answerable without opening the artifact.
+          system_grade_weights_version:
+            path: grading_weights.version
+            render: text
+          portfolio_outcome_weight:
+            path: grading_weights.portfolio_outcome_weight
     # The weekly graph runs on every NYSE trading day via the postclose
     # exercise chain, so the card is rewritten daily, not weekly. Declared
     # because without a cadence staleness is not computable and the console
