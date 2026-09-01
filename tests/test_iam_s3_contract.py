@@ -146,7 +146,20 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # a declared groom pause never renders as an undeclared broken-producer
     # gap — new "ops" read prefix, declared in grading/iam_s3_contract.json.
     "grading/tiles/groom.py": 3,
-    "grading/tiles/portfolio_outcome.py": 3,  # +1 I9684: predictor/model_zoo/leaderboard (pbo)
+    # alpha-engine-config-I9702 (2026-09-01): the per-date signals.json read
+    # moved out of this file into grading/regime_index.py, which serves the
+    # date->market_regime join from one persisted index instead of one ~637KB
+    # GET per session since inception. 3 -> 2 here; the moved site (plus the
+    # index's own read and write) is pinned on regime_index.py below. No
+    # contract/IAM change: "signals" was already `read` and the index lives
+    # under "evaluator", already `readwrite`.
+    "grading/tiles/portfolio_outcome.py": 2,  # I9684 pbo leaderboard + eod_pnl.csv
+    # alpha-engine-config-I9702: three sites — `read_index`'s get_object and
+    # `write_index`'s put_object on evaluator/indexes/market_regime.json (the
+    # "evaluator" prefix, already declared readwrite for the report card), and
+    # `_fetch_one`'s get_object on signals/{date}/signals.json (the "signals"
+    # prefix, already declared read). New FILE, no new prefix.
+    "grading/regime_index.py": 3,
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
     "grading/tiles/substrate.py": 1,
