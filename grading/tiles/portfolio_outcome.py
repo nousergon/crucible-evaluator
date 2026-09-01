@@ -36,7 +36,7 @@ from nousergon_lib.quant.stats.dsr import compute_psr
 from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wilson_score_interval
 
 from grading.history import CardHistory
-from grading.metric_record import build_metric
+from grading.metric_record import MetricContractError, build_metric
 from grading.thresholds.registry import DEFAULT_BAND, resolve as resolve_band
 from grading.module_agg import build_tile
 from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
@@ -450,6 +450,16 @@ def _build_pbo_component(bucket: str, s3_client=None):
     src = f"s3://{bucket}/{MODEL_ZOO_LEADERBOARD_KEY}"
     band = resolve_band(MODULE, "pbo", DEFAULT_BAND)
     target = band.target
+    if target is None:
+        # Fail loud rather than grade against no bar. §12 declares 0.2; a null
+        # target here means the registry row was edited to ungraded, and the
+        # only alternative to raising is a silent unconditional GREEN — the
+        # exact silent-pass config#7476's slot exists to prevent.
+        raise MetricContractError(
+            "pbo: the threshold registry declares no target for "
+            "(portfolio_outcome, pbo). The bar is SYSTEM_OPTIMIZED.md §12 "
+            "(PBO < 0.2); restore it in grading/thresholds/registry.yaml."
+        )
 
     block, na_detail = _read_selection_pbo(bucket, s3_client=s3_client)
     if block is None:

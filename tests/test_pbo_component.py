@@ -167,6 +167,21 @@ class TestPboComponent:
         assert "horizon-60d" in r
         assert "2026-08-28" in r
 
+    def test_ungraded_registry_row_raises_never_silent_green(self, s3, monkeypatch):
+        """A null target would make every branch fall through to an
+        unconditional pass. Grading against no bar must raise."""
+        import grading.tiles.portfolio_outcome as po
+        from grading.metric_record import MetricContractError
+
+        class _NoBar:
+            target = None
+            red_line = None
+
+        monkeypatch.setattr(po, "resolve_band", lambda *a, **k: _NoBar())
+        _put_leaderboard(s3, {"date": "2026-08-28", "selection_pbo": _block()})
+        with pytest.raises(MetricContractError, match="declares no target"):
+            po._build_pbo_component(BUCKET, s3_client=s3)
+
     def test_corrupt_leaderboard_raises_never_renders_a_number(self, s3):
         s3.put_object(Bucket=BUCKET, Key=MODEL_ZOO_LEADERBOARD_KEY, Body=b"{not json")
         with pytest.raises(ValueError, match="not valid JSON"):
