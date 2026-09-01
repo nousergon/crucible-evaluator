@@ -34,10 +34,25 @@ the proven reference implementation this mirrors:
     resilience walk-back (deliberately generous, for partial/retried
     Saturday runs) will silently accept last week's artifact with no signal
     that grading happened on stale content;
-  - cadence comes from ``alpha-engine-config/ARTIFACT_REGISTRY.yaml``:
-    ``saturday_sf`` artifacts must carry data from the run's own week;
-    ``eod_sf``/daily artifacts must carry data from the last NYSE trading
-    day (calendar-aware via ``krepis.dates``);
+  - the gated artifacts, their S3 key templates and their cadences are READ
+    from ``alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml`` at run
+    time, via ``grading.artifact_registry`` (the published S3 mirror, typed
+    through ``nousergon_lib.artifact_freshness.ArtifactSpec``). This module
+    declares only WHICH declared artifacts it hard-gates — a property of the
+    grader, not of the registry — and how each one's content date is
+    recovered. Everything the registry already declares comes from the
+    registry (`alpha-engine-config-I9731`). Cadence drives the window:
+    ``saturday_sf``/``sunday_sf`` artifacts must carry data from the run's own
+    week; ``eod_sf``/``weekday_sf`` artifacts must carry data from the last
+    NYSE trading day (calendar-aware via ``krepis.dates``); ``event_driven``
+    artifacts are presence-gated only, because their row declares that their
+    age is not a staleness signal and that their liveness rides a separate
+    monitored anchor. A cadence with no window rule here RAISES — an
+    unrecognised cadence must never silently grade as fresh;
+  - the registry is not optional and has no fallback: if it cannot be loaded,
+    the preflight raises ``RegistryUnavailableError`` rather than grading
+    against nothing. A fallback table IS the drift this gate was rebuilt to
+    remove;
   - ANY breach — stale content, or a declared input missing outright — HARD
     FAILS (raises) naming the artifact, its resolved content date, and the
     expected window. No warn-and-continue, no partial report: a caught
@@ -68,10 +83,28 @@ import boto3
 from botocore.exceptions import ClientError
 
 from krepis.dates import is_fresh_in_trading_days
+from nousergon_lib.artifact_freshness import ArtifactSpec
 
+from grading.artifact_registry import (
+    REGISTRY_BUCKET,
+    REGISTRY_KEY,
+    RegistryRowMissingError,
+    RegistryUnavailableError,
+    load_specs,
+)
 from grading.artifacts import DEFAULT_ARTIFACT_MAX_AGE_DAYS
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "GATED_ARTIFACT_IDS",
+    "InputArtifactError",
+    "MissingInputArtifactError",
+    "RegistryRowMissingError",
+    "RegistryUnavailableError",
+    "StaleInputArtifactError",
+    "assert_input_freshness",
+]
 
 
 class InputArtifactError(RuntimeError):
@@ -127,19 +160,20 @@ def _get_json_body(s3, bucket: str, key: str) -> dict | None:
     return json.loads(resp["Body"].read())
 
 
-def _newest_dated_instance(
-    s3, bucket: str, prefix: str, filename: str, run_date: _date,
+def _newest_dated_instance_for(
+    s3, bucket: str, spec: "ArtifactSpec", run_date: _date,
     *, max_age_days: int = DEFAULT_ARTIFACT_MAX_AGE_DAYS,
 ) -> _date | None:
-    """Resolved instance date for a ``backtest/{date}/<filename>`` artifact:
-    the freshest existing copy at/before ``run_date`` within the same
-    resilience window ``grading.artifacts.get_json_windowed`` uses to build
-    the tiles — so this preflight judges the SAME instance the tiles will
-    actually grade, not a stricter/looser one. Returns ``None`` if no
-    instance exists anywhere in the window (a genuinely missing artifact)."""
+    """Resolved instance date for a date-templated JSON artifact: the freshest
+    existing copy at/before ``run_date`` within the same resilience window
+    ``grading.artifacts.get_json_windowed`` uses to build the tiles — so this
+    preflight judges the SAME instance the tiles will actually grade, not a
+    stricter/looser one. The key comes from the artifact's declared
+    ``s3_key_template``. Returns ``None`` if no instance exists anywhere in the
+    window (a genuinely missing artifact)."""
     for delta in range(max_age_days + 1):
         d = run_date - timedelta(days=delta)
-        key = f"{prefix.format(date=d.isoformat())}/{filename}"
+        key = _resolve_key(spec, d)
         try:
             body = _get_json_body(s3, bucket, key)
         except (json.JSONDecodeError, ValueError):
@@ -156,139 +190,216 @@ class _CheckOutcome:
     window: str
 
 
-def _check_metrics_json(s3, bucket: str, run_date: _date) -> _CheckOutcome:
-    """``backtest/{run_date}/metrics.json`` — carries an explicit ``run_date``
-    field (excluded from the signal_quality ``overall`` payload downstream,
-    but present in the raw artifact), the strongest content-derived signal
-    available for the research-free-derived e2e counterfactual family: the
-    backtester stamps this file with the cohort date it actually computed
-    against, on the SAME run that writes ``e2e_lift.json``."""
-    prefix = f"backtest/{run_date.isoformat()}"
-    body = _get_json_body(s3, bucket, f"{prefix}/metrics.json")
+# ── Registry-derived key + window resolution ────────────────────────────────
+#
+# Everything below reads the artifact's declared row rather than a literal.
+# `spec.s3_key_template` is the key; `spec.cadence` is the window rule.
+
+#: Cadences whose artifacts must carry data from the RUN'S OWN ISO week.
+_WEEKLY_CADENCES: frozenset[str] = frozenset({"saturday_sf", "sunday_sf"})
+#: Cadences whose artifacts must carry data from the last NYSE session(s).
+_DAILY_CADENCES: frozenset[str] = frozenset({"eod_sf", "weekday_sf"})
+
+
+def _resolve_key(spec: ArtifactSpec, d: _date) -> str:
+    """Render a declared key template for instance date ``d``.
+
+    Mirrors the placeholder set ``nousergon_lib.artifact_freshness._format_key``
+    supports (``{date}`` / ``{trading_day}`` / ``{cycle_label}``). A template
+    with no placeholder renders to itself, which is how the fixed-key rows
+    (``trades/eod_pnl.csv``, ``predictor/weights/meta/manifest.json``) work.
+    """
+    iso = d.isoformat()
+    try:
+        return spec.s3_key_template.format(date=iso, trading_day=iso, cycle_label=iso)
+    except (KeyError, IndexError) as exc:
+        raise RegistryUnavailableError(
+            f"{spec.artifact_id}: declared s3_key_template "
+            f"{spec.s3_key_template!r} carries a placeholder this preflight "
+            f"cannot resolve ({type(exc).__name__}: {exc}). Supported: "
+            "{date} / {trading_day} / {cycle_label}."
+        ) from exc
+
+
+def _window_label(spec: ArtifactSpec, run_date: _date, *, max_stale_trading_days: int = 1) -> str:
+    """Human-readable window this run judges ``spec`` against."""
+    if spec.cadence in _WEEKLY_CADENCES:
+        return f"week of {_week_start(run_date).isoformat()}"
+    if spec.cadence in _DAILY_CADENCES:
+        return f"<= {max_stale_trading_days} trading day(s) of {run_date.isoformat()}"
+    return (
+        f"event_driven — age is not a staleness signal for this row; its "
+        f"producer liveness rides {spec.liveness_via!r}"
+    )
+
+
+def _assert_in_window(
+    spec: ArtifactSpec,
+    content_date: _date,
+    run_date: _date,
+    *,
+    what: str,
+    max_stale_trading_days: int = 1,
+) -> str:
+    """Apply the cadence-declared freshness window; return its label.
+
+    Raises ``StaleInputArtifactError`` on breach, and
+    ``RegistryUnavailableError`` on a cadence this preflight has no rule for —
+    never a silent pass. An unrecognised cadence is a registry change this
+    grader has not been taught to read, and treating it as fresh is how a
+    re-cadenced row becomes an ungated input.
+    """
+    if spec.cadence in _WEEKLY_CADENCES:
+        if not _in_run_week(content_date, run_date):
+            raise StaleInputArtifactError(
+                f"{spec.artifact_id} is stale: {what}={content_date.isoformat()} is "
+                f"outside this week's window [{_week_start(run_date).isoformat()}, "
+                f"{run_date.isoformat()}] for the evaluator run at "
+                f"run_date={run_date.isoformat()}. Declared cadence "
+                f"{spec.cadence!r}, severity {spec.severity!r}, owner "
+                f"{spec.owner_repo!r} (ARTIFACT_REGISTRY.yaml)."
+            )
+    elif spec.cadence in _DAILY_CADENCES:
+        if not is_fresh_in_trading_days(content_date, run_date, max_stale=max_stale_trading_days):
+            raise StaleInputArtifactError(
+                f"{spec.artifact_id} is stale: {what}={content_date.isoformat()} is "
+                f"more than {max_stale_trading_days} NYSE trading day(s) behind "
+                f"run_date={run_date.isoformat()}. Declared cadence "
+                f"{spec.cadence!r}, severity {spec.severity!r}, owner "
+                f"{spec.owner_repo!r} (ARTIFACT_REGISTRY.yaml)."
+            )
+    elif spec.cadence != "event_driven":
+        raise RegistryUnavailableError(
+            f"{spec.artifact_id}: declared cadence {spec.cadence!r} has no "
+            "freshness-window rule in the evaluator preflight. Add one (and a "
+            "test) rather than letting an unrecognised cadence grade as fresh."
+        )
+    return _window_label(spec, run_date, max_stale_trading_days=max_stale_trading_days)
+
+
+# ── Per-artifact content-date recovery ──────────────────────────────────────
+#
+# The registry declares WHERE an artifact lives and HOW OFTEN it is written.
+# It does not declare how to recover the date its CONTENT was computed for —
+# that is per-artifact knowledge (a JSON field, a CSV column, or, where the
+# payload persists no date of its own, the resolved instance key). Each
+# function below owns exactly that, and nothing else.
+
+
+def _check_metrics_json(s3, bucket: str, spec: ArtifactSpec, run_date: _date) -> _CheckOutcome:
+    """``backtest_metrics`` — carries an explicit ``run_date`` field (excluded
+    from the signal_quality ``overall`` payload downstream, but present in the
+    raw artifact), the strongest content-derived signal available for the
+    research-free-derived e2e counterfactual family: the backtester stamps
+    this file with the cohort date it actually computed against, on the SAME
+    run that writes ``e2e_lift.json``."""
+    key = _resolve_key(spec, run_date)
+    body = _get_json_body(s3, bucket, key)
     if body is None:
         raise MissingInputArtifactError(
-            f"metrics.json: no artifact at s3://{bucket}/{prefix}/metrics.json — "
+            f"{spec.artifact_id}: no artifact at s3://{bucket}/{key} — "
             f"required input for the weekly assessment (run_date={run_date.isoformat()})."
         )
     content_date = _parse_date(body.get("run_date"))
     if content_date is None:
         raise MissingInputArtifactError(
-            f"metrics.json: s3://{bucket}/{prefix}/metrics.json has no readable "
+            f"{spec.artifact_id}: s3://{bucket}/{key} has no readable "
             "'run_date' field — cannot verify freshness of a content-dated artifact."
         )
-    if not _in_run_week(content_date, run_date):
-        raise StaleInputArtifactError(
-            f"metrics.json is stale: content run_date={content_date.isoformat()} is "
-            f"outside this week's window [{_week_start(run_date).isoformat()}, "
-            f"{run_date.isoformat()}] for the evaluator run at run_date={run_date.isoformat()}."
-        )
-    return _CheckOutcome("metrics_json", content_date.isoformat(), f"week of {_week_start(run_date).isoformat()}")
+    window = _assert_in_window(spec, content_date, run_date, what="content run_date")
+    return _CheckOutcome(spec.artifact_id, content_date.isoformat(), window)
 
 
-def _check_e2e_lift(s3, bucket: str, run_date: _date) -> _CheckOutcome:
-    """``backtest/{date}/e2e_lift.json`` — the artifact directly named in the
-    2026-07-18 incident: computed from the research-free parquet
+def _check_e2e_lift(s3, bucket: str, spec: ArtifactSpec, run_date: _date) -> _CheckOutcome:
+    """``backtest_e2e_lift`` — the artifact directly named in the 2026-07-18
+    incident: computed from the research-free parquet
     (``predictor_outcomes_research_free``) among other cohorts, but persists
-    no cohort-date of its own. The strongest available signal without
-    reading the parquet directly (out of this repo's scope — the parquet is
+    no cohort-date of its own. The strongest available signal without reading
+    the parquet directly (out of this repo's scope — the parquet is
     read+aggregated upstream by crucible-backtester's evaluate.py) is the
-    artifact's own RESOLVED S3 instance date: which day's
-    ``backtest/{date}/e2e_lift.json`` actually answered. Walking back
-    silently past the run's own week (as the tiles' resilience window
-    tolerates for partial/retried runs) is exactly the loophole a silently
-    no-op'd producer exploits — assert the resolved instance falls in-week.
+    artifact's own RESOLVED S3 instance date: which day's key actually
+    answered. Walking back silently past the run's own week (as the tiles'
+    resilience window tolerates for partial/retried runs) is exactly the
+    loophole a silently no-op'd producer exploits.
+
+    NOTE (`alpha-engine-config-I9731`): the hardcoded table this replaced named
+    ``research_producer_leaderboard`` as this entry's registry row. That was
+    wrong — the row is ``backtest_e2e_lift`` — and it is the measured instance
+    of the drift a hand-maintained mirror produces.
     """
-    instance_date = _newest_dated_instance(s3, bucket, "backtest/{date}", "e2e_lift.json", run_date)
+    instance_date = _newest_dated_instance_for(s3, bucket, spec, run_date)
     if instance_date is None:
         raise MissingInputArtifactError(
-            f"e2e_lift.json: no instance found under s3://{bucket}/backtest/*/e2e_lift.json "
-            f"within the {DEFAULT_ARTIFACT_MAX_AGE_DAYS}-day resilience window of "
-            f"run_date={run_date.isoformat()}."
+            f"{spec.artifact_id}: no instance found under s3://{bucket}/"
+            f"{spec.s3_key_template} within the {DEFAULT_ARTIFACT_MAX_AGE_DAYS}-day "
+            f"resilience window of run_date={run_date.isoformat()}."
         )
-    if not _in_run_week(instance_date, run_date):
+    try:
+        window = _assert_in_window(spec, instance_date, run_date, what="freshest resolvable instance")
+    except StaleInputArtifactError as exc:
         raise StaleInputArtifactError(
-            f"e2e_lift.json is stale: the freshest resolvable instance is dated "
-            f"{instance_date.isoformat()}, outside this week's window "
-            f"[{_week_start(run_date).isoformat()}, {run_date.isoformat()}] for the "
-            f"evaluator run at run_date={run_date.isoformat()}. This is the artifact "
-            "class behind the 2026-07-18 incident (config-I3053/config#3058): a "
-            "silently no-op'd research-free-backfill producer left this week's "
-            "e2e_lift.json unrefreshed, and grading proceeded on last week's cohort."
-        )
-    return _CheckOutcome("e2e_lift_json", instance_date.isoformat(), f"week of {_week_start(run_date).isoformat()}")
+            f"{exc} This is the artifact class behind the 2026-07-18 incident "
+            "(config-I3053/config#3058): a silently no-op'd research-free-backfill "
+            "producer left this week's e2e_lift.json unrefreshed, and grading "
+            "proceeded on last week's cohort."
+        ) from exc
+    return _CheckOutcome(spec.artifact_id, instance_date.isoformat(), window)
 
 
-def _incumbent_retained_this_week(s3, bucket: str, run_date: _date) -> bool:
-    """True when model-zoo ran this cycle and deliberately kept the incumbent.
+def _check_predictor_manifest(s3, bucket: str, spec: ArtifactSpec, run_date: _date) -> _CheckOutcome:
+    """``predictor_meta_weights_manifest`` — the model-zoo promotion record the
+    Predictor tile grades leak-free CPCV IC from (``meta_model_oos_ic_cpcv``).
+    Fixed-key pointer, no ``{date}`` segment, so the only reliable
+    content-derived signal is a date-shaped field inside the manifest itself;
+    every live-shipped manifest carries one of ``training_date`` / ``run_date``
+    / ``date`` (config#1601 / L4468 SSOT).
 
-    When ``ModelZooSelect`` promotes nothing, ``predictor/weights/meta/manifest.json``
-    is unchanged and its ``date`` field legitimately predates this ISO week.
-    The promotion record is the authoritative signal that the stale-looking
-    manifest is the intended serving bundle (alpha-engine-config-I9255).
+    Its declared cadence is ``event_driven`` since 2026-08-28
+    (`alpha-engine-config-I9018`): ``promote_to_champion`` is the sole writer
+    and a week with no promotion is the expected case, so the row's own age
+    carries no staleness signal and its producer liveness rides the separately
+    monitored ``model_zoo_leaderboard_latest`` anchor. Presence and a readable
+    date are still hard-required — an absent or undated manifest is a defect in
+    every cadence.
+
+    `alpha-engine-config-I9255`'s ``_incumbent_retained_this_week`` carve-out —
+    a second S3 read of ``predictor/model_zoo/promotions/{date}.json`` to prove
+    a stale-looking manifest was an intentional no-promotion week — is RETIRED
+    by this change (`alpha-engine-config-I9731`). It was a hand-rolled subset of
+    exactly what ``cadence: event_driven`` declares, on the one row that now
+    declares it; keeping both would be the same duplicated-truth defect one
+    layer down.
     """
-    promo_key = f"predictor/model_zoo/promotions/{run_date.isoformat()}.json"
-    promo = _get_json_body(s3, bucket, promo_key)
-    if promo is None:
-        return False
-    if promo.get("promoted") is not None:
-        return False
-    prior = promo.get("prior_champion_version_id")
-    after = promo.get("champion_version_id_after")
-    return bool(prior and after and prior == after)
-
-
-def _check_predictor_manifest(s3, bucket: str, run_date: _date) -> _CheckOutcome:
-    """``predictor/weights/meta/manifest.json`` — the model-zoo promotion
-    record the Predictor tile grades leak-free CPCV IC from
-    (``meta_model_oos_ic_cpcv``). Fixed-key pointer, no ``{date}`` segment, so
-    the only reliable content-derived signal is a date-shaped field inside
-    the manifest itself; every live-shipped manifest carries one of
-    ``training_date`` / ``run_date`` / ``date`` (config#1601 / L4468 SSOT).
-    """
-    key = "predictor/weights/meta/manifest.json"
+    key = _resolve_key(spec, run_date)
     body = _get_json_body(s3, bucket, key)
     if body is None:
         raise MissingInputArtifactError(
-            f"predictor manifest: no artifact at s3://{bucket}/{key} — required "
+            f"{spec.artifact_id}: no artifact at s3://{bucket}/{key} — required "
             f"model-zoo promotion-record input for the weekly assessment."
         )
     raw = body.get("training_date") or body.get("run_date") or body.get("date")
     content_date = _parse_date(raw)
     if content_date is None:
         raise MissingInputArtifactError(
-            f"predictor manifest: s3://{bucket}/{key} has no readable "
+            f"{spec.artifact_id}: s3://{bucket}/{key} has no readable "
             "training_date/run_date/date field — cannot verify freshness."
         )
-    if not _in_run_week(content_date, run_date):
-        if _incumbent_retained_this_week(s3, bucket, run_date):
-            window = (
-                f"incumbent retained (model-zoo promotions/{run_date.isoformat()}.json "
-                f"promoted=null, champion unchanged)"
-            )
-            return _CheckOutcome(
-                "predictor_meta_weights_manifest",
-                content_date.isoformat(),
-                window,
-            )
-        raise StaleInputArtifactError(
-            f"predictor manifest is stale: content date={content_date.isoformat()} is "
-            f"outside this week's window [{_week_start(run_date).isoformat()}, "
-            f"{run_date.isoformat()}] for the evaluator run at run_date={run_date.isoformat()}."
-        )
-    return _CheckOutcome("predictor_meta_weights_manifest", content_date.isoformat(), f"week of {_week_start(run_date).isoformat()}")
+    window = _assert_in_window(spec, content_date, run_date, what="content date")
+    return _CheckOutcome(spec.artifact_id, content_date.isoformat(), window)
 
 
-def _check_signals(s3, bucket: str, run_date: _date) -> _CheckOutcome:
-    """``signals/{date}/signals.json`` — the research signals input the
-    Portfolio Outcome tile joins for ``regime_weighted_alpha``. Key-templated
-    by date, so its own key IS the content date; resolved the same way
-    ``e2e_lift.json`` is (freshest instance at/before run_date, asserted
-    in-week) rather than requiring an exact same-day key (Friday-anchored
-    trading-day runs legitimately read a slightly earlier signals.json)."""
+def _check_signals(s3, bucket: str, spec: ArtifactSpec, run_date: _date) -> _CheckOutcome:
+    """``research_signals`` — the research signals input the Portfolio Outcome
+    tile joins for ``regime_weighted_alpha``. Key-templated by date, so its own
+    key IS the content date; resolved the same way ``e2e_lift.json`` is
+    (freshest instance at/before run_date, asserted against the declared
+    cadence window) rather than requiring an exact same-day key
+    (Friday-anchored trading-day runs legitimately read a slightly earlier
+    signals.json)."""
     instance_date = None
     for delta in range(DEFAULT_ARTIFACT_MAX_AGE_DAYS + 1):
         d = run_date - timedelta(days=delta)
-        key = f"signals/{d.isoformat()}/signals.json"
+        key = _resolve_key(spec, d)
         try:
             resp = s3.head_object(Bucket=bucket, Key=key)
         except ClientError as e:
@@ -303,35 +414,29 @@ def _check_signals(s3, bucket: str, run_date: _date) -> _CheckOutcome:
             break
     if instance_date is None:
         raise MissingInputArtifactError(
-            f"signals.json: no instance found under s3://{bucket}/signals/*/signals.json "
-            f"within {DEFAULT_ARTIFACT_MAX_AGE_DAYS} days of run_date={run_date.isoformat()}."
+            f"{spec.artifact_id}: no instance found under s3://{bucket}/"
+            f"{spec.s3_key_template} within {DEFAULT_ARTIFACT_MAX_AGE_DAYS} days of "
+            f"run_date={run_date.isoformat()}."
         )
-    if not _in_run_week(instance_date, run_date):
-        raise StaleInputArtifactError(
-            f"signals.json is stale: the freshest resolvable instance is dated "
-            f"{instance_date.isoformat()}, outside this week's window "
-            f"[{_week_start(run_date).isoformat()}, {run_date.isoformat()}] for the "
-            f"evaluator run at run_date={run_date.isoformat()}."
-        )
-    return _CheckOutcome("research_signals", instance_date.isoformat(), f"week of {_week_start(run_date).isoformat()}")
+    window = _assert_in_window(spec, instance_date, run_date, what="freshest resolvable instance")
+    return _CheckOutcome(spec.artifact_id, instance_date.isoformat(), window)
 
 
-def _check_eod_pnl(s3, bucket: str, run_date: _date, *, max_stale_trading_days: int = 1) -> _CheckOutcome:
-    """``trades/eod_pnl.csv`` — the portfolio-outcome ground truth (NAV /
+def _check_eod_pnl(s3, bucket: str, spec: ArtifactSpec, run_date: _date, *, max_stale_trading_days: int = 1) -> _CheckOutcome:
+    """``eod_reconcile_pnl`` — the portfolio-outcome ground truth (NAV /
     alpha-vs-SPY). Carries a real per-row ``date`` column; content-derived
-    freshness is ``max(date)`` across all rows, asserted within
-    ``max_stale_trading_days`` NYSE sessions of ``run_date`` (calendar-aware
-    via ``krepis.dates`` — a Saturday run must not be judged stale merely
-    because no trading happened over the weekend). ``eod_sf`` (daily)
-    cadence per ARTIFACT_REGISTRY.yaml."""
-    key = "trades/eod_pnl.csv"
+    freshness is ``max(date)`` across all rows, asserted against the declared
+    ``eod_sf`` cadence window (calendar-aware via ``krepis.dates`` — a Saturday
+    run must not be judged stale merely because no trading happened over the
+    weekend)."""
+    key = _resolve_key(spec, run_date)
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code in ("NoSuchKey", "404"):
             raise MissingInputArtifactError(
-                f"eod_pnl.csv: no artifact at s3://{bucket}/{key} — required "
+                f"{spec.artifact_id}: no artifact at s3://{bucket}/{key} — required "
                 "portfolio-outcome ground-truth input for the weekly assessment."
             ) from e
         logger.error("freshness_preflight: S3 read failed for s3://%s/%s: %s", bucket, key, e)
@@ -341,33 +446,49 @@ def _check_eod_pnl(s3, bucket: str, run_date: _date, *, max_stale_trading_days: 
     dates = sorted(d for d in (_parse_date(r["date"]) for r in rows) if d is not None)
     if not dates:
         raise MissingInputArtifactError(
-            f"eod_pnl.csv: s3://{bucket}/{key} has no parseable 'date' rows — "
+            f"{spec.artifact_id}: s3://{bucket}/{key} has no parseable 'date' rows — "
             "cannot verify freshness of a content-dated artifact."
         )
     content_date = dates[-1]
-    if not is_fresh_in_trading_days(content_date, run_date, max_stale=max_stale_trading_days):
-        raise StaleInputArtifactError(
-            f"eod_pnl.csv is stale: freshest row date={content_date.isoformat()} is "
-            f"more than {max_stale_trading_days} NYSE trading day(s) behind "
-            f"run_date={run_date.isoformat()}."
-        )
-    return _CheckOutcome("eod_reconcile_pnl", content_date.isoformat(), f"<= {max_stale_trading_days} trading day(s) of {run_date.isoformat()}")
+    window = _assert_in_window(
+        spec, content_date, run_date,
+        what="freshest row date", max_stale_trading_days=max_stale_trading_days,
+    )
+    return _CheckOutcome(spec.artifact_id, content_date.isoformat(), window)
 
 
-# Registry of every hard-gated input, in the order the issue enumerates them.
-# Each entry maps 1:1 to an ARTIFACT_REGISTRY.yaml row (named in the comment)
-# so the cadence + owner are traceable back to the SoT registry. Artifacts
-# the tiles already treat as legitimately-optional/known-unwired (veto_value,
-# scanner_opt, cio_opt, sizing_ab, predictor_sizing — see grading/artifacts.py
-# module docstring) are deliberately NOT hard-gated here: promoting them would
-# turn a documented "not yet persisted" state into a false hard-fail.
-_CHECKS = (
-    ("metrics_json", _check_metrics_json),               # backtest_metrics
-    ("e2e_lift_json", _check_e2e_lift),                  # research_producer_leaderboard / research-free counterfactual
-    ("predictor_meta_weights_manifest", _check_predictor_manifest),  # predictor_meta_weights_manifest
-    ("research_signals", _check_signals),                # research_signals
-    ("eod_reconcile_pnl", _check_eod_pnl),                # eod_reconcile_pnl
+# The artifacts this grader hard-gates, keyed by their ARTIFACT_REGISTRY.yaml
+# `artifact_id`. This tuple is the ONLY registry-adjacent literal left in this
+# module, and deliberately so: WHICH declared artifacts a grader refuses to
+# grade without is a property of the grader, not of the registry — the registry
+# declares 185 artifacts and this gate covers five of them. Everything else
+# about each one (bucket, key template, cadence, SLA, severity, owner, liveness
+# anchor) is READ from the registry at run time by `grading.artifact_registry`,
+# and `tests/test_freshness_preflight_registry_contract.py` fails if any id here
+# stops resolving to a live row.
+#
+# Artifacts the tiles already treat as legitimately-optional/known-unwired
+# (veto_value, scanner_opt, cio_opt, sizing_ab, predictor_sizing — see
+# grading/artifacts.py module docstring) are deliberately NOT hard-gated here:
+# promoting them would turn a documented "not yet persisted" state into a false
+# hard-fail.
+GATED_ARTIFACT_IDS: tuple[str, ...] = (
+    "backtest_metrics",
+    "backtest_e2e_lift",
+    "predictor_meta_weights_manifest",
+    "research_signals",
+    "eod_reconcile_pnl",
 )
+
+#: artifact_id -> content-date recovery function. Keys must equal
+#: :data:`GATED_ARTIFACT_IDS` exactly; the contract test asserts it.
+_CHECK_FNS = {
+    "backtest_metrics": _check_metrics_json,
+    "backtest_e2e_lift": _check_e2e_lift,
+    "predictor_meta_weights_manifest": _check_predictor_manifest,
+    "research_signals": _check_signals,
+    "eod_reconcile_pnl": _check_eod_pnl,
+}
 
 
 def assert_input_freshness(
@@ -429,11 +550,20 @@ def assert_input_freshness(
             "cannot resolve the freshness window."
         ) from exc
 
+    # The declared registry is loaded BEFORE any check runs, and on the dry
+    # path exactly as on the real one. It is never absorbed into UNMEASURED:
+    # "an input artifact is absent" is a finding about the fleet a rehearsal
+    # may record, while "I could not load the predicates I grade against" is a
+    # defect in the grader — a preflight that cannot read its own rules and
+    # reports clean is worse than one that fails (alpha-engine-config-I9731).
+    specs = load_specs(GATED_ARTIFACT_IDS, s3_client=s3)
+
     checked: list[dict] = []
     unmeasured = 0
-    for name, fn in _CHECKS:
+    for name in GATED_ARTIFACT_IDS:
+        fn = _CHECK_FNS[name]
         try:
-            outcome = fn(s3, bucket, run_d)
+            outcome = fn(s3, bucket, specs[name], run_d)
         except (MissingInputArtifactError, StaleInputArtifactError) as exc:
             if not dry_run:
                 raise
@@ -464,7 +594,15 @@ def assert_input_freshness(
             "freshness_preflight: %s OK (content_date=%s, window=%s)",
             outcome.artifact_id, outcome.content_date, outcome.window,
         )
-    provenance = {"run_date": run_date, "checks": checked}
+    provenance = {
+        "run_date": run_date,
+        "checks": checked,
+        # Console/report-card provenance mirrors grading/coverage.py's
+        # `denominator_source` shape: name the document the predicates came
+        # from, so a card can be traced to the registry revision it was graded
+        # against without reading this module (alpha-engine-config-I9731).
+        "predicate_source": f"s3://{REGISTRY_BUCKET}/{REGISTRY_KEY}#artifacts",
+    }
     if dry_run:
         # Stated in BOTH polarities (sf-pipeline-policy 2.3a): a dry run that
         # measured everything and one that measured nothing must not render
@@ -472,5 +610,5 @@ def assert_input_freshness(
         # `unmeasured` says how much of the gate actually had inputs.
         provenance["dry_run"] = True
         provenance["unmeasured"] = unmeasured
-        provenance["measured"] = len(_CHECKS) - unmeasured
+        provenance["measured"] = len(GATED_ARTIFACT_IDS) - unmeasured
     return provenance

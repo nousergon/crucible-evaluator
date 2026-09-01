@@ -272,7 +272,10 @@ class TestBuildReportCard:
         # Provenance also records the freshness preflight that ran first.
         assert card["_provenance"]["freshness_preflight"]["run_date"] == RUN_DATE
         checked_ids = {c["artifact_id"] for c in card["_provenance"]["freshness_preflight"]["checks"]}
-        assert "e2e_lift_json" in checked_ids
+        # The registry `artifact_id` since alpha-engine-config-I9731 — the
+        # preflight's provenance now names the row it graded against, not a
+        # local alias.
+        assert "backtest_e2e_lift" in checked_ids
         assert "eod_reconcile_pnl" in checked_ids
 
     def test_partial_artifacts_grade_na_loudly(self, s3):

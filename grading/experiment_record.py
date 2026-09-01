@@ -70,17 +70,19 @@ REFERENCE_EXPERIMENT_ID = "reference"
 
 _EVALUATOR_REPO_KEY = "crucible-evaluator"
 
-# The artifact_id keys (freshness_preflight._CHECKS's per-check ids, e.g.
-# "research_signals", "predictor_meta_weights_manifest", "metrics_json",
-# "e2e_lift_json", "eod_reconcile_pnl") that feed each product slot, for the
-# synthesized fingerprint. Best-effort substring membership test — an
-# artifact_id not matched here simply doesn't contribute to any slot's
-# fingerprint (never an error; new artifact_ids added to _CHECKS later just
-# don't count toward a slot's fingerprint until this map is updated).
+# The artifact_id keys (freshness_preflight.GATED_ARTIFACT_IDS, which since
+# alpha-engine-config-I9731 are the ARTIFACT_REGISTRY.yaml `artifact_id`s
+# themselves: "research_signals", "predictor_meta_weights_manifest",
+# "backtest_metrics", "backtest_e2e_lift", "eod_reconcile_pnl") that feed each
+# product slot, for the synthesized fingerprint. Best-effort substring
+# membership test — an artifact_id not matched here simply doesn't contribute
+# to any slot's fingerprint (never an error; new artifact_ids added to
+# GATED_ARTIFACT_IDS later just don't count toward a slot's fingerprint until
+# this map is updated).
 _SLOT_ARTIFACT_PREFIXES: dict[str, tuple[str, ...]] = {
     "research": ("research", "signals", "e2e_lift", "scanner", "attractiveness"),
     "model": ("predictor",),
-    "strategy": ("metrics_json", "eod_reconcile", "trades", "executor", "backtester"),
+    "strategy": ("backtest_metrics", "metrics_json", "eod_reconcile", "trades", "executor", "backtester"),
 }
 
 
