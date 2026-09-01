@@ -58,7 +58,7 @@ class TestUnmeasuredTile:
         components = [_na(f"c{i}", "N/A-MISSING-INPUT") for i in range(10)]
         components.append(_na("c10", "N/A-NOT-IMPL"))
         assert module_status(components) == "N/A-MISSING-INPUT"
-        tile = build_tile("agent", components)
+        tile = build_tile("agent", components, roster=[c.name for c in components])
         assert tile["letter"] == "N/A"
         assert tile["n_components"] == 11
         assert tile["n_graded"] == 0
@@ -68,7 +68,8 @@ class TestUnmeasuredTile:
         components = [_na(f"c{i}", "N/A-MISSING-INPUT") for i in range(10)]
         components.append(_graded("c10"))
         assert module_status(components) == "WATCH"
-        assert build_tile("agent", components)["n_graded"] == 1
+        assert build_tile("agent", components,
+                          roster=[c.name for c in components])["n_graded"] == 1
 
     def test_status_names_the_reason_by_plurality(self):
         assert unmeasured_status(
@@ -130,7 +131,9 @@ def _tile_dict(name, statuses):
         _graded(f"{name}{i}") if s == "GREEN" else _na(f"{name}{i}", s)
         for i, s in enumerate(statuses)
     ]
-    return build_tile(name, components)
+    # Roster injected as the fixture's own component set — see
+    # tests/test_tile_roster_denominator.py for the registry-backed roster.
+    return build_tile(name, components, roster=[c.name for c in components])
 
 
 class TestCompositeScope:

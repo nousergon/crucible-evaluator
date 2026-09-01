@@ -75,6 +75,7 @@ class Band:
     n_floor_declared: int | None
     dynamic: bool
     note: str | None
+    surface_tile: str
 
     @property
     def graded(self) -> bool:
@@ -144,10 +145,37 @@ class ThresholdRegistry:
             n_floor_declared=row.get("n_floor_declared"),
             dynamic=bool(row.get("dynamic", False)),
             note=row.get("note"),
+            surface_tile=row.get("surface_tile") or module,
         )
 
     def is_dynamic(self, module: str, name: str) -> bool:
         return bool(self.rows.get((module, name), {}).get("dynamic", False))
+
+    def surface_tile(self, module: str, name: str) -> str:
+        """The card tile this row renders on — its module unless declared otherwise."""
+        row = self.rows.get((module, name))
+        if row is None:
+            raise ThresholdRegistryError(
+                f"no threshold registry row for ({module!r}, {name!r})"
+            )
+        return row.get("surface_tile") or module
+
+    def tile_rosters(self) -> dict[str, frozenset[str]]:
+        """``surface tile -> the component names that tile is obliged to render``.
+
+        The per-tile half of ``coverage.declared_component_names``'s roster, and
+        derived from the SAME rows (``alpha-engine-config-I9612``). A tile's
+        status is graded against this set rather than against the list its
+        builder happened to hand ``build_tile``, so a builder that silently
+        drops a component cannot shrink its own denominator.
+
+        Names are unique across the whole registry (pinned by a test), so a
+        flat per-tile set is unambiguous.
+        """
+        out: dict[str, set[str]] = {}
+        for (module, name), row in self.rows.items():
+            out.setdefault(row.get("surface_tile") or module, set()).add(name)
+        return {tile: frozenset(names) for tile, names in out.items()}
 
     def graded_keys(self) -> list[tuple[str, str]]:
         """Every ``(module, metric)`` whose champion band imposes a bar.
@@ -168,7 +196,8 @@ _REQUIRED_OBJECTIVE_KEYS = ("name", "source", "derivation", "unit", "horizon_cyc
 _REQUIRED_SCORING_KEYS = ("metric", "label", "estimator", "cohort_max_cards",
                           "n_floor_cards", "n_floor_per_status", "statuses_scored")
 _ALLOWED_ROW_KEYS = frozenset({"target", "red_line", "higher_is_better",
-                               "n_floor_declared", "dynamic", "note"})
+                               "n_floor_declared", "dynamic", "note",
+                               "surface_tile"})
 
 
 def parse_registry(doc: dict[str, Any]) -> ThresholdRegistry:
@@ -266,6 +295,12 @@ def parse_registry(doc: dict[str, Any]) -> ThresholdRegistry:
                     f"registry.metrics.{module}.{name} is dynamic — its bands come from "
                     f"the data and must not also be declared here"
                 )
+            surface = row.get("surface_tile")
+            if surface is not None and (not isinstance(surface, str) or not surface):
+                raise ThresholdRegistrySchemaError(
+                    f"registry.metrics.{module}.{name}.surface_tile must be a "
+                    f"non-empty string naming the card tile this row renders on"
+                )
             if row.get("dynamic") and not row.get("note"):
                 raise ThresholdRegistrySchemaError(
                     f"registry.metrics.{module}.{name} is dynamic and must carry a note "
@@ -287,3 +322,24 @@ def load_registry(path: Path | None = None) -> ThresholdRegistry:
 def resolve(module: str, name: str, band: str = DEFAULT_BAND) -> Band:
     """Resolve one metric's champion bands. Raises on an unregistered metric."""
     return load_registry().resolve(module, name, band)
+
+
+def tile_roster(tile: str) -> frozenset[str]:
+    """Every component name the card tile ``tile`` is obliged to render.
+
+    Raises ``ThresholdRegistryError`` on a tile the registry does not know.
+    A tile whose roster cannot be named cannot be graded against one, and
+    falling back to "whatever was handed in" is the exact defect
+    ``alpha-engine-config-I9612`` removes — so this is loud, never empty.
+    """
+    rosters = load_registry().tile_rosters()
+    try:
+        return rosters[tile]
+    except KeyError:
+        raise ThresholdRegistryError(
+            f"no threshold registry rows surface on tile {tile!r} — known tiles: "
+            f"{sorted(rosters)}. Every card tile grades against its DECLARED "
+            f"roster (alpha-engine-config-I9612); add the tile's rows to "
+            f"{REGISTRY_PATH.name}, or declare `surface_tile: {tile}` on the "
+            f"rows that render there."
+        ) from None

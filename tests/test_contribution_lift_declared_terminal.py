@@ -175,7 +175,8 @@ def test_the_nine_live_declared_components_all_leave_the_denominator(s3_with) ->
     # pinned in test_coverage_registry_denominator.py).
     census = card_component_census(
         {"contribution_lift": tile},
-        declared={c["name"] for c in tile["components"]},
+        declared={c["name"] for c in tile["components"]
+                  if not c.get("unreported")},
         declared_modules={},
     )
     assert census["total"] == 0, (

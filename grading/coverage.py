@@ -208,6 +208,16 @@ def card_component_census(
         for component in tile.get("components") or []:
             if not isinstance(component, dict):
                 continue
+            if component.get("unreported"):
+                # A `module_agg.UnreportedComponent` stub: the tile renders it
+                # so its own verdict cannot ignore the gap
+                # (alpha-engine-config-I9612), but it is NOT a rendered record.
+                # Leaving it here would move the component out of `unreported`
+                # and into the rendered set, which is where I8193 deliberately
+                # did not put it — two surfaces reporting one fact twice, in
+                # disagreeing shapes. Skipping it lets the declared-but-absent
+                # branch below own it, exactly as before.
+                continue
             name = component.get("name") or "?"
             if name in rendered:
                 duplicated.append(f"{rendered[name][0]}.{name} / {tile_name}.{name}")
@@ -353,6 +363,7 @@ def _mark_coverage_unmeasured(tiles: dict[str, Any], exc: BaseException) -> None
             records = [
                 MetricRecord.model_validate(c)
                 for c in (backtester.get("components") or [])
+                if not (isinstance(c, dict) and c.get("unreported"))
             ]
             rebuilt = build_tile("backtester", records)
             for key in ("status", "letter", "numeric_grade", "n_components"):
@@ -472,9 +483,13 @@ def _replace_evaluator_coverage(
     # tile rollup and the record it summarizes would then disagree.
     from grading.metric_record import MetricRecord
 
+    # Unreported stubs are dropped before revalidation and re-minted by
+    # `build_tile` from the roster — they are not `MetricRecord`s and never
+    # were (alpha-engine-config-I9612).
     records = [
         record if i == index else MetricRecord.model_validate(c)
         for i, c in enumerate(components)
+        if i == index or not (isinstance(c, dict) and c.get("unreported"))
     ]
     rebuilt = build_tile("backtester", records)
 
