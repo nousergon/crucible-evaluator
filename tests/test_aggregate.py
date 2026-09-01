@@ -292,20 +292,62 @@ class TestBuildReportCard:
         assert "shadow_book.json" in card["_provenance"]["artifacts"]["artifacts_missing"]
 
     def test_v2_tiles_attached(self, s3):
-        # RC v2 MetricRecord tiles are nested under "tiles" (portfolio + predictor).
+        # RC v2 MetricRecord tiles are nested under "tiles".
+        #
+        # alpha-engine-config-I9734: the ten-name literal that stood here is
+        # GONE. It was the card's second membership declaration and nothing
+        # reconciled it with the registry's — so it could only ever agree with
+        # the code by hand. Membership is asserted as an observable property
+        # instead, by `test_a_module_added_to_the_registry_appears_on_the_card`
+        # below (a registry edit, no Python edit, and the tile is on the card)
+        # and by tests/test_card_population.py. What is checked here is the
+        # SHAPE of whatever the card published.
         _seed_full(s3)
         card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
-        assert set(card["tiles"]) == {
-            "portfolio_outcome", "predictor", "research", "executor",
-            "backtester", "substrate", "agent", "behavioral", "director_quality",
-            "contribution_lift",
-        }
+        assert card["tiles"], "the card published no tiles at all"
         for tile in card["tiles"].values():
             assert "status" in tile and "components" in tile
         # Unified v2 overall status rolls up the tiles.
         assert card["tiles_overall_status"] in (
             "GREEN", "WATCH", "RED", "N/A-NOT-RUN",
         )
+
+    def test_a_module_added_to_the_registry_appears_on_the_card(self, s3, monkeypatch):
+        """The closes-when of alpha-engine-config-I9734, end to end.
+
+        A module reaches the card by being DECLARED — one edit, to
+        `grading/thresholds/registry.yaml`. Before I9734 this test failed:
+        `grading/coverage.py` already read the registry, so the new module
+        entered the coverage denominator, while `aggregate.py`'s hardcoded
+        ten-key tile list meant it reached no tile at all. Graded on one path,
+        invisible on the other — the drift the whole issue is about.
+        """
+        import copy
+
+        import yaml
+
+        from grading.thresholds import registry as reg
+
+        with open(reg.REGISTRY_PATH, encoding="utf-8") as fh:
+            doc = copy.deepcopy(yaml.safe_load(fh))
+        doc["metrics"]["fleet_widget"] = {
+            "widget_uptime_ratio": {"target": 0.99, "red_line": 0.95,
+                                    "higher_is_better": True},
+        }
+        doc["card"]["tiles"]["fleet_widget"] = {}
+        patched = reg.parse_registry(doc)
+        monkeypatch.setattr(reg, "load_registry", lambda path=None: patched)
+
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+
+        assert "fleet_widget" in card["tiles"]
+        tile = card["tiles"]["fleet_widget"]
+        # No grading/tiles/fleet_widget.py exists, so it renders as its full
+        # declared roster with every component UNREPORTED — visibly missing,
+        # never silently absent.
+        assert tile["unreported"] == ["widget_uptime_ratio"]
+        assert tile["n_graded"] == 0
 
     def test_tiles_carry_per_tile_freshness_stamps(self, s3):
         # config-I2556: every tile carries as_of + source_artifact_dates.

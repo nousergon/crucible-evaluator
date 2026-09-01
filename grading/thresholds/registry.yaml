@@ -168,6 +168,119 @@ shared_bands:
       fallback, which grades RAW precision instead of precision-minus-base-rate
       and therefore needs an absolute bar rather than an edge bar.
 
+# ── card: the report card's DECLARED POPULATION and its grading tables ──────
+#
+# alpha-engine-config-I9734. Until this block existed the card declared its
+# membership FOUR times and nothing reconciled them: this file's 9 `metrics`
+# modules, a hardcoded ten-key `_tile_builders` list in `grading/aggregate.py`
+# whose own comment called itself "the membership source of truth", the
+# four-name `_CASCADE_MODULES` tuple in `grading/module_agg.py`, and the keys of
+# the Python weight tables in `grading/scorecard.py`. Adding a fleet module took
+# six coordinated hand-edits; missing one graded it in one path and made it
+# invisible in the other.
+#
+# The tile SET is not declared here — it is DERIVED from the rows above/below
+# (each row's `surface_tile`, defaulting to its owning module), and
+# `parse_registry` RAISES when `card.tiles` and that derived set disagree. So
+# `tiles` declares ORDER and per-tile ROLE only; it cannot invent or omit a
+# member. A tile declared here with no builder in `grading/aggregate.py` still
+# renders — as its full declared roster, every component UNREPORTED — which is
+# what makes "add a module to registry.yaml and it appears on the card" true
+# without a Python edit, and what makes the absence visible rather than silent.
+#
+# WEIGHTS AND BANDS ARE MOVED, NOT CHANGED. Every number below is the Python
+# literal it replaces, byte for byte at the value level: `GRADE_BANDS`,
+# `WEIGHT_TABLE_VERSION`, `RESEARCH_WEIGHTS`, `PREDICTOR_WEIGHTS`,
+# `EXECUTOR_WEIGHTS`, `PORTFOLIO_OUTCOME_WEIGHT` and `PROCESS_WEIGHTS` as they
+# stood in `grading/scorecard.py`. Whether the headline should weigh all nine
+# modules instead of four CHANGES THE PUBLISHED GRADE and is not decided here —
+# it belongs to `alpha-engine-config-I9690`.
+card:
+  # Stamped onto the artifact as `grading_weights.version` — a published grade
+  # whose weights live only in source is not a verifiable number.
+  weight_table_version: "2026-08-31"
+
+  # The 0-100 → letter ladder (`scorecard.GRADE_BANDS`). Ordered high to low;
+  # the first band whose `min` the score reaches wins.
+  grade_bands:
+    - {min: 90, letter: "A"}
+    - {min: 80, letter: "A-"}
+    - {min: 73, letter: "B+"}
+    - {min: 65, letter: "B"}
+    - {min: 58, letter: "B-"}
+    - {min: 50, letter: "C+"}
+    - {min: 42, letter: "C"}
+    - {min: 35, letter: "C-"}
+    - {min: 28, letter: "D+"}
+    - {min: 20, letter: "D"}
+    - {min: 0, letter: "F"}
+
+  # The card tiles, IN BUILD AND PUBLICATION ORDER. Membership is validated
+  # against the derived `surface_tile` set at load — this list may reorder and
+  # annotate, never redefine, who is on the card.
+  #
+  #   cascades: true   this tile's RED cascades to the card's overall status
+  #                    (`module_agg._CASCADE_MODULES`, RC v2 module→overall).
+  #   process_weight   its share of the PROCESS half of the headline composite
+  #                    (`scorecard.PROCESS_WEIGHTS`, ruled 2026-08-18 on
+  #                    alpha-engine-config-I7210). Must sum to 1.0 across the
+  #                    tiles that declare it.
+  #   headline_weight  a tile weighing directly against the process half
+  #                    (`scorecard.PORTFOLIO_OUTCOME_WEIGHT`,
+  #                    alpha-engine-config-I9005). headline_weight plus the
+  #                    process half must sum to 1.0.
+  tiles:
+    portfolio_outcome:
+      headline_weight: 0.50
+    predictor:
+      cascades: true
+      process_weight: 0.25
+    research:
+      cascades: true
+      process_weight: 0.40
+    executor:
+      cascades: true
+      process_weight: 0.35
+    backtester: {}
+    substrate:
+      cascades: true
+    agent: {}
+    behavioral: {}
+    director_quality: {}
+    contribution_lift: {}
+
+  # Within-module component weight tables (`scorecard.RESEARCH_WEIGHTS` /
+  # `PREDICTOR_WEIGHTS` / `EXECUTOR_WEIGHTS`). Each must sum to 1.0, and each
+  # key must be a component of that tile's declared roster.
+  #
+  # research: the 2026-08-18 ruling on alpha-engine-config-I7210 removed `cio`
+  # (0.20) and `sector_teams_avg` (0.25) — they graded orchestration retired
+  # 2026-07-12 — and rescaled the survivors PROPORTIONALLY over the 0.55 that
+  # actually voted, so no component's weight relative to another moved:
+  #   scanner 0.10/0.55 = 2/11 · macro_agent 0.10/0.55 = 2/11 ·
+  #   composite_scoring 0.20/0.55 = 4/11 · calibration_diagnostics 0.15/0.55 = 3/11
+  # Written as the exact double each rational rounds to — the three-decimal
+  # values quoted on I7210 (0.182/0.182/0.364/0.273) sum to 1.001 and would
+  # fail the sum-to-1.0 check.
+  component_weights:
+    research:
+      scanner: 0.18181818181818182                 # 2/11
+      macro_agent: 0.18181818181818182             # 2/11
+      composite_scoring: 0.36363636363636365       # 4/11
+      calibration_diagnostics: 0.2727272727272727  # 3/11
+    predictor:
+      meta_model: 0.55
+      veto_gate: 0.45
+    executor:
+      entry_triggers: 0.10
+      risk_guard: 0.15
+      exit_rules: 0.15
+      position_sizing: 0.10
+      portfolio: 0.25
+      excursion: 0.15
+      action_entropy: 0.10
+
+
 metrics:
   agent:
     agent_latency_p95: {target: 15000.0, red_line: 60000.0, higher_is_better: false, n_floor_declared: 1}
