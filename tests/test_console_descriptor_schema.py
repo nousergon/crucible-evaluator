@@ -184,3 +184,128 @@ def test_runs_binding_is_deliberately_absent():
     """
     descriptor = _load_descriptor()
     assert "runs" not in descriptor
+
+
+# ---------------------------------------------------------------------------
+# The economic surface (alpha-engine-config-I9005)
+# ---------------------------------------------------------------------------
+#
+# `console-policy.md` §2.6 onboards a module by pointing at where its facts
+# already live — which means a declared `path` that resolves to nothing renders
+# the field as absent, silently, on the one surface a reader trusts. These
+# tests are the producer-side half: every path the descriptor declares must
+# actually exist on output THIS REPO EMITS.
+#
+# Deliberately built from the producers rather than a fixture. A fixture would
+# drift from the artifact exactly the way a hand-maintained monitored-things
+# list drifts (`observability-policy.md` §2.2), and its drift would be
+# invisible for the same reason.
+
+
+def _get_path(doc, dotted: str):
+    """`console/records_shape.py::get_path`, reimplemented, not imported.
+
+    Same reason the schema is vendored: this repo has no dependency on
+    nousergon-console. Returns a `_MISSING` sentinel rather than None so a
+    field whose real value IS None cannot pass as "present" or fail as
+    "absent" — that conflation is the defect this test exists to catch.
+    """
+    cur = doc
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _MISSING
+        cur = cur[part]
+    return cur
+
+
+_MISSING = object()
+
+
+def _document_fields_paths(descriptor: dict) -> dict[str, str]:
+    docs = _document_fields_binding(descriptor)["documents"]
+    assert len(docs) == 1
+    return {
+        name: spec["path"] for name, spec in docs[0]["fields"].items()
+    }
+
+
+def test_every_declared_economic_path_resolves_on_a_real_card():
+    """The binding may not name a path the producer does not emit.
+
+    Covers both halves of the I9005 surface: the outcome TILE's own roll-up
+    (built here by the real Tile 0 builder) and the HEADLINE the outcome now
+    votes in (built here by the real composite).
+    """
+    import boto3
+    from moto import mock_aws
+
+    from grading.scorecard import compute_scorecard
+    from grading.tiles.portfolio_outcome import build_portfolio_outcome_tile
+
+    # An EMPTY bucket, on purpose — the tile's own N/A-MISSING-INPUT path is
+    # the HARDER case: a tile that measured nothing must still emit every key
+    # the console binds, or an absent producer renders as an absent FIELD
+    # instead of a loud N/A (`observability-policy.md` §8.3 — `no data` is
+    # never rendered green, and it is never rendered as nothing either).
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="alpha-engine-research")
+        tile = build_portfolio_outcome_tile("alpha-engine-research", s3_client=s3)
+
+    card = compute_scorecard()
+    card["tiles"] = {"portfolio_outcome": tile}
+    assert str(tile["status"]).startswith("N/A"), tile["status"]
+
+    declared = _document_fields_paths(_load_descriptor())
+    economic = {
+        name: path for name, path in declared.items()
+        if path.startswith(("tiles.portfolio_outcome.", "overall.", "grading_weights."))
+    }
+    # Guards the filter itself: a rename that emptied this set would make the
+    # loop below vacuously pass.
+    assert len(economic) >= 9, economic
+
+    missing = {
+        name: path for name, path in economic.items()
+        if _get_path(card, path) is _MISSING
+    }
+    assert not missing, (
+        "console.descriptor.yaml declares paths this repo's producers do not "
+        f"emit — the console would render these fields absent: {missing}"
+    )
+
+
+def test_the_headline_binding_takes_display_not_the_bare_letter():
+    """`grading/scorecard.py::_display` exists so a partial or partial-scope
+    grade never renders as a bare letter. A console binding on
+    `overall.letter` would undo that on the surface most people read
+    (config-I7202 deliverable 3)."""
+    declared = _document_fields_paths(_load_descriptor())
+    assert declared["system_grade_display"] == "overall.display"
+    assert "overall.letter" not in declared.values()
+
+
+def test_the_outcome_verdict_carries_its_denominator():
+    """A tile status with no component count is a dot that cannot say how much
+    it measured (alpha-engine-config-I8177)."""
+    declared = _document_fields_paths(_load_descriptor())
+    assert declared["portfolio_outcome_status"] == "tiles.portfolio_outcome.status"
+    assert declared["portfolio_outcome_components"] == "tiles.portfolio_outcome.n_components"
+    assert declared["portfolio_outcome_graded"] == "tiles.portfolio_outcome.n_graded"
+    assert declared["portfolio_outcome_as_of"] == "tiles.portfolio_outcome.as_of"
+
+
+def test_the_economic_components_are_not_bound_twice():
+    """§2.5 — two same-rank claims on one entity is a conflict, not coverage.
+
+    The per-component economic Signals (alpha_vs_spy, sharpe_ratio, …) are
+    already claimed by the `s3-records` fan-out below. The `document-fields`
+    binding must add the ROLL-UP and nothing that duplicates a row the fan-out
+    already produces.
+    """
+    descriptor = _load_descriptor()
+    assert _s3_records_binding(descriptor)["records_path"] == "tiles.*.components"
+    for path in _document_fields_paths(descriptor).values():
+        assert ".components" not in path, (
+            f"{path} re-claims a record the s3-records fan-out already owns"
+        )
