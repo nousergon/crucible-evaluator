@@ -37,6 +37,7 @@ from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wil
 
 from grading.history import CardHistory
 from grading.metric_record import build_metric
+from grading.thresholds.registry import DEFAULT_BAND, resolve as resolve_band
 from grading.module_agg import build_tile
 from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
 from grading.power import annotate_power_all
@@ -55,6 +56,18 @@ logger = logging.getLogger(__name__)
 MODULE = "portfolio_outcome"
 EOD_PNL_KEY = "trades/eod_pnl.csv"
 SIGNALS_KEY_TEMPLATE = "signals/{date}/signals.json"
+# alpha-engine-config-I9684 — the model-zoo rotation leaderboard, which is the
+# ONLY artifact in the fleet that persists a CSCV/PBO verdict. crucible-predictor
+# writes it from `training/model_zoo.py::_selection_pbo` on every rotation, over
+# the aligned (n_splits x n_specs) per-spec IC matrix of the specs that actually
+# raced. The evaluator reads the verdict; it never recomputes it and it never
+# reconstructs a trial matrix of its own.
+MODEL_ZOO_LEADERBOARD_KEY = "predictor/model_zoo/leaderboard/latest.json"
+# The floor is NOT authored here. `nousergon_lib.quant.stats.pbo.cscv_pbo`
+# declares `min_splits: int = 4` as the point below which it refuses to return a
+# number at all; that is the floor this component reports N against, so the card
+# and the engine cannot disagree about when PBO is underpowered.
+_PBO_MIN_SPLITS = 4
 _TRADING_DAYS = 252
 _TRADING_DAYS_PER_MONTH = 21
 _ALPHA_TREND_N_FLOOR = 60
@@ -367,6 +380,152 @@ def _read_regime_for_dates(bucket: str, dates: list[str], s3_client=None) -> dic
     return regimes
 
 
+def _read_selection_pbo(bucket: str, s3_client=None) -> tuple[dict | None, str]:
+    """Read the model-zoo rotation leaderboard's ``selection_pbo`` block.
+
+    Returns ``(block_or_None, na_detail)``. ``block`` is ``None`` with a
+    specific, operator-readable reason whenever the verdict is not available;
+    the reason NAMES the producer and the key, never "insufficient data".
+
+    Fail-loud on a real S3 fault (mirrors ``read_eod_pnl`` / ``_read_regime_for_dates``):
+    a permissions or network error must never be read as "the rotation didn't
+    compute PBO".
+    """
+    s3 = s3_client or boto3.client("s3")
+    uri = f"s3://{bucket}/{MODEL_ZOO_LEADERBOARD_KEY}"
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=MODEL_ZOO_LEADERBOARD_KEY)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return None, (
+                f"pbo: no model-zoo rotation leaderboard at {uri} — "
+                f"crucible-predictor's ModelZooSelect stage has not written one. "
+                f"PBO requires the rotation's (n_splits x n_specs) per-spec "
+                f"performance matrix; the evaluator does not reconstruct it."
+            )
+        logger.error("S3 read failed for %s: %s", uri, e)
+        raise
+    try:
+        payload = json.loads(resp["Body"].read())
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"model-zoo leaderboard at {uri} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"model-zoo leaderboard at {uri} is not a JSON object.")
+    block = payload.get("selection_pbo")
+    if not isinstance(block, dict):
+        return None, (
+            f"pbo: {uri} carries no `selection_pbo` block — the rotation ran but "
+            f"crucible-predictor did not emit a CSCV verdict for it "
+            f"(training/model_zoo.py::_selection_pbo)."
+        )
+    block = dict(block)
+    block["_leaderboard_date"] = payload.get("date")
+    return block, ""
+
+
+def _build_pbo_component(bucket: str, s3_client=None):
+    """Component: CSCV Probability of Backtest Overfitting (alpha-engine-config-I9684).
+
+    The second of the two leak-free terms in the fleet's own written graduation
+    bar (``alpha-engine-config/private-docs/SYSTEM_OPTIMIZED.md`` s12: *"leak-free
+    validated (DSR significant, **PBO < 0.2**)"*, restated in s2 Tier 1 as
+    "PBO ... target < 0.2"). ``dsr`` has been on this tile since config#2454;
+    ``pbo`` was computed nowhere the card could see it, so any predicate written
+    against s12 was unevaluable.
+
+    The bar is DECLARED, not authored here: 0.2 lives in the threshold registry
+    row, sourced from s12. The status is passed explicitly (the ``beta_vs_spy``
+    precedent) because the generic deriver orients direction from the
+    target/red-line ORDERING, and s12 declares a target with no red line -- with
+    ``red_line=None`` the deriver would silently read PBO as higher-is-better and
+    grade a healthy 0.09 as WATCH. Nothing goes RED: a red line for PBO is not
+    written down anywhere, and this component does not invent one.
+
+    ``n_samples`` is the CSCV split count and ``n_floor`` is the engine's own
+    declared ``min_splits``. The TRIAL axis (``n_specs``) carries its own
+    power question that no document answers -- it is reported in full in the
+    reason (spec count, dropped specs, selection concentration) rather than
+    silently folded into a letter. See alpha-engine-config-I9685.
+    """
+    src = f"s3://{bucket}/{MODEL_ZOO_LEADERBOARD_KEY}"
+    band = resolve_band(MODULE, "pbo", DEFAULT_BAND)
+    target = band.target
+
+    block, na_detail = _read_selection_pbo(bucket, s3_client=s3_client)
+    if block is None:
+        return build_metric(
+            name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
+            n_floor=_PBO_MIN_SPLITS, source_path=src, implemented=False,
+            na_detail=na_detail,
+        )
+
+    status_raw = block.get("status")
+    n_splits = block.get("n_splits")
+    n_specs = block.get("n_specs")
+    n_splits = int(n_splits) if isinstance(n_splits, (int, float)) else None
+    n_specs = int(n_specs) if isinstance(n_specs, (int, float)) else None
+    pbo = block.get("pbo")
+    pbo = float(pbo) if isinstance(pbo, (int, float)) and math.isfinite(float(pbo)) else None
+
+    if status_raw != "ok" or pbo is None:
+        reason = block.get("reason") or f"engine status={status_raw!r}"
+        return build_metric(
+            name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
+            n_samples=n_splits, n_floor=_PBO_MIN_SPLITS, source_path=src,
+            status="N/A-LOW-N",
+            reason=(
+                f"pbo: the rotation's CSCV returned no number ({reason}); "
+                f"n_splits={n_splits}, n_specs={n_specs}. The engine's declared "
+                f"floor is min_splits={_PBO_MIN_SPLITS} "
+                f"(nousergon_lib.quant.stats.pbo.cscv_pbo)."
+            ),
+        )
+
+    # Everything the reader needs to judge how much this number is worth --
+    # the trial axis is where a CSCV estimate degenerates, so it is stated,
+    # never inferred away.
+    dropped = block.get("dropped_misaligned_specs") or []
+    counts = block.get("selected_counts") or {}
+    caveats = [f"n_specs={n_specs}"]
+    if dropped:
+        caveats.append(f"{len(dropped)} spec(s) dropped as misaligned ({', '.join(map(str, dropped))})")
+    if isinstance(counts, dict) and len(counts) == 1 and n_splits:
+        only = next(iter(counts))
+        caveats.append(
+            f"selection is DEGENERATE — '{only}' was the in-sample winner in all "
+            f"{n_splits} splits, so this PBO measures a strictly dominant "
+            f"configuration, not a contested sweep"
+        )
+    lb_date = block.get("_leaderboard_date")
+    if lb_date:
+        caveats.append(f"rotation {lb_date}")
+
+    if n_splits is None or n_splits < _PBO_MIN_SPLITS:
+        status = "N/A-LOW-N"
+        headline = (
+            f"pbo = {pbo:.4g} over n_splits={n_splits}, below the engine's "
+            f"declared floor of {_PBO_MIN_SPLITS} — UNDERPOWERED"
+        )
+    elif target is not None and pbo < target:
+        status = "GREEN"
+        headline = f"pbo = {pbo:.4g} < {target:g} (the declared bar, SYSTEM_OPTIMIZED.md s12), N={n_splits} splits"
+    else:
+        # WATCH, never RED: s12 declares a target and no red line, and this
+        # component does not author one.
+        status = "WATCH"
+        headline = (
+            f"pbo = {pbo:.4g} does NOT clear the declared bar of {target:g} "
+            f"(SYSTEM_OPTIMIZED.md s12), N={n_splits} splits"
+        )
+
+    return build_metric(
+        name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
+        value=pbo, unit=PROBABILITY, n_samples=n_splits, n_floor=_PBO_MIN_SPLITS,
+        source_path=src, higher_is_better=False, status=status,
+        reason=f"{headline}. " + "; ".join(caveats) + ".",
+    )
+
+
 def _regime_na_detail(
     bucket_counts: dict[str, int], qualifying: dict[str, float], total_joined: int,
     *, n_floor: int, min_bucket_n: int, min_buckets: int,
@@ -562,6 +721,10 @@ def build_portfolio_outcome_tile(
             miss("cvar_95_daily", "ratio", "supporting", 60, -0.01, -0.04),
             miss("alpha_trend", "pct", "diagnostic", _ALPHA_TREND_N_FLOOR, 0.0, None, "ols_slope_newey_west_hac"),
         ]
+        # pbo reads the model-zoo leaderboard, NOT eod_pnl.csv — a missing EOD
+        # export says nothing about whether the rotation computed a CSCV verdict,
+        # so it is built here too rather than blanket-N/A'd (I9622).
+        components.append(_build_pbo_component(bucket, s3_client=s3_client))
         annotate_power_all(components)
         return build_tile(MODULE, components)
 
@@ -716,6 +879,12 @@ def build_portfolio_outcome_tile(
                 "empty, or not yet backfilled — see config#2454)."
             ).format(bucket=bucket),
         ))
+
+    # 12b. PBO (supporting) — CSCV Probability of Backtest Overfitting, the
+    #      selection-overfitting complement to dsr and the second of the two
+    #      leak-free terms in SYSTEM_OPTIMIZED.md §12's graduation bar
+    #      (alpha-engine-config-I9684).
+    components.append(_build_pbo_component(bucket, s3_client=s3_client))
 
     # 13. Regime-weighted alpha (critical) — market-regime decomposition of daily
     #     alpha via a join against signals/{date}/signals.json's market_regime

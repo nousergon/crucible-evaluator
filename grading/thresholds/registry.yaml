@@ -249,6 +249,18 @@ metrics:
     information_ratio: {target: 0.5, red_line: 0.0, n_floor_declared: 60}
     max_dd_duration_days: {target: 30.0, red_line: 90.0, higher_is_better: false, n_floor_declared: 2}
     max_drawdown: {target: -0.15, red_line: -0.25, n_floor_declared: 2}
+    # alpha-engine-config-I9684 — CSCV Probability of Backtest Overfitting.
+    # `target: 0.2` is DECLARED, not authored here: SYSTEM_OPTIMIZED.md §12
+    # ("leak-free validated (DSR significant, PBO < 0.2)") and §2 Tier 1
+    # ("PBO … target < 0.2"). `red_line: null` because §12 declares a target and
+    # no red line — the tile passes an explicit status (the beta_vs_spy
+    # precedent) so PBO never renders RED against a bar nobody wrote, and so the
+    # deriver's target/red_line ORDERING cannot silently read PBO as
+    # higher-is-better. `n_floor_declared: 4` is the CSCV split floor declared by
+    # the shared engine itself (nousergon_lib.quant.stats.pbo.cscv_pbo's
+    # `min_splits: int = 4`), not a number chosen here. The TRIAL-axis power
+    # floor (n_specs) is undeclared anywhere in the fleet — see I9623.
+    pbo: {target: 0.2, red_line: null, higher_is_better: false, n_floor_declared: 4}
     psr: {target: 0.95, red_line: 0.5, n_floor_declared: 60}
     regime_weighted_alpha: {target: 0.0, red_line: 0.0, n_floor_declared: 30}
     sharpe_ratio: {target: 1.0, red_line: 0.0, n_floor_declared: 60}

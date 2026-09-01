@@ -103,9 +103,16 @@ class TestBuildTileMissingInput:
         # N/A-MISSING-INPUT. alpha-engine-config-I9612: any declared roster
         # member the builder did not emit at all is additionally rendered
         # N/A-UNREPORTED, which is a different fact and says so.
+        # alpha-engine-config-I9684: `pbo` reads the model-zoo leaderboard, not
+        # eod_pnl.csv, so a missing EOD export is NOT its missing input — it is
+        # excluded here and asserted on its own below. Folding it in would have
+        # made the tile claim eod_pnl.csv was pbo's input, which is false.
         statuses = {c["status"] for c in tile["components"]
-                    if not c.get("unreported")}
+                    if not c.get("unreported") and c["name"] != "pbo"}
         assert statuses == {"N/A-MISSING-INPUT"}
+        pbo = next(c for c in tile["components"] if c["name"] == "pbo")
+        assert pbo["status"] == "N/A-NOT-IMPL"
+        assert "model_zoo/leaderboard" in pbo["status_reason"]
         # alpha-engine-config-I8177: a tile in which NOTHING graded is
         # UNMEASURED, not measured-and-borderline. It reports the N/A
         # class its components declare (module_agg.unmeasured_status).
