@@ -41,6 +41,7 @@ from grading.thresholds.registry import DEFAULT_BAND, resolve as resolve_band
 from grading.module_agg import build_tile
 from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
 from grading.power import annotate_power_all
+from grading.regime_index import SIGNALS_KEY_TEMPLATE, resolve_regimes
 from grading.units import (
     ANNUALIZED_RATIO,
     DAYS,
@@ -55,7 +56,6 @@ logger = logging.getLogger(__name__)
 
 MODULE = "portfolio_outcome"
 EOD_PNL_KEY = "trades/eod_pnl.csv"
-SIGNALS_KEY_TEMPLATE = "signals/{date}/signals.json"
 # alpha-engine-config-I9684 — the model-zoo rotation leaderboard, which is the
 # ONLY artifact in the fleet that persists a CSCV/PBO verdict. crucible-predictor
 # writes it from `training/model_zoo.py::_selection_pbo` on every rotation, over
@@ -340,44 +340,33 @@ def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
 # regime_weighted_alpha — market-regime decomposition of daily alpha (config#857 C2-fu)
 # ---------------------------------------------------------------------------
 
-def _read_regime_for_dates(bucket: str, dates: list[str], s3_client=None) -> dict[str, str]:
+def _resolve_regimes_for_dates(bucket: str, dates: list[str], s3_client=None):
     """Join each ``eod_pnl.csv`` date to its ``market_regime`` tag.
 
-    Reads ``s3://{bucket}/signals/{date}/signals.json`` for every date and pulls
-    the TOP-LEVEL ``market_regime`` field (``bull``/``neutral``/``caution``/
-    ``bear`` — matches ``crucible-research/scripts/backfill_calibrator_v1_context.py``'s
-    ``payload.get("market_regime")``). A date with no ``signals.json``
-    (``NoSuchKey`` — weekends/holidays already shouldn't reach ``eod_pnl.csv``,
-    but be defensive) or no ``market_regime`` key is SKIPPED, never fabricated —
-    the caller sees it simply absent from the returned mapping. Any other S3
-    error is fail-loud (mirrors ``read_eod_pnl``'s posture: a real S3 problem
-    must not be silently read as "this date has no regime").
+    Delegates to ``grading/regime_index.py``, which serves the join from one
+    small persisted index (``evaluator/indexes/market_regime.json``) and fetches
+    only the dates that index does not already answer, through a bounded thread
+    pool. Before alpha-engine-config-I9702 this was one SEQUENTIAL
+    ``get_object`` of a ~637KB ``signals/{date}/signals.json`` PER DATE over the
+    full since-inception history — 121 GETs to read 121 short strings, growing
+    by one every weekday, and the dominant term in the ReportCard stage's
+    duration regression from ~68s (through 2026-08-20) to a 300s
+    ``States.Timeout`` on 2026-08-30.
 
-    One ``get_object`` per date — ``eod_pnl.csv``'s date range is bounded to the
-    still-young live book's since-inception history (tens to low hundreds of
-    rows today), so N sequential GETs is fine; revisit (parallelize / batch) if
-    the live book's history grows materially.
+    The card contract is unchanged: the TOP-LEVEL ``market_regime`` field
+    (``bull``/``neutral``/``caution``/``bear``) is what is read, and a date with
+    no ``signals.json`` or no ``market_regime`` key is SKIPPED, never fabricated
+    — the caller sees it simply absent from ``resolution.regimes``, and
+    ``_regime_na_detail`` renders that as a specific N/A. What IS new is that
+    such a date is now recorded as an explicit ``null`` in the index and
+    counted in its ``n_unresolved``, so an invisible skip became a countable
+    fact. A real S3 fault still raises.
+
+    Returns the whole ``RegimeResolution`` (not just the mapping) because the
+    merged index rides out to ``grading/handler.py`` to be persisted — this
+    module, like every tile builder here, performs no S3 write of its own.
     """
-    s3 = s3_client or boto3.client("s3")
-    regimes: dict[str, str] = {}
-    for d in dates:
-        key = SIGNALS_KEY_TEMPLATE.format(date=d)
-        try:
-            resp = s3.get_object(Bucket=bucket, Key=key)
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-                continue
-            logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
-            raise
-        try:
-            payload = json.loads(resp["Body"].read())
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("Skipping corrupt signals.json at s3://%s/%s", bucket, key)
-            continue
-        regime = payload.get("market_regime") if isinstance(payload, dict) else None
-        if regime:
-            regimes[d] = regime
-    return regimes
+    return resolve_regimes(bucket, dates, s3_client=s3_client)
 
 
 def _read_selection_pbo(bucket: str, s3_client=None) -> tuple[dict | None, str]:
@@ -901,8 +890,12 @@ def build_portfolio_outcome_tile(
     #     tag (config#857 C2-fu). Equal-weight mean log-alpha across regime
     #     buckets meeting the sample floor; N/A (not a guess) if the book hasn't
     #     yet traded through >=2 regimes with enough days in each.
-    regime_by_date = _read_regime_for_dates(bucket, series.dates, s3_client=s3_client)
-    rwa = _compute_regime_weighted_alpha(series.dates, active, regime_by_date)
+    regime_resolution = _resolve_regimes_for_dates(
+        bucket, series.dates, s3_client=s3_client,
+    )
+    rwa = _compute_regime_weighted_alpha(
+        series.dates, active, regime_resolution.regimes,
+    )
     components.append(build_metric(
         name="regime_weighted_alpha", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="regime_weighted_log_alpha", measurement_horizon="since_inception",
@@ -938,6 +931,13 @@ def build_portfolio_outcome_tile(
     # persist it as its own artifact (evaluator/{run_date}/attribution.json)
     # without recomputing it — one build per cycle, one number everywhere.
     tile["attribution"] = _attr_payload
+    # alpha-engine-config-I9702 — the merged date->market_regime index, handed
+    # to the report-card handler to persist at evaluator/indexes/
+    # market_regime.json. `None` when nothing changed (no no-op PUT). Rides on
+    # the tile under a leading underscore, the convention this repo already uses
+    # for build output that is NOT card content: aggregate.py pops it before the
+    # card is written, exactly as it does for `_threshold_leaderboard`.
+    tile["_regime_index"] = regime_resolution.index
     # config#2885: surface silently-dropped CSV rows so the report card
     # shows data-integrity issues (unparseable portfolio_nav/daily_return_pct).
     if series is not None:

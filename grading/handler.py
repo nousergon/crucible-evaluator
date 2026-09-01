@@ -33,6 +33,7 @@ from krepis.logging import setup_logging
 from grading.aggregate import build_report_card, write_report_card
 from grading.experiment_record import build_experiment_record, write_experiment_record
 from grading.pipeline_gates import gates_unmeasured, log_gate_state, read_gate_state
+from grading.regime_index import write_index as write_regime_index
 from grading.self_test import run_self_test, verdict_is_pass, write_self_test
 from grading.thresholds.scoring import write_leaderboard
 
@@ -389,6 +390,11 @@ def _run(event: dict | None = None, context=None) -> dict:
     # card content. Popped before the card is written so the card stays lean.
     threshold_leaderboard = card.pop("_threshold_leaderboard", None)
 
+    # alpha-engine-config-I9702 — the merged date->market_regime index built by
+    # Tile 0. Same convention: build output, popped before the card is written.
+    # `None` means every date was already indexed and there is nothing to PUT.
+    regime_index = card.pop("_regime_index", None)
+
     latest_key = None
     dated_key = None
     if write:
@@ -441,6 +447,29 @@ def _run(event: dict | None = None, context=None) -> dict:
                 "the scoring result): %s", run_date, exc, exc_info=True,
             )
 
+    # alpha-engine-config-I9702 — persist the date->market_regime index. This is
+    # what makes the NEXT build O(1) in the regime join instead of one ~637KB
+    # S3 GET per session since inception (121 today, +1 per weekday, and the
+    # dominant term in the ReportCard stage's 68s -> 300s timeout regression).
+    #
+    # Isolated and fail-SOFT, like the three artifacts above: a failed index
+    # write costs the next cycle its speed-up, never this cycle's card. NOT
+    # silent — the WARN names the loss, and the very next build simply re-fetches
+    # the un-indexed dates and tries again, which is a self-healing degradation
+    # rather than a stuck one. The observable signature of a persistently failing
+    # write is the duration regression this fix removes, on the same
+    # `alpha-engine-evaluator` Duration metric that surfaced it.
+    regime_index_key = None
+    if write and regime_index is not None:
+        try:
+            regime_index_key = write_regime_index(bucket, regime_index, s3_client=None)
+        except Exception as exc:  # noqa: BLE001 — derived cache, never fatal
+            logger.warning(
+                "regime index write failed for %s (the report card is unaffected; "
+                "the next build re-fetches the un-indexed dates): %s",
+                run_date, exc, exc_info=True,
+            )
+
     experiment_record_key = None
     if write:
         try:
@@ -470,6 +499,11 @@ def _run(event: dict | None = None, context=None) -> dict:
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),
         "experiment_record_key": experiment_record_key,
         "threshold_leaderboard_key": threshold_leaderboard_key,
+        # I9702 — `null` here on a healthy steady-state cycle is a VALUE: it says
+        # every eod_pnl.csv date was already served from the index and nothing
+        # needed re-persisting. A key on every single cycle would mean the index
+        # is not actually converging.
+        "regime_index_key": regime_index_key,
         # §2.3a rule 3 — every surface presenting the run's results carries the
         # verdict state. `degraded_self_test` is derived from the verdict rather
         # than set independently, so the two can never disagree, and a missing

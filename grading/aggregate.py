@@ -26,8 +26,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+from botocore.config import Config as BotoConfig
 
 from grading.artifacts import read_scorecard_inputs
 from grading.coverage import (
@@ -58,6 +60,21 @@ from grading.tiles.research import build_research_tile
 from grading.tiles.substrate import build_substrate_tile
 
 logger = logging.getLogger(__name__)
+
+# alpha-engine-config-I9702 — worker count for the tile-build pool. Ten tiles,
+# so ten workers runs every one concurrently and the stage's wall-clock becomes
+# the MAX tile latency rather than the SUM. The tiles are network-bound (S3
+# GETs), not CPU-bound, so this is not competing for the Lambda's single vCPU;
+# the shared boto3 client below is given a connection pool sized for these ten
+# plus the regime index's own bounded fetch pool (grading/regime_index.py).
+_TILE_POOL_WORKERS = 10
+# botocore's default max_pool_connections is 10, which the tile pool alone would
+# saturate — urllib3 then opens and discards connections outside the pool on
+# every extra concurrent request. 10 tile workers + 8 regime-fetch workers + a
+# margin. Sized here, on ONE shared client, which also makes the pool safe:
+# boto3 clients are thread-safe to CALL, but constructing one is not, and
+# leaving `s3_client=None` would have had ten threads each build their own.
+_S3_MAX_POOL_CONNECTIONS = 24
 
 # The evaluator's own report-card namespace (NOT backtest/{date}/grading.json).
 REPORT_CARD_PREFIX = "evaluator"
@@ -204,6 +221,15 @@ def build_report_card(
     # "report card attestation UNKNOWN ... the producer never ran this cycle"
     # every Friday instead, most recently at 2026-08-29T01:44Z from execution
     # offcycle-shell-20260829-004717 — a run in which nothing failed.
+    # I9702 — materialize ONE shared client before anything below runs. The tile
+    # builders execute concurrently and each would otherwise call
+    # `boto3.client("s3")` itself; client CONSTRUCTION walks a shared session
+    # cache and is not thread-safe, while a constructed client is. This also
+    # sizes the connection pool once, for every concurrent reader downstream.
+    s3_client = s3_client or boto3.client(
+        "s3", config=BotoConfig(max_pool_connections=_S3_MAX_POOL_CONNECTIONS),
+    )
+
     freshness_provenance = assert_input_freshness(
         bucket, run_date, s3_client=s3_client, dry_run=dry_run,
     )
@@ -282,9 +308,56 @@ def build_report_card(
     # outcome voter out of the denominator and RAISE the headline grade because
     # the outcome measurement broke, which is the exact inversion the I7210
     # failure-scores-zero rule exists to prevent.
-    portfolio_outcome_tile = build_portfolio_outcome_tile(
-        bucket, s3_client=s3_client, history=history, n_trials=n_trials,
-    )
+    #
+    # alpha-engine-config-I9702 — the ten tile builders run in a BOUNDED THREAD
+    # POOL rather than strictly sequentially. Each reads its own disjoint S3
+    # artifacts and shares no mutable state, so total wall-clock was the SUM of
+    # ten independent network-bound latencies; one slow tile set the stage's
+    # duration and there was no reason for it to. The pool is submitted here,
+    # in declaration order, and RESOLVED in declaration order below.
+    #
+    # Error semantics are deliberately UNCHANGED. Resolving in declaration
+    # order means the first failing tile in that order is the exception that
+    # propagates, exactly as sequential execution would, and nothing is
+    # swallowed: a tile build that raises still fails the card. That is not an
+    # oversight — swallowing a tile here would drop a voter out of the
+    # denominator and RAISE the headline grade because a measurement broke,
+    # the exact inversion the I7210 failure-scores-zero rule exists to prevent
+    # (see the portfolio_outcome note below). The pool changes WHEN work runs,
+    # never what a failure means.
+    _tile_builders: list[tuple[str, object]] = [
+        ("portfolio_outcome", lambda: build_portfolio_outcome_tile(
+            bucket, s3_client=s3_client, history=history, n_trials=n_trials,
+        )),
+        ("predictor", lambda: build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history)),
+        ("research", lambda: build_research_tile(bucket, run_date, s3_client=s3_client, history=history)),
+        ("executor", lambda: build_executor_tile(bucket, run_date, s3_client=s3_client)),
+        ("backtester", lambda: build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history)),
+        ("substrate", lambda: build_substrate_tile(
+            bucket, run_date, s3_client=s3_client,
+            threshold_leaderboard=threshold_leaderboard,
+            threshold_leaderboard_error=threshold_leaderboard_error,
+        )),
+        ("agent", lambda: build_agent_tile(bucket, run_date, s3_client=s3_client)),
+        ("behavioral", lambda: build_behavioral_tile(bucket, run_date, s3_client=s3_client)),
+        ("director_quality", lambda: build_director_quality_tile(bucket, run_date, s3_client=s3_client)),
+        ("contribution_lift", lambda: build_contribution_lift_tile(bucket, run_date, s3_client=s3_client)),
+    ]
+    with ThreadPoolExecutor(
+        max_workers=_TILE_POOL_WORKERS, thread_name_prefix="tile",
+    ) as pool:
+        _futures = [(name, pool.submit(fn)) for name, fn in _tile_builders]
+    # `.result()` in declaration order — the pool has already joined, so this
+    # only unwraps values (and re-raises, deterministically ordered).
+    built_tiles = {name: fut.result() for name, fut in _futures}
+
+    portfolio_outcome_tile = built_tiles["portfolio_outcome"]
+    # I9702 — the merged date->market_regime index, popped off the tile before
+    # it becomes card content and carried out to the handler under the same
+    # leading-underscore convention `_threshold_leaderboard` uses. `None` means
+    # every date was already indexed and a PUT would be a no-op.
+    regime_index = portfolio_outcome_tile.pop("_regime_index", None)
+
     scorecard = compute_scorecard(
         **inputs,
         portfolio_outcome=_outcome_voter(portfolio_outcome_tile),
@@ -316,28 +389,11 @@ def build_report_card(
     #     (research/predictor/executor/behavioral) so it renders beside that
     #     component on any surface grouping by a record's own `.module`.
     # TEN tiles total; the historical numbering skips 8 (0–7, 9, 10) — there
-    # is no Tile 8. This dict is the membership source of truth (pinned by
-    # tests/test_aggregate.py + test_handler.py).
-    tiles = {
-        # Built ABOVE, before compute_scorecard, because its grade is now a
-        # voter in the v1 composite (alpha-engine-config-I9005). Built once and
-        # reused here: two builds would be two reads of eod_pnl.csv and two
-        # chances for the voting number and the published tile to disagree.
-        "portfolio_outcome": portfolio_outcome_tile,
-        "predictor": build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
-        "research": build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
-        "executor": build_executor_tile(bucket, run_date, s3_client=s3_client),
-        "backtester": build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history),
-        "substrate": build_substrate_tile(
-            bucket, run_date, s3_client=s3_client,
-            threshold_leaderboard=threshold_leaderboard,
-            threshold_leaderboard_error=threshold_leaderboard_error,
-        ),
-        "agent": build_agent_tile(bucket, run_date, s3_client=s3_client),
-        "behavioral": build_behavioral_tile(bucket, run_date, s3_client=s3_client),
-        "director_quality": build_director_quality_tile(bucket, run_date, s3_client=s3_client),
-        "contribution_lift": build_contribution_lift_tile(bucket, run_date, s3_client=s3_client),
-    }
+    # is no Tile 8. `_tile_builders` above is the membership source of truth
+    # (pinned by tests/test_aggregate.py + test_handler.py); this dict is its
+    # projection, so membership cannot drift between what is BUILT and what is
+    # PUBLISHED (I9702 — before the pool, the two were two separate literals).
+    tiles = {name: built_tiles[name] for name, _ in _tile_builders}
     # alpha-engine-config-I8177 — `evaluator_coverage` grades THIS card, not the
     # legacy v1 `grading.json`.
     #
@@ -375,6 +431,10 @@ def build_report_card(
     # is build output rather than card content. The handler pops it before the
     # card is written, so the card itself does not carry the whole leaderboard.
     scorecard["_threshold_leaderboard"] = threshold_leaderboard
+    # I9702, same convention: build output, not card content. The handler pops
+    # it and persists it under its own `write` flag, so the pre-promotion
+    # canary (`{"write": false}`) still writes nothing at all.
+    scorecard["_regime_index"] = regime_index
     # Unified RC v2 overall status — worst-of (portfolio outcome leads; a RED in
     # any cascade module fails overall), per module_agg.overall_status. The
     # Backtester / Substrate / Agent tiles join later; overall_status tolerates
