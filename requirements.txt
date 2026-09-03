@@ -190,7 +190,7 @@ pandas~=3.0
 # `krepis/model_registry.py`. A merged publish workflow is not a published
 # package, and this fleet has shipped a green "Publish to PyPI" that served
 # unchanged metadata.
-krepis[flow-doctor,openai]==0.59.39  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; alpha-engine-config-I8408 arms `total_timeout` on the Director's streamed plan call
+krepis[flow-doctor,openai]==0.59.44  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; alpha-engine-config-I8408 arms `total_timeout` on the Director's streamed plan call
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
