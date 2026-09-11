@@ -190,7 +190,7 @@ pandas~=3.0
 # `krepis/model_registry.py`. A merged publish workflow is not a published
 # package, and this fleet has shipped a green "Publish to PyPI" that served
 # unchanged metadata.
-krepis[flow-doctor,openai]==0.59.53  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; alpha-engine-config-I8408 arms `total_timeout` on the Director's streamed plan call; 0.59.39 -> 0.59.53 (alpha-engine-config-I10141 deliverable 3) for the NYSE-calendar coverage fix in krepis-PR206 (trading_calendar previously answered True for any pre-2025 weekday; now covers from 2016-01-01 and raises TradingCalendarPrecedesCoverageError before that)
+krepis[flow-doctor,openai]==0.59.57  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I10399 makes resolve_group_spec put a MODEL GROUP on the wire instead of the qualified primary deployment name, which is what lets LiteLLM apply the group's fallback chain (krepis-PR215, alpha-engine-config-I10403)
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
