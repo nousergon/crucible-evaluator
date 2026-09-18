@@ -107,6 +107,37 @@ DEGRADED_FAMILY_LABELS: dict[str, str] = {
     "research_predictor_degraded": "an internal ResearchPredictorParallel fail-open",
 }
 
+#: Which degradation families actually cover the run's PRE-SPEND correctness
+#: gates, and which do not. ``alpha-engine-config-I10534`` / ``-I10062``.
+#:
+#: Only ``gate_degraded`` does. It is written by exactly three SF Pass states —
+#: ``LibPinGateDegraded``, ``PipelineContractGateDegraded`` and
+#: ``SetMutexAcquireDegradedFlag`` — all of which sit ahead of every stage that
+#: spends. The other three families are written by states that run alongside or
+#: after the spending stages: ``SaturdayHealthCheckDegraded`` /
+#: ``SubstrateHealthCheckDegraded`` (tail), ``ParityDegraded`` (post-backtest),
+#: and the ten ``Mark*Degraded`` states inside ``ResearchPredictorParallel``.
+#:
+#: This split exists because the module asserted the opposite. On run_date
+#: 2026-09-04 and 2026-09-11 the ONLY family that fired was
+#: ``research_predictor_degraded``, via a single route — ``ChallengerShadow``
+#: raising ``ChallengerShadowGapError`` and being caught ``States.ALL`` into
+#: ``MarkChallengerShadowDegraded`` (measured on executions
+#: ``watch-rerun-2026-09-04-3`` and
+#: ``51f6aa74-939a-ba89-22a6-751c65d5f9e3_1067770b-6b63-aa1b-8b21-891b904fcdd0``).
+#: Both pre-spend gates reported ``MEASURED`` on both runs. The card, the
+#: Director digest and the weekly email nonetheless all said "the run's
+#: pre-spend protection was incomplete", and the email rendered its unmeasured-
+#: gate list as the literal placeholder ``unnamed`` because that list was empty.
+#: The weekly Director then read the sentence and filed it as a P0 twice
+#: (``alpha-engine-config-I10062``, ``-I10534``).
+#:
+#: The verdict is UNCHANGED by this split — any fired family still withholds the
+#: attestation. What changes is only the REASON, which must be true: a claim
+#: that money went unprotected, made on a week when it did not, is the fastest
+#: way to teach a reader to skip the week when it did.
+PRE_SPEND_FAMILIES: frozenset[str] = frozenset({"gate_degraded"})
+
 
 def _statement(verdict: str, unmeasured: list[tuple[str, str]], degraded: list[str],
                families_unreported: list[str], n_gates: int, top_reason: str) -> str:
@@ -237,6 +268,14 @@ def read_gate_state(gate_state: Any) -> dict:
         fam for fam in DEGRADED_FAMILY_LABELS
         if gate_state.get(fam) is True
     ]
+    # alpha-engine-config-I10534: carried as two lists so every downstream
+    # surface (digest, email banner, console, the Director's own prompt) keys on
+    # the PROPERTY rather than re-deriving it, or worse, parsing the sentence.
+    # Both are always present, in both polarities — an absent list would make
+    # "nothing pre-spend fired" indistinguishable from "this card predates the
+    # split".
+    degraded_pre_spend = [f for f in degraded if f in PRE_SPEND_FAMILIES]
+    degraded_other = [f for f in degraded if f not in PRE_SPEND_FAMILIES]
     # A family the SF did not send is NOT false — it is unreported. Recorded
     # separately so "no degradation" and "nobody said" stay distinguishable.
     families_unreported = [
@@ -280,12 +319,32 @@ def read_gate_state(gate_state: Any) -> dict:
         # Without this the head renders "NOT VERIFIED — " with an empty reason:
         # this is the one path where the verdict is UNKNOWN and NEITHER a gate
         # nor an unreported family explains why.
-        top_reason = top_reason or (
-            f"{len(degraded)} fail-open "
-            f"{'degradations were' if len(degraded) > 1 else 'degradation was'} "
-            "recorded on this run, so the run's pre-spend protection was "
-            "incomplete even though every gate that DID report reported MEASURED."
-        )
+        #
+        # alpha-engine-config-I10534: and the reason branches on WHICH families
+        # fired, because "pre-spend protection was incomplete" is a claim about
+        # money and it was false on every run that ever rendered it. See
+        # PRE_SPEND_FAMILIES.
+        n = len(degraded)
+        were = "degradations were" if n > 1 else "degradation was"
+        # Neither branch names the families: the trailing clause in `_statement`
+        # already does, on both, and naming them twice in one paragraph is how a
+        # sentence stops being read.
+        if degraded_pre_spend:
+            top_reason = top_reason or (
+                f"{n} fail-open {were} recorded on this run, including the "
+                "pre-spend gate family, so the run's pre-spend protection was "
+                "incomplete even though every gate that DID report reported "
+                "MEASURED."
+            )
+        else:
+            top_reason = top_reason or (
+                f"{n} fail-open {were} recorded on this run, none of them in "
+                "the pre-spend gate family — both pre-spend correctness gates "
+                "reported MEASURED, so this run's spend WAS gated. The "
+                "attestation is withheld because a stage produced its output "
+                "without its guarantee; the finding is a broken stage, not "
+                "unprotected money."
+            )
 
     block = {
         "schema": SCHEMA,
@@ -295,6 +354,8 @@ def read_gate_state(gate_state: Any) -> dict:
         "gates": gates,
         "unmeasured": [k for k, _ in unmeasured],
         "degraded_families": degraded,
+        "degraded_pre_spend": degraded_pre_spend,
+        "degraded_other": degraded_other,
         "families_unreported": families_unreported,
         "reason": top_reason,
         "statement": _statement(
@@ -303,6 +364,28 @@ def read_gate_state(gate_state: Any) -> dict:
         ),
     }
     return block
+
+
+def pre_spend_degraded(block: Any) -> bool:
+    """True when a family covering the run's PRE-SPEND gates fail-opened.
+
+    ``alpha-engine-config-I10534``. Read from ``degraded_pre_spend`` when the
+    block carries it, and otherwise re-derived from ``degraded_families`` so a
+    card written before the split (every card up to 2026-09-11) resolves to the
+    same answer rather than to a silent False.
+
+    Deliberately NOT a verdict: a surface that needs to know whether the money
+    was gated asks this, and a surface that needs to know whether the card is
+    attested asks :func:`gates_unmeasured`. Collapsing the two is the defect
+    this function exists to end.
+    """
+    b = block or {}
+    explicit = b.get("degraded_pre_spend")
+    if isinstance(explicit, list):
+        return bool(explicit)
+    return any(
+        f in PRE_SPEND_FAMILIES for f in (b.get("degraded_families") or [])
+    )
 
 
 def gates_unmeasured(block: Any) -> bool:

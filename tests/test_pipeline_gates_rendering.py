@@ -156,3 +156,116 @@ def test_pipeline_gates_do_not_withhold_director_actions():
     vb = {"verdict": "PASS", "as_of": {},
           PIPELINE_GATES_KEY: read_gate_state(_UNMEASURED)}
     assert actions_withheld(vb) is False
+
+
+# ---------------------------------------------------------------------------
+# A fail-open OUTSIDE the pre-spend gates must not be reported as one INSIDE
+# them (alpha-engine-config-I10534 / -I10062).
+#
+# Measured origin: on run_date 2026-09-04 and 2026-09-11 the weekly SF fired
+# exactly one degradation route — ChallengerShadow raising
+# ChallengerShadowGapError into MarkChallengerShadowDegraded — while BOTH
+# pre-spend gates reported MEASURED. All three surfaces said "the run's
+# pre-spend protection was incomplete", and the email named its (empty)
+# unmeasured-gate list as the literal placeholder "unnamed". The Director read
+# that sentence and filed it P0 twice.
+# ---------------------------------------------------------------------------
+
+_RP_DEGRADED = _payload(research_predictor_degraded=True)
+_GATE_DEGRADED = _payload(gate_degraded=True)
+
+
+def test_a_non_pre_spend_fail_open_still_withholds_the_attestation():
+    """The verdict is NOT widened. This is the load-bearing assertion: the whole
+    fix is a truer REASON, never a broader success condition."""
+    block = read_gate_state(_RP_DEGRADED)
+    assert block["verdict"] == UNKNOWN
+    assert block["degraded_families"] == ["research_predictor_degraded"]
+
+
+def test_a_non_pre_spend_fail_open_does_not_claim_the_spend_was_unprotected():
+    block = read_gate_state(_RP_DEGRADED)
+    assert "pre-spend protection was incomplete" not in block["statement"]
+    assert "none of them in the pre-spend gate family" in block["statement"]
+    assert "spend WAS gated" in block["statement"]
+    # and it still names what DID fail open, so the finding is actionable
+    assert "ResearchPredictorParallel" in block["statement"]
+
+
+def test_a_pre_spend_fail_open_still_makes_the_strong_claim():
+    block = read_gate_state(_GATE_DEGRADED)
+    assert block["verdict"] == UNKNOWN
+    assert "pre-spend protection was incomplete" in block["statement"]
+    assert block["degraded_pre_spend"] == ["gate_degraded"]
+
+
+@pytest.mark.parametrize("payload,pre,other", [
+    (_payload(), [], []),
+    (_RP_DEGRADED, [], ["research_predictor_degraded"]),
+    (_GATE_DEGRADED, ["gate_degraded"], []),
+    (_payload(gate_degraded=True, parity_degraded=True),
+     ["gate_degraded"], ["parity_degraded"]),
+])
+def test_the_split_is_carried_as_data_in_both_polarities(payload, pre, other):
+    block = read_gate_state(payload)
+    assert block["degraded_pre_spend"] == pre
+    assert block["degraded_other"] == other
+
+
+def test_pre_spend_degraded_falls_back_for_a_card_written_before_the_split():
+    from grading.pipeline_gates import pre_spend_degraded
+
+    legacy = {"degraded_families": ["gate_degraded"]}
+    assert pre_spend_degraded(legacy) is True
+    assert pre_spend_degraded({"degraded_families": ["parity_degraded"]}) is False
+    assert pre_spend_degraded({}) is False
+    assert pre_spend_degraded(None) is False
+
+
+def test_the_email_banner_never_renders_the_unnamed_placeholder():
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(_RP_DEGRADED)}
+    prefix, plain, html = _verdict_banner(vb)
+    assert prefix == "[GATES UNVERIFIED] "
+    assert "unnamed" not in plain
+    assert "gates did not all run this cycle" not in plain
+    assert "OUTSIDE the pre-spend gates" in plain
+    assert "spend WAS gated" in plain
+    assert "ResearchPredictorParallel" in plain
+
+
+def test_the_email_banner_keeps_the_strong_wording_for_a_pre_spend_fail_open():
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(_GATE_DEGRADED)}
+    _, plain, _ = _verdict_banner(vb)
+    assert "pre-spend gate family fail-opened" in plain
+    assert "BEFORE it spent" in plain
+
+
+def test_the_email_banner_on_a_card_the_sf_never_reported():
+    """No gate_state at all drives BOTH gates UNKNOWN, so this lands on the
+    unmeasured branch and names them — the one thing it must never do is render
+    an empty list as a placeholder."""
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(None)}
+    _, plain, _ = _verdict_banner(vb)
+    assert "lib_pin_drift" in plain and "pipeline_contract" in plain
+    assert "unnamed" not in plain
+
+
+def test_the_email_banner_default_when_nothing_explains_the_withholding():
+    """A hand-built or future block that is UNKNOWN with no unmeasured gate and
+    no fired family still gets a sentence rather than an empty parenthetical."""
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: {"verdict": UNKNOWN, "unmeasured": [],
+                               "degraded_families": [], "statement": ""}}
+    _, plain, _ = _verdict_banner(vb)
+    assert "did not report this cycle's gate state" in plain
+    assert "unnamed" not in plain
+
+
+def test_the_digest_carries_the_corrected_sentence_too():
+    text = summarize_report_card(_card(_RP_DEGRADED))
+    assert "⚠ PIPELINE GATES" in text
+    assert "pre-spend protection was incomplete" not in text
+    assert "spend WAS gated" in text
