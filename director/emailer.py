@@ -203,19 +203,67 @@ def _gate_only_banner(gates: dict) -> tuple[str, str, str]:
     * nothing is withheld, and the banner says so, so the absence of withheld
       actions is not read as the banner being decorative.
     """
+    from grading.pipeline_gates import DEGRADED_FAMILY_LABELS, pre_spend_degraded
+
     statement = (gates.get("statement") or "").strip()
-    unmeasured = ", ".join(gates.get("unmeasured") or []) or "unnamed"
-    headline = (
-        "PIPELINE GATES: NOT VERIFIED — the weekly run's pre-spend correctness "
-        f"gates did not all run this cycle ({unmeasured})."
-    )
-    context = (
-        "The numbers in this plan are unaffected and nothing was withheld: the "
-        "correctness attestation PASSED, the tiles are real, and the Director "
-        "filed and escalated as usual. What is missing is the earlier check that "
-        "the pipeline's own contract and library pins were sound before it spent. "
-        "Read the plan; do not read it as gate-verified."
-    )
+    unmeasured = list(gates.get("unmeasured") or [])
+    degraded = list(gates.get("degraded_families") or [])
+    shared_tail = "Read the plan; do not read it as gate-verified."
+
+    # alpha-engine-config-I10534: this banner used to assert, unconditionally,
+    # that the pre-spend gates "did not all run this cycle", naming
+    # `unmeasured` — and on the only two runs it has ever fired for (run_date
+    # 2026-09-04 and 2026-09-11) `unmeasured` was EMPTY, so it rendered the
+    # literal word "unnamed" over a block whose own rows said MEASURED/MEASURED.
+    # Both gates ran. What fail-opened was ChallengerShadow, downstream of the
+    # spend. The banner now states which of the three cases it is.
+    if unmeasured:
+        headline = (
+            "PIPELINE GATES: NOT VERIFIED — the weekly run's pre-spend "
+            "correctness gates did not all run this cycle "
+            f"({', '.join(unmeasured)})."
+        )
+        context = (
+            "The numbers in this plan are unaffected and nothing was withheld: the "
+            "correctness attestation PASSED, the tiles are real, and the Director "
+            "filed and escalated as usual. What is missing is the earlier check that "
+            "the pipeline's own contract and library pins were sound before it "
+            f"spent. {shared_tail}"
+        )
+    elif pre_spend_degraded(gates):
+        headline = (
+            "PIPELINE GATES: NOT VERIFIED — the weekly run's pre-spend gate "
+            "family fail-opened this cycle."
+        )
+        context = (
+            "The numbers in this plan are unaffected and nothing was withheld. "
+            "What is missing is the guarantee that the pipeline's contract, "
+            "library pins and run mutex were sound BEFORE it spent: a gate "
+            f"produced a result it could not stand behind. {shared_tail}"
+        )
+    elif degraded:
+        named = "; ".join(DEGRADED_FAMILY_LABELS.get(d, d) for d in degraded)
+        headline = (
+            "PIPELINE GATES: NOT VERIFIED — a fail-open degradation was recorded "
+            "OUTSIDE the pre-spend gates this cycle."
+        )
+        context = (
+            "Both pre-spend correctness gates reported MEASURED, so this run's "
+            f"spend WAS gated. What fail-opened alongside or after it: {named}. "
+            "The numbers in this plan are unaffected and nothing was withheld; "
+            "the attestation is withheld because a stage produced its output "
+            f"without its guarantee. {shared_tail}"
+        )
+    else:
+        headline = (
+            "PIPELINE GATES: NOT VERIFIED — the Step Function did not report "
+            "this cycle's gate state."
+        )
+        context = (
+            "The numbers in this plan are unaffected and nothing was withheld. "
+            "Nothing said whether the pre-spend gates ran, and an absence of "
+            f"evidence is never read as a pass. {shared_tail}"
+        )
     plain = "\n".join([
         f"!  {headline}",
         f"   {statement}" if statement else "",
