@@ -269,3 +269,66 @@ def test_the_digest_carries_the_corrected_sentence_too():
     assert "⚠ PIPELINE GATES" in text
     assert "pre-spend protection was incomplete" not in text
     assert "spend WAS gated" in text
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11073 — the route reaches the surface Brian opens
+#
+# The whole failure mode this closes is a reader acting on the banner's first
+# sentence. "an internal ResearchPredictorParallel fail-open" names one of ten
+# possibilities; MarkChallengerShadowDegraded names the one that happened.
+# ---------------------------------------------------------------------------
+
+_RP_ROUTED = _payload(
+    research_predictor_degraded=True,
+    research_predictor_degraded_routes=["MarkChallengerShadowDegraded"],
+)
+_RP_TWO_ROUTES = _payload(
+    research_predictor_degraded=True,
+    research_predictor_degraded_routes=["MarkChallengerShadowDegraded",
+                                        "MarkModelZooDegraded"],
+)
+
+
+def test_the_banner_headline_names_the_single_route_that_fired():
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(_RP_ROUTED)}
+    prefix, plain, html = _verdict_banner(vb)
+    assert prefix == "[GATES UNVERIFIED] "
+    headline = plain.splitlines()[0]
+    assert "MarkChallengerShadowDegraded" in headline, (
+        "the route is in the body but not the headline — the failure mode "
+        "being designed against (alpha-engine-config-I10062, -I10534) is a "
+        "reader who acts on the first sentence alone"
+    )
+    assert "MarkChallengerShadowDegraded" in html
+
+
+def test_two_routes_are_both_named_in_the_banner_body():
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(_RP_TWO_ROUTES)}
+    _, plain, html = _verdict_banner(vb)
+    for route in ("MarkChallengerShadowDegraded", "MarkModelZooDegraded"):
+        assert route in plain and route in html
+    # The headline counts rather than listing: two SF state names do not fit a
+    # subject-line-length sentence, and a truncated one names the wrong route.
+    assert "2 fail-open routes fired" in plain.splitlines()[0]
+
+
+def test_an_unnamed_route_says_so_on_the_surface_rather_than_reading_clean():
+    """The pre-1.1.0 producer. The banner must still fire, and must say the
+    route is unknown — silence here is what made the old boolean unreadable."""
+    vb = {"verdict": "PASS", "as_of": {},
+          PIPELINE_GATES_KEY: read_gate_state(_RP_DEGRADED)}
+    prefix, plain, _ = _verdict_banner(vb)
+    assert prefix == "[GATES UNVERIFIED] "
+    assert "did not name the route" in plain
+    assert "research_predictor_degraded" in plain
+
+
+def test_the_digest_carries_the_route_too():
+    """The Director's prompt digest is what the LLM reads; a route named only in
+    the email leaves the automated reader exactly as blind as before."""
+    card = _card(_RP_ROUTED)
+    text = summarize_report_card(card)
+    assert "MarkChallengerShadowDegraded" in text
