@@ -190,7 +190,7 @@ pandas~=3.0
 # `krepis/model_registry.py`. A merged publish workflow is not a published
 # package, and this fleet has shipped a green "Publish to PyPI" that served
 # unchanged metadata.
-krepis[flow-doctor,openai]==0.59.57  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I10399 makes resolve_group_spec put a MODEL GROUP on the wire instead of the qualified primary deployment name, which is what lets LiteLLM apply the group's fallback chain (krepis-PR215, alpha-engine-config-I10403)
+krepis[flow-doctor,openai]==0.59.64  # pinned per §139 — first-party/fast-moving deps are pinned, never floored (alpha-engine-config-I7635); alpha-engine-config-I10399 makes resolve_group_spec put a MODEL GROUP on the wire instead of the qualified primary deployment name, which is what lets LiteLLM apply the group's fallback chain (krepis-PR215, alpha-engine-config-I10403); raised to 0.59.64 (krepis-PR226, alpha-engine-config-I11100): record_llm_call degrades an unpriced cost record instead of dropping it on PriceCardLookupError, the root cause of the 2026-09-19 weekly SF's AggregateCosts breach (director-plan emitted no cost record)
 # config#2454: grading/aggregate.py imports
 # nousergon_lib.quant.stats.trial_accumulator (the cumulative DSR trial-count
 # reader) ships in v0.124.3 (lib#198, merged 2026-07-17).
