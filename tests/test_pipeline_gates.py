@@ -45,7 +45,7 @@ _SCHEMA_PATH = (
 #: the other, so this pin is what makes a one-sided edit fail loudly instead of
 #: silently forking the contract. Changing the schema means changing this digest
 #: in BOTH repos, in the same cross-repo change.
-_SCHEMA_SHA256 = "5f4c4a7736238103aa64d9cf989eddfd87840612a6872b266ce1e5578c2439b6"
+_SCHEMA_SHA256 = "6287e392be263af8a31ffae8a6dac7f3bdd7e0a032d282dd85527fca907f0fa0"
 
 
 def _clean_payload(**overrides) -> dict:
@@ -357,3 +357,118 @@ def test_a_json_parsed_unrecognised_status_never_reads_as_measured():
     assert block["gates"]["pipeline_contract"]["status"] == UNKNOWN
     assert block["verdict"] == UNKNOWN
     assert "unrecognised status" in block["gates"]["pipeline_contract"]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11073 — the named ResearchPredictorParallel routes
+#
+# ``research_predictor_degraded`` is one boolean over TEN distinct SF fail-open
+# routes. On run_date 2026-09-04 and 2026-09-11 the route that fired was
+# MarkChallengerShadowDegraded; no rendered surface named it, and the Director
+# filed two P0 investigations (-I10062, -I10534) that had to be root-caused
+# from the raw SF execution history. Consumer half of the contract.
+# ---------------------------------------------------------------------------
+
+from grading.pipeline_gates import FAMILY_ROUTE_KEYS  # noqa: E402
+
+_ROUTES_KEY = "research_predictor_degraded_routes"
+
+
+def test_the_route_map_is_keyed_on_a_family_the_module_knows():
+    """A routes key for a family outside DEGRADED_FAMILY_LABELS would never be
+    read — the loop that renders it iterates the families."""
+    from grading.pipeline_gates import DEGRADED_FAMILY_LABELS
+    assert set(FAMILY_ROUTE_KEYS) <= set(DEGRADED_FAMILY_LABELS)
+
+
+def test_a_clean_run_carries_the_routes_key_empty_not_absent():
+    """principles.md #7: [] is a MEASUREMENT that no route fired. Absent is not."""
+    block = read_gate_state(_clean_payload(**{_ROUTES_KEY: []}))
+    assert block["degraded_routes"] == {}
+    assert block["routes_unnamed"] == []
+
+
+def test_a_named_route_reaches_the_block_and_the_statement():
+    block = read_gate_state(_clean_payload(
+        research_predictor_degraded=True,
+        **{_ROUTES_KEY: ["MarkChallengerShadowDegraded"]},
+    ))
+    assert block["degraded_routes"] == {
+        "research_predictor_degraded": ["MarkChallengerShadowDegraded"]
+    }
+    assert block["routes_unnamed"] == []
+    assert "MarkChallengerShadowDegraded" in block["statement"], (
+        "the route reached the block and stopped there — the statement is the "
+        "sentence a human reads, and naming the route only in a field nobody "
+        "renders is the same blindness one layer down"
+    )
+
+
+def test_two_routes_in_one_run_both_survive():
+    """alpha-engine-config-I10540: measured 2026-09-12, two routes fired in one
+    run and the last-write-wins degraded_summary kept only the second."""
+    block = read_gate_state(_clean_payload(
+        research_predictor_degraded=True,
+        **{_ROUTES_KEY: ["MarkChallengerShadowDegraded", "MarkModelZooDegraded"]},
+    ))
+    assert block["degraded_routes"]["research_predictor_degraded"] == [
+        "MarkChallengerShadowDegraded", "MarkModelZooDegraded"
+    ]
+    for route in ("MarkChallengerShadowDegraded", "MarkModelZooDegraded"):
+        assert route in block["statement"]
+
+
+def test_a_v1_payload_is_not_unknown_for_schema_reasons():
+    """A producer that predates the field must still be read, and must be told
+    apart from one that reported no route."""
+    block = read_gate_state(_clean_payload(research_predictor_degraded=True))
+    assert block["degraded_routes"] == {}
+    assert [f for f, _ in block["routes_unnamed"]] == ["research_predictor_degraded"]
+    why = block["routes_unnamed"][0][1]
+    assert "predates" in why and _ROUTES_KEY in why
+    assert "did not name" in block["statement"]
+
+
+def test_an_empty_routes_list_on_a_fired_family_is_named_a_producer_defect():
+    """The third state: a 1.1.0 producer that fired and named nothing. Not the
+    same finding as a producer that has no such field, and not rendered as one."""
+    block = read_gate_state(_clean_payload(
+        research_predictor_degraded=True, **{_ROUTES_KEY: []},
+    ))
+    assert [f for f, _ in block["routes_unnamed"]] == ["research_predictor_degraded"]
+    why = block["routes_unnamed"][0][1]
+    assert "producer defect" in why
+    assert "predates" not in why, (
+        "an empty list and an absent key have different causes and different "
+        "fixes; collapsing them sends the reader to the wrong repo"
+    )
+
+
+def test_routes_on_a_family_that_did_not_fire_are_not_invented():
+    block = read_gate_state(_clean_payload(**{_ROUTES_KEY: []}))
+    assert block["verdict"] == "MEASURED"
+    assert block["routes_unnamed"] == []
+
+
+@pytest.mark.parametrize("junk", [None, "MarkScannerDegraded", 7, {"a": 1},
+                                  ["", None, 3]])
+def test_a_malformed_routes_value_never_raises_and_never_passes(junk):
+    """Never raises is this module's whole contract; and junk must not be read
+    as 'a route was named'."""
+    block = read_gate_state(_clean_payload(
+        research_predictor_degraded=True, **{_ROUTES_KEY: junk},
+    ))
+    assert block["degraded_routes"] == {}
+    assert [f for f, _ in block["routes_unnamed"]] == ["research_predictor_degraded"]
+    assert block["verdict"] == UNKNOWN
+
+
+def test_the_producer_payload_naming_routes_validates_against_the_schema():
+    """Producer/consumer contract test: the exact payload nousergon-data's
+    ReportCard state now sends on a degraded run."""
+    payload = _clean_payload(
+        research_predictor_degraded=True,
+        **{_ROUTES_KEY: ["MarkChallengerShadowDegraded"]},
+    )
+    jsonschema.validate(payload, json.loads(_SCHEMA_PATH.read_text()))
+    assert read_gate_state(payload)["verdict"] == UNKNOWN

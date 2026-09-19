@@ -208,6 +208,9 @@ def _gate_only_banner(gates: dict) -> tuple[str, str, str]:
     statement = (gates.get("statement") or "").strip()
     unmeasured = list(gates.get("unmeasured") or [])
     degraded = list(gates.get("degraded_families") or [])
+    # alpha-engine-config-I11073: which ROUTE, not only which family.
+    routes = dict(gates.get("degraded_routes") or {})
+    unnamed = [f for f, _ in (gates.get("routes_unnamed") or [])]
     shared_tail = "Read the plan; do not read it as gate-verified."
 
     # alpha-engine-config-I10534: this banner used to assert, unconditionally,
@@ -242,14 +245,35 @@ def _gate_only_banner(gates: dict) -> tuple[str, str, str]:
             f"produced a result it could not stand behind. {shared_tail}"
         )
     elif degraded:
-        named = "; ".join(DEGRADED_FAMILY_LABELS.get(d, d) for d in degraded)
-        headline = (
-            "PIPELINE GATES: NOT VERIFIED — a fail-open degradation was recorded "
-            "OUTSIDE the pre-spend gates this cycle."
+        named = "; ".join(
+            DEGRADED_FAMILY_LABELS.get(d, d)
+            + (f" [{', '.join(routes[d])}]" if routes.get(d) else "")
+            for d in degraded
         )
+        # The route names go in the HEADLINE, not only the body: this banner's
+        # whole failure mode (alpha-engine-config-I10062, -I10534) was a reader
+        # who acted on the first sentence alone. One route names itself there;
+        # more than one would not fit, and the body carries them.
+        route_names = [r for d in degraded for r in routes.get(d, [])]
+        if len(route_names) == 1:
+            what = f"{route_names[0]} fail-opened"
+        elif route_names:
+            what = f"{len(route_names)} fail-open routes fired"
+        else:
+            what = "a fail-open degradation was recorded"
+        headline = (
+            f"PIPELINE GATES: NOT VERIFIED — {what} OUTSIDE the pre-spend gates "
+            "this cycle."
+        )
+        unnamed_tail = (
+            " The Step Function did not name the route for "
+            + ", ".join(unnamed)
+            + " — read the execution history."
+        ) if unnamed else ""
         context = (
             "Both pre-spend correctness gates reported MEASURED, so this run's "
-            f"spend WAS gated. What fail-opened alongside or after it: {named}. "
+            f"spend WAS gated. What fail-opened alongside or after it: {named}."
+            f"{unnamed_tail} "
             "The numbers in this plan are unaffected and nothing was withheld; "
             "the attestation is withheld because a stage produced its output "
             f"without its guarantee. {shared_tail}"

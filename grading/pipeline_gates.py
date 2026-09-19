@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 #: ``grading/contracts/sf_gate_state.v1.schema.json``; the SoT copy lives at
 #: ``nousergon-data/infrastructure/contracts/sf_gate_state.v1.schema.json`` and
 #: both are pinned by digest in each repo's contract test.
-SCHEMA = "sf_gate_state-1.0.0"
+SCHEMA = "sf_gate_state-1.1.0"
 SCHEMA_VERSION = 1
 
 #: Where the normalized block sits on the report card, the Director's verdict
@@ -105,6 +105,29 @@ DEGRADED_FAMILY_LABELS: dict[str, str] = {
     "health_check_degraded": "tail health checks (SaturdayHealthCheck/WeeklySubstrateHealthCheck)",
     "parity_degraded": "parity verdict (pit_parity/replay)",
     "research_predictor_degraded": "an internal ResearchPredictorParallel fail-open",
+}
+
+#: Families that aggregate MORE THAN ONE fail-open route, mapped to the
+#: ``gate_state`` key naming which of them fired (``alpha-engine-config-I11073``,
+#: producer contract 1.1.0).
+#:
+#: ``research_predictor_degraded`` is one boolean over TEN distinct SF routes:
+#: MarkScannerDegraded, ScannerResourceKillDegraded, MarkRegimeSubstrateDegraded,
+#: MarkChallengerShadowDegraded, MarkRegimeRetrospectiveEvalDegraded,
+#: MarkEvalJudgeDegraded, MarkEvalRollingMeanDegraded,
+#: MarkRationaleClusteringDegraded, MarkCounterfactualDegraded,
+#: MarkModelZooDegraded. On run_date 2026-09-04 and 2026-09-11 the route that
+#: fired was MarkChallengerShadowDegraded — the ``scanner_predictor_direct``
+#: arm's missing ``predictor/predictions_research_free/{date}.json``, already
+#: tracked as ``alpha-engine-config-I10067`` / ``-I10301``. Nothing on any
+#: rendered surface named it, so the Director filed two P0 investigations
+#: (``-I10062``, ``-I10534``) that had to be root-caused from the raw SF
+#: execution history instead.
+#:
+#: A map rather than a special case, because the defect is the SHAPE — a family
+#: that aggregates routes and reports only a boolean — not this one family.
+FAMILY_ROUTE_KEYS: dict[str, str] = {
+    "research_predictor_degraded": "research_predictor_degraded_routes",
 }
 
 #: Which degradation families actually cover the run's PRE-SPEND correctness
@@ -140,7 +163,9 @@ PRE_SPEND_FAMILIES: frozenset[str] = frozenset({"gate_degraded"})
 
 
 def _statement(verdict: str, unmeasured: list[tuple[str, str]], degraded: list[str],
-               families_unreported: list[str], n_gates: int, top_reason: str) -> str:
+               families_unreported: list[str], n_gates: int, top_reason: str,
+               routes: dict[str, list[str]] | None = None,
+               routes_unnamed: list[tuple[str, str]] | None = None) -> str:
     """The one sentence a human reads. Present in both polarities.
 
     Deliberately phrased ``NOT VERIFIED`` rather than ``FAILED``: a gate that
@@ -185,10 +210,26 @@ def _statement(verdict: str, unmeasured: list[tuple[str, str]], degraded: list[s
             + " — unreported is not false."
         )
     if degraded:
+        # alpha-engine-config-I11073: name the ROUTE, not only the family. A
+        # reader who is told "an internal ResearchPredictorParallel fail-open"
+        # has been told which of ten things might have happened, which is the
+        # same as being told to go read the execution history.
+        routes = routes or {}
         head += (
             " Fail-open degradation recorded on this run: "
-            + "; ".join(DEGRADED_FAMILY_LABELS.get(d, d) for d in degraded)
+            + "; ".join(
+                DEGRADED_FAMILY_LABELS.get(d, d)
+                + (f" [{', '.join(routes[d])}]" if routes.get(d) else "")
+                for d in degraded
+            )
             + "."
+        )
+    # Present in BOTH polarities of the naming itself: a family that fired and
+    # named no route is a THIRD state, and rendering it as an unadorned family
+    # name would make it indistinguishable from a family that has no routes.
+    for family, why in (routes_unnamed or []):
+        head += (
+            f" The Step Function did not name which {family} route fired — {why}"
         )
     return head
 
@@ -217,6 +258,15 @@ def read_gate_state(gate_state: Any) -> dict:
         run, never absent.
     ``degraded_families``
         the SF fail-open families that fired.
+    ``degraded_routes``
+        ``{family: [SF state name, ...]}`` for every fired family that named its
+        routes (``alpha-engine-config-I11073``). Absent families are omitted;
+        the key itself is always present, ``{}`` on a clean run.
+    ``routes_unnamed``
+        ``[(family, why), ...]`` — families that fired over a multi-route key
+        and named nothing. A separate field from ``degraded_routes`` because
+        "fired, and here is the route" and "fired, and nobody said which" are
+        different findings and must not collapse into an empty list.
     ``statement``
         the human sentence; see :func:`_statement`.
     """
@@ -283,6 +333,36 @@ def read_gate_state(gate_state: Any) -> dict:
         if not isinstance(gate_state.get(fam), bool)
     ]
 
+    # alpha-engine-config-I11073. Three states, kept apart on purpose:
+    #   named      -> the routes are in `degraded_routes`
+    #   absent key -> the producer predates contract 1.1.0
+    #   empty list -> the producer IS 1.1.0 and named nothing while the family
+    #                 fired, which is a producer defect, not an observation
+    # The last two both land in `routes_unnamed`, each with its own cause, so a
+    # reader can tell "upgrade the SF" from "the SF is lying" without guessing.
+    degraded_routes: dict[str, list[str]] = {}
+    routes_unnamed: list[tuple[str, str]] = []
+    for family, key in FAMILY_ROUTE_KEYS.items():
+        raw = gate_state.get(key)
+        named = (
+            [r for r in raw if isinstance(r, str) and r]
+            if isinstance(raw, list) else []
+        )
+        if named:
+            degraded_routes[family] = named
+        elif gate_state.get(family) is True:
+            routes_unnamed.append((family, (
+                f"the payload carries no {key}, so this producer predates the "
+                "contract version that names routes (1.1.0, "
+                "alpha-engine-config-I11073). Read the Step Function execution "
+                "history for the route."
+            ) if raw is None else (
+                f"the payload carries an EMPTY {key} while {family} is true. A "
+                "route that fires names itself, so this is a producer defect, "
+                "not a run with no route. Read the Step Function execution "
+                "history for the route and file against the producer."
+            )))
+
     # alpha-engine-config-I7312: `degraded` — the families that actually FIRED
     # — belongs in the verdict, not only in the narrative below it.
     #
@@ -346,6 +426,12 @@ def read_gate_state(gate_state: Any) -> dict:
                 "unprotected money."
             )
 
+    if routes_unnamed and not top_reason:
+        top_reason = (
+            f"{routes_unnamed[0][0]} fired and the Step Function did not name "
+            "which route did it."
+        )
+
     block = {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -356,11 +442,14 @@ def read_gate_state(gate_state: Any) -> dict:
         "degraded_families": degraded,
         "degraded_pre_spend": degraded_pre_spend,
         "degraded_other": degraded_other,
+        "degraded_routes": degraded_routes,
+        "routes_unnamed": routes_unnamed,
         "families_unreported": families_unreported,
         "reason": top_reason,
         "statement": _statement(
             verdict, unmeasured, degraded, families_unreported,
             len(GATE_LABELS), top_reason,
+            routes=degraded_routes, routes_unnamed=routes_unnamed,
         ),
     }
     return block
