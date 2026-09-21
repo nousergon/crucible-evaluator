@@ -54,10 +54,42 @@ to do, INCLUDING the two shapes of "correctly did less":
   reported, which is double-counting, not honesty.
 
 ``ERROR_SUB_STATUSES`` are the outcomes in which work the stage was asked for
-did not happen and the leg said so — ``error`` (including a judge's
-correctness REFUSAL, which is a correct verdict about an incorrect setup and
-still means no RetroGrade exists) and ``partial`` (the loop-verification pass
-ran against a ledger it could not fully resolve).
+did not happen because something went WRONG and the leg said so — ``error``
+(an exception, a transport fault, a leg that should have produced output and
+did not) and ``partial`` (the loop-verification pass ran against a ledger it
+could not fully resolve).
+
+``REFUSED_SUB_STATUSES`` is the third class, and it is neither of the other
+two. ``refused`` is a GUARD DECLINING BY DESIGN: the retro judge resolved to
+the same served model that produced the plan it was asked to grade, and
+refused rather than publish a self-graded RetroGrade
+(``director/retro.py::_assert_judge_did_not_grade_its_own_plan``). Nothing
+went wrong — the guard worked. What it leaves behind is an **absent verdict**,
+and that is governed by §2.3a rather than by §2.3b's error clause:
+
+* **§2.3a rule 2** — *a missing verdict propagates as ``UNKNOWN``, never as
+  pass.* The RetroGrade is a verdict about the previous cycle's plan quality;
+  a refusal means there is none, and it must not read as one.
+* **§2.3a rule 3** — *every surface presenting the run's results carries the
+  verdict state.* So the refusal is NAMED — on the stage result, on the
+  execution record, and on the completion marker the operator's notice reads.
+* **§2.3b, third paragraph** — *a sub-result whose failure genuinely cannot
+  degrade the stage is a §2.3 fail-open like any other and carries the same
+  written rationale; it is never silent because it was nested.* That is the
+  clause permitting a refusal not to degrade the stage, and it is also the one
+  forbidding it to be silent.
+
+Treating a refusal as an error was the shape corrected on 2026-09-19 for the
+M slot: a correctly-refused ``model_zoo`` promotion was made to terminate
+``ExecutionSucceeded`` with ``degraded: false`` and ``model_zoo_unservable:
+true`` — the refusal named, the run clean — after a day was spent on a correct
+verdict being reported as a failure (``nousergon-data-PR1816``/``PR1818``).
+A weekly cycle is 5.4 hours and its terminal ``Fail`` pages Brian; a guard
+doing its job must not spend either.
+
+**Never a clean ``ok`` for either.** The defect ``alpha-engine-config-I11299``
+names — ``status: "ok"`` over a leg that did not do its job — stays fixed on
+BOTH sides of the split: an error degrades, a refusal reports ``refused``.
 
 Anything else is ``unclassified`` and degrades. A reader that treats an
 unrecognised status as healthy goes quiet the first time a producer invents a
@@ -102,6 +134,13 @@ PASS_SUB_STATUSES: frozenset[str] = frozenset(
 
 ERROR_SUB_STATUSES: frozenset[str] = frozenset({"error", "partial"})
 
+#: A guard declining BY DESIGN — see the module docstring. Distinct from
+#: ERROR_SUB_STATUSES, and deliberately NOT folded into PASS_SUB_STATUSES with
+#: ``withheld``: a §2.3a withholding is already carried by ``withheld_summary``
+#: on this same payload and has its own reported family, whereas a refused
+#: RetroGrade had no surface at all before this clause.
+REFUSED_SUB_STATUSES: frozenset[str] = frozenset({"refused"})
+
 #: What a sub-result status outside BOTH vocabularies is reported as — never a
 #: pass (§2.3b, "the vocabulary is closed at both ends").
 UNCLASSIFIED = "unclassified"
@@ -110,7 +149,21 @@ UNCLASSIFIED = "unclassified"
 #: member of the conformance probe's ``PASS_STATUSES``, which is what makes the
 #: honest stage stop being reported as a violation.
 STAGE_OK = "ok"
+#: A leg declined by design and the verdict it would have produced is ABSENT.
+#: Not a pass (§2.3a rule 2) and not a degradation (§2.3b, third paragraph).
+#: Also not a member of the conformance probe's ``PASS_STATUSES``, so the probe
+#: reads a refusal as a refusal rather than as a pass over an errored leg.
+STAGE_REFUSED = "refused"
 STAGE_DEGRADED = "degraded"
+
+#: Worst-first. ``apply_substatus_honesty`` takes the first that matches, so a
+#: run with BOTH an errored and a refused leg reports ``degraded`` — and still
+#: names the refusal separately, because the two are recorded on independent
+#: fields rather than on one status string.
+_STATUS_LADDER: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (STAGE_DEGRADED, ("error", UNCLASSIFIED)),
+    (STAGE_REFUSED, ("refused",)),
+)
 
 #: Longest detail string carried onto the SF output. The underlying text stays
 #: whole on the summary's own ``*_error`` field and in the Lambda log; this is
@@ -132,6 +185,8 @@ def classify(status: Any) -> str:
         return UNCLASSIFIED
     if status in PASS_SUB_STATUSES:
         return "pass"
+    if status in REFUSED_SUB_STATUSES:
+        return "refused"
     if status in ERROR_SUB_STATUSES:
         return "error"
     return UNCLASSIFIED
@@ -177,11 +232,15 @@ def build_sub_statuses(summary: dict) -> dict[str, dict]:
     return out
 
 
+def _verdicts(sub_statuses: dict[str, dict], wanted: tuple[str, ...]) -> list[str]:
+    return sorted(k for k, e in sub_statuses.items() if e.get("verdict") in wanted)
+
+
 def stage_status(sub_statuses: dict[str, dict]) -> str:
-    """``degraded`` when any leg is an error or unclassified, else ``ok``."""
-    for entry in sub_statuses.values():
-        if entry.get("verdict") in ("error", UNCLASSIFIED):
-            return STAGE_DEGRADED
+    """``degraded`` > ``refused`` > ``ok`` — the worst leg decides."""
+    for status, verdicts in _STATUS_LADDER:
+        if _verdicts(sub_statuses, verdicts):
+            return status
     return STAGE_OK
 
 
@@ -200,11 +259,17 @@ def apply_substatus_honesty(summary: dict) -> dict:
     if not sub_statuses:
         return summary
     summary["sub_statuses"] = sub_statuses
-    summary["degraded_sub_results"] = sorted(
-        key
-        for key, entry in sub_statuses.items()
-        if entry.get("verdict") in ("error", UNCLASSIFIED)
+    summary["degraded_sub_results"] = _verdicts(sub_statuses, ("error", UNCLASSIFIED))
+    summary["refused_sub_results"] = _verdicts(sub_statuses, ("refused",))
+    # A dedicated boolean, not an inference from the list, because the Step
+    # Function's Choice states cannot measure an array's length: the SF reads
+    # this field directly, and it is emitted on EVERY fan-out summary — false
+    # included — so "no refusal" is distinguishable from "this stage stopped
+    # reporting refusals at all" (principles.md §2.7).
+    summary["retro_refused"] = "retro" in sub_statuses and (
+        sub_statuses["retro"].get("verdict") == "refused"
     )
-    if summary["degraded_sub_results"] and summary.get("status") == STAGE_OK:
-        summary["status"] = STAGE_DEGRADED
+    derived = stage_status(sub_statuses)
+    if derived != STAGE_OK and summary.get("status") == STAGE_OK:
+        summary["status"] = derived
     return summary

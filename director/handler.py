@@ -485,20 +485,26 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict, budget=No
         logger.warning("Director retro skipped — out of invocation budget: %s", e)
         return {"retro": "skipped", "retro_reason": f"invocation budget exhausted: {e}"}
     except SelfGradedRetroError as e:
-        # A correctness REFUSAL, not a transport failure — and still `error`.
+        # A GUARD DECLINING BY DESIGN — its own sub-status, neither `ok` nor
+        # `error`. The judge resolved to the model that produced the plan it
+        # was asked to grade and refused to publish a self-graded RetroGrade.
+        # Nothing went wrong; the guard worked. What it leaves is an ABSENT
+        # VERDICT, which sf-pipeline-policy.md §2.3a rule 2 says propagates as
+        # a named non-pass and rule 3 says every surface carrying the run's
+        # results must show — not a stage degradation, and above all not a
+        # pass. See director/substatus.py's module docstring for the full
+        # derivation and for why treating this as an error is the shape that
+        # was corrected for the M slot on 2026-09-19.
         #
-        # The sub-status stays `error` because the OUTCOME is the one §2.3b
-        # cares about: no RetroGrade was published, and the conformance probe's
-        # ERROR_STATUSES vocabulary (nous-ergon-ops scripts/
-        # sf_substatus_honesty.py) is closed, so inventing a word here would
-        # make the probe report the leg `unclassified` instead of naming it.
-        # `retro_outcome` carries the distinction that a reader DOES need: a
-        # refusal is fixed in the registry (alpha-engine-config-I8202), a
-        # failure is fixed in the judge. ERROR, not WARNING, for the reason
-        # alpha-engine-config-I11299 exists: this leg has been silently
-        # unpublished for >= 2 weekly cycles.
+        # ERROR, not WARNING, for the reason alpha-engine-config-I11299
+        # exists: this leg has been silently unpublished for >= 2 weekly
+        # cycles. A loud log about a correct refusal is still correct.
+        #
+        # The root cause of the refusal is alpha-engine-config-I8202 (registry
+        # invariant 15 compares entry ids, not served models) and is fixed
+        # there, not here.
         logger.error("Director retro REFUSED (plan already written, non-fatal): %s", e)
-        return {"retro": "error", "retro_outcome": "refused", "retro_error": str(e)}
+        return {"retro": "refused", "retro_outcome": "refused", "retro_error": str(e)}
     except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
         logger.warning("Director retro failed (plan already written, non-fatal): %s", e)
         return {"retro": "error", "retro_outcome": "failed", "retro_error": str(e)}

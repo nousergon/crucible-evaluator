@@ -30,8 +30,10 @@ from __future__ import annotations
 from director.substatus import (
     ERROR_SUB_STATUSES,
     PASS_SUB_STATUSES,
+    REFUSED_SUB_STATUSES,
     STAGE_DEGRADED,
     STAGE_OK,
+    STAGE_REFUSED,
     SUB_RESULT_KEYS,
     UNCLASSIFIED,
     apply_substatus_honesty,
@@ -48,7 +50,7 @@ SCHEDULED_2026_09_19 = {
     "run_date": "2026-09-18",
     "n_action_items": 11,
     "digest_email": "sent",
-    "retro": "error",
+    "retro": "refused",
     "retro_error": (
         "Retro judge served 'deepseek-v4-pro', which is the model that produced "
         "the plan it was grading (run_date '2026-09-11', served 'deepseek-v4-pro') "
@@ -63,17 +65,65 @@ SCHEDULED_2026_09_19 = {
 }
 
 
-def test_the_measured_scheduled_run_now_reports_degraded():
-    """The regression case, end to end."""
+def test_the_measured_scheduled_run_reports_refused_not_ok_and_not_degraded():
+    """The regression case, end to end.
+
+    The 2026-09-19 retro was a GUARD REFUSAL, so the honest outcome is
+    ``refused`` — never ``ok`` (the defect I11299 names) and never
+    ``degraded`` (which would terminate a complete 5.4-hour cycle ``Fail``
+    and page Brian for a guard doing its job).
+    """
     summary = apply_substatus_honesty(dict(SCHEDULED_2026_09_19))
 
+    assert summary["status"] == STAGE_REFUSED
+    assert summary["status"] != STAGE_OK
+    assert summary["degraded_sub_results"] == []
+    assert summary["refused_sub_results"] == ["retro"]
+    assert summary["retro_refused"] is True
+    assert summary["sub_statuses"]["retro"]["status"] == "refused"
+    assert summary["sub_statuses"]["retro"]["verdict"] == "refused"
+    assert "self-grading bias" in summary["sub_statuses"]["retro"]["detail"]
+
+
+def test_a_genuinely_errored_retro_still_degrades():
+    """The other side of the split: an exception is not a refusal."""
+    summary = apply_substatus_honesty(
+        {**SCHEDULED_2026_09_19, "retro": "error", "retro_outcome": "failed",
+         "retro_error": "judge overloaded"}
+    )
     assert summary["status"] == STAGE_DEGRADED
     assert summary["degraded_sub_results"] == ["retro"]
-    assert summary["sub_statuses"]["retro"]["status"] == "error"
-    assert summary["sub_statuses"]["retro"]["verdict"] == "error"
-    assert "self-grading bias" in summary["sub_statuses"]["retro"]["detail"]
-    # The three healthy legs stay healthy and are still declared — a stage that
-    # names only its failures cannot be read as "the rest was checked".
+    assert summary["refused_sub_results"] == []
+    assert summary["retro_refused"] is False
+
+
+def test_an_error_outranks_a_refusal_and_both_stay_named():
+    """Worst-of decides the STATUS; the two lists keep both facts."""
+    summary = apply_substatus_honesty(
+        {**SCHEDULED_2026_09_19, "deploy_success": "error"}
+    )
+    assert summary["status"] == STAGE_DEGRADED
+    assert summary["degraded_sub_results"] == ["deploy_success"]
+    assert summary["refused_sub_results"] == ["retro"]
+    assert summary["retro_refused"] is True
+
+
+def test_retro_refused_is_emitted_on_every_fan_out_including_false():
+    """principles.md §2.7: a component emitting nothing is unobserved, not
+    healthy. The SF reads this boolean directly (a Choice cannot measure an
+    array's length), so its ABSENCE must mean "no fan-out", never "no
+    refusal"."""
+    clean = apply_substatus_honesty({**SCHEDULED_2026_09_19, "retro": "ok"})
+    assert clean["retro_refused"] is False
+    assert clean["status"] == STAGE_OK
+    no_fan_out = apply_substatus_honesty({"status": "disabled"})
+    assert "retro_refused" not in no_fan_out
+
+
+def test_the_healthy_legs_are_still_declared():
+    """A stage that names only its failures cannot be read as "the rest was
+    checked"."""
+    summary = apply_substatus_honesty(dict(SCHEDULED_2026_09_19))
     for key in ("director_loop", "director_issues", "deploy_success"):
         assert summary["sub_statuses"][key]["verdict"] == "pass"
 
@@ -178,14 +228,17 @@ def test_the_policy_s_own_test_for_every_leg():
         assert key in errored["degraded_sub_results"], key
 
 
-def test_the_two_vocabularies_are_disjoint():
+def test_the_three_vocabularies_are_disjoint():
     assert not (PASS_SUB_STATUSES & ERROR_SUB_STATUSES)
+    assert not (PASS_SUB_STATUSES & REFUSED_SUB_STATUSES)
+    assert not (ERROR_SUB_STATUSES & REFUSED_SUB_STATUSES)
 
 
 def test_classify_is_total():
     assert classify(None) == "pass"
     assert classify("ok") == "pass"
     assert classify("error") == "error"
+    assert classify("refused") == "refused"
     assert classify("nonsense") == UNCLASSIFIED
     assert classify(7) == UNCLASSIFIED
 

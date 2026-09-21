@@ -1288,8 +1288,8 @@ class TestRetro:
         `retro: error`, the plan (primary deliverable) still ships,
         `director/{date}/retro.json` is NOT written — there is no self-graded
         verdict for the trend ledger or the Report Card to read — and the
-        STAGE reports `degraded` rather than `ok` (§2.3b,
-        alpha-engine-config-I11299)."""
+        STAGE reports `refused` rather than `ok` (alpha-engine-config-I11299,
+        sf-pipeline-policy.md §2.3a rules 2-3)."""
         import botocore.exceptions
 
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
@@ -1311,14 +1311,20 @@ class TestRetro:
 
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
 
-        # alpha-engine-config-I11299: `degraded`, not `ok`. The refusal is
-        # correct and the plan still shipped — but a refused grade means no
-        # RetroGrade exists for this cycle, and the stage says so now.
-        assert out["status"] == "degraded"
-        assert out["degraded_sub_results"] == ["retro"]
-        assert out["retro"] == "error"
-        assert out["retro_outcome"] == "refused"  # a verdict, not a transport fault
-        assert out["sub_statuses"]["retro"]["verdict"] == "error"
+        # alpha-engine-config-I11299: `refused` — never `ok` (the defect the
+        # issue names) and never `degraded` (which would terminate a complete
+        # 5.4-hour weekly cycle Fail and page Brian for a guard doing its
+        # job). sf-pipeline-policy.md §2.3a rules 2-3: the RetroGrade verdict
+        # is ABSENT and must be named on every surface carrying the run's
+        # results; §2.3b's third paragraph is what permits it not to degrade
+        # the stage while forbidding it to be silent.
+        assert out["status"] == "refused"
+        assert out["degraded_sub_results"] == []
+        assert out["refused_sub_results"] == ["retro"]
+        assert out["retro_refused"] is True
+        assert out["retro"] == "refused"
+        assert out["retro_outcome"] == "refused"
+        assert out["sub_statuses"]["retro"]["verdict"] == "refused"
         assert "self-grading" in out["retro_error"]
         assert json.loads(
             s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read()
