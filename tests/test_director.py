@@ -1035,8 +1035,16 @@ class TestRetro:
         assert out["retro"] == "skipped"
 
     def test_handler_retro_failure_is_best_effort(self, s3, monkeypatch):
-        # A retro failure must NOT lose the plan (primary deliverable) — status
-        # stays ok, the plan is written, the retro records its error.
+        # A retro failure must NOT lose the plan (primary deliverable) — the
+        # plan is written and the retro records its error.
+        #
+        # alpha-engine-config-I11299: the enclosing status is now `degraded`,
+        # not `ok`. Best-effort means the stage does not FAIL and the primary
+        # deliverable ships; it never meant the stage may report a clean pass
+        # over a leg that errored (sf-pipeline-policy.md §2.3b). This assertion
+        # read `ok` until 2026-09-21, and that is the defect I11299 names: the
+        # same shape reached three live executions, two of which terminated
+        # ExecutionSucceeded with degraded: false.
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
         s3.put_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json",
                       Body=json.dumps(_CARD).encode())
@@ -1049,8 +1057,11 @@ class TestRetro:
             raise RuntimeError("judge overloaded")
         monkeypatch.setattr(R, "grade_prior_plan", _boom)
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
-        assert out["status"] == "ok"  # plan still shipped
+        assert out["status"] == "degraded"  # honest: one leg errored (§2.3b)
+        assert out["degraded_sub_results"] == ["retro"]
         assert out["retro"] == "error" and "judge overloaded" in out["retro_error"]
+        assert out["retro_outcome"] == "failed"  # a fault, not a refusal
+        assert out["action_plan_key"]  # plan still shipped
         assert json.loads(s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read())
 
     # ── config#1673: cross-model judge (judge != generator) ─────────
@@ -1274,9 +1285,11 @@ class TestRetro:
         self, s3, monkeypatch
     ):
         """End to end: the refusal reaches the handler's best-effort wrapper as
-        `retro: error`, the plan (primary deliverable) still ships, and
+        `retro: error`, the plan (primary deliverable) still ships,
         `director/{date}/retro.json` is NOT written — there is no self-graded
-        verdict for the trend ledger or the Report Card to read."""
+        verdict for the trend ledger or the Report Card to read — and the
+        STAGE reports `refused` rather than `ok` (alpha-engine-config-I11299,
+        sf-pipeline-policy.md §2.3a rules 2-3)."""
         import botocore.exceptions
 
         monkeypatch.setenv("DIRECTOR_ENABLED", "1")
@@ -1298,8 +1311,20 @@ class TestRetro:
 
         out = H.handler({"date": RUN_DATE, "bucket": BUCKET})
 
-        assert out["status"] == "ok"  # the plan still shipped
-        assert out["retro"] == "error"
+        # alpha-engine-config-I11299: `refused` — never `ok` (the defect the
+        # issue names) and never `degraded` (which would terminate a complete
+        # 5.4-hour weekly cycle Fail and page Brian for a guard doing its
+        # job). sf-pipeline-policy.md §2.3a rules 2-3: the RetroGrade verdict
+        # is ABSENT and must be named on every surface carrying the run's
+        # results; §2.3b's third paragraph is what permits it not to degrade
+        # the stage while forbidding it to be silent.
+        assert out["status"] == "refused"
+        assert out["degraded_sub_results"] == []
+        assert out["refused_sub_results"] == ["retro"]
+        assert out["retro_refused"] is True
+        assert out["retro"] == "refused"
+        assert out["retro_outcome"] == "refused"
+        assert out["sub_statuses"]["retro"]["verdict"] == "refused"
         assert "self-grading" in out["retro_error"]
         assert json.loads(
             s3.get_object(Bucket=BUCKET, Key=out["action_plan_key"])["Body"].read()
