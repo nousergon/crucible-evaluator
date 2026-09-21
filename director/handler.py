@@ -45,6 +45,7 @@ from director.issue_filer import (
 )
 from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
+from director.substatus import apply_substatus_honesty
 from director.verdict import (
     PIPELINE_GATES_KEY,
     actions_withheld,
@@ -464,7 +465,7 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict, budget=No
     reason rather than an error — declining a grade we cannot finish is the
     correct outcome, and it is materially different from a judge that failed."""
     from director.budget import BudgetExhausted
-    from director.retro import grade_prior_plan
+    from director.retro import SelfGradedRetroError, grade_prior_plan
 
     prior = _load_prior_plan(s3, bucket, run_date)
     if prior is None:
@@ -483,9 +484,24 @@ def _run_retro_best_effort(s3, bucket: str, run_date: str, card: dict, budget=No
     except BudgetExhausted as e:
         logger.warning("Director retro skipped — out of invocation budget: %s", e)
         return {"retro": "skipped", "retro_reason": f"invocation budget exhausted: {e}"}
+    except SelfGradedRetroError as e:
+        # A correctness REFUSAL, not a transport failure — and still `error`.
+        #
+        # The sub-status stays `error` because the OUTCOME is the one §2.3b
+        # cares about: no RetroGrade was published, and the conformance probe's
+        # ERROR_STATUSES vocabulary (nous-ergon-ops scripts/
+        # sf_substatus_honesty.py) is closed, so inventing a word here would
+        # make the probe report the leg `unclassified` instead of naming it.
+        # `retro_outcome` carries the distinction that a reader DOES need: a
+        # refusal is fixed in the registry (alpha-engine-config-I8202), a
+        # failure is fixed in the judge. ERROR, not WARNING, for the reason
+        # alpha-engine-config-I11299 exists: this leg has been silently
+        # unpublished for >= 2 weekly cycles.
+        logger.error("Director retro REFUSED (plan already written, non-fatal): %s", e)
+        return {"retro": "error", "retro_outcome": "refused", "retro_error": str(e)}
     except Exception as e:  # noqa: BLE001 — secondary path; the plan already shipped
         logger.warning("Director retro failed (plan already written, non-fatal): %s", e)
-        return {"retro": "error", "retro_error": str(e)}
+        return {"retro": "error", "retro_outcome": "failed", "retro_error": str(e)}
 
 
 def _run_deploy_success_best_effort(s3, bucket: str, token: str | None, budget=None) -> dict:
@@ -962,6 +978,14 @@ def _run(event: dict | None = None, context=None) -> dict:
         **issues_summary,
         **deploy_summary,
     }
+    # sf-pipeline-policy.md §2.3b (alpha-engine-config-I11299). This summary
+    # fans out into four independently-statused legs under ONE enclosing
+    # `status`, and every §2.3 mechanism — the SF Catch, the Mark*Degraded
+    # states, the completion marker — reads only the enclosing one. Applied
+    # BEFORE `_record_stage_coverage` so the honest status is what reaches the
+    # stage-coverage artifact, the SF output and the execution record alike,
+    # rather than being recomputed (or not) by each reader.
+    apply_substatus_honesty(summary)
     _record_stage_coverage("Director", run_date=run_date, started=_started, result=summary)
     logger.info("Director plan written: %s", summary)
     return summary
