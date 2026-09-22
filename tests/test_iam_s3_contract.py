@@ -141,6 +141,11 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # read prefixes, no contract/IAM change.
     "grading/freshness_preflight.py": 3,
     "grading/history.py": 2,
+    # alpha-engine-config-I11113: two sites — the list_objects_v2 paginator over
+    # decision_artifacts/_cost_raw/{date}/ and one get_object per .jsonl object.
+    # "decision_artifacts" was already declared readwrite above (I8152), so this
+    # is a new FILE on an existing prefix: no contract row and no IAM change.
+    "grading/producers/cost_pricing.py": 2,
     "grading/producers/deploy_success.py": 1,
     "grading/tiles/agent.py": 1,
     "grading/tiles/backtester.py": 3,

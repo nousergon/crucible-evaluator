@@ -463,4 +463,11 @@ metrics:
     schema_drift_incidents: {target: 0.0, red_line: 3.0, higher_is_better: false, n_floor_declared: 1}
     sf_success_rate_4w: {target: 0.95, red_line: 0.8, n_floor_declared: 3}
     unattended_first_pass_rate: {target: 0.95, red_line: 0.5, n_floor_declared: 3}
+    # alpha-engine-config-I11113 — rows in the trailing-week _cost_raw window
+    # whose cost_source is "unpriced" or "usage_unreported": the row EXISTS
+    # (fan-in coverage passes) but nobody can say what the call cost. Target 0;
+    # red-line 25 separates a one-off (a model served once before its price card
+    # landed) from a SUSTAINED card gap like the 2026-09-12 glm-5.3 promotion,
+    # which unpriced every `ultra` call for days — tens of rows per cycle.
+    unpriced_cost_rows: {target: 0.0, red_line: 25.0, higher_is_better: false, n_floor_declared: 1}
     watchdog_firings: {target: 0.0, red_line: 2.0, higher_is_better: false, n_floor_declared: 1}

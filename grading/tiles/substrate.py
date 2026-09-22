@@ -32,6 +32,12 @@ from botocore.exceptions import BotoCoreError, ClientError
 from grading.artifacts import get_json, get_json_windowed
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.producers.cost_pricing import (
+    COST_RAW_PREFIX,
+    CostPricingUnmeasured,
+    format_by_callsite,
+    scan_degraded_cost_rows,
+)
 from grading.producers.deploy_success import DEPLOY_SUCCESS_KEY
 from grading.thresholds.scoring import build_arm_components, leaderboard_key
 from grading.units import COUNT_EVENTS, COUNT_ROWS, DAYS, FRACTION
@@ -123,6 +129,25 @@ _SCHEMA_DRIFT_METRIC = "daily_append_schema_drift_count"
 # 80%. A rollup older than the freshness window means the producer stopped
 # running → grade a transparent stale N/A rather than a false-confident number.
 _DEPLOY_SUCCESS_MAX_AGE_DAYS = 21
+
+# unpriced_cost_rows (supporting, alpha-engine-config-I11113) — how many rows in
+# the trailing-week `decision_artifacts/_cost_raw/` window carry a degraded
+# `cost_source` ("unpriced" — krepis could not find a price card for a served
+# model; "usage_unreported" — the provider returned no usage to price). The row
+# is WRITTEN in both cases and fan-in coverage is satisfied, so `CostCoverageError`
+# passes; what is lost is only the dollar figure. That makes this a DEGRADATION,
+# not a failure — `supporting` criticality, so it never cascades a tile to RED on
+# the critical path, and no new gate.
+#
+# Bands: target 0 (steady state is every call priced) / red-line 25. A single
+# unpriced row is a WATCH-worthy one-off — a model served once before its card
+# landed. A SUSTAINED gap is what the 2026-09-12 glm-5.3 promotion produced: one
+# missing card silently unpriced every `ultra` call for days, which is tens of
+# rows per cycle, not a handful. 25 is set above the one-off and below the
+# sustained case deliberately; it is not a hand-tuned literal but the boundary
+# between those two shapes, and it lives in the threshold registry like every
+# other band (config#7476).
+_UNPRICED_COST_ROWS_WINDOW_DAYS = 7
 
 
 def _cw_metric_sum(cw, namespace: str, metric: str, as_of: datetime, window_days: int) -> float | None:
@@ -746,6 +771,77 @@ def build_substrate_tile(
             name="deploy_success_rate", module=MODULE, metric_type="pct", criticality="supporting",
             n_floor=3, source_path=ds_src,
             input_present=False, na_detail=na,
+        ))
+
+    # 4b. unpriced_cost_rows (supporting, alpha-engine-config-I11113) — the
+    #     count of cost rows in the trailing-week _cost_raw window that exist but
+    #     cannot be priced. This is the surface deliverable 4 of I11100 asked for
+    #     and krepis structurally could not provide: krepis is a pure library with
+    #     no deployment and no alerting surface, so the degrade it writes had no
+    #     reader anywhere in the fleet. It renders here, beside the other
+    #     substrate-integrity counts, because the Report Card is already the
+    #     weekly cost surface and a MetricRecord is self-describing — the console
+    #     renders it with no dashboard change (policy-console).
+    #
+    #     "Could not read the window" is a DIFFERENT record from "zero degraded
+    #     rows": the producer raises CostPricingUnmeasured and this grades a
+    #     loud N/A-MISSING-INPUT naming the partition and the fault, never 0.
+    #     Collapsing the two would reproduce exactly the defect class being
+    #     closed here (principles.md §2.7).
+    ucr_src = f"s3://{bucket}/{COST_RAW_PREFIX}/{{date}}/**/*.jsonl"
+    if run_date:
+        try:
+            scan = scan_degraded_cost_rows(
+                s3, bucket, run_date, window_days=_UNPRICED_COST_ROWS_WINDOW_DAYS
+            )
+        except CostPricingUnmeasured as e:
+            logger.warning("unpriced_cost_rows: window unmeasurable (%s) — grading N/A, NOT zero", e)
+            components.append(build_metric(
+                name="unpriced_cost_rows", module=MODULE, metric_type="count",
+                criticality="supporting",
+                estimator="degraded_cost_source_row_count",
+                measurement_horizon=f"trailing_{_UNPRICED_COST_ROWS_WINDOW_DAYS}d",
+                n_floor=1, higher_is_better=False, source_path=ucr_src,
+                input_present=False,
+                na_detail=(f"unpriced_cost_rows: the {_UNPRICED_COST_ROWS_WINDOW_DAYS}d "
+                           f"{COST_RAW_PREFIX}/ window ending {run_date} could not be counted "
+                           f"in full ({e}) — this is UNMEASURED, not zero: a row that exists "
+                           f"but cannot be priced would be invisible either way, so the count "
+                           f"is withheld rather than reported low."),
+            ))
+        else:
+            total = scan["degraded_total"]
+            breakdown = format_by_callsite(scan["by_callsite"])
+            by_src = scan["by_cost_source"]
+            window = f"{scan['partitions'][0]}..{scan['partitions'][-1]}"
+            components.append(build_metric(
+                name="unpriced_cost_rows", module=MODULE, metric_type="count",
+                criticality="supporting",
+                estimator="degraded_cost_source_row_count",
+                measurement_horizon=f"trailing_{_UNPRICED_COST_ROWS_WINDOW_DAYS}d",
+                value=float(total), unit=COUNT_ROWS, n_samples=1, n_floor=1,
+                higher_is_better=False, source_path=ucr_src,
+                reason=(f"unpriced_cost_rows = {total} of {scan['rows_scanned']} cost row(s) "
+                        f"over {scan['objects_scanned']} object(s) in {window} carry a degraded "
+                        f"cost_source (unpriced={by_src['unpriced']}, "
+                        f"usage_unreported={by_src['usage_unreported']}) vs target 0 / "
+                        f"red-line 25 — by callsite: {breakdown}. The rows EXIST and fan-in "
+                        f"coverage passes; what is missing is the price, so this cycle's "
+                        f"AlphaEngine/Cost understates by whatever those calls cost. "
+                        f"A non-zero count means a served model has no active price card "
+                        f"(unpriced) or a route returned no usage (usage_unreported)."),
+            ))
+    else:
+        components.append(build_metric(
+            name="unpriced_cost_rows", module=MODULE, metric_type="count",
+            criticality="supporting",
+            estimator="degraded_cost_source_row_count",
+            measurement_horizon=f"trailing_{_UNPRICED_COST_ROWS_WINDOW_DAYS}d",
+            n_floor=1, higher_is_better=False, source_path=ucr_src,
+            input_present=False,
+            na_detail=("unpriced_cost_rows: no run_date supplied, so the "
+                       f"{COST_RAW_PREFIX}/ window is undefined — the count is "
+                       "withheld rather than reported as zero."),
         ))
 
     # 5-7. Accepted permanent honest-N/A (config#1153 Batch E, operator ruling
