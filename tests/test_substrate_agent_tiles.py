@@ -10,6 +10,7 @@ from moto import mock_aws
 
 import nousergon_lib.pipeline_status as ps
 from grading.tiles.agent import build_agent_tile
+from grading.producers.cost_pricing import COST_RAW_PREFIX
 from grading.tiles.substrate import PRICE_CACHE_FRESHNESS_SENTINEL_KEY, build_substrate_tile
 
 BUCKET = "alpha-engine-research"
@@ -66,12 +67,13 @@ class TestSubstrate:
         assert sf["status"] == "N/A-MISSING-INPUT"
         assert "discoverable" in sf["status_reason"]
 
-    def test_tile_has_twelve_components(self, s3):
-        # 12 = the original 9 + unattended_first_pass_rate (config#1059) + one
+    def test_tile_has_thirteen_components(self, s3):
+        # 13 = the original 9 + unattended_first_pass_rate (config#1059) + one
         # threshold-slot scoring record per arm (config#7476, one per registry
-        # arm — champion-challenger §3 scores every arm every cycle).
+        # arm — champion-challenger §3 scores every arm every cycle)
+        # + unpriced_cost_rows (alpha-engine-config-I11113).
         tile = build_substrate_tile(BUCKET, s3_client=s3)
-        assert tile["n_components"] == 12
+        assert tile["n_components"] == 13
         assert tile["module"] == "substrate"
 
     def test_threshold_arm_records_are_present_and_never_silent(self, s3):
@@ -101,6 +103,101 @@ class TestSubstrate:
         _put_price_cache_sentinel(s3, datetime.now(UTC))
         tile = build_substrate_tile(BUCKET, s3_client=s3, as_of=datetime.now(UTC))
         assert tile["status"] == "WATCH"
+
+
+class TestUnpricedCostRows:
+    """alpha-engine-config-I11113 — the Report Card surface for krepis's
+    `cost_source` degrades, which nothing in the fleet read before this.
+
+    The load-bearing test here is `test_negative_control_*`: a deliberately
+    injected unpriced row must be VISIBLE on the card within one cycle. A suite
+    that only proves zero renders as zero does not close the issue.
+    """
+
+    RUN_DATE = "2026-09-19"
+
+    def _put_cost_rows(self, s3, date, callsite, rows):
+        key = f"{COST_RAW_PREFIX}/{date}/krepis-abc123/{callsite}.0.jsonl"
+        s3.put_object(Bucket=BUCKET, Key=key,
+                      Body="\n".join(json.dumps(r) for r in rows).encode("utf-8"))
+
+    def _row(self, cost_source, callsite):
+        return {
+            "ts": f"{self.RUN_DATE}T12:00:00+00:00",
+            "model": "glm-5.3",
+            "input_tokens": 900,
+            "output_tokens": 120,
+            "cost_usd": None if cost_source in ("unpriced", "usage_unreported") else 0.42,
+            "cost_source": cost_source,
+            "callsite_id": callsite,
+            "agent_id": callsite,
+        }
+
+    def test_zero_renders_as_a_measured_zero(self, s3):
+        self._put_cost_rows(s3, self.RUN_DATE, "director-plan",
+                            [self._row("price_card", "director-plan")])
+        tile = build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3)
+        c = _comp(tile, "unpriced_cost_rows")
+        assert c["value"] == 0.0
+        assert c["status"] == "GREEN"
+        assert c["criticality"] == "supporting"
+
+    def test_negative_control_injected_unpriced_row_is_visible_on_the_card(self, s3):
+        """THE closes-when: inject one unpriced row, build the card, see it."""
+        self._put_cost_rows(s3, self.RUN_DATE, "director-plan", [
+            self._row("price_card", "director-plan"),
+            self._row("unpriced", "director-plan"),
+        ])
+        tile = build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3)
+        c = _comp(tile, "unpriced_cost_rows")
+        assert c["value"] == 1.0
+        assert c["status"] != "GREEN"          # a degraded row is never green
+        assert "director-plan" in c["status_reason"]   # named per callsite
+        assert "unpriced=1" in c["status_reason"]
+
+    def test_negative_control_usage_unreported_is_visible_too(self, s3):
+        self._put_cost_rows(s3, self.RUN_DATE, "evaljudge-sync",
+                            [self._row("usage_unreported", "evaljudge-sync")])
+        tile = build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3)
+        c = _comp(tile, "unpriced_cost_rows")
+        assert c["value"] == 1.0
+        assert "evaljudge-sync" in c["status_reason"]
+        assert "usage_unreported=1" in c["status_reason"]
+
+    def test_a_sustained_card_gap_goes_red(self, s3):
+        self._put_cost_rows(s3, self.RUN_DATE, "director-plan",
+                            [self._row("unpriced", "director-plan")] * 30)
+        tile = build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3)
+        c = _comp(tile, "unpriced_cost_rows")
+        assert c["value"] == 30.0
+        assert c["status"] == "RED"
+
+    def test_unreadable_window_is_na_not_zero(self, s3):
+        """The defect class this issue is about: 'zero' and 'could not read'
+        must not render identically."""
+        key = f"{COST_RAW_PREFIX}/{self.RUN_DATE}/krepis-abc123/director-plan.0.jsonl"
+        s3.put_object(Bucket=BUCKET, Key=key, Body=b"{not json}\n")
+        tile = build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3)
+        c = _comp(tile, "unpriced_cost_rows")
+        assert c["value"] is None
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "UNMEASURED, not zero" in c["status_reason"]
+
+    def test_unreadable_and_zero_are_distinguishable_records(self, s3):
+        clean = _comp(build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3),
+                      "unpriced_cost_rows")
+        key = f"{COST_RAW_PREFIX}/{self.RUN_DATE}/krepis-abc123/director-plan.0.jsonl"
+        s3.put_object(Bucket=BUCKET, Key=key, Body=b"{not json}\n")
+        broken = _comp(build_substrate_tile(BUCKET, run_date=self.RUN_DATE, s3_client=s3),
+                       "unpriced_cost_rows")
+        assert clean["value"] == 0.0 and clean["status"] == "GREEN"
+        assert broken["value"] is None and broken["status"].startswith("N/A")
+        assert clean["status_reason"] != broken["status_reason"]
+
+    def test_no_run_date_withholds_rather_than_reporting_zero(self, s3):
+        c = _comp(build_substrate_tile(BUCKET, s3_client=s3), "unpriced_cost_rows")
+        assert c["value"] is None
+        assert c["status"].startswith("N/A")
 
 
 class TestDeploySuccessRate:
