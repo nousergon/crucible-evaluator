@@ -454,6 +454,20 @@ class TestCarryover:
         assert row["carry_count"] == 0
         assert row["escalated"] is False
 
+    def test_merge_keeps_ruled_unrecovered_flags_on_re_proposal(self):
+        """A re-proposed id keeps its loop-verification state, so the next
+        pass does not re-notify and refile (alpha-engine-config-I11456)."""
+        ledger = {"items": [{"id": "revive-momentum-l1", "status": "carried_over",
+                             "first_seen": "2026-05-23", "carry_count": 1, "issue_number": 501,
+                             "ruled_unrecovered_notified": True,
+                             "ruled_unrecovered_filed": True,
+                             "ruled_unrecovered_issue": 777}]}
+        merged = merge_plan_into_ledger(ledger, _plan(), RUN_DATE)
+        row = next(r for r in merged["items"] if r["id"] == "revive-momentum-l1")
+        assert row["ruled_unrecovered_notified"] is True
+        assert row["ruled_unrecovered_filed"] is True
+        assert row["ruled_unrecovered_issue"] == 777
+
 
 class TestHandler:
     def test_disabled_is_noop(self, s3, monkeypatch):

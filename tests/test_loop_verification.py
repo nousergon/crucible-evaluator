@@ -320,3 +320,22 @@ def test_ruled_unrecovered_still_adverse_next_run_files_new_issue_not_reopen():
     assert len(gh.filed_issues) == 1
     assert "#100" in gh.filed_issues[0]["body"]
     assert item["ruled_unrecovered_filed"] is True
+
+
+def test_ruled_unrecovered_already_filed_is_not_refiled():
+    """Once the new issue has been filed, later passes (the next weekly run,
+    or a same-week re-run) do not file it again while the metric stays
+    adverse. Before this guard every run refiled: the same title landed five
+    times on 2026-09-19/20."""
+    gh = FakeGitHub(issues={
+        100: {"state": "closed", "labels": [], "state_reason": "not_planned"},
+    })
+    item = _item(evidence=["price_cache_freshness"])
+    item["ruled_unrecovered_notified"] = True
+    LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    result = LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert len(gh.filed_issues) == 1
+    assert result["filed_for_ruling_issues"] == []
+    assert result["closed_ruled_unrecovered"] == 1
+    assert 100 not in gh.patched_state
