@@ -191,6 +191,13 @@ def load_ledger(bucket: str, s3_client=None) -> dict:
     return json.loads(resp["Body"].read())
 
 
+_RULED_UNRECOVERED_FLAGS = (
+    "ruled_unrecovered_notified",
+    "ruled_unrecovered_filed",
+    "ruled_unrecovered_issue",
+)
+
+
 def merge_plan_into_ledger(ledger: dict, plan: DirectorWeeklyActionPlan, run_date: str) -> dict:
     """Upsert this week's action items into the ledger by stable id.
 
@@ -234,6 +241,12 @@ def merge_plan_into_ledger(ledger: dict, plan: DirectorWeeklyActionPlan, run_dat
         if existing:
             row["first_seen"] = existing.get("first_seen", run_date)
             row["issue_number"] = existing.get("issue_number")
+            # Loop-verification state belongs to issue_number, which is kept
+            # above; dropping it made a re-proposed item re-notify and refile
+            # every run (alpha-engine-config-I11456).
+            for flag in _RULED_UNRECOVERED_FLAGS:
+                if flag in existing:
+                    row[flag] = existing[flag]
             if ai.status == "resolved":
                 row["carry_count"] = 0
                 row["escalated"] = False
