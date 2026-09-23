@@ -243,7 +243,12 @@ def verify_and_correct(
                 comments = _fetch_comments(api, number, gh_request, token)
                 if _is_human_ruled(res, comments):
                     counts["closed_ruled_unrecovered"] += 1
-                    if item.get("ruled_unrecovered_notified"):
+                    if item.get("ruled_unrecovered_filed"):
+                        # Already re-tracked as a new issue on a prior run;
+                        # filing again is a duplicate (alpha-engine-config
+                        # 9/19-9/20: one title filed five times in 14h).
+                        pass
+                    elif item.get("ruled_unrecovered_notified"):
                         new_number = _file_new_issue_for_ruled_unrecovered(
                             api, number, item, gh_request, token,
                         )
@@ -374,6 +379,7 @@ def _file_new_issue_for_ruled_unrecovered(
         )
         return None
     item["ruled_unrecovered_filed"] = True
+    item["ruled_unrecovered_issue"] = res.get("number")
     return res.get("number")
 
 
