@@ -339,3 +339,27 @@ def test_ruled_unrecovered_already_filed_is_not_refiled():
     assert result["filed_for_ruling_issues"] == []
     assert result["closed_ruled_unrecovered"] == 1
     assert 100 not in gh.patched_state
+
+
+def test_ruled_unrecovered_new_issue_carries_the_item_priority():
+    """The re-track issue carries the ledger item's P-label, as a fresh
+    proposal does. Nine landed with none on 2026-09-24."""
+    gh = FakeGitHub(issues={
+        100: {"state": "closed", "labels": [], "state_reason": "not_planned"},
+    })
+    item = _item(evidence=["price_cache_freshness"])
+    item["ruled_unrecovered_notified"] = True
+    item["priority"] = "P0"
+    LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert gh.filed_issues[0]["labels"] == ["area:director-proposals", "P0"]
+
+
+def test_ruled_unrecovered_new_issue_ignores_a_malformed_priority():
+    gh = FakeGitHub(issues={
+        100: {"state": "closed", "labels": [], "state_reason": "not_planned"},
+    })
+    item = _item(evidence=["price_cache_freshness"])
+    item["ruled_unrecovered_notified"] = True
+    item["priority"] = "urgent"
+    LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert gh.filed_issues[0]["labels"] == ["area:director-proposals"]
