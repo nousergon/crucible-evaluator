@@ -49,6 +49,8 @@ import re
 from director.issue_filer import slug_issue_number_map
 from director.roadmap_pr import _gh_request
 
+_PRIORITY_LABEL = re.compile(r"P[0-3]")
+
 logger = logging.getLogger(__name__)
 
 ADVERSE_STATUSES = {"RED", "WATCH"}
@@ -368,9 +370,16 @@ def _file_new_issue_for_ruled_unrecovered(
         f"## Evidence\n{evidence}\n\n"
         f"## Prior issue\n#{number}\n"
     )
+    # Carry the ledger item's priority, as issue_filer does for a fresh
+    # proposal. Without it every re-track landed unprioritised (nine on
+    # 2026-09-24, P0 items among them) and sat outside every P-ordered queue.
+    labels = ["area:director-proposals"]
+    priority = item.get("priority")
+    if isinstance(priority, str) and _PRIORITY_LABEL.fullmatch(priority):
+        labels.append(priority)
     status, res = gh_request(
         "POST", f"{api}/issues",
-        token, {"title": title, "body": body, "labels": ["area:director-proposals"]},
+        token, {"title": title, "body": body, "labels": labels},
     )
     if status not in (200, 201):
         logger.warning(
