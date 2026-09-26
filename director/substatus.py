@@ -45,6 +45,12 @@ to do, INCLUDING the two shapes of "correctly did less":
   carve-out, and ``alpha-engine-config-I11299`` names it explicitly: *do not
   widen the degraded flag so far that a legitimately-skipped retro marks a run
   degraded — ``error`` and ``skipped`` are different sub-statuses.*
+* ``nochange`` — the leg ran and found nothing new to write (issue_filer /
+  roadmap_pr: every candidate already filed). Same family as ``skipped``:
+  correctly did less; measured 2026-09-26 as the sole false-positive that
+  terminated the weekly SF ``DegradedRun`` (``director_issues: "nochange"``
+  classified ``unclassified``). Tracker: ``alpha-engine-config`` follow-up to
+  I11299.
 * ``disabled`` — the channel is switched off by configuration.
 * ``withheld`` / ``mutations_withheld`` — §2.3a withholding. The leg was gated
   OFF by a correctness verdict that is itself already on this summary
@@ -129,7 +135,7 @@ _DETAIL_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 PASS_SUB_STATUSES: frozenset[str] = frozenset(
-    {"ok", "skipped", "disabled", "withheld", "mutations_withheld"}
+    {"ok", "skipped", "disabled", "nochange", "withheld", "mutations_withheld"}
 )
 
 ERROR_SUB_STATUSES: frozenset[str] = frozenset({"error", "partial"})

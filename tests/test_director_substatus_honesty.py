@@ -188,6 +188,22 @@ def test_a_withheld_leg_does_not_double_count_the_2_3a_verdict():
     assert summary["status"] == STAGE_OK
 
 
+def test_director_issues_nochange_is_a_pass_not_unclassified():
+    """Measured 2026-09-26 cadence run: sole DegradedRun reason was
+    weekly_director_substatus_degraded with degraded_sub_results=["director_issues"]
+    and director_issues="nochange" (all items already filed). That is correctly
+    did less — same family as skipped — not an unclassified failure.
+    """
+    summary = apply_substatus_honesty(
+        {**SCHEDULED_2026_09_19, "retro": "ok", "director_issues": "nochange"}
+    )
+    assert summary["status"] == STAGE_OK
+    assert summary["degraded_sub_results"] == []
+    entry = summary["sub_statuses"]["director_issues"]
+    assert entry["status"] == "nochange"
+    assert entry["verdict"] == "pass"
+
+
 def test_an_unrecognised_sub_status_is_unclassified_and_degrades():
     """The vocabulary is closed at BOTH ends (§2.3b).
 
@@ -237,6 +253,7 @@ def test_the_three_vocabularies_are_disjoint():
 def test_classify_is_total():
     assert classify(None) == "pass"
     assert classify("ok") == "pass"
+    assert classify("nochange") == "pass"
     assert classify("error") == "error"
     assert classify("refused") == "refused"
     assert classify("nonsense") == UNCLASSIFIED
