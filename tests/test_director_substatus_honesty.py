@@ -260,5 +260,73 @@ def test_classify_is_total():
     assert classify(7) == UNCLASSIFIED
 
 
+def test_a_token_that_lost_issues_write_degrades_as_an_error():
+    summary = apply_substatus_honesty(
+        {**SCHEDULED_2026_09_19, "retro": "ok", "director_issues": "skipped_unscoped"}
+    )
+    assert summary["status"] == STAGE_DEGRADED
+    assert summary["sub_statuses"]["director_issues"]["verdict"] == "error"
+
+
+def _leg_status_literals() -> dict[str, set[str]]:
+    """Every string literal the Director's code can put on a graded leg.
+
+    Collected from the source rather than listed by hand: a leg's vocabulary
+    is whatever its producer writes, and the 2026-09-26 ``DegradedRun`` was a
+    producer word (``issue_filer``'s ``nochange``) that nothing compared
+    against these sets.
+    """
+    import ast
+    from pathlib import Path
+
+    director = Path(__file__).resolve().parents[1] / "director"
+    found: dict[str, set[str]] = {key: set() for key in SUB_RESULT_KEYS}
+
+    def constants(node: ast.AST) -> set[str]:
+        # Only the values an expression can evaluate TO: an IfExp's test holds
+        # lookup keys, not statuses.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.IfExp):
+            return constants(node.body) | constants(node.orelse)
+        return set()
+
+    for path in director.glob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if isinstance(k, ast.Constant) and k.value in found and v is not None:
+                        found[k.value] |= constants(v) if isinstance(v, (ast.Constant, ast.IfExp)) else set()
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value in found
+                        and isinstance(node.value, (ast.Constant, ast.IfExp))
+                    ):
+                        found[target.slice.value] |= constants(node.value)
+        if path.name == "issue_filer.py":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if isinstance(k, ast.Constant) and k.value == "status" and isinstance(v, ast.Constant):
+                            found["director_issues"].add(v.value)
+    return found
+
+
+def test_every_status_a_leg_can_emit_is_in_a_declared_vocabulary():
+    declared = PASS_SUB_STATUSES | ERROR_SUB_STATUSES | REFUSED_SUB_STATUSES
+    found = _leg_status_literals()
+    assert found["director_issues"] >= {"nochange", "skipped_unscoped"}
+    undeclared = {key: sorted(words - declared) for key, words in found.items() if words - declared}
+    assert not undeclared, (
+        f"leg status word(s) in neither vocabulary: {undeclared}. Classify each "
+        "in director/substatus.py — an unlisted word reads as 'unclassified' and "
+        "degrades the weekly run."
+    )
+
+
 def test_stage_status_of_an_empty_fan_out_is_ok():
     assert stage_status({}) == STAGE_OK

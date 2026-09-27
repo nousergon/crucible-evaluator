@@ -62,8 +62,13 @@ to do, INCLUDING the two shapes of "correctly did less":
 ``ERROR_SUB_STATUSES`` are the outcomes in which work the stage was asked for
 did not happen because something went WRONG and the leg said so — ``error``
 (an exception, a transport fault, a leg that should have produced output and
-did not) and ``partial`` (the loop-verification pass ran against a ledger it
-could not fully resolve).
+did not), ``partial`` (the loop-verification pass ran against a ledger it
+could not fully resolve) and ``skipped_unscoped`` (``issue_filer`` got a
+401/403: the Director's GitHub token has lost ``issues:write``, so the plan's
+items were not filed). The last was the pre-activation state when the channel
+shipped; the channel has long been live, so a token losing scope now is a
+broken channel, and it is named as one rather than falling through to
+``unclassified``.
 
 ``REFUSED_SUB_STATUSES`` is the third class, and it is neither of the other
 two. ``refused`` is a GUARD DECLINING BY DESIGN: the retro judge resolved to
@@ -138,7 +143,7 @@ PASS_SUB_STATUSES: frozenset[str] = frozenset(
     {"ok", "skipped", "disabled", "nochange", "withheld", "mutations_withheld"}
 )
 
-ERROR_SUB_STATUSES: frozenset[str] = frozenset({"error", "partial"})
+ERROR_SUB_STATUSES: frozenset[str] = frozenset({"error", "partial", "skipped_unscoped"})
 
 #: A guard declining BY DESIGN — see the module docstring. Distinct from
 #: ERROR_SUB_STATUSES, and deliberately NOT folded into PASS_SUB_STATUSES with
