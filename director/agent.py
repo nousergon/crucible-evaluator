@@ -1125,6 +1125,7 @@ def _default_llm(
     *,
     group: str | None = None,
     callsite_id: str = "director-plan",
+    plan_ceiling_s: float | None = None,
 ) -> _KrepisStructuredDirector:
     """Construct the real structured-output Director client (lazy import).
 
@@ -1329,10 +1330,23 @@ def _default_llm(
     # quoted as ONE attempt against everything else the invocation can afford.
     # `_invoke_with_retry` still retries — funded by whatever is left, which is
     # enough after a fast failure and correctly nothing after a full-quote one.
+    #
+    # alpha-engine-config-I11936: `plan_ceiling_s` is the HOME's ceiling
+    # (`director/hosting.py`). Omitted, it is the Lambda's 600s — every existing
+    # caller is unchanged. The weekly-spot home passes its own 1,800s; that one
+    # number becomes BOTH the quote's ceiling and the streamed call's
+    # `total_timeout`, so the box keeps a hard total bound rather than losing it
+    # along with the 900s cap.
+    ceiling = DIRECTOR_PLAN_CEILING_S if plan_ceiling_s is None else float(plan_ceiling_s)
+    if ceiling <= DIRECTOR_PLAN_IDLE_TIMEOUT_S:
+        raise ValueError(
+            f"plan_ceiling_s={ceiling:.0f}s must exceed the {DIRECTOR_PLAN_IDLE_TIMEOUT_S:.0f}s "
+            "idle bound — krepis refuses total_timeout <= idle_timeout"
+        )
     plan_budget = budget or UNBOUNDED
     quoted_timeout = plan_budget.quote(
         "director-plan",
-        DIRECTOR_PLAN_CEILING_S,
+        ceiling,
         attempts=1,
         downstream_s=RETRO_JUDGE_RESERVE_S,
     )
@@ -1357,6 +1371,10 @@ def _default_llm(
         # `_stamp_route_degradation` measures `result.model` against.
         primary_model=route.get("primary_model"),
         attempt_cost_s=quoted_timeout,
+        # Anchored on the home's STATIC ceiling, never the shrinking quote —
+        # see `DIRECTOR_PLAN_TOTAL_TIMEOUT_S` for why. On Lambda this is that
+        # constant's 600s exactly.
+        total_timeout_s=ceiling,
     )
 
 
@@ -1907,6 +1925,7 @@ def build_action_plan(
     budget=None,
     group: str | None = None,
     callsite_id: str = "director-plan",
+    plan_ceiling_s: float | None = None,
 ) -> DirectorWeeklyActionPlan:
     """Run the Director: report card → DirectorWeeklyActionPlan.
 
@@ -1925,7 +1944,9 @@ def build_action_plan(
     :data:`DIRECTOR_GROUP`). Production passes nothing; the arm evaluation
     (``evals/director_arm_eval.py``, alpha-engine-config-I9486) passes each
     arm under test, with a distinct ``callsite_id`` so its spend does not land
-    on the production plan call's cost row. Ignored when ``llm`` is injected —
+    on the production plan call's cost row. ``plan_ceiling_s`` is the home's
+    plan ceiling (``director/hosting.py``); omitted, the Lambda's 600s.
+    Ignored when ``llm`` is injected —
     an injected client has already chosen its route, and silently re-resolving
     around it would make the parameter a lie.
     """
@@ -1939,7 +1960,8 @@ def build_action_plan(
             "are meaningless alongside an injected `llm`, which has already "
             "resolved one. Pass one or the other."
         )
-    llm = llm or _default_llm(budget, group=group, callsite_id=callsite_id)
+    llm = llm or _default_llm(budget, group=group, callsite_id=callsite_id,
+                              plan_ceiling_s=plan_ceiling_s)
     messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
                               resolved_digest=resolved_digest)
     plan = _invoke_with_retry(llm, messages, budget=budget)
