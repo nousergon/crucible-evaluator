@@ -21,6 +21,14 @@ advisory failure must never break the run that produced the real trading
 artifacts). The Anthropic key + langchain are only needed when the flag is on.
 
 Lambda handler reference: ``director.handler.handler``.
+
+**Two homes, one code path** (alpha-engine-config-I11936). The weekly SF now
+runs the Director on its launcher spot over SSM (``director/box_run.py``), where
+there is no 900s Lambda cap; this Lambda entrypoint is kept working unchanged.
+Both call :func:`run_director`, which differs only in the ``HostProfile``
+(``director/hosting.py``) it quotes the plan call against — every artifact
+(``director/<date>/action_plan.json``, ``director/latest/``, the carry-over
+ledger, the retro, the digest, the issues) is written by the same ``_run``.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ import boto3
 from director.agent import build_action_plan
 from director.budget import skip_if_unaffordable
 from director.carryover import load_ledger, merge_plan_into_ledger, write_ledger
+from director.hosting import LAMBDA, HostProfile
 from director.issue_filer import (
     DEFAULT_REPO,
     file_director_issues,
@@ -666,7 +675,12 @@ def _ensure_registry(bucket: str, s3) -> None:
     if _os.environ.get("LLM_MODEL_REGISTRY_PATH"):
         return  # already set — nothing to do (fingerprint captured when it was)
 
-    dest = "/tmp/LLM_MODEL_REGISTRY.yaml"
+    # `DIRECTOR_REGISTRY_DEST` exists for the weekly-spot home
+    # (alpha-engine-config-I11936): a Lambda's /tmp dies with its container,
+    # but a box's /tmp outlives a run, and the `exists()` short-circuit below
+    # would serve a LATER run last week's bytes. `box_run` points this at a
+    # fresh per-run directory; Lambda sets nothing and keeps the old path.
+    dest = os.environ.get("DIRECTOR_REGISTRY_DEST") or "/tmp/LLM_MODEL_REGISTRY.yaml"
     if not Path(dest).exists():
         from botocore.exceptions import ClientError
         try:
@@ -746,8 +760,19 @@ def handler(event: dict | None = None, context=None) -> dict:
     `flush_default_sink` returns 0 when no sink is configured and never
     raises — telemetry must not take down the work it measures.
     """
+    return run_director(event, context, host=LAMBDA)
+
+
+def run_director(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA) -> dict:
+    """The shared entrypoint: run the Director in ``host``'s budget, then flush.
+
+    ``handler`` (Lambda) and ``director/box_run.py`` (the weekly spot) both
+    land here, so the cost-sink flush below — and everything ``_run`` writes —
+    is identical in both homes. See ``handler``'s docstring for why the flush
+    is a ``finally``.
+    """
     try:
-        return _run(event, context)
+        return _run(event, context, host=host)
     finally:
         try:
             from krepis.cost_sink import flush_default_sink
@@ -761,7 +786,7 @@ def handler(event: dict | None = None, context=None) -> dict:
             logger.error("cost-sink flush unavailable — records lost: %s", exc)
 
 
-def _run(event: dict | None = None, context=None) -> dict:
+def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA) -> dict:
     """Build + persist the weekly Director action plan (flag-gated).
 
     ``action="check_deploy_drift"`` (config#2348) is a separate, lightweight
@@ -878,7 +903,7 @@ def _run(event: dict | None = None, context=None) -> dict:
         resolved_digest = _fetch_resolved_digest_best_effort(gh_token, run_date, budget=budget)
     plan = build_action_plan(card, run_date=run_date, carryover=ledger,
                              roadmap_digest=backlog_digest, resolved_digest=resolved_digest,
-                             budget=budget)
+                             budget=budget, plan_ceiling_s=host.plan_ceiling_s)
 
     plan_key = f"director/{run_date}/action_plan.json"
     stamped_body = stamp_plan_artifact(plan, verdict_block)
@@ -975,6 +1000,9 @@ def _run(event: dict | None = None, context=None) -> dict:
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
         "digest_email": "sent" if email_sent else "not_sent",
+        # Which home produced this run (alpha-engine-config-I11936), so the SF
+        # output and the stage-coverage record say where the plan was made.
+        "host": host.name,
         # §2.3a — the withholding is visible in the SF execution output, not only
         # in the artifact. A stage that quietly did less than usual and returned
         # `status: ok` is the same blindness one layer up.

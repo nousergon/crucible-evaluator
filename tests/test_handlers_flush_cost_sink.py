@@ -26,6 +26,26 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _HANDLERS = sorted(_REPO_ROOT.glob("*/handler.py"))
 
 
+def _flushing_function(tree: ast.Module, path: Path) -> ast.FunctionDef:
+    """The function that must carry the flush: ``handler`` itself, or — when
+    ``handler`` only delegates (``return run_director(...)``) to a module-level
+    function — that function. alpha-engine-config-I11936: the Director's
+    handler delegates to ``run_director``, which the off-Lambda entrypoint
+    (``director/box_run.py``) shares, so the flush lives where BOTH homes run it.
+    """
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    handler = funcs.get("handler")
+    assert handler is not None, f"{path} defines no module-level `handler`"
+    body = [n for n in handler.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    if (len(body) == 1 and isinstance(body[0], ast.Return)
+            and isinstance(body[0].value, ast.Call)
+            and isinstance(body[0].value.func, ast.Name)
+            and body[0].value.func.id in funcs):
+        return funcs[body[0].value.func.id]
+    return handler
+
+
 def test_handler_set_is_not_empty():
     """Guards the parametrisation: an empty glob would pass vacuously."""
     assert len(_HANDLERS) >= 2, f"only found {[str(p) for p in _HANDLERS]}"
@@ -34,12 +54,7 @@ def test_handler_set_is_not_empty():
 @pytest.mark.parametrize("path", _HANDLERS, ids=lambda p: p.parent.name)
 def test_handler_flushes_the_cost_sink_in_a_finally(path: Path):
     tree = ast.parse(path.read_text())
-    handler = next(
-        (n for n in tree.body
-         if isinstance(n, ast.FunctionDef) and n.name == "handler"),
-        None,
-    )
-    assert handler is not None, f"{path} defines no module-level `handler`"
+    handler = _flushing_function(tree, path)
 
     tries = [n for n in ast.walk(handler) if isinstance(n, ast.Try) and n.finalbody]
     assert tries, (
@@ -63,10 +78,7 @@ def test_handler_flushes_the_cost_sink_in_a_finally(path: Path):
 @pytest.mark.parametrize("path", _HANDLERS, ids=lambda p: p.parent.name)
 def test_flush_failure_cannot_break_the_handler(path: Path):
     tree = ast.parse(path.read_text())
-    handler = next(
-        n for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "handler"
-    )
+    handler = _flushing_function(tree, path)
     guarded = any(
         isinstance(n, ast.Try)
         and any(isinstance(node, ast.alias) and node.name == "flush_default_sink"
