@@ -14,22 +14,32 @@ hiding it.
 ``sf_success_rate_4w`` is the headline substrate metric, wired over the 3
 Step Function ARNs (Saturday / Weekday / EOD) via
 ``nousergon_lib.pipeline_status`` — ``list_recent_pipeline_runs`` for
-discovery, ``read_work_outcome``/``classify_work`` for the per-execution
-work verdict (alpha-engine-config-I8069).
+discovery, ``classify_work`` for the per-execution work verdict
+(alpha-engine-config-I8069) and ``build_cycle_shape`` for the cycle fold. It
+is graded in two scopes published side by side: ``full_scope`` and the
+headline ``clean_with_declared_skips``, which puts stages excused by a
+REGISTERED cadence-skip witness out of scope (alpha-engine-config-I11987,
+option A).
 
 Spec: ``system-report-card-revamp-260522.md`` Tile 5.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from grading.artifacts import get_json, get_json_windowed
+# The label a stage excused by a registered cadence-skip witness carries on the
+# card — the attestation's own vocabulary for a stage switched off by a recorded
+# decision: neither passed nor failed, and its guarantee still missing.
+from grading.attestation import NOT_IN_SCOPE
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
 from grading.producers.cost_pricing import (
@@ -191,6 +201,139 @@ def _discover_sf_arns(sfn) -> list[str]:
     return arns
 
 
+#: Pipelines whose cycle is keyed on the TRADING day (alpha-engine-config-I8809).
+#:
+#: A scheduled weekly execution carries no ``input.run_date`` and an opaque
+#: name, so its key falls through to its own ``startDate`` — the Saturday —
+#: while every recovery rerun of the same cycle carries the Friday trading day.
+#: Measured 2026-10-05 on the live state machine: the 2026-10-02 cycle's
+#: scheduled run keyed ``2026-10-03`` and its three watch-reruns keyed
+#: ``2026-10-02``, so the card graded ONE week as TWO cycles — a scheduled
+#: failure with no recovery beside it and a recovery with no scheduled run.
+#: That split makes a first-pass/recovered count meaningless, which is why
+#: ``alpha-engine-config-I11987`` needs it closed. ``resolve_trading_day`` is
+#: idempotent on a trading day, so a key that already is one is unchanged.
+#: Scoped to the weekly SF: the two daily SFs run ON the session they serve.
+_TRADING_DAY_KEYED_SFS = frozenset({"ne-weekly-freshness-pipeline"})
+
+def _read_execution(execution_arn: str, sfn) -> tuple[object, tuple[str, ...], dict]:
+    """``(WorkOutcome, entered_states, input)`` for one execution, ONE history walk.
+
+    The per-execution verdict is the same ``classify_work`` predicate
+    ``read_work_outcome`` applies (alpha-engine-config-I8069). This reads the
+    history itself because the cycle fold needs two things that function
+    discards: every entered state name — the registered cadence-skip witness
+    (``MarkParityVerdictUnknownByCadence``) is not a spine stage, so
+    ``WorkOutcome.stages_entered`` never carries it — and the execution input,
+    which says whether the run was a rehearsal. Calling both would walk every
+    history twice.
+    """
+    from nousergon_lib.pipeline_status import RunStatus, classify_work, entered_states_from_history
+
+    desc = sfn.describe_execution(executionArn=execution_arn)
+    sm_arn = str(desc.get("stateMachineArn") or "")
+    sm_name = sm_arn.rsplit(":", 1)[-1] if sm_arn else execution_arn.split(":")[6]
+    events: list = []
+    kwargs = {"executionArn": execution_arn, "maxResults": 1000}
+    while True:
+        page = sfn.get_execution_history(**kwargs)
+        events.extend(page.get("events") or [])
+        token = page.get("nextToken")
+        if not token:
+            break
+        kwargs["nextToken"] = token
+    states = tuple(entered_states_from_history(events))
+    start, stop = desc.get("startDate"), desc.get("stopDate")
+    duration = (stop - start).total_seconds() if start and stop else None
+    outcome = classify_work(
+        state_machine_name=sm_name,
+        status=RunStatus(str(desc.get("status"))),
+        entered_states=list(states),
+        duration_sec=duration,
+        execution_arn=execution_arn,
+        execution_name=str(desc.get("name") or "") or None,
+    )
+    try:
+        payload = json.loads(desc.get("input") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return outcome, states, payload if isinstance(payload, dict) else {}
+
+
+def _cycle_key(sf_name: str, run_date: str | None, start: datetime) -> str:
+    """The cycle an execution belongs to — see ``_TRADING_DAY_KEYED_SFS``."""
+    key = run_date or start.date().isoformat()
+    if sf_name in _TRADING_DAY_KEYED_SFS:
+        from krepis.dates import resolve_trading_day
+
+        try:
+            return resolve_trading_day(key)
+        except ValueError:
+            logger.warning("sf_success_rate: cannot resolve %r to a trading day — keyed as-is", key)
+    return key
+
+
+def _credited(outcome, states):
+    """The work verdict a cycle fold may credit for this execution.
+
+    A FAILED / TIMED_OUT / ABORTED execution ENTERED the stage it died in, and
+    ``build_cycle_shape`` folds entered stages. Crediting that stage would let
+    a cycle whose last run failed inside, say, ``Director`` read as complete —
+    the 2026-09-26 scheduled run did exactly that, ``DegradedRun`` on a
+    degraded Director after entering it. So the last spine stage a failed
+    execution entered, in ENTRY order, is withheld; every earlier one was left
+    behind for a later state and is evidence of work done.
+    """
+    if outcome.reason != "execution_failed" or not outcome.stages_entered:
+        return outcome
+    spine_entered = set(outcome.stages_entered)
+    last = next((s for s in reversed(states) if s in spine_entered), None)
+    if last is None:
+        return outcome
+    return replace(outcome, stages_entered=tuple(s for s in outcome.stages_entered if s != last))
+
+
+def _fold(sf_name: str, key: str, execs: list) -> dict:
+    """Grade one cycle in both scopes. ``execs`` = ``[(status, role, outcome, states)]``.
+
+    - ``full_scope``: the declared spine, every stage, nothing excused. Either
+      one execution entered all of it (``classify_work`` ``full_run``, the
+      alpha-engine-config-I8069 rule) or the cycle's contributing executions
+      did between them (``build_cycle_shape`` union, no declared skip).
+    - ``declared``: the same fold, except that a stage excused by a
+      REGISTERED cadence-skip witness (``CADENCE_SKIP_MARKER_STAGES`` — the
+      cycle's own walk entered the marker state) is out of scope. Brian's
+      ruling on alpha-engine-config-I11987, option A. An input flag is never
+      read: ``skip_rag_ingestion: true`` on the trigger excuses nothing.
+
+    Both require at least one contributing execution that SUCCEEDED and did
+    some spine work — a cycle whose every run failed is not clean in either
+    scope however much of the spine they entered — and the fold credits a
+    failed execution only with the stages it LEFT (``_credited``).
+    """
+    from nousergon_lib.pipeline_status import RunStatus, build_cycle_shape
+
+    full_run = any(outcome.did_work for _st, _role, outcome, _s in execs)
+    shape = build_cycle_shape(
+        pipeline=sf_name,
+        run_date=key,
+        outcomes=[(_credited(outcome, states), role, states) for _st, role, outcome, states in execs],
+    )
+    succeeded_with_work = any(
+        outcome.status is RunStatus.SUCCEEDED and outcome.stages_entered
+        for _st, _role, outcome, _s in execs
+    )
+    union_complete = bool(shape.stage_spine) and shape.did_work and succeeded_with_work
+    full_scope = full_run or (union_complete and not shape.has_declared_skips)
+    declared = full_scope or union_complete
+    return {
+        "full_scope": full_scope,
+        "declared": declared,
+        "declared_skipped": shape.stages_declared_skipped if declared and not full_scope else (),
+        "shape": shape,
+    }
+
+
 def _sf_success_rate(
     sfn, as_of: datetime, window_days: int,
 ) -> dict | None:
@@ -202,82 +345,72 @@ def _sf_success_rate(
 
     - ``cycle_rate`` (distinct-cycle outcome): a TRADING CYCLE that ultimately
       completed clean = success, REGARDLESS of how many recovery runs it took.
-      This is the honest "did the work get done?" axis — a Saturday that failed
-      its scheduled run but was recovered-to-green still produced the retrains/
-      backtests, so the downstream tiles are NOT measured on a starved system.
     - ``unattended_rate`` (first-pass / no-operator): the SCHEDULED run
       (pipeline_role ∈ scheduled-cadence) succeeded with NO recovery run in the
-      same cycle. This surfaces the genuine target — full automation — honestly
-      (e.g. ~0 for Saturday) instead of hiding it inside the conflated number.
+      same cycle.
 
-    **Cycle key (principled approximation + its limitation):** the lightweight
-    ``PipelineExecutionSummary`` carries ``pipeline_role`` + ``start_utc`` but
-    NOT the artifact ``trading_day``, so a cycle cannot be keyed on the true
-    trading day. We approximate one cycle = ``(sf_name, start_utc UTC-date)``:
-    all executions of a given SF that START on the same UTC calendar date are
-    treated as one cycle, with recovery reruns landing same-day as the scheduled
-    run. This holds for the live cadence (scheduled run + same-day recoveries);
-    it would mis-split only if a recovery slipped past UTC midnight (rare) — in
-    which case the cycle is counted as two, slightly UNDER-counting recovery
-    linkage (conservative: never inflates the unattended rate). When the SF
-    summary gains a ``trading_day`` field, re-key on it directly.
+    **Two scopes, side by side (alpha-engine-config-I11987, option A).** Each
+    cycle is graded twice by ``_fold``:
 
-    **Work verdict (alpha-engine-config-I8069):** an execution's terminal
-    status alone cannot distinguish a real run from a no-op — ``watch-
-    rerun-2026-08-16-4`` terminated SUCCEEDED in eight minutes having entered
-    exactly one of sixteen declared stages and still made the old rule read
-    the cycle clean. Every terminal, role-carrying, in-window execution is
-    classified with ``nousergon_lib.pipeline_status.read_work_outcome``
-    (``classify_work`` against the execution's own entered-state history) into
-    ``COMPLETED`` / ``SKIPPED`` / ``INCOMPLETE`` / ``IN_FLIGHT``:
+    - ``full_scope`` — every declared spine stage ran. This is what
+      ``cycle_rate`` meant before I11987, now also crediting a recovery that
+      completed the spine across executions (``build_cycle_shape``).
+    - ``declared`` (``clean_with_declared_skips``) — stages excused by a
+      REGISTERED cadence-skip witness are out of scope (``NOT_IN_SCOPE``). The
+      witness is a state the cycle's own walk entered, mapped to the stages it
+      excuses by ``nousergon_lib.pipeline_status.CADENCE_SKIP_MARKER_STAGES``;
+      absence is never a skip, and the execution input's ``skip_*`` flags are
+      never read. ``cycle_rate`` / ``unattended_rate`` are this scope; the
+      ``*_full_scope`` keys carry the other, and every declared-only clean
+      cycle is counted (``n_cycles_clean_with_declared_skips``) and named per
+      stage (``declared_skips``). A declared-out stage's assurance is MISSING,
+      not passed — for parity that is the contamination half, which the card's
+      attestation reports separately; this rate adds no contamination guarantee.
 
-    - ``SKIPPED`` (e.g. ``WeeklyRunDaySkip`` on the THU-SAT self-skip days) is
-      **excluded from both denominators entirely** — it is the pipeline
-      correctly declining to run, not an opportunity that went unmeasured.
-    - A cycle is **clean** iff at least one of its (non-skipped) executions
-      is ``COMPLETED`` — full declared-spine coverage. ``INCOMPLETE``
-      (``vacuous_success`` / ``partial_success`` / ``execution_failed``)
-      never counts clean, replacing the old raw ``status == "SUCCEEDED"``
-      check for every one of the 3 SFs (the S3 ``run_scope.json`` heuristic
-      this superseded, config-I7644, covered the weekly pipeline only —
-      ``classify_work`` reads the execution's own state history and works
-      identically for all three).
+    Clean cycles are further split ``first_pass`` (a scheduled run alone was
+    clean and no recovery ran) versus ``recovered`` (anything else that ended
+    clean), so cumulative recovery never reads as unattended success.
+
+    **Cycle key:** ``input.run_date`` falling back to the start date, both
+    normalised to the trading day for ``_TRADING_DAY_KEYED_SFS`` (see there).
+    Rehearsals (an execution whose input declares ``rehearsal``) are excluded
+    entirely and counted: they dry-run the graph under a recovery role, and
+    folded into a cycle their entered stages would read as work done.
+
+    **Work verdict (alpha-engine-config-I8069):** every terminal, role-carrying,
+    in-window execution is classified with ``classify_work`` against its own
+    entered-state history; ``SKIPPED`` executions (e.g. ``WeeklyRunDaySkip``)
+    are excluded from every denominator.
 
     Returns ``{cycle_rate, n_cycles, n_cycles_clean, unattended_rate,
-    n_unattended, per_sf, per_sf_unattended}`` or ``None`` when no SF ARNs are
-    discoverable. Terminal = SUCCEEDED/FAILED/TIMED_OUT/ABORTED; RUNNING /
-    NOT_RUN excluded up front by status, ``IN_FLIGHT`` verdicts (there should
-    be none, by construction) excluded again via ``counts_as_cycle``.
+    n_unattended, n_unattended_ok, per_sf, per_sf_unattended, ...full-scope and
+    split keys..., scope_detail, truncated}`` or ``None`` when no SF ARNs are
+    discoverable.
     """
-    from nousergon_lib.pipeline_status import list_recent_pipeline_runs, read_work_outcome
+    from nousergon_lib.pipeline_status import list_recent_pipeline_runs
 
     arns = _discover_sf_arns(sfn)
     if not arns:
         return None
     cutoff = as_of - timedelta(days=window_days)
-    n_cycles = n_cycles_clean = 0
-    n_unattended_cycles = n_unattended_ok = 0
+    n_cycles = n_clean = n_clean_full = 0
+    n_clean_first_pass = n_clean_recovered = 0
+    n_unatt = n_unatt_ok = n_unatt_ok_full = 0
+    n_rehearsals = 0
     per_sf: dict[str, str] = {}
+    per_sf_full: dict[str, str] = {}
     per_sf_unattended: dict[str, str] = {}
+    per_sf_unattended_full: dict[str, str] = {}
+    declared_skips: dict[str, dict[str, int]] = {}
     scope_detail: dict[str, str] = {}
     truncated: list[str] = []
     for arn in arns:
+        sf_name = arn.rsplit(":", 1)[-1]
         runs = list_recent_pipeline_runs(arn, limit=_SF_EXEC_SCAN_LIMIT, client=sfn)
-        # WINDOW TRUNCATION (alpha-engine-config-I8183). `limit` bounds this
-        # scan by COUNT while the metric's name bounds it by TIME, and the two
-        # disagree the moment an SF is busier than the limit. At the previous
-        # limit=50, measured 2026-08-22: ne-weekly-freshness-pipeline had 102
-        # terminal executions in the trailing 28 days, so the scan reached
-        # back only to 2026-08-04 — an 18-day window published as
-        # `sf_success_rate_4w` over `trailing_4w`.
-        #
-        # A truncated scan yields a TRUE number about a smaller world than its
-        # name claims, which is worse than no number: it is falsifiable-looking
-        # and wrong, and nothing downstream can tell. So this does not silently
-        # widen and hope — it detects the condition and refuses to publish a
-        # rate for it. `list_recent_pipeline_runs` returns most-recent-first,
-        # so if the scan filled to the limit AND its OLDEST execution still
-        # starts after the cutoff, executions inside the window were cut off.
+        # WINDOW TRUNCATION (alpha-engine-config-I8183): a count-bounded scan
+        # that filled up while its oldest execution is still inside the window
+        # describes a shorter period than the metric's name. Detected and
+        # refused, never silently published.
         if len(runs) >= _SF_EXEC_SCAN_LIMIT:
             oldest = min((r.start_utc for r in runs if getattr(r, "start_utc", None)), default=None)
             if oldest is not None and oldest > cutoff:
@@ -287,35 +420,18 @@ def _sf_success_rate(
                     "TRUNCATED and any rate computed from it would describe a shorter "
                     "period than its own name (alpha-engine-config-I8183). Raise "
                     "_SF_EXEC_SCAN_LIMIT or move to a time-bounded walk.",
-                    arn.rsplit(":", 1)[-1], len(runs), oldest, window_days, cutoff,
+                    sf_name, len(runs), oldest, window_days, cutoff,
                 )
-                truncated.append(arn.rsplit(":", 1)[-1])
-        # Bucket this SF's terminal, role-carrying, in-window executions into
-        # cycles keyed on the TRADING DAY (`input.run_date`), falling back to
-        # the UTC date of start_utc when the execution input carries none.
-        #
-        # The fallback is the OLD key and it is wrong in a specific direction:
-        # measured 2026-08-15, the weekly pipeline's recovery reruns for
-        # run_date 2026-08-15 started at 20:21 US/Pacific, which is 2026-08-16
-        # in UTC. Keyed on the start date, that cycle splits in two and the
-        # half holding the recovery run reads as a standalone success with no
-        # failed scheduled run beside it. `run_date` arrives on the summary
-        # from nousergon-lib (config-I7644); below the version that supplies
-        # it every weekly execution falls back and WARNS, because a fix that
-        # goes quietly inert on a stale pin is not a fix.
-        cycles: dict[object, list[tuple[str, str | None, object]]] = {}
+                truncated.append(sf_name)
+        cycles: dict[str, list[tuple[str, str, object, tuple[str, ...]]]] = {}
         for r in runs:
             start = getattr(r, "start_utc", None)
             if start is None or start < cutoff:
                 continue
-            # PRODUCTION runs only: EventBridge-triggered + operator-tracked
-            # executions carry a pipeline_role; ad-hoc smoke / legacy runs have
-            # no role and would misleadingly tank the rate (cry-wolf).
+            # PRODUCTION runs only: ad-hoc smoke / legacy runs carry no role.
             role = getattr(r, "pipeline_role", None)
             if role is None:
                 continue
-            # RunStatus is a (str, Enum) — str() yields "RunStatus.SUCCEEDED",
-            # so read .value to get the bare AWS status vocabulary.
             raw = getattr(r, "status", None)
             status = getattr(raw, "value", raw)
             if status not in _SF_TERMINAL:
@@ -328,86 +444,95 @@ def _sf_success_rate(
                     "recovery rerun into its own cycle (config-I7644).",
                     getattr(r, "name", "?"),
                 )
-            outcome = read_work_outcome(r.execution_arn, client=sfn)
-            if not outcome.counts_as_cycle:
-                # SKIPPED (declared self-skip terminal, e.g. WeeklyRunDaySkip)
-                # or IN_FLIGHT — excluded from the denominator entirely, not
-                # merely marked not-clean (alpha-engine-config-I8069).
+            outcome, states, payload = _read_execution(r.execution_arn, sfn)
+            if payload.get("rehearsal"):
+                n_rehearsals += 1
                 continue
-            # NORMALISE TO str (alpha-engine-config-I8183). `run_date` is a
-            # str off the summary; `start.date()` is a datetime.date. Mixed
-            # into one dict they can never collide, so the SAME calendar day
-            # split into TWO cycles whenever some of its executions carried
-            # `input.run_date` and others did not — which is the normal case,
-            # not an edge one: measured 2026-08-22, the weekly SF had 56
-            # executions with a run_date and 46 without, the preopen SF 4 with
-            # and 24 without. The split inflates the DENOMINATOR only (each
-            # half is graded on its own), so it silently drags the rate down.
-            #
-            # Measured effect on the published 2026-08-22 card: weekly 0/16
-            # became 0/13, preopen 13/26 became 13/20, postclose 15/18
-            # unchanged (all 21 of its executions carry a run_date).
-            #
-            # Note this is NOT the fallback's documented limitation above — a
-            # recovery slipping past UTC midnight is rare and conservative.
-            # This is a type mismatch that fired on the common path.
-            key = run_date or start.date().isoformat()
-            cycles.setdefault(key, []).append((status, role, outcome))
+            if not outcome.counts_as_cycle:
+                # SKIPPED or IN_FLIGHT — excluded from the denominator entirely
+                # (alpha-engine-config-I8069).
+                continue
+            # Always a str (alpha-engine-config-I8183): a str/date mix split
+            # one calendar day into two cycles.
+            key = _cycle_key(sf_name, run_date, start)
+            cycles.setdefault(key, []).append((status, role, outcome, states))
 
-        sf_cycles = sf_cycles_clean = 0
-        sf_unatt = sf_unatt_ok = 0
-        for _day, execs in cycles.items():
+        sf_cycles = sf_clean = sf_clean_full = 0
+        sf_unatt = sf_unatt_ok = sf_unatt_ok_full = 0
+        for day, execs in sorted(cycles.items()):
             sf_cycles += 1
-            # Distinct-cycle outcome: clean iff ANY execution in the cycle (the
-            # scheduled run OR a recovery rerun) is a COMPLETED work outcome —
-            # full declared-spine coverage per classify_work. A terminal status
-            # of SUCCEEDED that entered no declared stage (vacuous_success) or
-            # left some unreached (partial_success) is INCOMPLETE and never
-            # counts clean — this is what let an 8-minute, 22-flags-all-true
-            # no-op stand in for a four-hour weekly run (config-I7644).
-            did_work = any(outcome.did_work for _st, _role, outcome in execs)
-            detail = "; ".join(outcome.explain() for _st, _role, outcome in execs)
-            # Keyed by (sf, day), not day alone (alpha-engine-config-I8183):
-            # this dict is shared across all three SFs, so on a day two of
-            # them ran, the second overwrote the first last-write-wins and the
-            # card's per-cycle scope showed one pipeline while claiming to
-            # describe the day. The 2026-08-22 card's '2026-08-21' entry
-            # listed only weekly, though preopen also failed that day.
-            scope_detail[f"{arn.rsplit(':', 1)[-1]}:{_day}"] = detail
-            if did_work:
-                sf_cycles_clean += 1
-            else:
-                logger.warning("sf_success_rate: cycle %s did not complete its work — %s", _day, detail)
-            # Unattended first-pass: only cycles that HAD a scheduled run count
-            # toward the unattended denominator (an operator-only ad-hoc day is
-            # not an unattended-cadence opportunity). It succeeded unattended iff
-            # the scheduled run itself was COMPLETED *and* no recovery role
-            # appears.
-            scheduled = [(st, role, outcome) for st, role, outcome in execs if role in _SCHEDULED_ROLES]
+            graded = _fold(sf_name, day, execs)
+            shape = graded["shape"]
+            detail = "; ".join(outcome.explain() for _st, _role, outcome, _s in execs)
+            scope = (
+                "clean" if graded["full_scope"]
+                else "clean_with_declared_skips" if graded["declared"]
+                else "not_clean"
+            )
+            scope_detail[f"{sf_name}:{day}"] = f"[{scope}] {shape.explain()} | {detail}"
+            sf_clean_full += graded["full_scope"]
+            sf_clean += graded["declared"]
+            for stage in graded["declared_skipped"]:
+                bucket = declared_skips.setdefault(sf_name, {})
+                bucket[stage] = bucket.get(stage, 0) + 1
+            if not graded["declared"]:
+                logger.warning("sf_success_rate: cycle %s:%s did not complete its work — %s", sf_name, day, detail)
+            # Unattended first-pass: only cycles that HAD a scheduled run count.
+            # It succeeded unattended iff a scheduled run ALONE was clean in the
+            # scope at hand and no recovery role appears beside it.
+            scheduled = [e for e in execs if e[1] in _SCHEDULED_ROLES]
+            first_pass_full = first_pass = False
             if scheduled:
                 sf_unatt += 1
-                had_recovery = any(role not in _SCHEDULED_ROLES for _st, role, _o in execs)
-                scheduled_ok = any(outcome.did_work for _st, _role, outcome in scheduled)
-                if scheduled_ok and not had_recovery:
-                    sf_unatt_ok += 1
+                had_recovery = any(role not in _SCHEDULED_ROLES for _st, role, _o, _s in execs)
+                if not had_recovery:
+                    alone = [_fold(sf_name, day, [e]) for e in scheduled]
+                    first_pass_full = any(g["full_scope"] for g in alone)
+                    first_pass = any(g["declared"] for g in alone)
+                sf_unatt_ok_full += first_pass_full
+                sf_unatt_ok += first_pass
+            if graded["declared"]:
+                if first_pass:
+                    n_clean_first_pass += 1
+                else:
+                    n_clean_recovered += 1
 
         n_cycles += sf_cycles
-        n_cycles_clean += sf_cycles_clean
-        n_unattended_cycles += sf_unatt
-        n_unattended_ok += sf_unatt_ok
-        name = arn.rsplit(":", 1)[-1]
-        per_sf[name] = f"{sf_cycles_clean}/{sf_cycles}"
-        per_sf_unattended[name] = f"{sf_unatt_ok}/{sf_unatt}"
+        n_clean += sf_clean
+        n_clean_full += sf_clean_full
+        n_unatt += sf_unatt
+        n_unatt_ok += sf_unatt_ok
+        n_unatt_ok_full += sf_unatt_ok_full
+        per_sf[sf_name] = f"{sf_clean}/{sf_cycles}"
+        per_sf_full[sf_name] = f"{sf_clean_full}/{sf_cycles}"
+        per_sf_unattended[sf_name] = f"{sf_unatt_ok}/{sf_unatt}"
+        per_sf_unattended_full[sf_name] = f"{sf_unatt_ok_full}/{sf_unatt}"
 
     return {
-        "cycle_rate": (n_cycles_clean / n_cycles) if n_cycles else None,
+        # Headline scope: clean_with_declared_skips (I11987 option A).
+        "cycle_rate": (n_clean / n_cycles) if n_cycles else None,
         "n_cycles": n_cycles,
-        "n_cycles_clean": n_cycles_clean,
-        "unattended_rate": (n_unattended_ok / n_unattended_cycles) if n_unattended_cycles else None,
-        "n_unattended": n_unattended_cycles,
-        "n_unattended_ok": n_unattended_ok,
+        "n_cycles_clean": n_clean,
+        "unattended_rate": (n_unatt_ok / n_unatt) if n_unatt else None,
+        "n_unattended": n_unatt,
+        "n_unattended_ok": n_unatt_ok,
         "per_sf": per_sf,
         "per_sf_unattended": per_sf_unattended,
+        # Full scope, side by side — never folded into the headline.
+        "cycle_rate_full_scope": (n_clean_full / n_cycles) if n_cycles else None,
+        "n_cycles_clean_full_scope": n_clean_full,
+        "unattended_rate_full_scope": (n_unatt_ok_full / n_unatt) if n_unatt else None,
+        "n_unattended_ok_full_scope": n_unatt_ok_full,
+        "per_sf_full_scope": per_sf_full,
+        "per_sf_unattended_full_scope": per_sf_unattended_full,
+        # How the headline's clean cycles were reached.
+        "n_cycles_clean_with_declared_skips": n_clean - n_clean_full,
+        "n_cycles_clean_first_pass": n_clean_first_pass,
+        "n_cycles_clean_recovered": n_clean_recovered,
+        # {sf: {stage: n_cycles}} — stages graded NOT_IN_SCOPE by a registered
+        # witness on a cycle that is clean only because of it.
+        "declared_skips": declared_skips,
+        "n_rehearsals_excluded": n_rehearsals,
         # Both polarities, per cycle. A rate rendered without its denominator
         # is not a falsifiable claim, and this is the field that says which
         # cycles were graded narrow and why.
@@ -416,6 +541,54 @@ def _sf_success_rate(
         # limit, so `cycle_rate` describes a shorter period than its name.
         # The caller renders N/A rather than publishing it.
         "truncated": truncated,
+    }
+
+
+def _pct(rate: float | None) -> str:
+    return "n/a" if rate is None else f"{rate:.0%}"
+
+
+def _declared_skips_text(sf: dict) -> str:
+    parts = [
+        f"{name}: " + ", ".join(f"{stage}×{n}" for stage, n in sorted(stages.items()))
+        for name, stages in sorted((sf.get("declared_skips") or {}).items())
+    ]
+    return "; ".join(parts) or "none"
+
+
+def _cycle_scope_block(sf: dict) -> dict:
+    """The two scopes and the first-pass/recovered split, as structured fields.
+
+    Rides on the SF components as an extra ``cycle_scope`` field
+    (``MetricRecord`` allows extras). The headline ``value`` is the
+    ``clean_with_declared_skips`` rate; ``full_scope`` is never folded into it.
+    """
+    return {
+        "headline_scope": "clean_with_declared_skips",
+        "ruling": "alpha-engine-config-I11987 option A (2026-10-04)",
+        "n_cycles": sf["n_cycles"],
+        "clean_with_declared_skips": {
+            "rate": sf["cycle_rate"], "n_clean": sf["n_cycles_clean"], "per_sf": sf["per_sf"],
+        },
+        "full_scope": {
+            "rate": sf["cycle_rate_full_scope"], "n_clean": sf["n_cycles_clean_full_scope"],
+            "per_sf": sf["per_sf_full_scope"],
+        },
+        "n_clean_only_by_declared_skips": sf["n_cycles_clean_with_declared_skips"],
+        "declared_skips": {
+            "label": NOT_IN_SCOPE,
+            "witness_registry": "nousergon_lib.pipeline_status.CADENCE_SKIP_MARKER_STAGES",
+            "stages_by_sf": sf["declared_skips"],
+            "assurance": "missing — not a pass; contamination is reported by the attestation",
+        },
+        "first_pass": {
+            "n_clean": sf["n_cycles_clean_first_pass"],
+            "unattended_rate": sf["unattended_rate"],
+            "unattended_rate_full_scope": sf["unattended_rate_full_scope"],
+            "n_scheduled_cycles": sf["n_unattended"],
+        },
+        "recovered": {"n_clean": sf["n_cycles_clean_recovered"]},
+        "n_rehearsals_excluded": sf["n_rehearsals_excluded"],
     }
 
 
@@ -543,20 +716,35 @@ def build_substrate_tile(
                 unatt_detail=f"unattended_first_pass_rate: no scheduled-cadence SF cycles in the last {_SF_WINDOW_DAYS}d.",
             )
         else:
-            # Distinct-cycle outcome (critical headline).
+            # Distinct-cycle outcome (critical headline), graded in the
+            # clean_with_declared_skips scope (alpha-engine-config-I11987,
+            # option A) with the full-scope result beside it — in the reason
+            # AND as the structured `cycle_scope` block, so no reader has to
+            # parse prose to see what the headline excused.
+            cycle_scope = _cycle_scope_block(sf)
             components.append(build_metric(
                 name="sf_success_rate_4w", module=MODULE, metric_type="pct", criticality="critical",
                 estimator="distinct_cycle_success_4w", measurement_horizon="trailing_4w",
                 value=sf["cycle_rate"], unit=FRACTION, n_samples=sf["n_cycles"], n_floor=3,
                 source_path=sf_src,
                 reason=(f"sf_success_rate_4w = {sf['cycle_rate']:.0%} ({sf['n_cycles_clean']}/{sf['n_cycles']} "
-                        f"DISTINCT production-role cycles completed clean — recovery counts as clean — in "
-                        f"{_SF_WINDOW_DAYS}d: {sf['per_sf']}) vs target 95% / red-line 80%. "
-                        f"Re-keyed off per-execution (config#1059): a recovered cycle still produced its "
-                        f"artifacts, so downstream tiles are NOT measured on a starved system. "
-                        f"A cycle whose only green run left stages NOT_REACHED does not count "
-                        f"clean (config-I7644); per-cycle scope: {sf['scope_detail'] or 'no run_scope artifacts in window'}."),
-            ))
+                        f"DISTINCT production-role cycles clean_with_declared_skips in {_SF_WINDOW_DAYS}d: "
+                        f"{sf['per_sf']}) vs target 95% / red-line 80%. "
+                        f"FULL SCOPE (every declared stage ran): "
+                        f"{_pct(sf['cycle_rate_full_scope'])} ({sf['n_cycles_clean_full_scope']}/{sf['n_cycles']}: "
+                        f"{sf['per_sf_full_scope']}). "
+                        f"{sf['n_cycles_clean_with_declared_skips']} cycle(s) clean only because a REGISTERED "
+                        f"cadence-skip witness put stages {NOT_IN_SCOPE} ({_declared_skips_text(sf)}) — an "
+                        f"input skip_* flag excuses nothing (alpha-engine-config-I11987, option A). "
+                        f"{NOT_IN_SCOPE} is not a pass: the guarantee those stages produce is MISSING — for "
+                        f"parity that is contamination assurance, reported separately by the card's attestation "
+                        f"(contamination_verdict), and this rate adds none. "
+                        f"Of {sf['n_cycles_clean']} clean: {sf['n_cycles_clean_first_pass']} on the scheduled "
+                        f"first pass, {sf['n_cycles_clean_recovered']} recovered by an operator rerun "
+                        f"(config#1059: a recovered cycle still produced its artifacts). "
+                        f"A cycle whose only green run left stages NOT_REACHED does not count clean "
+                        f"(config-I7644); per-cycle scope: {sf['scope_detail'] or 'no cycles in window'}."),
+            ).model_copy(update={"cycle_scope": cycle_scope}))
             # Unattended first-pass (supporting — the true automation target).
             if sf["unattended_rate"] is None:
                 components.append(build_metric(
@@ -572,11 +760,14 @@ def build_substrate_tile(
                     value=sf["unattended_rate"], unit=FRACTION, n_samples=sf["n_unattended"], n_floor=3,
                     source_path=sf_src,
                     reason=(f"unattended_first_pass_rate = {sf['unattended_rate']:.0%} ({sf['n_unattended_ok']}/"
-                            f"{sf['n_unattended']} scheduled cycles succeeded with NO operator recovery in "
-                            f"{_SF_WINDOW_DAYS}d: {sf['per_sf_unattended']}) vs target 95% / red-line 50%. "
+                            f"{sf['n_unattended']} scheduled cycles clean_with_declared_skips with NO operator "
+                            f"recovery in {_SF_WINDOW_DAYS}d: {sf['per_sf_unattended']}) vs target 95% / red-line 50%. "
+                            f"FULL SCOPE: {_pct(sf['unattended_rate_full_scope'])} "
+                            f"({sf['n_unattended_ok_full_scope']}/{sf['n_unattended']}: "
+                            f"{sf['per_sf_unattended_full_scope']}). "
                             f"The genuine full-automation target (config#970/L4552d) — distinct from the "
                             f"did-the-work-get-done cycle rate above."),
-                ))
+                ).model_copy(update={"cycle_scope": cycle_scope}))
     except (ClientError, BotoCoreError) as e:
         code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else type(e).__name__
         logger.warning("sf_success_rate_4w: SF API read failed (%s) — grading N/A", e)

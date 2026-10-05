@@ -294,17 +294,19 @@ def _outcome_for(status: str, execution_arn: str) -> ps.WorkOutcome:
 
 
 def _wire_sf(monkeypatch, runs):
-    """Wire both nousergon_lib.pipeline_status entry points the tile calls:
-    discovery (list_recent_pipeline_runs) and the per-execution work verdict
-    (read_work_outcome, alpha-engine-config-I8069)."""
+    """Wire both entry points the tile calls: discovery
+    (nousergon_lib.pipeline_status.list_recent_pipeline_runs) and the
+    per-execution read (``_read_execution`` — the work verdict of
+    alpha-engine-config-I8069 plus the entered states and input the
+    alpha-engine-config-I11987 cycle fold needs)."""
     monkeypatch.setattr(
         "nousergon_lib.pipeline_status.list_recent_pipeline_runs",
         lambda arn, **kw: runs,
     )
     outcomes = {r.execution_arn: _outcome_for(r.status, r.execution_arn) for r in runs}
     monkeypatch.setattr(
-        "nousergon_lib.pipeline_status.read_work_outcome",
-        lambda execution_arn, client=None: outcomes[execution_arn],
+        "grading.tiles.substrate._read_execution",
+        lambda execution_arn, sfn: (outcomes[execution_arn], (), {}),
     )
 
 
