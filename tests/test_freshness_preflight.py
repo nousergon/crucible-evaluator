@@ -526,12 +526,18 @@ class TestRegistryIsNotOptional:
         """A cadence this preflight has no window rule for is a registry change
         the grader has not been taught to read. Defaulting it to "fresh" is how
         a re-cadenced row becomes an ungated input; defaulting it to "stale"
-        would page on correct behaviour. It raises."""
+        would page on correct behaviour. It raises.
+
+        ``sla_minutes_after_cron`` is re-declared 0 with the cadence: since
+        nousergon-lib v0.124.132 an SLA a continuous trading-day row never
+        consults is refused at typing (alpha-engine-config-I10805), which
+        raises before this preflight's own rule is reached."""
         _seed_registry(s3, REGISTRY_FIXTURE.replace(
-            '    s3_key_template: "trades/eod_pnl.csv"\n    cadence: eod_sf\n',
+            '    s3_key_template: "trades/eod_pnl.csv"\n    cadence: eod_sf\n'
+            "    sla_minutes_after_cron: 60\n",
             '    s3_key_template: "trades/eod_pnl.csv"\n'
             "    cadence: continuous\n    interval_minutes: 1440\n"
-            "    run_calendar: trading_days\n",
+            "    run_calendar: trading_days\n    sla_minutes_after_cron: 0\n",
         ))
         _seed_all_fresh(s3)
         with pytest.raises(RegistryUnavailableError, match="no\n?\\s*freshness-window rule|freshness-window rule"):
