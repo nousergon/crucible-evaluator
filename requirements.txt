@@ -211,7 +211,28 @@ krepis[flow-doctor,openai]==0.59.64  # pinned per §139 — first-party/fast-mov
 # NOT gain this dependency — `evals/` is not COPYed into it (see Dockerfile) —
 # so the bump is a test-and-tooling surface change, graded by the in-image
 # pytest job exactly as any other.
-nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+# Raised to v0.124.157 (alpha-engine-config-I11987, option A): the substrate
+# tile's `sf_success_rate_4w` now folds each cycle with
+# `pipeline_status.build_cycle_shape` and grades stages excused by a REGISTERED
+# cadence-skip witness (`CADENCE_SKIP_MARKER_STAGES`, lib#428, first shipped in
+# v0.124.139) as NOT_IN_SCOPE. Below .139 `CycleShape` has no
+# `stages_declared_skipped` / `has_declared_skips`, so the fold raises
+# AttributeError at the first weekly card.
+#
+# .157 and NOT the current .167, on measurement. The lib grades every
+# execution against TODAY's spine. .143-.157 carry the I11269 transition
+# markers (WaitForCollectionManifests PENDING, the v1 data stages RETIRING);
+# .158 dropped them. Recomputed 2026-10-05 over the live SF history with the
+# OLD (pre-I11987) fold, the 2026-10-02 card's window reads:
+#   .116 (the previous pin)  preopen 15/19, postclose 14/19 — exactly as
+#        published; every POST-cutover cycle is short the retired v1 stages;
+#   .157                     preopen 17/19, postclose 17/19;
+#   .167                     preopen  2/19 — every PRE-cutover cycle is short
+#        WaitForCollectionManifests, a stage that did not exist yet.
+# The trailing 28-day window holds pre-cutover cycles until ~2026-10-31, so
+# this pin must be re-raised then — or sooner, if the lib learns the spine of
+# the definition an execution actually ran.
+nousergon-lib[quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.157
 
 # Director (Layer C) — single structured LLM call for PLAN GENERATION
 # (director/agent.py, DIRECTOR_GROUP="ultra", resolved through

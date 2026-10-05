@@ -98,8 +98,13 @@ def _rate(monkeypatch, runs, outcomes_by_arn):
         lambda arn, limit=50, client=None: runs,
     )
     monkeypatch.setattr(
-        "nousergon_lib.pipeline_status.read_work_outcome",
-        lambda execution_arn, client=None: outcomes_by_arn[execution_arn],
+        "grading.tiles.substrate._read_execution",
+        lambda execution_arn, sfn: (
+            outcomes_by_arn[execution_arn],
+            (*outcomes_by_arn[execution_arn].stages_entered,
+             outcomes_by_arn[execution_arn].terminal_state or ""),
+            {},
+        ),
     )
     monkeypatch.setattr(
         "grading.tiles.substrate._discover_sf_arns",
@@ -174,7 +179,11 @@ def test_the_vacuous_success_watch_rerun_counts_as_a_non_clean_cycle(monkeypatch
     # the dict is shared across all three SFs, so keyed on the day alone a
     # second SF running that day overwrote the first last-write-wins, and the
     # card showed one pipeline while claiming to describe the day.
-    assert "vacuous_success" in sf["scope_detail"]["ne-weekly-freshness-pipeline:2026-08-15"]
+    #
+    # The day is 2026-08-14, not the run_date 2026-08-15: the weekly SF's
+    # cycle is keyed on the TRADING day (alpha-engine-config-I8809 /
+    # -I11987), and 2026-08-15 was a Saturday — its trading day is Friday.
+    assert "vacuous_success" in sf["scope_detail"]["ne-weekly-freshness-pipeline:2026-08-14"]
 
 
 def test_the_no_op_recovery_does_not_make_the_real_2026_08_15_cycle_clean(monkeypatch):
@@ -226,10 +235,17 @@ def test_a_recovered_cycle_that_did_the_work_still_counts_clean(monkeypatch):
     assert sf["n_unattended"] == 1
 
 
-def test_the_same_cycle_keyed_on_start_date_would_have_split_in_two(monkeypatch):
-    """The old key, reproduced by dropping run_date. Two cycles, and the one
-    holding the (still non-clean) vacuous-success run has no failed scheduled
-    run beside it — which is how a dead week could read partially clean."""
+def test_the_same_cycle_keyed_on_start_date_no_longer_splits_in_two(monkeypatch):
+    """The old key, reproduced by dropping run_date: a Saturday scheduled run
+    and a Sunday-UTC recovery used to grade as TWO cycles, and the one holding
+    the (still non-clean) vacuous-success run had no failed scheduled run
+    beside it — which is how a dead week could read partially clean.
+
+    Since alpha-engine-config-I11987 the weekly SF's key is normalised to the
+    trading day, so both land on Friday 2026-08-14: ONE cycle, still not
+    clean. Measured 2026-10-05 this is the common path, not an edge — every
+    scheduled weekly run keys on its Saturday start date while its recovery
+    reruns carry the Friday trading day."""
     scheduled = _outcome_failed("arn:aws:states:us-east-1:1:execution:x:scheduled")
     vacuous = _outcome_from_fixture("weekly_vacuous_success_watch_rerun_2026_08_16_4.json")
     runs = [
@@ -242,8 +258,10 @@ def test_the_same_cycle_keyed_on_start_date_would_have_split_in_two(monkeypatch)
         scheduled.execution_arn: scheduled,
         vacuous.execution_arn: vacuous,
     })
-    assert sf["n_cycles"] == 2
+    assert sf["n_cycles"] == 1
     assert sf["n_cycles_clean"] == 0
+    assert sf["n_cycles_clean_full_scope"] == 0
+    assert list(sf["scope_detail"]) == ["ne-weekly-freshness-pipeline:2026-08-14"]
 
 
 def test_a_missing_run_date_warns_rather_than_going_quietly_inert(monkeypatch, caplog):
