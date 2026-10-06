@@ -74,6 +74,66 @@ def artifact_is_stale(age_days: int | None, max_age_days: int) -> bool:
     return age_days > max_age_days
 
 
+#: The three agent-runtime components whose source the producer DECLARES on
+#: ``agent_quality.json :: agent_telemetry_source`` (alpha-engine-config-I9631).
+AGENT_TELEMETRY_KEYS: frozenset[str] = frozenset({
+    "agent_validation_failure_rate",
+    "retry_storm_count",
+    "agent_latency_p95",
+})
+
+#: Producer statuses on ``agent_telemetry_source``, in words a card reader can
+#: act on. An unknown status is quoted verbatim rather than guessed at.
+_AGENT_TELEMETRY_STATUS_WORDS: dict[str, str] = {
+    "no_runs_in_window": "no agent run was recorded in the window",
+    "not_instrumented": "every run in the window predates the agent telemetry emitter",
+    "no_agent_calls": "the runs in the window made no agent call",
+    "error": "the producer could not read the agent telemetry",
+    "ok": "the producer read agent calls but wrote no block for this field",
+}
+
+
+def _agent_telemetry_declared_absence(aq: dict, key: str) -> str | None:
+    """The producer's own declaration of why an agent-runtime field is absent.
+
+    ``scripts/build_agent_quality.py`` in crucible-research writes an
+    ``agent_telemetry_source`` block on every artifact naming the source it
+    read (the Think Tank run manifests), the window, how many runs it saw and
+    how many carried telemetry, and the last instrumented run. When one of
+    the three runtime fields is absent, that block — not an inference from
+    the absent key — is what the card should say (alpha-engine-config-I9616
+    closes-when: "a declared-absent N/A naming the last datapoint and its
+    date"). Returns ``None`` when the artifact carries no declaration (a
+    producer older than I9631), so the caller keeps its generic reason.
+    """
+    if key not in AGENT_TELEMETRY_KEYS:
+        return None
+    decl = aq.get("agent_telemetry_source")
+    if not isinstance(decl, dict):
+        return None
+    status = decl.get("status")
+    words = _AGENT_TELEMETRY_STATUS_WORDS.get(status, f"producer status {status!r}")
+    window = decl.get("window") if isinstance(decl.get("window"), dict) else {}
+    span = (
+        f" {window.get('start')}..{window.get('end')}"
+        if window.get("start") and window.get("end") else ""
+    )
+    last = decl.get("last_instrumented_run")
+    if isinstance(last, dict) and last.get("trading_day"):
+        last_txt = f"last instrumented run {last.get('run_id')} on {last.get('trading_day')}"
+    else:
+        last_txt = "no instrumented run on record"
+    detail = f"; error: {decl['error']}" if status == "error" and decl.get("error") else ""
+    return (
+        f"{key}: declared absent by the producer — {words} "
+        f"(source={decl.get('source')!r}, window{span}, "
+        f"runs_seen={decl.get('runs_seen')}, "
+        f"runs_instrumented={decl.get('runs_instrumented')}; {last_txt}{detail}). "
+        f"Owner: {decl.get('owner') or 'research agent-quality producer'} "
+        f"(alpha-engine-config-I9616, I9631)."
+    )
+
+
 def agent_quality_na_reason(aq: dict | None, key: str) -> str:
     """Precise N/A reason for one ``agent_quality.json``-sourced component.
 
@@ -103,6 +163,9 @@ def agent_quality_na_reason(aq: dict | None, key: str) -> str:
             f"config#1149)."
         )
     if key not in aq:
+        declared = _agent_telemetry_declared_absence(aq, key)
+        if declared is not None:
+            return declared
         return (
             f"{key}: agent_quality.json present (status=ok) but this field "
             f"was not computed this cycle — the producer wrote no block for "
