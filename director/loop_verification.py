@@ -47,6 +47,7 @@ import logging
 import re
 
 from director.issue_filer import slug_issue_number_map
+from director.item_validity_gate import not_valid_to_grade
 from director.roadmap_pr import _gh_request
 
 _PRIORITY_LABEL = re.compile(r"P[0-3]")
@@ -217,8 +218,10 @@ def verify_and_correct(
         "examined": 0, "skipped_no_issue": 0, "lookup_failed": 0, "corrections": 0,
         "open": 0, "closed_verified": 0, "closed_unrecovered": 0,
         "closed_unverifiable": 0, "escalated": 0, "closed_ruled_unrecovered": 0,
+        "closed_not_valid_to_grade": 0,
     }
     reopened: list[int] = []
+    not_graded: list[int] = []
     escalated: list[int] = []
     filed_for_ruling: list[int] = []
 
@@ -240,6 +243,15 @@ def verify_and_correct(
 
         counts["examined"] += 1
         if res.get("state") == "closed":
+            # alpha-engine-config-I11990: a closed item whose declared
+            # completion / ruling says it is not valid to grade this week is
+            # never judged on cited-metric color — no reopen, no notice, no
+            # re-track. The verdict and its reason are already stamped on the
+            # row by ``item_validity_gate.assess_ledger``; this only obeys it.
+            if not_valid_to_grade(item):
+                counts["closed_not_valid_to_grade"] += 1
+                not_graded.append(number)
+                continue
             outcome = evidence_still_adverse(item.get("evidence") or [], status_map)
             if outcome == "adverse":
                 comments = _fetch_comments(api, number, gh_request, token)
@@ -286,6 +298,7 @@ def verify_and_correct(
         "reopened_issues": reopened,
         "escalated_issues": escalated,
         "filed_for_ruling_issues": filed_for_ruling,
+        "not_valid_to_grade_issues": not_graded,
     }
 
 
