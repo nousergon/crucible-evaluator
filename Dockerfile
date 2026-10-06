@@ -67,6 +67,17 @@ RUN NOUSERGON_LIB_LINE="$(grep '^nousergon-lib' requirements.txt)" && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
 
+# nous-ergon-ops-I738: assert, at BUILD time, that the krepis this image just
+# installed can actually run its DLP scan here — binary on PATH, ruleset chain
+# resolvable, scanning enabled. Exits 1 when not ready, so an image missing a
+# krepis runtime prerequisite fails to build (in CI's docker-image-tests and in
+# deploy alike) instead of failing closed on the Director's first LLM call.
+# Must follow the pip install: it is the INSTALLED krepis that decides what it
+# needs, and krepis declares those needs in its own .github/consumers.yaml
+# (`runtime_prerequisites`). Same gate infrastructure/director_on_box.sh runs
+# before the box Director starts. No scan, no network call.
+RUN python -m krepis.session_dlp preflight
+
 # Application code (Layer B grading + Layer C director skeleton).
 COPY grading/ ${LAMBDA_TASK_ROOT}/grading/
 COPY director/ ${LAMBDA_TASK_ROOT}/director/
