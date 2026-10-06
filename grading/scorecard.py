@@ -957,9 +957,30 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     Where the band is unreachable, selection edge (precision - base rate)
     carries the weight instead.
     """
-    sl = _safe_get(e2e, "scanner_lift")
+    # alpha-engine-config-I11985 / I11155: grade the cut the live scanner
+    # PUBLISHED (``scanner_lift_live``) when the producer emits it. The retired
+    # gate's ``scanner_lift`` is graded only on an artifact with neither the
+    # live block nor a frozen-source stamp; once its own ``source_freshness``
+    # says scanner_evaluations is frozen it is history, not this week's scanner.
+    sl_live = _safe_get(e2e, "scanner_lift_live")
+    live = (isinstance(sl_live, dict) and sl_live.get("status") == "ok"
+            and sl_live.get("n_passing") is not None)
+    sl = sl_live if live else _safe_get(e2e, "scanner_lift")
     if not sl or _safe_get(sl, "n_passing") is None:
         return {"grade": None, "letter": "N/A", "reason": "insufficient data"}
+    if not live and (_safe_get(sl, "source_freshness") or {}).get("stale"):
+        src = next(iter((sl.get("source_freshness") or {}).get("sources") or []), {}) or {}
+        return {
+            "grade": None, "letter": "N/A",
+            "reason": (
+                "no graded read of the cut the live scanner published; the only "
+                f"scanner read is the retired arm's frozen record "
+                f"({sl.get('first_eval_date')}..{sl.get('last_eval_date')}, source "
+                f"{src.get('table')} newest {src.get('newest_date')}) — historical, "
+                "not graded (alpha-engine-config-I11985)"
+            ),
+            "arm": _safe_get(sl, "arm"),
+        }
 
     lift = _safe_get(sl, "lift")
     n_passing = _safe_get(sl, "n_passing", default=0)
@@ -1048,10 +1069,18 @@ def _grade_scanner(e2e: dict | None, scanner_opt: dict | None) -> dict:
     detail["n_universe_basis"] = "(ticker, eval_date) observations, not tickers"
     if arm:
         detail["arm"] = arm
-        detail["live_arm_graded_by"] = (
-            "attractiveness_ic (config-I2994) — the live champion feed's "
-            "attractiveness_score IC. This component is NOT the live scanner."
-        )
+        if live:
+            detail["cohorts"] = (
+                f"{sl.get('n_cohorts_matured_21d')} matured of "
+                f"{len(sl.get('cohort_dates') or [])} published weekly cuts "
+                f"({sl.get('first_matured_eval_date_21d')}..{sl.get('last_matured_eval_date_21d')})"
+            )
+            detail["source"] = sl.get("source")
+        else:
+            detail["live_arm_graded_by"] = (
+                "attractiveness_ic (config-I2994) — the live champion feed's "
+                "attractiveness_score IC. This component is NOT the live scanner."
+            )
     # 5d stays visible as a diagnostic whenever 21d is what got graded.
     if horizon == "21d" and isinstance(clf_5d, dict):
         p5 = clf_5d.get("precision")
