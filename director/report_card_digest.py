@@ -132,6 +132,12 @@ def _component_line(c: dict) -> str:
     # horizon) must NOT drive a confident root-cause/de-risk prescription.
     if c.get("measurement_horizon"):
         parts.append(f"horizon {c['measurement_horizon']}")
+    # alpha-engine-config-I11089 — the window and source the value was computed
+    # over, as the tile declared it ("undeclared" when it could not be read).
+    # Two components on one tile can carry different N over different dates;
+    # without this the Director reads them as one population.
+    if (wl := _window_label(c)):
+        parts.append(f"window {wl}")
     if c.get("reliability") == "low":
         parts.append("⚠ reliability LOW — verify metric validity before acting")
     reason = c.get("status_reason")
@@ -139,6 +145,13 @@ def _component_line(c: dict) -> str:
     if reason:
         line += f"\n      reason: {reason}"
     return line
+
+
+def _window_label(obj) -> str | None:
+    w = obj.get("window") if isinstance(obj, dict) else None
+    if not isinstance(w, dict):
+        return None
+    return str(w.get("label") or "") or None
 
 
 def _chip(status) -> str:
@@ -375,6 +388,8 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
             + (f" ({len(permanent)} permanent)" if permanent else "")
             + (f", {len(other)} UNCLASSIFIED" if other else ""))
     out = [head]
+    if (wl := _window_label(tile)):
+        out.append(f"  - window: {wl}")
     if not comps:
         out.append("  - ⚠ this tile carries NO components — nothing on it is measured.")
     declared_n = tile.get("n_components")
