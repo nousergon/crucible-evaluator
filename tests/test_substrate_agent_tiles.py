@@ -597,6 +597,64 @@ class TestAgent:
         tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert _comp(tile, "agent_validation_failure_rate")["status"] == "N/A-MISSING-INPUT"
 
+    # ── declared absence of the agent-runtime fields (alpha-engine-config-I9616/I9631) ──
+
+    def test_absent_runtime_field_quotes_the_producers_declaration(self, s3):
+        """The producer declares what it read; the card must say THAT — the
+        source, the window, the run counts and the last instrumented run —
+        rather than inferring 'not computed' from an absent key."""
+        _put_agent_quality(s3, {
+            "status": "ok",
+            "cost_per_signal": {"value": 0.40, "n": 25},
+            "agent_telemetry_source": {
+                "source": "thinktank_run_manifest",
+                "owner": "crucible-research thinktank/client.py (alpha-engine-config-I9631)",
+                "status": "not_instrumented",
+                "window": {"start": "2026-06-14", "end": "2026-06-20"},
+                "runs_seen": 5, "runs_instrumented": 0, "invocations": 0,
+                "last_instrumented_run": None,
+            },
+        })
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        for name in ("agent_validation_failure_rate", "retry_storm_count", "agent_latency_p95"):
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT", name
+            reason = c["status_reason"]
+            assert "declared absent by the producer" in reason, name
+            assert "predates the agent telemetry emitter" in reason, name
+            assert "2026-06-14..2026-06-20" in reason, name
+            assert "runs_seen=5" in reason and "runs_instrumented=0" in reason, name
+            assert "no instrumented run on record" in reason, name
+            assert "thinktank/client.py" in reason, name
+        # A field outside the telemetry set keeps its own reason.
+        assert "declared absent" not in _comp(tile, "judge_rubric_distribution")["status_reason"]
+
+    def test_declared_absence_names_the_last_instrumented_run_and_error(self, s3):
+        _put_agent_quality(s3, {
+            "status": "ok",
+            "agent_telemetry_source": {
+                "source": "thinktank_run_manifest", "status": "error",
+                "error": "ValidationError: invocations",
+                "window": {"start": "2026-06-14", "end": "2026-06-20"},
+                "runs_seen": 3, "runs_instrumented": 2,
+                "last_instrumented_run": {"run_id": "abc123", "trading_day": "2026-06-19"},
+            },
+        })
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        reason = _comp(tile, "agent_latency_p95")["status_reason"]
+        assert "could not read the agent telemetry" in reason
+        assert "last instrumented run abc123 on 2026-06-19" in reason
+        assert "ValidationError: invocations" in reason
+
+    def test_artifact_without_a_declaration_keeps_the_generic_reason(self, s3):
+        """An artifact from a producer older than I9631 carries no declaration;
+        the reason must not invent one."""
+        _put_agent_quality(s3, {"status": "ok", "cost_per_signal": {"value": 0.4, "n": 25}})
+        tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
+        reason = _comp(tile, "retry_storm_count")["status_reason"]
+        assert "was not computed this cycle" in reason
+        assert "declared absent" not in reason
+
 
 class _FakeCW:
     """Stub CloudWatch client: maps metric name → trailing-window Sum (or None
