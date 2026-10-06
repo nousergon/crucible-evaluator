@@ -150,3 +150,116 @@ class TestSuppression:
         out = annotate_power_all(recs)
         assert out is recs
         assert recs[0].status == "WATCH"
+
+
+# ── alpha-engine-config-I11169 / -I11988: the letter follows the FINAL status ──
+#
+# The 2026-10-02 card carried power-downgraded WATCH rows still lettered "F":
+# build_metric stamps derived_letter from the status a record is born with, and
+# the downgrade moved the status without moving the letter. These cases build
+# records the way production does (build_metric, so the letter is stamped at
+# birth) and pin the letter against the status at every surface that emits one.
+
+from krepis.metrics import derive_letter  # noqa: E402
+
+from grading.metric_record import build_metric  # noqa: E402
+from grading.module_agg import build_tile  # noqa: E402
+from grading.power import (  # noqa: E402
+    DISPOSITION_DOWNGRADED,
+    DISPOSITION_RED_EARNED_BY_ESTIMATE,
+)
+
+
+def _built(**over):
+    kw = dict(
+        name="sharpe_ratio", module="portfolio_outcome", metric_type="sharpe",
+        criticality="critical", estimator="sharpe_with_bootstrap_ci",
+        measurement_horizon="since_inception", value=0.204,
+        unit="annualized_ratio", n_samples=119, n_floor=60, target=1.0,
+        red_line=0.0, ci_low=-2.772, ci_high=2.948, ci_method="bootstrap",
+        source_path="s3://x/trades/eod_pnl.csv",
+    )
+    kw.update(over)
+    return build_metric(**kw)
+
+
+#: information_ratio exactly as the frozen 2026-10-02 card read it (I11988
+#: audit comment on I11169): value -1.793, CI [-4.421, +0.8849], N 144,
+#: target 0.5, red-line 0.0, target_inside_ci true.
+_OCT2_IR = dict(
+    name="information_ratio", metric_type="ratio",
+    estimator="info_ratio_bootstrap_ci", value=-1.7929880167239172,
+    n_samples=144, target=0.5, red_line=0.0, ci_low=-4.421, ci_high=0.8849,
+)
+
+
+class TestLetterFollowsFinalStatus:
+    def test_a_born_red_record_is_lettered_f(self):
+        """Precondition: the record really is born RED/F, so the next test is
+        exercising the downgrade, not a record that was never F."""
+        rec = _built()
+        assert (rec.status, rec.derived_letter) == ("RED", "F")
+
+    def test_a_power_downgraded_watch_is_never_lettered_f(self):
+        """THE DEFECT: status WATCH with derived_letter F."""
+        rec = annotate_power(_built())
+        assert rec.status == "WATCH"
+        assert rec.status_before_power == "RED"
+        assert rec.derived_letter == derive_letter("WATCH") == "C"
+        assert rec.power_disposition == DISPOSITION_DOWNGRADED
+
+    def test_the_tile_serialises_every_letter_from_the_final_status(self):
+        """The chokepoint: whatever moved a status after construction, the
+        component the tile publishes carries the letter of the status the
+        rollup graded."""
+        stale = _built()
+        stale.status = "WATCH"            # a mutation that forgot the letter
+        assert stale.derived_letter == "F"
+        tile = build_tile("portfolio_outcome", [stale], roster=[stale.name])
+        (comp,) = tile["components"]
+        assert comp["status"] == "WATCH"
+        assert comp["derived_letter"] == "C"
+
+    def test_no_published_component_letter_disagrees_with_its_status(self):
+        recs = annotate_power_all([
+            _built(),                                       # downgraded
+            _built(**_OCT2_IR),                             # retained RED
+            _built(name="psr", metric_type="pct",           # untouched WATCH
+                   estimator="probabilistic_sharpe", value=0.646,
+                   unit="probability", target=0.95, red_line=0.5,
+                   ci_low=None, ci_high=None, n_samples=144),
+        ])
+        tile = build_tile("portfolio_outcome", recs, roster=[r.name for r in recs])
+        for comp in tile["components"]:
+            assert comp["derived_letter"] == derive_letter(comp["status"]), comp["name"]
+        assert tile["letter"] == derive_letter(tile["status"])
+
+
+class TestPointEstimateRedIsPublishedAsSuch:
+    """I11169's premise: information_ratio's CI contains BOTH target and
+    red-line yet it stays RED while Sharpe is downgraded. The rule (I8188)
+    downgrades only a RED produced by the CI's bad-side bound; the Oct 2 IR's
+    point estimate is itself below its red-line, so it is RED by the estimate.
+    These pin that the RED stands AND that the record says why."""
+
+    def test_oct2_information_ratio_stays_red_and_lettered_f(self):
+        rec = annotate_power(_built(**_OCT2_IR))
+        assert rec.target_inside_ci is True
+        assert rec.status == "RED"
+        assert rec.derived_letter == "F"
+        assert getattr(rec, "status_before_power", None) is None
+
+    def test_it_names_the_branch_it_took(self):
+        rec = annotate_power(_built(**_OCT2_IR))
+        assert rec.power_disposition == DISPOSITION_RED_EARNED_BY_ESTIMATE
+        assert "earned by the estimate" in rec.status_reason
+        assert "-1.79299" in rec.status_reason
+
+    def test_the_note_is_not_appended_twice(self):
+        rec = annotate_power(annotate_power(_built(**_OCT2_IR)))
+        assert rec.status_reason.count("earned by the estimate") == 1
+
+    def test_untouched_records_carry_no_disposition(self):
+        rec = annotate_power(_built(value=1.2, ci_low=0.4, ci_high=2.0))
+        assert rec.status == "GREEN"
+        assert rec.power_disposition is None

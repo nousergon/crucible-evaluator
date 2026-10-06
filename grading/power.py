@@ -44,6 +44,24 @@ years — the same order as the ~3,875 sessions computed by hand in I8188.
 Publishing that number is the point. A metric that needs 16 years of data to
 grade is not a failing metric; it is an unmeasured one, and those are different
 facts that must not render identically.
+
+THE LETTER FOLLOWS THE FINAL STATUS (alpha-engine-config-I11169 / -I11988).
+``build_metric`` stamps ``derived_letter`` from the status it was born with.
+Until this was fixed, the downgrade below moved ``status`` RED→WATCH and left
+``derived_letter="F"`` behind, so the Oct 2 card carried WATCH rows still
+lettered F — a letter claiming a failure the power analysis had just said the
+data cannot show. The downgrade now re-derives the letter from the status it
+writes, and ``grading/module_agg.py::build_tile`` re-derives every component's
+letter from its final status at serialisation, so no later mutation can leave
+a stale one either.
+
+THE OTHER HALF OF THE RULE IS PUBLISHED TOO. A RED whose CI contains the target
+but whose POINT ESTIMATE is at/worse than the red-line (the Oct 2
+information_ratio: −1.79 against a 0.0 red-line, CI [−4.42, +0.88]) is kept RED
+— the estimate itself is on the failing side, which is evidence, if weak. The
+asymmetry against a downgraded Sharpe is therefore the rule working, not the
+rule misfiring, and ``power_disposition`` now says which branch each record
+took so a reader (and the Director) can see it rather than re-derive it.
 """
 
 from __future__ import annotations
@@ -52,10 +70,18 @@ import logging
 import math
 from typing import Any
 
+from krepis.metrics import derive_letter
+
 logger = logging.getLogger(__name__)
 
 # Published beside the number, never applied silently.
 POWER_SUPPRESSION_REASON_PREFIX = "Power-limited"
+
+#: ``power_disposition`` vocabulary — which branch of the rule a record took.
+#: ``None`` means the rule had nothing to act on (not RED, or no target inside
+#: the CI).
+DISPOSITION_DOWNGRADED = "downgraded_ci_width"
+DISPOSITION_RED_EARNED_BY_ESTIMATE = "red_earned_by_point_estimate"
 
 
 def observed_half_width(ci_low: float | None, ci_high: float | None) -> float | None:
@@ -177,6 +203,7 @@ def annotate_power(record: Any) -> Any:
     inside = target_inside_ci(target=target, ci_low=ci_low, ci_high=ci_high)
     record.n_required = n_req
     record.target_inside_ci = inside
+    record.power_disposition = None
 
     if getattr(record, "status", None) != "RED":
         return record
@@ -186,10 +213,29 @@ def annotate_power(record: Any) -> Any:
         value=value, red_line=red_line, ci_low=ci_low, ci_high=ci_high,
         target=target,
     ):
+        # The target is inside the CI, but the point estimate itself is at or
+        # worse than the red-line: the RED stands. Say so on the record, so the
+        # contrast with a downgraded neighbour reads as the rule, not a defect.
+        record.power_disposition = DISPOSITION_RED_EARNED_BY_ESTIMATE
+        note_marker = "so this RED is earned by the estimate"
+        if (value is not None and red_line is not None
+                and note_marker not in (record.status_reason or "")):
+            record.status_reason = (
+                f"{record.status_reason} Power: the CI [{float(ci_low):g}, "
+                f"{float(ci_high):g}] also contains the target ({target:g}), "
+                f"but the point estimate {float(value):g} is at or worse than "
+                f"the red-line ({float(red_line):g}), {note_marker} and is "
+                f"not power-downgraded (grading/power.py)."
+            )
         return record
 
     record.status_before_power = "RED"
     record.status = "WATCH"
+    # The letter is a projection of the status; it must move with it. A WATCH
+    # still lettered "F" claims a failure this very branch just said the data
+    # cannot show (alpha-engine-config-I11169).
+    record.derived_letter = derive_letter(record.status)
+    record.power_disposition = DISPOSITION_DOWNGRADED
     shortfall = ""
     if n_req is not None and n_samples:
         extra = max(0, n_req - int(n_samples))

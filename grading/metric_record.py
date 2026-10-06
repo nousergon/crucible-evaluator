@@ -141,6 +141,7 @@ def build_metric(
     measurement_horizon: str | None = None,
     reliability: str | None = None,
     arm: str | None = None,
+    window: dict | None = None,
 ) -> MetricRecord:
     """Construct a fully-populated ``MetricRecord``.
 
@@ -195,6 +196,13 @@ def build_metric(
     keeps measuring the old source. ``MetricRecord`` allows extra fields, so
     this passes straight through (same low-risk pattern as ``estimator`` /
     ``reliability`` / ``permanent_na``, config#1153 / L4562).
+
+    ``window`` (alpha-engine-config-I11089) is the measurement window's
+    PROVENANCE — which dates, how many trading days and which source artifact(s)
+    the value was computed over — as a tile builder declares it. Passed through
+    as an extra field only when given, so a tile that does not declare one emits
+    exactly the record it did before. ``grading/tiles/portfolio_outcome.py`` is
+    the first declarer; ``director/report_card_digest.py`` renders it.
 
     ``unit`` (config#7485, krepis-PR158 `unit: str | None` field) is the
     RETURN/measurement unit of ``value`` — never the statistical kind already
@@ -319,4 +327,7 @@ def build_metric(
         permanent_na_reason=permanent_na_reason,
         # config#2318: optional measurement-arm label (extra field).
         arm=arm,
+        # alpha-engine-config-I11089: optional window provenance (extra field),
+        # omitted entirely when the tile declares none.
+        **({"window": window} if window is not None else {}),
     )

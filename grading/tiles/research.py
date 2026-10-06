@@ -54,6 +54,19 @@ _PRECISION_FLOOR = 30  # selected names needed for a confident precision read
 # stamps onto ``scanner_lift`` / ``actual_scanner_pass``).
 _SCANNER_METRIC_ARM = "tech_score_baseline (retired from live feed 2026-06-29)"
 
+# alpha-engine-config-I11985 / I11155: the cut the live scanner PUBLISHED
+# (``candidates/{run_date}/candidates.json::scanner_eval_log``), graded by the
+# backtester as ``e2e_lift.json::scanner_lift_live`` with the same estimator as
+# ``scanner_lift``. When it is present the ``scanner`` component grades IT; the
+# retired arm's ``scanner_lift`` is carried in the reason as a labeled,
+# dated historical read and never graded as this week's scanner once its own
+# ``source_freshness`` stamp says the source is frozen. Fallback label for an
+# artifact whose live block omits ``arm``.
+_SCANNER_LIVE_CUT_ARM = (
+    "scanner_live_cut (the cut the live scanner published — "
+    "candidates/{run_date}/candidates.json::scanner_eval_log.quant_filter_pass)"
+)
+
 # config-I2994: the live champion feed's ranking score IS the scanner universe-
 # board attractiveness_score (copied verbatim into signals.json by crucible-
 # research scoring/signals_envelope.py). ``attractiveness_ic`` (attractiveness_
@@ -96,7 +109,7 @@ def _pick_clf(block: dict) -> tuple[dict | None, str]:
 def _precision_metric(
     name, clf, *, criticality, source,
     lift=None, lift_label=None, missing_detail=None, horizon="5d",
-    history: CardHistory | None = None, arm=None,
+    history: CardHistory | None = None, arm=None, window=None, trend_by_arm=False,
 ) -> dict:
     """A selection-precision MetricRecord graded as the EDGE over the base rate.
 
@@ -122,14 +135,24 @@ def _precision_metric(
     (extra field) and woven into the reason string so the Director's evidence
     walker — which reads ``status_reason``/``reason`` generically — inherits
     the label with no director/-side changes needed.
+
+    ``window`` (alpha-engine-config-I11985) is a source/date clause appended to
+    the reason — which cohorts the number was measured over, and anything the
+    reader must not confuse it with. ``trend_by_arm`` restricts the cross-cycle
+    trend to prior cards that measured the same ``arm``.
     """
 
     def _tr(value):
-        return history.trends_for(MODULE, name, value) if history is not None else {}
+        if history is None:
+            return {}
+        if trend_by_arm and arm:
+            return history.trends_for(MODULE, name, value, arm=arm)
+        return history.trends_for(MODULE, name, value)
 
     _band = resolve_band(MODULE, name)
     hz = f"[{horizon}] "
     arm_s = f" [arm: {arm}]" if arm else ""
+    window_s = f" {window}" if window else ""
     if not clf or clf.get("precision") is None:
         return build_metric(
             name=name, module=MODULE, metric_type="pct", criticality=criticality,
@@ -158,7 +181,7 @@ def _precision_metric(
             ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
             ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
             reason=(f"{hz}{name} precision = {precision:.1%} (raw — base rate unavailable; "
-                    f"N={n_sel}){lift_s}{arm_s}." if w.get("status") == "ok" else None),
+                    f"N={n_sel}){lift_s}{arm_s}.{window_s}" if w.get("status") == "ok" else None),
             arm=arm,
             **_tr(precision),
         )
@@ -175,10 +198,70 @@ def _precision_metric(
         ci_method="wilson" if w.get("status") == "ok" else None, source_path=source,
         reason=(f"{hz}{name} edge = {edge:+.1%} (precision {precision:.1%} − base-rate {base_rate:.1%}; "
                 f"Wilson CI [{ci_low:+.2f}, {ci_high:+.2f}], N={n_sel} selected) "
-                f"vs target +{_band.target:.0%} / red-line {_band.red_line:+.0%}{lift_s}{arm_s}.")
+                f"vs target +{_band.target:.0%} / red-line {_band.red_line:+.0%}{lift_s}{arm_s}.{window_s}")
         if w.get("status") == "ok" else None,
         arm=arm,
         **_tr(edge),
+    )
+
+
+def _scanner_live_window(sl_live: dict) -> str:
+    """Which published cohorts the live scanner read covers, and from where."""
+    n_pub = len(sl_live.get("cohort_dates") or [])
+    return (
+        f"[live cohorts: {sl_live.get('n_cohorts_matured_21d')} of {n_pub} published "
+        f"weekly cuts matured at 21d ({sl_live.get('first_matured_eval_date_21d')}.."
+        f"{sl_live.get('last_matured_eval_date_21d')}), newest published "
+        f"{sl_live.get('newest_published_cohort')}; source {sl_live.get('source')}; "
+        f"rule {sl_live.get('cohort_rule')}]"
+    )
+
+
+def _retired_scanner_history(sl: dict) -> str | None:
+    """The retired arm's ``scanner_lift`` as a dated historical read, or None.
+
+    Stated beside the live grade (never in place of it) so the Director can tell
+    the live edge from the retired arm's historical edge — and so the same
+    number is never re-read as this week's evidence once its source is frozen.
+    """
+    clf, hz = _pick_clf(sl)
+    if not clf or clf.get("precision") is None:
+        return None
+    tp, fp = int(clf.get("tp", 0)), int(clf.get("fp", 0))
+    fn, tn = int(clf.get("fn", 0)), int(clf.get("tn", 0))
+    n_pop = tp + fp + fn + tn
+    edge_s = (f"edge {clf['precision'] - (tp + fn) / n_pop:+.1%}" if n_pop
+              else f"precision {clf['precision']:.1%}")
+    lift = (sl.get("lift_21d_log") or {}).get("lift") if hz == "21d" else sl.get("lift")
+    lift_s = f", {hz}-lift {lift:+.2%}" if lift is not None else ""
+    fresh = sl.get("source_freshness") or {}
+    src = next(iter(fresh.get("sources") or []), {}) or {}
+    age_s = (f"; source {src.get('table')} newest {src.get('newest_date')}, "
+             f"{src.get('age_days')}d old at {fresh.get('run_date')}"
+             if src.get("newest_date") else "")
+    return (
+        f"HISTORICAL, not graded: retired arm {sl.get('arm') or _SCANNER_METRIC_ARM} "
+        f"[{hz}] {edge_s} (N={tp + fp} selected) over "
+        f"{sl.get('first_eval_date')}..{sl.get('last_eval_date')}{lift_s}{age_s}"
+    )
+
+
+def _cf_cycle_source(cf: dict) -> tuple[str, bool]:
+    """``(clause, stale)`` naming the table the counterfactual's cycles come from.
+
+    attractiveness_eval's counterfactual draws its cycle set AND its "live gate"
+    leg from ``scanner_evaluations`` (the I8757 ``source_freshness`` stamp on the
+    block). Empty clause when the artifact predates the stamp.
+    """
+    fresh = cf.get("source_freshness") or {}
+    src = next(iter(fresh.get("sources") or []), {}) or {}
+    if not src.get("table"):
+        return "", False
+    stale = bool(fresh.get("stale"))
+    return (
+        f"cycles drawn from {src.get('table')} (newest {src.get('newest_date')}, "
+        f"{src.get('age_days')}d old{', STALE — writer retired ' + str(src.get('retired_date')) if stale else ''})",
+        stale,
     )
 
 
@@ -242,17 +325,52 @@ def build_research_tile(
     # the legacy 5d window collapsed precision toward the base rate (ROADMAP
     # L4551). Pre-2026-06-07 artifacts fall back to the 5d block via _pick_clf.
 
-    # 1. scanner (supporting) — precision of quant-filter passers vs baseline.
+    # 1. scanner (supporting) — precision of the scanner's selections vs the
+    #    scanned-universe base rate. alpha-engine-config-I11985 / I11155: grade
+    #    what the LIVE scanner published (``scanner_lift_live``) when the
+    #    producer emits it. The retired tech_score gate's ``scanner_lift`` is
+    #    graded only on an artifact that predates both the live block and the
+    #    I8757 freshness stamp; once its own stamp says ``scanner_evaluations``
+    #    is frozen it is a historical record, stated in the reason and never
+    #    graded as this week's scanner.
     sl = e2e.get("scanner_lift") or {}
-    sl_clf, sl_hz = _pick_clf(sl)
-    sl_lift = ((sl.get("lift_21d_log") or {}).get("lift") if sl_hz == "21d"
-               else sl.get("lift"))
-    components.append(_precision_metric(
-        "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
-        lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
-        missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
-        history=history, arm=_SCANNER_METRIC_ARM,
-    ))
+    sl_live = e2e.get("scanner_lift_live") or {}
+    retired_frozen = bool((sl.get("source_freshness") or {}).get("stale"))
+    retired_hist = _retired_scanner_history(sl)
+    live_clf, live_hz = _pick_clf(sl_live) if sl_live.get("status") == "ok" else (None, "21d")
+    if live_clf and live_clf.get("precision") is not None:
+        live_lift = ((sl_live.get("lift_21d_log") or {}).get("lift") if live_hz == "21d"
+                     else sl_live.get("lift"))
+        window = _scanner_live_window(sl_live) + (f" {retired_hist}." if retired_hist else "")
+        components.append(_precision_metric(
+            "scanner", live_clf, criticality="supporting", source=e2e_src, horizon=live_hz,
+            lift=live_lift, lift_label="21d-alpha-lift" if live_hz == "21d" else "return-lift",
+            history=history, arm=sl_live.get("arm") or _SCANNER_LIVE_CUT_ARM,
+            window=window, trend_by_arm=True,
+        ))
+    elif retired_frozen:
+        live_s = (f"scanner_lift_live {sl_live.get('status')}: {sl_live.get('reason')}"
+                  if sl_live else "no scanner_lift_live block (producer predates alpha-engine-config-I11985)")
+        components.append(_precision_metric(
+            "scanner", None, criticality="supporting", source=e2e_src, horizon="21d",
+            missing_detail=(
+                f"scanner: no graded read of the cut the live scanner published this cycle "
+                f"({live_s}). The only scanner read in e2e_lift is the retired arm's frozen "
+                f"record — {retired_hist or 'no classification block'} — which is not this "
+                f"week's scanner (alpha-engine-config-I11985)."
+            ),
+            arm=(sl_live.get("arm") if sl_live else None) or _SCANNER_LIVE_CUT_ARM,
+        ))
+    else:
+        sl_clf, sl_hz = _pick_clf(sl)
+        sl_lift = ((sl.get("lift_21d_log") or {}).get("lift") if sl_hz == "21d"
+                   else sl.get("lift"))
+        components.append(_precision_metric(
+            "scanner", sl_clf, criticality="supporting", source=e2e_src, horizon=sl_hz,
+            lift=sl_lift, lift_label="21d-alpha-lift" if sl_hz == "21d" else "return-lift",
+            missing_detail="scanner: e2e_lift.json absent or has no scanner classification this cycle.",
+            history=history, arm=_SCANNER_METRIC_ARM,
+        ))
 
     # 2. sector_teams_avg — RETIRED with the six-team graph (config-I2993) when
     #    the marker is present; otherwise pooled precision across the 6 teams.
@@ -950,6 +1068,14 @@ def build_research_tile(
             for e in top_n
         )
         lg_excess_s = _excess_s(live_gate)
+        # alpha-engine-config-I11155: the "live gate" leg is the
+        # scanner_evaluations quant_filter_pass survivor set — the retired
+        # tech_score arm — and the Director read it as the live feed's own 21d
+        # read. Name what it is, and how old.
+        cyc_s, _cyc_stale = _cf_cycle_source(cf)
+        lg_arm_s = (f" [{cyc_s}; the live-gate leg is that table's quant_filter_pass "
+                    f"survivor set — arm {_SCANNER_METRIC_ARM}, not the live feed or the "
+                    f"live scanner cut (alpha-engine-config-I11155)]" if cyc_s else "")
         pop_s = (f" Population (PIT, same cycles) mean {att_hz} alpha "
                  f"{live_gate['population_mean_alpha']:+.4f} — every arm above is "
                  f"stated against it."
@@ -969,7 +1095,7 @@ def build_research_tile(
                     f"{lg_excess_s}, N={n_surv} survivors).{pop_s} All cohorts [{rows_s}]. "
                     f"Sizes the prize of an "
                     f"attractiveness-ranked scanner feed (config#1398) — opportunity surface, "
-                    f"not a failure gate."),
+                    f"not a failure gate.{lg_arm_s}"),
         ))
     else:
         components.append(build_metric(
@@ -1112,6 +1238,11 @@ def build_research_tile(
         ci = sb20.get("excess_ci95") or [None, None]
         ci_low = ci[0] if isinstance(ci, list) and len(ci) == 2 else None
         ci_high = ci[1] if isinstance(ci, list) and len(ci) == 2 else None
+        # alpha-engine-config-I11985: the basket is the live arm's SCORE, but
+        # its cycles are the counterfactual's — drawn from scanner_evaluations.
+        sb_cyc_s, _sb_stale = _cf_cycle_source(cf)
+        sb_cyc_s = (f" [{sb_cyc_s}: the live arm's score measured on those cycles only "
+                    f"(alpha-engine-config-I11985)]" if sb_cyc_s else "")
         components.append(build_metric(
             name="scanner_basket_return", module=MODULE, metric_type="log_return",
             criticality="critical",
@@ -1130,7 +1261,8 @@ def build_research_tile(
                     f"[arm: {_LIVE_ARM_SCANNER}] "
                     + ("Not yet significant — WATCH, accumulating." if insig
                        else ("basket beats the population" if sb_excess > 0
-                             else "basket does not beat the population"))),
+                             else "basket does not beat the population"))
+                    + sb_cyc_s),
         ))
     else:
         components.append(build_metric(
