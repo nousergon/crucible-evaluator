@@ -48,6 +48,7 @@ import logging
 import os
 import time
 
+from director import emf
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
 from director.carryover import carry_count, is_p0, order_for_prompt
 # Pure, stdlib-only helpers (no boto3, no GitHub call) — the import graph is
@@ -584,7 +585,7 @@ def _warn_on_degraded_route(
         )
 
     try:
-        print(json.dumps({
+        emf.emit({
             "_aws": {
                 "Timestamp": int(time.time() * 1000),
                 "CloudWatchMetrics": [{
@@ -599,7 +600,7 @@ def _warn_on_degraded_route(
             "primary": primary,
             "route": route.get("route"),
             "exec_context": route.get("exec_context"),
-        }))
+        })
     except Exception:
         logger.exception(
             "Director: failed to emit %s — the fallback alarm is blind for "
@@ -924,7 +925,7 @@ def _emit_plan_latency(
             record["DirectorPlanCompletionTokens"],
         )
     try:
-        print(json.dumps({
+        emf.emit({
             "_aws": {
                 "Timestamp": int(time.time() * 1000),
                 "CloudWatchMetrics": [{
@@ -943,7 +944,7 @@ def _emit_plan_latency(
                 }],
             },
             **record,
-        }))
+        })
     except Exception:
         logger.exception(
             "Director: failed to emit DirectorPlanLatencySeconds — the latency "
