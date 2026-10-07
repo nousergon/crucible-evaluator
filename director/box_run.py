@@ -140,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Nothing on this host extracts the EMF lines the Director prints, so its
+    # metrics are also published directly (director/emf.py).
+    from director import emf
+
+    emf.enable_direct_put()
     try:
         from director.hosting import WEEKLY_SPOT, HostProfile, exit_code_for
 

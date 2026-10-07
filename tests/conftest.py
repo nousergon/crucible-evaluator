@@ -91,3 +91,14 @@ def _declared_artifact_registry(request, monkeypatch):
         "load_registry",
         lambda *_args, **_kwargs: registry_document(),
     )
+
+
+@pytest.fixture(autouse=True)
+def _director_emf_direct_put_off():
+    """``box_run.main`` turns on director/emf.py's PutMetricData for the rest
+    of its process. Reset it after every test so no later test publishes a
+    real metric."""
+    yield
+    from director import emf
+
+    emf._DIRECT_PUT = False
