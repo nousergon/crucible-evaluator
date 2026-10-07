@@ -272,7 +272,7 @@ def _run(status, days_ago, now, role="weekly", run_date=None):
     arn = f"arn:aws:states:us-east-1:0:execution:x:{next(_arn_counter)}"
     return SimpleNamespace(
         status=status, start_utc=now - timedelta(days=days_ago), pipeline_role=role,
-        execution_arn=arn, run_date=run_date,
+        end_utc=now - timedelta(days=days_ago), execution_arn=arn, run_date=run_date,
     )
 
 
