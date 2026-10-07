@@ -13,7 +13,7 @@ state walks of the live weekly spine; only the AWS read is replaced.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -67,7 +67,7 @@ def _exec(states, *, status="SUCCEEDED", role="weekly", run_date=None,
     )
     run = SimpleNamespace(
         name=arn.rsplit(":", 1)[-1], status=status, start_utc=start, pipeline_role=role,
-        execution_arn=arn, run_date=run_date,
+        end_utc=start + timedelta(hours=1), execution_arn=arn, run_date=run_date,
     )
     return run, (outcome, tuple(states), payload or {})
 
