@@ -247,9 +247,10 @@ class TestPlanLatencySignal:
         amber = _plan_amber_threshold_s()
         assert amber < DIRECTOR_PLAN_MEASURED_MAX_S < DIRECTOR_PLAN_CEILING_S
         assert amber == pytest.approx(0.9 * DIRECTOR_PLAN_MEASURED_MAX_S)
-        # 356.9s, 2026-08-22 16:04Z, outcome=ok, 32,643 completion tokens — the
-        # slowest call the Director is known to have needed. Amber is lit there.
-        assert amber < 356.9
+        # 596.04s, 2026-09-26 12:14Z, outcome=ok, 42,764 completion tokens — the
+        # slowest POST-cap call the Director is known to have needed
+        # (alpha-engine-config-I8200, re-anchored 2026-10-07). Amber is lit there.
+        assert amber < 596.04
 
     def test_healthy_call_still_publishes_a_zero(self):
         """observability-policy §9: absence of a signal is never rendered
@@ -263,18 +264,30 @@ class TestPlanLatencySignal:
         assert rec["DirectorPlanLatencySeconds"] == 90.0
 
     def test_amber_record_carries_the_quantities_that_explain_it(self):
-        # 356.9s / 48,240 chars / 32 carry-over items — the 2026-08-22 16:04Z
-        # call, read from this module's own EMF records. At the re-anchored
-        # 356.9s max this is exactly ON the measured requirement and therefore
-        # above amber.
+        # 596.04s / 68,528 chars / 20 carry-over items (13 omitted) — the
+        # 2026-09-26 12:14Z call, read from this module's own EMF records. At
+        # the re-anchored 596.04s max this is exactly ON the measured
+        # requirement and therefore above amber.
         rec = _emit_plan_latency(
-            elapsed_s=356.9, outcome="ok", prompt_chars=48240, carryover_items=32,
-            carryover_omitted=0,
+            elapsed_s=596.04, outcome="ok", prompt_chars=68528, carryover_items=20,
+            carryover_omitted=13,
         )
         assert rec["DirectorPlanLatencyAmber"] == 1
-        assert rec["DirectorPlanPromptChars"] == 48240
-        assert rec["DirectorPlanCarryoverItems"] == 32
-        assert rec["DirectorPlanCarryoverOmitted"] == 0
+        assert rec["DirectorPlanPromptChars"] == 68528
+        assert rec["DirectorPlanCarryoverItems"] == 20
+        assert rec["DirectorPlanCarryoverOmitted"] == 13
+
+    def test_post_cap_median_call_is_not_amber(self):
+        """alpha-engine-config-I8200: the anchor is the slowest post-cap
+        uncensored call, so a typical one does not light amber. 387.5s is the
+        median of the eleven Lambda-home post-cap samples (2026-09-27 14:58Z).
+        Under the pre-cap anchor (356.9 -> amber 321.2s) 9 of those 11 were
+        amber, which is why the alarm read red on calls that succeeded."""
+        rec = _emit_plan_latency(
+            elapsed_s=387.481, outcome="ok", prompt_chars=1, carryover_items=20,
+        )
+        assert rec["DirectorPlanLatencyAmber"] == 0
+        assert rec["DirectorPlanAmberSeconds"] == pytest.approx(536.4, abs=0.05)
 
     def test_emf_envelope_declares_every_metric_it_publishes(self, capsys):
         _emit_plan_latency(
