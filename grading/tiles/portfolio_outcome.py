@@ -34,6 +34,7 @@ from nousergon_lib.quant.risk_measures import historical_cvar
 from nousergon_lib.quant.riskstats import max_drawdown, sharpe_ratio, sortino_ratio
 from nousergon_lib.quant.stats.dsr import compute_psr
 from nousergon_lib.quant.stats.intervals import bootstrap_ci, newey_west_se, wilson_score_interval
+from nousergon_lib.quant.stats.trial_accumulator import DEFAULT_KEY as TRIAL_COUNT_KEY
 
 from grading.history import CardHistory
 from grading.metric_record import MetricContractError, build_metric
@@ -41,7 +42,7 @@ from grading.thresholds.registry import DEFAULT_BAND, resolve as resolve_band
 from grading.module_agg import build_tile
 from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
 from grading.power import annotate_power_all
-from grading.regime_index import SIGNALS_KEY_TEMPLATE, resolve_regimes
+from grading.regime_index import REGIME_INDEX_KEY, SIGNALS_KEY_TEMPLATE, resolve_regimes
 from grading.units import (
     ANNUALIZED_RATIO,
     DAYS,
@@ -83,13 +84,18 @@ _REGIME_MIN_BUCKETS = 2      # min qualifying regime buckets to decompose at all
 class EodPnlSeries:
     """Parsed daily series from eod_pnl.csv (returns as fractions, not pct)."""
 
-    def __init__(self, dates, nav, port, spy, alpha, rows_dropped: int = 0):
+    def __init__(self, dates, nav, port, spy, alpha, rows_dropped: int = 0,
+                 source_object: dict | None = None):
         self.dates = dates
         self.nav = nav            # portfolio NAV level series
         self.port = port          # daily portfolio returns (fraction)
         self.spy = spy            # daily SPY returns (fraction)
         self.alpha = alpha        # daily active return port-spy (fraction)
         self.rows_dropped = rows_dropped  # config#2885: silently-unparseable rows
+        # alpha-engine-config-I11089: WHICH object the series was read from
+        # (ETag / VersionId / LastModified as S3 returned them), so a window on
+        # the card names an exact artifact, not just a key that moves daily.
+        self.source_object = source_object or {}
 
     @property
     def n(self) -> int:
@@ -154,7 +160,14 @@ def read_eod_pnl(bucket: str, s3_client=None) -> EodPnlSeries | None:
             "(unparseable portfolio_nav or daily_return_pct)",
             rows_dropped,
         )
-    return EodPnlSeries(dates, nav, port, spy, alpha, rows_dropped=rows_dropped)
+    last_modified = resp.get("LastModified")
+    source_object = {
+        "etag": (resp.get("ETag") or "").strip('"') or None,
+        "version_id": resp.get("VersionId"),
+        "last_modified": last_modified.isoformat() if hasattr(last_modified, "isoformat") else last_modified,
+    }
+    return EodPnlSeries(dates, nav, port, spy, alpha, rows_dropped=rows_dropped,
+                        source_object=source_object)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +231,83 @@ def _max_dd_duration_days(nav: list[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# window provenance (alpha-engine-config-I11089)
+# ---------------------------------------------------------------------------
+#
+# Every portfolio figure on the card is a number OVER some window, and the
+# windows differ: the headline battery reads every parsed eod_pnl.csv row, the
+# regime decomposition only the rows that joined a regime tag, the attribution
+# only the sessions whose inputs closed, and PBO a model rotation's CSCV splits
+# with no calendar window at all. The card used to print `N=144`, `N=42` and
+# `N=102` side by side under one "since_inception" label and leave the reader to
+# infer which dates each covered. Each component now carries a `window` naming
+# its dates, its trading-day count and the artifact(s) it was computed from, and
+# a field that cannot be determined says `undeclared` — never a guessed date.
+
+UNDECLARED = "undeclared"
+
+# eod_pnl.csv rows carry no strategy / config identifier, so the card cannot say
+# which deployed configuration each day in a window was traded under. Stated on
+# every window rather than implied by "since_inception" (the I1084 / I11089
+# question: does this measure the DEPLOYED strategy?).
+_STRATEGY_EPOCH_NOTE = (
+    "eod_pnl.csv rows carry no strategy/config identifier, so the window spans "
+    "every configuration that traded in it"
+)
+
+
+def _window(
+    *, basis: str, sources: list[str], dates: list[str] | None = None,
+    rows_excluded: int | None = None, source_object: dict | None = None,
+    as_of: str | None = None, reason: str | None = None,
+) -> dict:
+    """One component's measurement-window provenance.
+
+    ``dates`` are exactly the observations the value was computed over (one per
+    trading day / session). ``start``/``end``/``trading_days`` are DERIVED from
+    them here, never passed in, so the provenance cannot disagree with the data
+    it describes. ``dates=None`` (no calendar window exists or none could be
+    read) renders every calendar field ``undeclared``.
+    """
+    w: dict = {"basis": basis, "sources": list(sources)}
+    if dates:
+        w["start"] = min(dates)
+        w["end"] = max(dates)
+        w["trading_days"] = len(dates)
+        dupes = len(dates) - len(set(dates))
+        if dupes:
+            w["duplicate_dates"] = dupes
+    else:
+        w["start"] = w["end"] = UNDECLARED
+        w["trading_days"] = None
+    if rows_excluded:
+        w["rows_excluded"] = rows_excluded
+    if source_object:
+        w["source_object"] = dict(source_object)
+    if as_of:
+        w["as_of"] = as_of
+    w["strategy_epoch"] = UNDECLARED
+    w["strategy_epoch_note"] = _STRATEGY_EPOCH_NOTE
+    if reason:
+        w["reason"] = reason
+    w["label"] = _window_label(w)
+    return w
+
+
+def _window_label(w: dict) -> str:
+    """Short, card-ready statement of the window (the digest prints this)."""
+    srcs = ", ".join(s.split("/", 3)[-1] if s.startswith("s3://") else s for s in w["sources"])
+    if w["start"] == UNDECLARED:
+        head = UNDECLARED
+        if w.get("as_of"):
+            head += f" (as of {w['as_of']})"
+    else:
+        head = f"{w['start']}→{w['end']}, {w['trading_days']} trading days"
+    extra = f"; {w['rows_excluded']} excluded" if w.get("rows_excluded") else ""
+    return f"{head}{extra} · {w['basis']} · from {srcs}"
+
+
+# ---------------------------------------------------------------------------
 # alpha_trend — OLS slope of daily alpha with HAC (Newey-West) SE (config#1962)
 # ---------------------------------------------------------------------------
 
@@ -276,7 +366,7 @@ def _effective_n(resid: np.ndarray) -> int:
     return max(1, min(n, int(round(n / inflation))))
 
 
-def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
+def _build_alpha_trend(alpha_pct: list[float], src: str, *, window: dict | None = None) -> object:
     """``alpha_trend`` component: is daily alpha statistically improving?
 
     Descriptive dashboard (crucible-dashboard PR350) shows the monthly-bucket
@@ -295,6 +385,7 @@ def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
             name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
             estimator="ols_slope_newey_west_hac", measurement_horizon="since_inception",
             n_floor=_ALPHA_TREND_N_FLOOR, n_samples=n_eff, band="unbanded", source_path=src,
+            window=window,
             status="N/A-LOW-N",
             reason=(
                 f"{name}: N_eff={n_eff} (raw N={n}) below the autocorrelation-adjusted "
@@ -333,6 +424,7 @@ def _build_alpha_trend(alpha_pct: list[float], src: str) -> object:
         value=monthly, unit=PCT, n_samples=n_eff, n_floor=_ALPHA_TREND_N_FLOOR,
         ci_low=ci_low, ci_high=ci_high, ci_method="newey-west",
         bh_fdr_adjusted_p=p, source_path=src, status=status, reason=reason,
+        window=window,
     )
 
 
@@ -463,10 +555,23 @@ def _build_pbo_component(bucket: str, s3_client=None):
         )
 
     block, na_detail = _read_selection_pbo(bucket, s3_client=s3_client)
+    # alpha-engine-config-I11089 — PBO is NOT measured over the eod_pnl.csv
+    # window: its N is CSCV splits of one model rotation's training data, and
+    # the leaderboard declares no calendar window for them. Say so rather than
+    # let it sit under the tile's headline dates.
+    pbo_w = _window(
+        basis="cscv_splits_of_one_model_rotation", sources=[src],
+        as_of=(block or {}).get("_leaderboard_date"),
+        reason=(
+            "the model-zoo leaderboard declares no calendar window for its CSCV "
+            "splits; N counts splits, not trading days"
+            if block is not None else "no selection_pbo verdict to read a window from"
+        ),
+    )
     if block is None:
         return build_metric(
             name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=_PBO_MIN_SPLITS, source_path=src, implemented=False,
+            n_floor=_PBO_MIN_SPLITS, source_path=src, implemented=False, window=pbo_w,
             na_detail=na_detail,
         )
 
@@ -483,7 +588,7 @@ def _build_pbo_component(bucket: str, s3_client=None):
         return build_metric(
             name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
             n_samples=n_splits, n_floor=_PBO_MIN_SPLITS, source_path=src,
-            status="N/A-LOW-N",
+            window=pbo_w, status="N/A-LOW-N",
             reason=(
                 f"pbo: the rotation's CSCV returned no number ({reason}); "
                 f"n_splits={n_splits}, n_specs={n_specs}. The engine's declared "
@@ -556,7 +661,7 @@ def _build_pbo_component(bucket: str, s3_client=None):
     return build_metric(
         name="pbo", module=MODULE, metric_type="pct", criticality="supporting",
         value=pbo, unit=PROBABILITY, n_samples=n_splits, n_floor=_PBO_MIN_SPLITS,
-        source_path=src, higher_is_better=False, status=status,
+        source_path=src, window=pbo_w, higher_is_better=False, status=status,
         reason=f"{headline}. " + "; ".join(caveats) + ".",
     )
 
@@ -608,14 +713,17 @@ def _compute_regime_weighted_alpha(
 
     Returns a dict: ``value`` (None if not decomposable), ``n_samples`` (total
     joined samples across qualifying buckets only), ``na_detail`` (None when
-    populated), ``bucket_counts`` (all observed regimes, for diagnostics).
+    populated), ``bucket_counts`` (all observed regimes, for diagnostics),
+    ``dates`` (exactly the dates ``n_samples`` counts — alpha-engine-config-I11089).
     """
     buckets: dict[str, list[float]] = {}
+    bucket_dates: dict[str, list[str]] = {}
     for d, a in zip(dates, alpha):
         regime = regime_by_date.get(d)
         if regime is None or (1 + a) <= 0:
             continue
         buckets.setdefault(regime, []).append(math.log1p(a))
+        bucket_dates.setdefault(regime, []).append(d)
 
     bucket_counts = {r: len(vals) for r, vals in buckets.items()}
     total_joined = sum(bucket_counts.values())
@@ -626,6 +734,8 @@ def _compute_regime_weighted_alpha(
             "value": None,
             "n_samples": total_joined,
             "bucket_counts": bucket_counts,
+            # I11089: the dates behind n_samples, for the window provenance.
+            "dates": sorted(d for ds in bucket_dates.values() for d in ds),
             "na_detail": _regime_na_detail(
                 bucket_counts, qualifying_means, total_joined,
                 n_floor=n_floor, min_bucket_n=min_bucket_n, min_buckets=min_buckets,
@@ -638,6 +748,7 @@ def _compute_regime_weighted_alpha(
         "value": value,
         "n_samples": qualifying_n,
         "bucket_counts": bucket_counts,
+        "dates": sorted(d for r in qualifying_means for d in bucket_dates[r]),
         "na_detail": None,
     }
 
@@ -677,6 +788,18 @@ def _build_attribution_components(bucket: str, s3_client=None) -> tuple[list, di
     n = attr.get("sessions_used") or 0
     bf = attr.get("brinson_fachler") or {}
     act = attr.get("active_return") or {}
+    # alpha-engine-config-I11089 — attribution's window is the sessions whose
+    # inputs closed, a subset of the eod_pnl.csv rows (each session needs a prior
+    # row, sector weights and ETF returns), so its N is not the tile's N.
+    session_dates = [s.get("date") for s in (attr.get("per_session") or []) if s.get("date")]
+    skipped = attr.get("sessions_skipped") or {}
+    attr_w = _window(
+        basis="attribution_sessions",
+        sources=attr.get("source_paths") or [src],
+        dates=session_dates if ok else None,
+        rows_excluded=sum(v for v in skipped.values() if isinstance(v, int)) if ok else None,
+        reason=None if ok else "attribution not built this cycle; no session window",
+    )
 
     def _m(name, value, metric_type, unit, criticality, estimator):
         return build_metric(
@@ -685,7 +808,7 @@ def _build_attribution_components(bucket: str, s3_client=None) -> tuple[list, di
             measurement_horizon="since_inception",
             value=value if ok else None, unit=unit,
             n_samples=n if ok else None, n_floor=20, source_path=src,
-            input_present=ok, na_detail=reason,
+            input_present=ok, na_detail=reason, window=attr_w,
         )
 
     resid = bf.get("residual_pct_of_active")
@@ -736,10 +859,15 @@ def build_portfolio_outcome_tile(
 
     if series is None:
         # Whole tile N/A-MISSING-INPUT — one record per component, specific reason.
+        absent_w = _window(
+            basis="eod_pnl_daily_rows", sources=[src],
+            reason="trades/eod_pnl.csv absent this cycle; no window can be read",
+        )
+
         def miss(name, mt, crit, floor, tgt, rl, est=None):
             return build_metric(
                 name=name, module=MODULE, metric_type=mt, criticality=crit, n_floor=floor,
-                source_path=src, input_present=False,
+                source_path=src, input_present=False, window=absent_w,
                 estimator=est, measurement_horizon="since_inception",
                 na_detail=f"{name}: trades/eod_pnl.csv not present this cycle — no EOD reconciliation export to grade.",
                 **_tr(name, None),
@@ -761,13 +889,27 @@ def build_portfolio_outcome_tile(
         # so it is built here too rather than blanket-N/A'd (I9622).
         components.append(_build_pbo_component(bucket, s3_client=s3_client))
         annotate_power_all(components)
-        return build_tile(MODULE, components)
+        tile = build_tile(MODULE, components)
+        tile["window"] = absent_w
+        return tile
 
     n = series.n
     port = series.port
     nav = series.nav
     active = series.alpha
     components = []
+
+    # alpha-engine-config-I11089 — the window every eod_pnl.csv-derived figure
+    # below is computed over: exactly the parsed rows, from this object.
+    eod_w = _window(
+        basis="eod_pnl_daily_rows", sources=[src], dates=series.dates,
+        rows_excluded=series.rows_dropped, source_object=series.source_object,
+    )
+    dsr_w = _window(
+        basis="eod_pnl_daily_rows", sources=[src, f"s3://{bucket}/{TRIAL_COUNT_KEY}"],
+        dates=series.dates, rows_excluded=series.rows_dropped,
+        source_object=series.source_object,
+    )
 
     # 1. Sharpe (critical)
     sharpe = sharpe_ratio(port)
@@ -776,7 +918,7 @@ def build_portfolio_outcome_tile(
         name="sharpe_ratio", module=MODULE, metric_type="sharpe", criticality="critical",
         estimator="sharpe_with_bootstrap_ci", measurement_horizon="since_inception",
         value=sharpe, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
-        ci_low=s_lo, ci_high=s_hi, ci_method=s_m, source_path=src,
+        ci_low=s_lo, ci_high=s_hi, ci_method=s_m, source_path=src, window=eod_w,
         **_tr("sharpe_ratio", sharpe),
     ))
 
@@ -788,7 +930,7 @@ def build_portfolio_outcome_tile(
         name="information_ratio", module=MODULE, metric_type="ratio", criticality="critical",
         estimator="info_ratio_bootstrap_ci", measurement_horizon="since_inception",
         value=ir, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
-        ci_low=i_lo, ci_high=i_hi, ci_method=i_m, source_path=src,
+        ci_low=i_lo, ci_high=i_hi, ci_method=i_m, source_path=src, window=eod_w,
     ))
 
     # 3. PSR (critical) — P(true Sharpe > 0). Probability, no CI.
@@ -798,7 +940,7 @@ def build_portfolio_outcome_tile(
         name="psr", module=MODULE, metric_type="pct", criticality="critical",
         estimator="probabilistic_sharpe", measurement_horizon="since_inception",
         value=psr_val, unit=PROBABILITY, n_samples=psr_res.get("n", n), n_floor=60,
-        source_path=src,
+        source_path=src, window=eod_w,
     ))
 
     # 4. Alpha vs SPY (critical) — cumulative log-alpha since inception.
@@ -806,7 +948,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="alpha_vs_spy", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="cumulative_log_alpha", measurement_horizon="since_inception",
-        value=log_alpha, unit=LOG_RETURN, n_samples=n, n_floor=60, source_path=src,
+        value=log_alpha, unit=LOG_RETURN, n_samples=n, n_floor=60, source_path=src, window=eod_w,
         **_tr("alpha_vs_spy", log_alpha),
     ))
 
@@ -815,7 +957,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="max_drawdown", module=MODULE, metric_type="ratio", criticality="critical",
         estimator="peak_to_trough_nav", measurement_horizon="since_inception",
-        value=mdd, unit=FRACTION, n_samples=len(nav), n_floor=2, source_path=src,
+        value=mdd, unit=FRACTION, n_samples=len(nav), n_floor=2, source_path=src, window=eod_w,
     ))
 
     # 6. Sortino (supporting)
@@ -824,7 +966,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="sortino_ratio", module=MODULE, metric_type="sharpe", criticality="supporting",
         value=sortino, unit=ANNUALIZED_RATIO, n_samples=n, n_floor=60,
-        ci_low=so_lo, ci_high=so_hi, ci_method=so_m, source_path=src,
+        ci_low=so_lo, ci_high=so_hi, ci_method=so_m, source_path=src, window=eod_w,
     ))
 
     # 7. Calmar (supporting) — annualized return / |max drawdown|.
@@ -836,7 +978,7 @@ def build_portfolio_outcome_tile(
             calmar = ann_ret / abs(mdd)
     components.append(build_metric(
         name="calmar_ratio", module=MODULE, metric_type="ratio", criticality="supporting",
-        value=calmar, unit=RATIO, n_samples=n, n_floor=90, source_path=src,
+        value=calmar, unit=RATIO, n_samples=n, n_floor=90, source_path=src, window=eod_w,
     ))
 
     # 8. CVaR(95) daily (supporting) — mean worst-5% daily return.
@@ -846,7 +988,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="cvar_95_daily", module=MODULE, metric_type="ratio", criticality="supporting",
         value=cvar, unit=FRACTION, n_samples=n, n_floor=60,
-        ci_low=cv_lo, ci_high=cv_hi, ci_method=cv_m, source_path=src,
+        ci_low=cv_lo, ci_high=cv_hi, ci_method=cv_m, source_path=src, window=eod_w,
     ))
 
     # 9. Hit rate daily (diagnostic) — % days portfolio beats SPY. Wilson CI.
@@ -857,7 +999,7 @@ def build_portfolio_outcome_tile(
         name="hit_rate_daily", module=MODULE, metric_type="pct", criticality="diagnostic",
         value=hit, unit=FRACTION, n_samples=n, n_floor=60,
         ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
-        ci_method="wilson" if w.get("status") == "ok" else None, source_path=src,
+        ci_method="wilson" if w.get("status") == "ok" else None, source_path=src, window=eod_w,
         **_tr("hit_rate_daily", hit),
     ))
 
@@ -878,7 +1020,7 @@ def build_portfolio_outcome_tile(
         beta_status = "RED"
     components.append(build_metric(
         name="beta_vs_spy", module=MODULE, metric_type="ratio", criticality="diagnostic",
-        value=beta, unit=RATIO, n_samples=n, n_floor=60, source_path=src, status=beta_status,
+        value=beta, unit=RATIO, n_samples=n, n_floor=60, source_path=src, window=eod_w, status=beta_status,
         reason=(f"beta_vs_spy = {beta:.3g} (target band 0.7–1.1)." if beta is not None
                 else "beta_vs_spy: too few observations to estimate."),
     ))
@@ -887,7 +1029,7 @@ def build_portfolio_outcome_tile(
     components.append(build_metric(
         name="max_dd_duration_days", module=MODULE, metric_type="duration", criticality="diagnostic",
         value=float(_max_dd_duration_days(nav)), unit=DAYS, n_samples=len(nav), n_floor=2,
-        higher_is_better=False, source_path=src,
+        higher_is_better=False, source_path=src, window=eod_w,
     ))
 
     # 12. DSR (supporting) — deflated Sharpe, corrected for the
@@ -902,12 +1044,12 @@ def build_portfolio_outcome_tile(
         components.append(build_metric(
             name="dsr", module=MODULE, metric_type="pct", criticality="supporting",
             value=dsr_val, unit=PROBABILITY, n_samples=dsr_res.get("n", n), n_floor=60,
-            source_path=src,
+            source_path=src, window=dsr_w,
         ))
     else:
         components.append(build_metric(
             name="dsr", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=60, source_path=src, implemented=False,
+            n_floor=60, source_path=src, window=dsr_w, implemented=False,
             na_detail=(
                 "dsr: cumulative trial count unavailable this cycle "
                 "(s3://{bucket}/backtest/cumulative_trial_count.json missing, "
@@ -936,13 +1078,18 @@ def build_portfolio_outcome_tile(
         name="regime_weighted_alpha", module=MODULE, metric_type="log_return", criticality="critical",
         estimator="regime_weighted_log_alpha", measurement_horizon="since_inception",
         value=rwa["value"], unit=LOG_RETURN, n_samples=rwa["n_samples"], n_floor=_REGIME_ALPHA_N_FLOOR,
-        source_path=src,
+        source_path=src, window=_window(
+            basis="regime_joined_daily_rows",
+            sources=[src, f"s3://{bucket}/{REGIME_INDEX_KEY}", f"s3://{bucket}/{SIGNALS_KEY_TEMPLATE}"],
+            dates=rwa["dates"], source_object=series.source_object,
+            rows_excluded=n - len(rwa["dates"]),
+        ),
         input_present=rwa["na_detail"] is None,
         na_detail=rwa["na_detail"],
     ))
 
     # 14. Alpha trend (diagnostic) — is daily alpha statistically improving?
-    components.append(_build_alpha_trend([a * 100.0 for a in active], src))
+    components.append(_build_alpha_trend([a * 100.0 for a in active], src, window=eod_w))
 
     # 15-18. Benchmark-relative attribution (I8188 deliverables 6-7).
     #        Built from the same eod_pnl.csv plus SPY's published sector weights
@@ -967,6 +1114,11 @@ def build_portfolio_outcome_tile(
     # persist it as its own artifact (evaluator/{run_date}/attribution.json)
     # without recomputing it — one build per cycle, one number everywhere.
     tile["attribution"] = _attr_payload
+    # alpha-engine-config-I11089 — the headline window (the eod_pnl.csv rows the
+    # critical battery reads) at tile level, so a reader of the tile header
+    # sees which dates "Portfolio Outcome" means. Components whose window
+    # differs (regime, attribution, pbo) carry their own.
+    tile["window"] = eod_w
     # alpha-engine-config-I9702 — the merged date->market_regime index, handed
     # to the report-card handler to persist at evaluator/indexes/
     # market_regime.json. `None` when nothing changed (no no-op PUT). Rides on

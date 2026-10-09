@@ -56,6 +56,7 @@ import logging
 import os
 import time
 
+from director import emf
 from director.agent import (
     DIRECTOR_EXEC_CONTEXT,
     DIRECTOR_GROUP,
@@ -315,7 +316,8 @@ def _emit_self_grade_metric(
     Two metrics, both always emitted, mirroring
     ``agent._warn_on_degraded_route``'s namespace, dimension and transport
     (EMF log line, not ``PutMetricData`` — no ``monitoring`` interface endpoint
-    for one weekly data point):
+    for one weekly data point; on the weekly spot, where nothing extracts EMF,
+    ``director/emf.py`` also publishes the same values with ``PutMetricData``):
 
       ``RetroJudgeSelfGraded``        1 when the judge served the plan's model
       ``RetroJudgeSelfGradeUnknown``  1 when the comparison could not be made
@@ -329,7 +331,7 @@ def _emit_self_grade_metric(
     otherwise sound.
     """
     try:
-        print(json.dumps({
+        emf.emit({
             "_aws": {
                 "Timestamp": int(time.time() * 1000),
                 "CloudWatchMetrics": [{
@@ -347,7 +349,7 @@ def _emit_self_grade_metric(
             "judge_served_model": judge_model,
             "graded_plan_served_model": plan_model,
             "verdict": verdict,
-        }))
+        })
     except Exception:
         logger.exception(
             "Director retro: failed to emit the self-grading metric — the "

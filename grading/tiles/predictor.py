@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 import boto3
 from botocore.exceptions import ClientError
 
+from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from nousergon_lib.quant.stats.intervals import bootstrap_ci
 
 from grading.artifacts import PREDICTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
@@ -52,6 +53,33 @@ _DIRECTIONAL_L1_FEATURES = ("expected_move", "research_calibrator_prob", "moment
 # DIRECTIONS — mirrored here rather than cross-repo imported, since this tile only
 # reads the persisted JSON, never the backtester's Python).
 _CM_DIRECTIONS = ("UP", "FLAT", "DOWN")
+
+# alpha-engine-config-I11094 — a metric's ``measurement_horizon`` is a claim
+# about what its number measures, and the Director reasons from it ("all
+# measured at horizon 1d … must not drive predictor surgery"). It used to be a
+# literal typed at each call site, and two of those literals were false: the
+# confusion-matrix family was stamped ``1d`` and the veto gate ``10d``, while
+# both producers read the canonical 21d outcome (crucible-backtester
+# ``CURRENT_HORIZON_FILTER_SQL`` / ``beat_spy_21d``; the live 2026-10-02
+# confusion_matrix.json echoes ``horizons_days: [21]``). So the horizon is now
+# taken from what the artifact DECLARES, and where an artifact declares none
+# it is stamped ``undeclared`` — never a guessed literal.
+UNDECLARED_HORIZON = "undeclared"
+
+# The fleet primary outcome horizon. Used ONLY for veto_analysis.json, which
+# carries no horizon field: its producer resolves its outcome column from this
+# same chokepoint (crucible-backtester analysis/veto_analysis.py ``_PRIMARY_OC``),
+# so this is the producer's own declaration, not an assumption.
+PRIMARY_HORIZON_DAYS = DEFAULT_POLICY.primary_horizon
+
+
+def _horizon_label(days) -> str | None:
+    """``21`` -> ``"21d"``; anything that is not a positive whole number -> None."""
+    if isinstance(days, bool) or not isinstance(days, (int, float)):
+        return None
+    if days <= 0 or int(days) != days:
+        return None
+    return f"{int(days)}d"
 
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
@@ -111,7 +139,7 @@ def build_predictor_tile(
     if latest is None and manifest is None:
         miss = build_metric(
             name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
-            estimator="rank_ic", measurement_horizon="21d",
+            estimator="rank_ic", measurement_horizon=UNDECLARED_HORIZON,
             n_floor=10, source_path=manifest_src, input_present=False,
             na_detail="predictor metrics + weights manifest both absent this cycle.",
             **_tr("meta_l2_ic", None),
@@ -123,6 +151,11 @@ def build_predictor_tile(
     wf = manifest.get("walk_forward") or {}
     cpcv = manifest.get("meta_model_oos_ic_cpcv") or {}
     components = []
+    # I11094: the label horizon the manifest's ICs were measured against, as the
+    # training run declared it (crucible-predictor config.FORWARD_DAYS). The CPCV
+    # block carries its own copy; prefer it for the metric read from that block.
+    manifest_hz = _horizon_label(manifest.get("forward_days")) or UNDECLARED_HORIZON
+    cpcv_hz = _horizon_label(cpcv.get("forward_days")) or manifest_hz
 
     # alpha-engine-config#969: the producer (crucible-predictor#340) tags each
     # scalar IC field with its methodological reliability (leak-free vs
@@ -162,7 +195,7 @@ def build_predictor_tile(
         )
     components.append(build_metric(
         name="meta_l2_ic", module=MODULE, metric_type="ic", criticality="critical",
-        estimator="rank_ic", measurement_horizon="21d",
+        estimator="rank_ic", measurement_horizon=cpcv_hz,
         value=cpcv_mean, unit=RANK_IC, n_samples=n_combos, n_floor=10,
         ci_low=ci_low, ci_high=ci_high, ci_method=ci_method, source_path=manifest_src,
         input_present=cpcv_ok, reason=meta_reason,
@@ -175,17 +208,35 @@ def build_predictor_tile(
     mom_ic = wf.get("momentum_median_ic")
     vol_ic = wf.get("volatility_median_ic")
     n_folds = wf.get("n_folds")
+
+    # I11094 / I11988 root cause 7: N here is the number of walk-forward FOLDS
+    # in the training run's manifest — a fixed property of one training run,
+    # not a count of accumulating dates or names. Rendered unlabelled ("N=16")
+    # it read as a stalled writer, and the Director re-filed a disproved
+    # "outcome labels stopped accumulating" finding (I2972) off it. Say what N
+    # counts wherever the number is shown.
+    def _wf_reason(name: str, ic) -> str | None:
+        if ic is None:
+            return None  # N/A path: build_metric's own na reason applies
+        return (f"{name} [{manifest_hz}] = {ic:.4g} — median rank-IC over N={n_folds} "
+                f"walk-forward FOLDS of the training run dated {manifest.get('date', '?')} "
+                f"(N counts folds, not dates or names; it moves only when the model is "
+                f"retrained; n_floor 8).")
+
     components.append(build_metric(
         name="momentum_l1_ic", module=MODULE, metric_type="ic", criticality="critical",
-        estimator="rank_ic_oos", measurement_horizon="21d",
+        estimator="rank_ic_oos", measurement_horizon=manifest_hz,
         value=mom_ic, unit=RANK_IC, n_samples=n_folds, n_floor=8,
         source_path=manifest_src, input_present=mom_ic is not None,
+        reason=_wf_reason("momentum_l1_ic", mom_ic),
         reliability=_reliability_for("momentum_median_ic"),
     ))
     components.append(build_metric(
         name="volatility_l1_ic", module=MODULE, metric_type="ic", criticality="supporting",
+        measurement_horizon=manifest_hz,
         value=vol_ic, unit=RANK_IC, n_samples=n_folds, n_floor=8,
         source_path=manifest_src, input_present=vol_ic is not None,
+        reason=_wf_reason("volatility_l1_ic", vol_ic),
         reliability=_reliability_for("volatility_median_ic"),
     ))
     rescal_ic = (latest.get("l1_ic") or {}).get("research_calibrator")
@@ -244,7 +295,7 @@ def build_predictor_tile(
         )
     components.append(build_metric(
         name="ensemble_lift_over_best_l1", module=MODULE, metric_type="ic", criticality="critical",
-        estimator="ic_delta", measurement_horizon="21d",
+        estimator="ic_delta", measurement_horizon=cpcv_hz,
         value=lift, unit=RANK_IC, n_samples=n_combos, n_floor=10,
         source_path=manifest_src, input_present=lift_present, reason=lift_reason,
         na_detail=lift_na or "ensemble_lift: needs the leak-free meta IC and a directional standalone L1 alpha-IC.",
@@ -284,8 +335,14 @@ def build_predictor_tile(
     # threshold: of the names the gate vetoed, the fraction that actually
     # underperformed (did not beat SPY). Cross-tile read from the backtester's
     # backtest/{run_date}/veto_analysis.json (config#859 — was an unwired N/A).
-    # 10d-horizon measurement (beat_spy_10d), hence supporting not critical.
     # Windowed resolution (config#1190): freshest within the trailing window.
+    #
+    # Horizon (I11094): this was stamped "10d" (beat_spy_10d), but the producer
+    # moved to the canonical primary-horizon column (beat_spy_21d, config#1451)
+    # and the label never followed — so the card and the Director said "10d"
+    # about a 21d number. veto_analysis.json declares no horizon of its own; it
+    # resolves its outcome column from DEFAULT_POLICY.primary_horizon, so that
+    # is what is stamped here unless the artifact ever declares `horizon_days`.
     va, _va_date, va_age, _veto_key = (
         get_json_windowed(s3, bucket, "backtest/{date}/veto_analysis.json", run_date)
         if run_date else (None, None, None, None)
@@ -298,6 +355,11 @@ def build_predictor_tile(
         if cur is not None and entries:
             va_match = min(entries, key=lambda e: abs((e.get("confidence") or 0) - cur))
     va_stale = artifact_is_stale(va_age, PREDICTOR_ARTIFACT_MAX_AGE_DAYS)
+    veto_hz = (
+        _horizon_label((va or {}).get("horizon_days"))
+        or _horizon_label(PRIMARY_HORIZON_DAYS)
+        or UNDECLARED_HORIZON
+    )
     if va_match is not None and not va_stale:
         ci = va_match.get("precision_ci_95")
         ci_low = ci[0] if isinstance(ci, (list, tuple)) and len(ci) >= 2 else None
@@ -307,11 +369,11 @@ def build_predictor_tile(
         conf = va_match.get("confidence") or 0.0
         components.append(build_metric(
             name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
-            estimator="wilson_precision", measurement_horizon="10d",
+            estimator="wilson_precision", measurement_horizon=veto_hz,
             value=prec, unit=FRACTION, n_samples=n_v, n_floor=30,
             ci_low=ci_low, ci_high=ci_high, ci_method="wilson" if ci_low is not None else None,
             source_path=veto_src,
-            reason=(f"veto_gate_precision [10d] = {prec:.1%} at the live veto threshold {conf:.2f} "
+            reason=(f"veto_gate_precision [{veto_hz}] = {prec:.1%} at the live veto threshold {conf:.2f} "
                     f"({va_match.get('true_negatives')}/{n_v} vetoed names underperformed) "
                     f"vs target 60% / red-line 40%."),
         ))
@@ -327,7 +389,7 @@ def build_predictor_tile(
             na = f"veto_gate_precision: veto_analysis.json has no usable precision at the live threshold (status={va.get('status')}) this cycle."
         components.append(build_metric(
             name="veto_gate_precision", module=MODULE, metric_type="pct", criticality="supporting",
-            estimator="wilson_precision", measurement_horizon="10d",
+            estimator="wilson_precision", measurement_horizon=veto_hz,
             n_floor=30, source_path=veto_src, input_present=False,
             na_detail=na,
         ))
@@ -351,7 +413,49 @@ def build_predictor_tile(
     cm_stale = artifact_is_stale(cm_age, PREDICTOR_ARTIFACT_MAX_AGE_DAYS)
     cm_ok = isinstance(cm, dict) and cm.get("status") == "ok" and isinstance(cm.get("per_class"), dict) and not cm_stale
 
+    # I11094 — horizon and denominator are read from the artifact, and a
+    # confusion matrix whose numbers do not share one horizon and one base is
+    # refused rather than graded.
+    #   * Horizon: the producer echoes `horizons_days` (the distinct horizons of
+    #     the rows it counted). One value is the horizon; several means accuracy
+    #     and the base rates pool outcomes measured over different windows into
+    #     one N, which is no single horizon's number; none (an older artifact)
+    #     grades as before but is stamped `undeclared`.
+    #   * Denominator: accuracy is over `n`, and each class's base rate is
+    #     `n_actual / n`. If the per-class actual counts do not sum to `n`, the
+    #     base rates and the accuracy are over different populations and the
+    #     "lift" subtracts one from the other.
+    cm_hz = UNDECLARED_HORIZON
+    cm_invalid = None
+    if cm_ok:
+        declared = cm.get("horizons_days")
+        hz_labels = sorted(
+            {lbl for lbl in (_horizon_label(h) for h in declared) if lbl},
+            key=lambda lbl: int(lbl[:-1]),
+        ) if isinstance(declared, list) else []
+        if len(hz_labels) == 1:
+            cm_hz = hz_labels[0]
+        elif len(hz_labels) > 1:
+            cm_hz = "mixed_" + "+".join(hz_labels)
+            cm_invalid = (
+                f"confusion_matrix.json pools resolved outcomes at {len(hz_labels)} horizons "
+                f"({', '.join(hz_labels)}) into one N={cm.get('n')} — accuracy and base rates "
+                f"over mixed outcome windows are no single horizon's number (I11094)."
+            )
+        n_decl = cm.get("n")
+        actual_sum = sum(
+            (cm["per_class"].get(d) or {}).get("n_actual") or 0 for d in _CM_DIRECTIONS
+        )
+        if cm_invalid is None and isinstance(n_decl, int) and n_decl > 0 and actual_sum != n_decl:
+            cm_invalid = (
+                f"confusion_matrix.json per-class actual counts sum to {actual_sum}, not "
+                f"N={n_decl} — the base rates and the accuracy would be over different "
+                f"denominators (I11094)."
+            )
+
     def _cm_na(metric_name: str) -> str:
+        if cm_invalid is not None:
+            return f"{metric_name}: {cm_invalid}"
         if run_date is None:
             return f"{metric_name}: run_date not provided to the predictor tile; cross-tile confusion_matrix.json read skipped."
         if cm_stale:
@@ -361,7 +465,7 @@ def build_predictor_tile(
             return f"{metric_name}: confusion_matrix.json absent in the trailing window ending {run_date}."
         return f"{metric_name}: confusion_matrix.json has no usable accuracy/per_class breakdown (status={cm.get('status')}) this cycle."
 
-    if cm_ok:
+    if cm_ok and cm_invalid is None:
         n_total = cm.get("n")
         per_class = cm["per_class"]
         base_rates = {
@@ -376,24 +480,24 @@ def build_predictor_tile(
 
     # direction_accuracy_vs_majority_baseline (supporting) — overall directional
     # accuracy vs the trivial always-predict-the-majority-class baseline.
-    if cm_ok and base_rates and cm.get("accuracy") is not None:
+    if cm_ok and cm_invalid is None and base_rates and cm.get("accuracy") is not None:
         accuracy = cm["accuracy"]
         majority_class = max(base_rates, key=lambda d: base_rates[d])
         baseline = base_rates[majority_class]
         acc_lift = accuracy - baseline
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
-            criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
+            criticality="supporting", estimator="accuracy_delta", measurement_horizon=cm_hz,
             value=acc_lift, unit=FRACTION, n_samples=n_total, n_floor=30,
             source_path=cm_src,
-            reason=(f"direction_accuracy = {accuracy:.2%} vs always-{majority_class} majority-class "
+            reason=(f"direction_accuracy [{cm_hz}] = {accuracy:.2%} vs always-{majority_class} majority-class "
                     f"baseline {baseline:.2%} (N={n_total}) — lift {acc_lift:+.2%} vs target "
                     f"+3pp / red-line 0pp."),
         ))
     else:
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
-            criticality="supporting", estimator="accuracy_delta", measurement_horizon="1d",
+            criticality="supporting", estimator="accuracy_delta", measurement_horizon=cm_hz,
             n_floor=30, source_path=cm_src, input_present=False,
             na_detail=_cm_na("direction_accuracy_vs_majority_baseline"),
         ))
@@ -404,7 +508,7 @@ def build_predictor_tile(
     # precision 55.2% vs 60.6% base rate).
     for cls in ("UP", "DOWN"):
         name = f"{cls.lower()}_precision_vs_base_rate"
-        cls_stats = per_class.get(cls) if cm_ok else None
+        cls_stats = per_class.get(cls) if (cm_ok and cm_invalid is None) else None
         precision = cls_stats.get("precision") if cls_stats else None
         base_rate = base_rates.get(cls)
         if precision is not None and base_rate is not None:
@@ -412,20 +516,20 @@ def build_predictor_tile(
             prec_lift = precision - base_rate
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
-                criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
+                criticality="supporting", estimator="precision_delta", measurement_horizon=cm_hz,
                 value=prec_lift, unit=FRACTION, n_samples=n_pred, n_floor=30,
                 source_path=cm_src,
-                reason=(f"{name}: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
+                reason=(f"{name} [{cm_hz}]: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
                         f"(N={n_pred} predicted-{cls}) — lift {prec_lift:+.2%} vs target +3pp / red-line 0pp."),
             ))
         else:
             na = (
-                _cm_na(name) if not cm_ok
+                _cm_na(name) if not (cm_ok and cm_invalid is None)
                 else f"{name}: no {cls}-predicted rows this cycle (n_predicted=0) — precision undefined."
             )
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
-                criticality="supporting", estimator="precision_delta", measurement_horizon="1d",
+                criticality="supporting", estimator="precision_delta", measurement_horizon=cm_hz,
                 n_floor=30, source_path=cm_src, input_present=False,
                 na_detail=na,
             ))
