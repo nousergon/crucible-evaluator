@@ -377,6 +377,17 @@ def _sf_success_rate(
     entirely and counted: they dry-run the graph under a recovery role, and
     folded into a cycle their entered stages would read as work done.
 
+    **Point in time (alpha-engine-config-I12059):** the window is
+    ``[as_of - window_days, as_of]`` at both ends, start AND stop. The listing
+    is read now, so a historical ``as_of`` would otherwise grade executions
+    that had not started on the day it describes (measured 2026-10-06: the
+    10-04 calculation credited a 10-05 postclose run). An execution that
+    started after ``as_of`` is excluded and counted per SF; one that stopped
+    after ``as_of`` was in flight on the day and is excluded and named, so a
+    later recovery never repairs an earlier cutoff's cycle; a terminal
+    execution with no stop instant makes its cycle unevaluable (withheld,
+    named, and the caller renders N/A — never GREEN).
+
     **Work verdict (alpha-engine-config-I8069):** every terminal, role-carrying,
     in-window execution is classified with ``classify_work`` against its own
     entered-state history; ``SKIPPED`` executions (e.g. ``WeeklyRunDaySkip``)
@@ -404,6 +415,9 @@ def _sf_success_rate(
     declared_skips: dict[str, dict[str, int]] = {}
     scope_detail: dict[str, str] = {}
     truncated: list[str] = []
+    n_after_as_of: dict[str, int] = {}
+    in_flight_at_as_of: list[str] = []
+    temporally_unevaluable: list[str] = []
     for arn in arns:
         sf_name = arn.rsplit(":", 1)[-1]
         runs = list_recent_pipeline_runs(arn, limit=_SF_EXEC_SCAN_LIMIT, client=sfn)
@@ -424,9 +438,20 @@ def _sf_success_rate(
                 )
                 truncated.append(sf_name)
         cycles: dict[str, list[tuple[str, str, object, tuple[str, ...]]]] = {}
+        # Cycles holding an execution whose terminal instant cannot be placed
+        # against ``as_of`` (alpha-engine-config-I12059). Withheld from every
+        # denominator below and named, never folded on a guess.
+        unevaluable_keys: set[str] = set()
         for r in runs:
             start = getattr(r, "start_utc", None)
             if start is None or start < cutoff:
+                continue
+            # POINT-IN-TIME (alpha-engine-config-I12059): the window is
+            # [as_of - window_days, as_of], both ends. The SF listing is read
+            # NOW, so without this bound a historical as_of graded executions
+            # that had not started yet on the day it describes.
+            if start > as_of:
+                n_after_as_of[sf_name] = n_after_as_of.get(sf_name, 0) + 1
                 continue
             # PRODUCTION runs only: ad-hoc smoke / legacy runs carry no role.
             role = getattr(r, "pipeline_role", None)
@@ -435,6 +460,27 @@ def _sf_success_rate(
             raw = getattr(r, "status", None)
             status = getattr(raw, "value", raw)
             if status not in _SF_TERMINAL:
+                continue
+            # The CURRENT terminal status is only evidence about as_of if the
+            # execution had already stopped by then. One that stopped later was
+            # IN FLIGHT on the day, and IN_FLIGHT is excluded from every
+            # denominator (alpha-engine-config-I8069) — its later success or
+            # failure is not credited to the earlier cutoff.
+            end = getattr(r, "end_utc", None)
+            name = getattr(r, "name", None) or r.execution_arn.rsplit(":", 1)[-1]
+            if end is None:
+                # A terminal status with no stop instant: whether it had ended by
+                # as_of is unknowable, so its cycle is unevaluable — never GREEN.
+                logger.error(
+                    "sf_success_rate: %s:%s is %s with no end timestamp — cannot place its "
+                    "outcome against as_of %s; its cycle is withheld as unevaluable "
+                    "(alpha-engine-config-I12059).", sf_name, name, status, as_of,
+                )
+                unevaluable_keys.add(_cycle_key(sf_name, getattr(r, "run_date", None), start))
+                temporally_unevaluable.append(f"{sf_name}:{name}")
+                continue
+            if end > as_of:
+                in_flight_at_as_of.append(f"{sf_name}:{name}")
                 continue
             run_date = getattr(r, "run_date", None)
             if run_date is None:
@@ -459,6 +505,13 @@ def _sf_success_rate(
 
         sf_cycles = sf_clean = sf_clean_full = 0
         sf_unatt = sf_unatt_ok = sf_unatt_ok_full = 0
+        for key in unevaluable_keys:
+            dropped = cycles.pop(key, None)
+            scope_detail[f"{sf_name}:{key}"] = (
+                f"[unevaluable] an execution of this cycle carries no end timestamp, so "
+                f"its outcome cannot be placed against as_of {as_of.isoformat()} — withheld "
+                f"from every denominator ({len(dropped or ())} other execution(s) not folded)"
+            )
         for day, execs in sorted(cycles.items()):
             sf_cycles += 1
             graded = _fold(sf_name, day, execs)
@@ -541,6 +594,20 @@ def _sf_success_rate(
         # limit, so `cycle_rate` describes a shorter period than its name.
         # The caller renders N/A rather than publishing it.
         "truncated": truncated,
+        # Point-in-time eligibility (alpha-engine-config-I12059): the interval
+        # graded, and every execution the listing returned that it excluded.
+        "as_of": as_of.isoformat(),
+        "window_start": cutoff.isoformat(),
+        # {sf: n} executions that STARTED after as_of. They still occupy the
+        # count-bounded scan, which is why `truncated` is judged on the scan's
+        # oldest start rather than on how many executions fell in the window.
+        "n_executions_after_as_of": n_after_as_of,
+        # Started inside the window, stopped after as_of: in flight on the day.
+        "in_flight_at_as_of": in_flight_at_as_of,
+        # Non-empty ⇒ a terminal execution had no end timestamp, so its cycle
+        # could not be graded at as_of and the denominator is incomplete. The
+        # caller renders N/A rather than publishing it.
+        "temporally_unevaluable": temporally_unevaluable,
     }
 
 
@@ -589,6 +656,13 @@ def _cycle_scope_block(sf: dict) -> dict:
         },
         "recovered": {"n_clean": sf["n_cycles_clean_recovered"]},
         "n_rehearsals_excluded": sf["n_rehearsals_excluded"],
+        # The graded interval and what it excluded (alpha-engine-config-I12059).
+        "point_in_time": {
+            "as_of": sf.get("as_of"),
+            "window_start": sf.get("window_start"),
+            "n_executions_after_as_of": sf.get("n_executions_after_as_of", {}),
+            "in_flight_at_as_of": sf.get("in_flight_at_as_of", []),
+        },
     }
 
 
@@ -708,6 +782,20 @@ def build_substrate_tile(
                               f"(alpha-engine-config-I8183)."),
                 unatt_detail=(f"unattended_first_pass_rate: execution scan TRUNCATED for "
                               f"{', '.join(sf['truncated'])} — same window as above."),
+            )
+        elif sf.get("temporally_unevaluable"):
+            # Same honesty rule as truncation (alpha-engine-config-I12059): a
+            # cycle that could not be placed against as_of is missing from the
+            # denominator, so any rate here would claim more than was graded.
+            _na_pair(
+                input_present=False,
+                cycle_detail=(f"sf_success_rate_4w: {len(sf['temporally_unevaluable'])} terminal "
+                              f"execution(s) carry no end timestamp "
+                              f"({', '.join(sf['temporally_unevaluable'])}), so whether each had "
+                              f"finished by as_of {sf['as_of']} is unknown and its cycle cannot be "
+                              f"graded point-in-time (alpha-engine-config-I12059)."),
+                unatt_detail=(f"unattended_first_pass_rate: same unevaluable cycle(s) as above "
+                              f"({', '.join(sf['temporally_unevaluable'])})."),
             )
         elif sf["cycle_rate"] is None:
             _na_pair(

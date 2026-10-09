@@ -353,6 +353,24 @@ def numeric_grade(components: list[MetricRecord]) -> float | None:
     return sum(scores) / len(scores)
 
 
+def _letter_from_final_status(component: dict, derive_letter) -> dict:
+    """Re-derive a serialised component's letter from its FINAL status.
+
+    ``build_metric`` stamps ``derived_letter`` from the status a record was
+    born with, and anything that later moves the status (the power downgrade
+    in ``grading/power.py`` is the case that shipped) used to leave the old
+    letter behind: the 2026-10-02 card had WATCH rows lettered ``F``
+    (alpha-engine-config-I11169 / -I11988). The letter is a projection of the
+    status and nothing else, so it is projected here, once, at the point every
+    tile serialises its components — a letter can never claim more (or less)
+    than the status the rollup actually graded.
+    """
+    status = component.get("status")
+    if isinstance(status, str):
+        component["derived_letter"] = derive_letter(status)
+    return component
+
+
 def build_tile(
     module: str, components: list[MetricRecord], *,
     alpha: float = 0.05,
@@ -410,7 +428,8 @@ def build_tile(
     graded_against = [*components, *unreported]
 
     status = module_status(graded_against, alpha=alpha)
-    dumped = [c.model_dump(mode="json") for c in graded_against]
+    dumped = [_letter_from_final_status(c.model_dump(mode="json"), derive_letter)
+              for c in graded_against]
 
     stamps = [d for c in dumped if (d := c.get("last_updated_utc"))]
     as_of = max(stamps) if stamps else datetime.now(UTC).isoformat()

@@ -60,9 +60,18 @@ class CardHistory:
     disappear across weeks) contribute no point.
     """
 
-    def __init__(self, series: dict[tuple[str, str], list[float]], n_cards_found: int):
+    def __init__(
+        self,
+        series: dict[tuple[str, str], list[float]],
+        n_cards_found: int,
+        arm_series: dict[tuple[str, str, str], list[float]] | None = None,
+    ):
         self._series = series
         self.n_cards_found = n_cards_found
+        # (tile, name, arm) -> values, for a component whose measured arm can
+        # change under the same name (alpha-engine-config-I11985: ``scanner``
+        # moved from the retired tech_score gate to the live published cut).
+        self._arm_series = arm_series or {}
 
     @classmethod
     def empty(cls) -> "CardHistory":
@@ -72,7 +81,9 @@ class CardHistory:
         """Prior value series (oldest → newest) for one component; [] if none."""
         return list(self._series.get((tile, name), ()))
 
-    def trends_for(self, tile: str, name: str, current_value: float | None) -> dict:
+    def trends_for(
+        self, tile: str, name: str, current_value: float | None, *, arm: str | None = None,
+    ) -> dict:
         """``build_metric`` kwargs (``trend_4w`` / ``trend_13w``) for one component.
 
         The series is the prior cards' values with THIS cycle's value appended
@@ -80,17 +91,30 @@ class CardHistory:
         week's change. Returns ``{}`` when there is no prior history — the
         record then keeps its default (None trends, "→"), indistinguishable
         from the pre-config#1836 behavior.
+
+        ``arm`` restricts the prior values to cards where the component carried
+        that same ``arm`` label. A trend that splices one arm's values onto
+        another's reads a change of instrument as a change in skill
+        (alpha-engine-config-I11985).
         """
-        prior = self._series.get((tile, name))
+        prior = (self._arm_series.get((tile, name, arm)) if arm is not None
+                 else self._series.get((tile, name)))
         if not prior:
             return {}
         full = prior + ([float(current_value)] if current_value is not None else [])
         return {"trend_4w": full[-4:], "trend_13w": full[-13:]}
 
 
-def _extract_series(cards: list[dict]) -> dict[tuple[str, str], list[float]]:
-    """Pull value-bearing component readings out of parsed cards (oldest first)."""
-    series: dict[tuple[str, str], list[float]] = {}
+def _extract_series(
+    cards: list[dict], *, by_arm: bool = False,
+) -> dict[tuple, list[float]]:
+    """Pull value-bearing component readings out of parsed cards (oldest first).
+
+    ``by_arm`` keys the series by ``(tile, name, arm)`` instead, so a
+    component's readings under one measurement arm never trend against
+    another's. A component with no ``arm`` contributes nothing there.
+    """
+    series: dict[tuple, list[float]] = {}
     for card in cards:
         tiles = card.get("tiles")
         if not isinstance(tiles, dict):
@@ -108,8 +132,14 @@ def _extract_series(cards: list[dict]) -> dict[tuple[str, str], list[float]]:
                 # Skip N/A weeks — no zero-filling (config#1836).
                 if not name or value is None or status.startswith(_NA_PREFIX):
                     continue
+                if by_arm:
+                    if not comp.get("arm"):
+                        continue
+                    key: tuple = (tile_name, name, comp["arm"])
+                else:
+                    key = (tile_name, name)
                 try:
-                    series.setdefault((tile_name, name), []).append(float(value))
+                    series.setdefault(key, []).append(float(value))
                 except (TypeError, ValueError):
                     logger.warning(
                         "Non-numeric prior value for (%s, %s): %r — skipped",
@@ -196,4 +226,4 @@ def load_card_history(
             "Loaded %d prior report cards before %s for cross-cycle trends.",
             n_found, run_date,
         )
-    return CardHistory(_extract_series(cards), n_found)
+    return CardHistory(_extract_series(cards), n_found, _extract_series(cards, by_arm=True))

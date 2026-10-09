@@ -86,6 +86,9 @@ class _Run:
     def __init__(self, name, status, start, role, execution_arn, run_date=None):
         self.name = name
         self.start_utc = start
+        # The summary's stop instant (alpha-engine-config-I12059 places every
+        # terminal outcome against as_of by it).
+        self.end_utc = start + timedelta(minutes=30)
         self.pipeline_role = role
         self.status = status
         self.execution_arn = execution_arn
@@ -110,7 +113,10 @@ def _rate(monkeypatch, runs, outcomes_by_arn):
         "grading.tiles.substrate._discover_sf_arns",
         lambda sfn: [f"arn:aws:states:us-east-1:1:stateMachine:{_SM_NAME}"],
     )
-    return _sf_success_rate(object(), datetime(2026, 8, 22, tzinfo=UTC), 28)
+    # as_of is the END of 2026-08-22: the latest fixture starts 08-22 09:00, and
+    # an as_of of 08-22 00:00 graded it before it existed — the leak
+    # alpha-engine-config-I12059 closes.
+    return _sf_success_rate(object(), datetime(2026, 8, 23, tzinfo=UTC), 28)
 
 
 # --------------------------------------------------------------------------

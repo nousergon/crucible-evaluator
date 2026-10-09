@@ -609,3 +609,123 @@ class TestCrossCycleTrends:
         tile = build_predictor_tile(BUCKET, s3_client=s3, history=history)
         meta = _comp(tile, "meta_l2_ic")
         assert meta["trend_4w"] == [0.10, 0.12]
+
+
+class TestHorizonAndDenominatorConsistency:
+    """alpha-engine-config-I11094: every metric's ``measurement_horizon`` and
+    N must be what its number was actually computed over.
+
+    The confusion-matrix family was stamped ``1d`` and the veto gate ``10d``
+    while both producers read the canonical 21d outcome (the live 2026-10-02
+    confusion_matrix.json echoes ``horizons_days: [21]``). The Director then
+    filed I11094 off the false label: "all measured at horizon 1d … must not
+    drive predictor surgery". These tests fail on that code."""
+
+    _CM_FAMILY = (
+        "direction_accuracy_vs_majority_baseline",
+        "up_precision_vs_base_rate",
+        "down_precision_vs_base_rate",
+    )
+
+    def _tile(self, s3, cm=None, veto=None, manifest=_MANIFEST):
+        _seed(s3, manifest=manifest)
+        if cm is not None:
+            _put_confusion(s3, cm)
+        if veto is not None:
+            _put_veto(s3, veto)
+        return build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+
+    def _cm(self, **over):
+        return {**TestDirectionAccuracyVsBaseline._CM, **over}
+
+    def test_confusion_family_carries_the_artifacts_21d_not_1d(self, s3):
+        tile = self._tile(s3, cm=self._cm(horizons_days=[21]))
+        for name in self._CM_FAMILY:
+            c = _comp(tile, name)
+            assert c["measurement_horizon"] == "21d", name
+            assert "[21d]" in c["status_reason"], name
+            assert c["status"] in ("GREEN", "WATCH", "RED"), name
+
+    def test_confusion_family_horizon_follows_the_artifact(self, s3):
+        # Proves the horizon is read, not a literal that happens to say 21d.
+        tile = self._tile(s3, cm=self._cm(horizons_days=[5]))
+        for name in self._CM_FAMILY:
+            assert _comp(tile, name)["measurement_horizon"] == "5d", name
+
+    def test_mixed_horizon_confusion_matrix_is_refused(self, s3):
+        tile = self._tile(s3, cm=self._cm(horizons_days=[5, 21]))
+        for name in self._CM_FAMILY:
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT", name
+            assert c["value"] is None, name
+            assert c["measurement_horizon"] == "mixed_5d+21d", name
+            assert "5d, 21d" in c["status_reason"], name
+
+    def test_base_rate_denominator_must_match_accuracy_denominator(self, s3):
+        cm = self._cm()
+        cm["per_class"] = {**cm["per_class"], "FLAT": {**cm["per_class"]["FLAT"], "n_actual": 100}}
+        tile = self._tile(s3, cm=cm)  # 356 + 100 + 763 = 1219 != n=1379
+        for name in self._CM_FAMILY:
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-MISSING-INPUT", name
+            assert "sum to 1219, not N=1379" in c["status_reason"], name
+
+    def test_undeclared_confusion_horizon_grades_but_says_so(self, s3):
+        cm = self._cm()
+        cm.pop("horizons_days")
+        c = _comp(self._tile(s3, cm=cm), "direction_accuracy_vs_majority_baseline")
+        assert c["status"] == "RED"
+        assert c["measurement_horizon"] == "undeclared"
+
+    def test_veto_gate_is_stamped_at_the_producers_primary_horizon(self, s3):
+        from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+        vg = _comp(self._tile(s3, veto=TestVetoGatePrecision._OK), "veto_gate_precision")
+        expected = f"{DEFAULT_POLICY.primary_horizon}d"
+        assert vg["measurement_horizon"] == expected
+        assert vg["measurement_horizon"] != "10d"
+        assert f"[{expected}]" in vg["status_reason"]
+
+    def test_veto_gate_prefers_a_horizon_the_artifact_declares(self, s3):
+        veto = {**TestVetoGatePrecision._OK, "horizon_days": 10}
+        vg = _comp(self._tile(s3, veto=veto), "veto_gate_precision")
+        assert vg["measurement_horizon"] == "10d"
+        assert "[10d]" in vg["status_reason"]
+
+    def test_manifest_metrics_carry_the_manifests_forward_days(self, s3):
+        manifest = {**_MANIFEST, "forward_days": 5}
+        tile = self._tile(s3, manifest=manifest)
+        for name in ("meta_l2_ic", "momentum_l1_ic", "volatility_l1_ic", "ensemble_lift_over_best_l1"):
+            assert _comp(tile, name)["measurement_horizon"] == "5d", name
+
+    def test_manifest_without_forward_days_is_undeclared_not_assumed(self, s3):
+        tile = self._tile(s3)  # _MANIFEST declares no forward_days
+        for name in ("meta_l2_ic", "momentum_l1_ic", "volatility_l1_ic"):
+            assert _comp(tile, name)["measurement_horizon"] == "undeclared", name
+
+    def test_walk_forward_n_is_labelled_as_folds(self, s3):
+        # I11988 root cause 7: N=16 is walk-forward folds, not accumulating dates.
+        tile = self._tile(s3, manifest={**_MANIFEST, "forward_days": 21, "date": "2026-08-14"})
+        for name in ("momentum_l1_ic", "volatility_l1_ic"):
+            c = _comp(tile, name)
+            assert c["n_samples"] == 16
+            assert "N=16 walk-forward FOLDS" in c["status_reason"], name
+            assert "2026-08-14" in c["status_reason"], name
+            assert "[21d]" in c["status_reason"], name
+
+    def test_every_bracketed_horizon_in_a_reason_matches_the_stamp(self, s3):
+        """The general invariant: a reason that names a horizon names the
+        same one the record is stamped with — the card and its prose can
+        never disagree about what a number measures."""
+        import re
+
+        tile = self._tile(
+            s3, cm=self._cm(horizons_days=[21]), veto=TestVetoGatePrecision._OK,
+            manifest={**_MANIFEST, "forward_days": 21},
+        )
+        checked = 0
+        for c in tile["components"]:
+            for hz in re.findall(r"\[(\d+d)\]", c.get("status_reason") or ""):
+                assert hz == c["measurement_horizon"], (c["name"], hz, c["measurement_horizon"])
+                checked += 1
+        assert checked >= 6
