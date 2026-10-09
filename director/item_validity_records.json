@@ -1,0 +1,149 @@
+{
+  "_doc": "Declared item completion / ruling records the weekly Director reads (director/item_validity_gate.py, alpha-engine-config-I11990). Each record restates an AUTHORITATIVE closure or human ruling, copied unchanged from tests/fixtures/director_item_validity_known_answers.json (crucible-evaluator-PR338). The reopen_when threshold on each record is a declared value awaiting Brian's ruling on alpha-engine-config-I11990 / crucible-evaluator-PR338: do not change one without that ruling. A record whose condition is over a measure the report card does not carry is held unevaluable (never graded on color) until a producer supplies that observation.",
+  "schema_version": 1,
+  "records": [
+    {
+      "item": "alpha-engine-config-I2972",
+      "scope": {
+        "anchor": "nousergon-data:universe_returns 21d-horizon label writer",
+        "acceptance": "21d-labels-populating"
+      },
+      "completion": {
+        "kind": "premise_disproved",
+        "closed_on": "2026-07-20",
+        "closure_ref": "alpha-engine-config-I2972#issuecomment-5017155505",
+        "premise": "universe_returns 21d-horizon columns stopped populating after 2026-06-16",
+        "evidence": [
+          {
+            "measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}",
+            "observed_at": "2026-10-03",
+            "value": 0,
+            "source": "AlphaEngine/Data CloudWatch; alpha-engine-config-I11093#issuecomment-5968543453, re-queried by the I11988 audit"
+          }
+        ],
+        "reopen_when": {
+          "measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}",
+          "op": "gt",
+          "threshold": 0
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I11093",
+      "scope": {
+        "anchor": "nousergon-data:universe_returns 21d-horizon label surface",
+        "acceptance": "21d-grades-not-corrupted-by-label-stall"
+      },
+      "completion": {
+        "kind": "premise_disproved",
+        "closed_on": "2026-10-03",
+        "closure_ref": "alpha-engine-config-I11093#issuecomment-5968543453",
+        "premise": "the I2972 21d-return column stall is corrupting predictor/research 21d grades",
+        "evidence": [
+          {
+            "measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}",
+            "observed_at": "2026-10-03",
+            "value": 0,
+            "source": "AlphaEngine/Data CloudWatch"
+          },
+          {
+            "measure": "predictor_outcomes_grading_lag_trading_days{HorizonDays=21}",
+            "observed_at": "2026-10-03",
+            "value": 0,
+            "source": "AlphaEngine/Data CloudWatch"
+          }
+        ],
+        "reopen_when": {
+          "measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}",
+          "op": "gt",
+          "threshold": 0
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I7644",
+      "scope": {
+        "anchor": "crucible-evaluator:grading/tiles/substrate.py::_sf_success_rate",
+        "acceptance": "not-reached-stages-cycle-not-clean"
+      },
+      "completion": {
+        "kind": "repair_verified",
+        "closed_on": "2026-08-25",
+        "closure_ref": "alpha-engine-config-I7644#issuecomment-5418024826",
+        "change_ref": "crucible-evaluator-PR235",
+        "evidence": [
+          {
+            "measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages",
+            "observed_at": "2026-08-21",
+            "value": 0,
+            "source": "evaluator 2026-08-21 report card sf_success_rate_4w status_reason (weekly 0/16, per-cycle scope named)"
+          },
+          {
+            "measure": "sf_success_rate_4w",
+            "observed_at": "2026-08-21",
+            "value": 0.4667,
+            "n": 60,
+            "status": "RED",
+            "source": "evaluator 2026-08-21 report card"
+          }
+        ],
+        "reopen_when": {
+          "measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages",
+          "op": "gt",
+          "threshold": 0
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I964",
+      "scope": {
+        "anchor": "crucible-executor:value-stance falling-knife guard (L4549)",
+        "acceptance": "falling-knife-guard"
+      },
+      "ruling": {
+        "decision": "sunset",
+        "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I964#issuecomment-5593742298",
+        "reopen_when": {
+          "measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained",
+          "op": "eq",
+          "threshold": 1
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I1084",
+      "scope": {
+        "anchor": "crucible-backtester:portfolio report vs deployed strategy",
+        "acceptance": "portfolio-report-measures-deployed-strategy"
+      },
+      "ruling": {
+        "decision": "sunset",
+        "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I1084#issuecomment-5593740565",
+        "reopen_when": {
+          "measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained",
+          "op": "eq",
+          "threshold": 1
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I2978",
+      "scope": {
+        "anchor": "nousergon-data:universe_returns 21d-horizon label surface",
+        "acceptance": "21d-grades-not-corrupted-by-label-stall"
+      },
+      "ruling": {
+        "decision": "sunset",
+        "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I2978#issuecomment-5593739433",
+        "reopen_when": {
+          "measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained",
+          "op": "eq",
+          "threshold": 1
+        }
+      }
+    }
+  ]
+}
