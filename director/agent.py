@@ -765,7 +765,41 @@ def _stamp_route_degradation(plan, *, served_model, primary_model) -> bool | Non
 # sit at 91-98 tok/s. So the cap's contribution is bounded by how much of the
 # output it removes (one `carryover_review` disposition line per elided row),
 # not by the prompt characters it saves.
-DIRECTOR_PLAN_MEASURED_MAX_S = 356.9
+#
+# ── Re-anchored 2026-10-07, 356.9 -> 596.04, POST-cap (alpha-engine-config-I8200)
+#
+# The measurement the block above deferred. Read from this module's own EMF
+# records in /aws/lambda/alpha-engine-evaluator-director, every primary plan
+# attempt since the cap deployed that was `outcome=ok` (uncensored) with
+# `DirectorPlanCarryoverItems=20` (the cap binding, 7-13 rows omitted):
+#
+#   09-05 299.9  09-12 233.8  09-19 470.6  09-19 379.1  09-20 569.7  09-20 357.8
+#   09-20 559.3  09-24 585.5  09-26 382.5  09-26 596.0  09-27 387.5   (seconds)
+#
+# plus the first weekly-spot run, 10-04 332.6s (`outcome=ok`, box log). Twelve
+# samples against the three I8200 asked for. The slowest, 596.04s on 2026-09-26
+# 12:14Z, is the anchor: 42,764 completion tokens (35,646 of them reasoning),
+# 68,528 prompt chars. The 10-03 616.6s attempt is NOT a sample: it was censored
+# by the 600s Lambda wall (`error:StreamTotalTimeoutError`).
+#
+# The anchor moved, so the cap did not hold the requirement down — I8200's own
+# gotcha predicted this: duration tracks completion tokens, and those grew
+# (17-56k) when the `ultra` primary went to glm-5.3 on 2026-09-12, which spends
+# 75-85% of them reasoning (alpha-engine-config-I11936). That is the finding.
+#
+# Why this was not done on 2026-10-02 when the samples first sufficed
+# (alpha-engine-config-I9015): amber at 0.9 x 596.04 = 536.4s would have sat 64s
+# under a 600s wall the call was already brushing. That premise is gone. Since
+# 2026-10-04 the weekly Director runs on the weekly spot (director/hosting.py
+# WEEKLY_SPOT, 1,800s plan ceiling), so 536.4s is 30% of the wall it now runs
+# under. On the residual Lambda home (600s) amber still fires 64s before the
+# wall, and `_emit_plan_latency`'s clamp keeps it below any shorter quote.
+#
+# 596.04 finished 4s inside a 600s wall, so it is a LOWER bound on what the call
+# can need — every sample was taken under a ceiling that would have cut a slower
+# one off. The next re-anchor reads the WEEKLY_SPOT runs, whose 1,800s ceiling
+# censors nothing this call has ever produced.
+DIRECTOR_PLAN_MEASURED_MAX_S = 596.04
 DIRECTOR_PLAN_AMBER_FRACTION = 0.9
 
 
