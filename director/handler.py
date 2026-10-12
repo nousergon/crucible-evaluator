@@ -37,7 +37,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import boto3
@@ -52,6 +52,7 @@ from director.issue_filer import (
     open_issues_digest,
     recently_closed_proposals_digest,
 )
+from director.item_validity_gate import VERDICT_KEY, assess_ledger
 from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from director.substatus import apply_substatus_honesty
@@ -284,7 +285,8 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None
 
 
 def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget=None,
-                             verdict_block: dict | None = None) -> dict:
+                             verdict_block: dict | None = None,
+                             run_date: str | None = None) -> dict:
     """Phase H+ (config#3145): close the Director loop. Runs BEFORE this
     week's ledger write so any correction it makes (backfilled issue
     numbers, a sticky ``escalated`` flag) persists in the same write —
@@ -321,7 +323,18 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
 
     Ordering is load-bearing: the backfill runs BEFORE the verification pass, so
     on the cycle the attestation clears, that cycle's corrections already see the
-    numbers this cycle recovered."""
+    numbers this cycle recovered.
+
+    **Item validity runs between the two, under every verdict**
+    (``alpha-engine-config-I11990``). ``_assess_item_validity_best_effort``
+    stamps each ledger row with whether it is valid to grade on cited-metric
+    color this week, and why not when it is not, from the declared
+    completion / ruling records. It is a read of the Director's own ledger
+    against the card — the same class as the backfill — so a withheld verdict
+    still gets the per-item statement. It runs AFTER the backfill because a
+    row's own issue number is part of its work identity, and BEFORE
+    ``verify_and_correct``, which skips the color grade for a row the stamp
+    marks not valid."""
     if not token:
         return {"director_loop": "skipped", "director_loop_reason": "no GH token"}
     # config#6915: one check for the whole pass. The pass MUTATES (an issue
@@ -347,6 +360,9 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
         logger.warning("Director loop-verification backfill failed (non-fatal): %s", e)
         out["director_loop_backfill_error"] = str(e)
 
+    # --- runs regardless of the verdict (I11990): own-ledger annotation only.
+    out.update(_assess_item_validity_best_effort(items, card, run_date))
+
     # --- gated on the verdict: reopen-if-unrecovered and carryover escalation.
     # Named by authority. `actions_withheld` is asked about the ACTIONS, not
     # about this function, so a future non-mutating addition here does not
@@ -366,9 +382,13 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
     try:
         result = verify_and_correct(items, card, repo=DEFAULT_REPO, token=token)
         out.update({f"director_loop_{k}": v for k, v in result.items()})
+        # An unreadable records file graded nothing that was closed (fail
+        # closed, I11990): the pass did less than it was asked, so it reads
+        # PARTIAL — the same word a failed backfill or lookup earns.
         out["director_loop"] = (
             "partial"
             if out.get("director_loop_backfill_error") or result.get("lookup_failed")
+            or out.get("director_item_validity") == "error"
             else "ok"
         )
     except Exception as e:  # noqa: BLE001 — advisory correction pass; ledger already valid
@@ -376,6 +396,31 @@ def _verify_loop_best_effort(ledger: dict, card: dict, token: str | None, budget
         out["director_loop"] = "error"
         out["director_loop_error"] = str(e)
     return out
+
+
+def _assess_item_validity_best_effort(items: list[dict], card: dict | None,
+                                      run_date: str | None) -> dict:
+    """Stamp every ledger row with its item-validity verdict
+    (``director.item_validity_gate``, alpha-engine-config-I11990). Never raises.
+
+    If the assessment itself fails, every row is stamped NOT valid to grade with
+    the error as the reason — fail closed, and never left carrying LAST week's
+    stamp, which ``verify_and_correct`` would otherwise obey."""
+    try:
+        as_of = date.fromisoformat(str(run_date)[:10]) if run_date else datetime.now(timezone.utc).date()
+    except ValueError:
+        as_of = datetime.now(timezone.utc).date()
+    try:
+        return assess_ledger(items, card, as_of=as_of)
+    except Exception as e:  # noqa: BLE001 — annotation; never sinks the loop pass
+        logger.error("Director item-validity assessment failed — no closed item graded: %s", e)
+        reason = f"item-validity assessment failed ({type(e).__name__}: {e}); not graded"[:400]
+        for row in items:
+            row[VERDICT_KEY] = {
+                "as_of": as_of.isoformat(), "valid_to_grade": False,
+                "basis": "assessment_error", "decision": None, "matched": [], "reason": reason,
+            }
+        return {"director_item_validity": "error", "director_item_validity_error": str(e)}
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
@@ -947,7 +992,7 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
     # issue_number, sticky escalated flag) land in this week's persisted
     # ledger.
     loop_summary = _verify_loop_best_effort(merged, card, gh_token, budget=budget,
-                                            verdict_block=verdict_block)
+                                            verdict_block=verdict_block, run_date=run_date)
 
     ledger_key = write_ledger(bucket, merged, s3_client=s3)
 

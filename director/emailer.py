@@ -19,6 +19,7 @@ and never breaks the Director run.
 from __future__ import annotations
 
 import logging
+from html import escape as _html_escape
 from typing import Any
 
 from krepis.console import console_url
@@ -62,6 +63,7 @@ _LOOP_SUMMARY_LABELS = (
     ("closed_verified", "closed & verified"),
     ("closed_unrecovered", "closed but UNRECOVERED"),
     ("closed_unverifiable", "closed, unverifiable"),
+    ("closed_not_valid_to_grade", "closed, NOT valid to grade"),
     ("escalated", "escalated to Decision Queue"),
 )
 
@@ -110,6 +112,41 @@ def _loop_summary_line(loop_summary: dict | None) -> str | None:
         parts.append("backfill FAILED")
     prefix = "PARTIAL — " if status == "partial" else ""
     return "Director loop: " + prefix + ", ".join(parts)
+
+
+def _item_validity_lines(loop_summary: dict | None) -> list[str]:
+    """Per-item grading validity (alpha-engine-config-I11990).
+
+    Every ledger item graded by a declared completion / ruling record is named,
+    with its reason when it is NOT valid to grade — the reader sees which items
+    were withheld from the color grade and why, rather than a count. Items no
+    record covers are graded on cited-metric color exactly as before and are
+    counted, not listed; their per-item stamp is on the ledger row. A missing
+    or unreadable records file is said out loud, never left blank."""
+    if not loop_summary or "director_item_validity" not in loop_summary:
+        return []
+    status = loop_summary.get("director_item_validity")
+    head = "Item validity (alpha-engine-config-I11990): "
+    if status == "absent":
+        return [head + "records file ABSENT — every item graded on cited-metric color (pre-I11990 rule)."]
+    if status != "loaded":
+        err = loop_summary.get("director_item_validity_error") or "reason unavailable"
+        return [head + f"records UNREADABLE ({err}) — no closed item was graded this week."]
+    items = list(loop_summary.get("director_item_validity_items") or [])
+    by_record = [i for i in items if i.get("basis") == "item_validity_record"]
+    not_valid = [i for i in items if not i.get("valid_to_grade")]
+    lines = [
+        head + f"{len(not_valid)} of {len(items)} ledger item(s) NOT valid to grade; "
+        f"{len(by_record)} decided by a declared record, "
+        f"{sum(1 for i in items if i.get('basis') == 'no_record')} with no record "
+        "(graded on cited-metric color)."
+    ]
+    for it in sorted(by_record + [i for i in not_valid if i not in by_record],
+                     key=lambda i: (bool(i.get("valid_to_grade")), str(i.get("id")))):
+        issue = f" (#{it['issue_number']})" if it.get("issue_number") else ""
+        verdict = "valid to grade" if it.get("valid_to_grade") else "NOT valid to grade"
+        lines.append(f"  - {it.get('id')}{issue}: {verdict} — {it.get('reason')}")
+    return lines
 
 
 def _verdict_banner(verdict_block: dict | None) -> tuple[str, str, str] | None:
@@ -397,6 +434,9 @@ def build_director_digest(
     loop_line = _loop_summary_line(loop_summary)
     if loop_line:
         plain_lines += ["", loop_line]
+    validity_lines = _item_validity_lines(loop_summary)
+    if validity_lines:
+        plain_lines += [""] + validity_lines
     plain_lines += ["", footer,
                     f"Full detail (rationale, evidence, carry-over, self-grade): {url}"]
     plain_body = "\n".join(plain_lines)
@@ -431,6 +471,16 @@ def build_director_digest(
         "<th style='padding:3px 8px;'>Conf</th></tr>"
         f"{rows}</table>"
         + (f"<p style='font-size:12px;'>{loop_line}</p>" if loop_line else "")
+        + (
+            "<p style='font-size:12px;'>" + _html_escape(validity_lines[0]) + "</p>"
+            + (
+                "<ul style='margin:2px 0;font-size:12px;'>"
+                + "".join(f"<li>{_html_escape(line.strip()[2:])}</li>" for line in validity_lines[1:])
+                + "</ul>"
+                if len(validity_lines) > 1 else ""
+            )
+            if validity_lines else ""
+        )
         + f"<p style='font-size:11px;color:#555;margin-top:14px;'>{footer}</p>"
         + "<p style='font-size:10px;color:#aaa;margin-top:20px;'>"
         "Advisory only — the Director proposes; rationale, evidence, carry-over, "
