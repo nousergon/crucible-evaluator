@@ -1,0 +1,152 @@
+{
+  "_doc": "Known-answer fixtures for director/item_validity.py (alpha-engine-config-I11990, slice 1). Each record restates the AUTHORITATIVE closure or ruling of a real issue; each proposal restates an item the 2026-10-02 Director plan (or the I11984 filing) actually produced. 'current' is the evidence available on 2026-10-04. Values come from the closing comments and the I11988 audit cited in each 'source'. Do not edit an expected answer to make a test pass: a changed answer is a changed contract.",
+  "as_of": "2026-10-04",
+  "records": [
+    {
+      "item": "alpha-engine-config-I2972",
+      "scope": {"anchor": "nousergon-data:universe_returns 21d-horizon label writer", "acceptance": "21d-labels-populating"},
+      "completion": {
+        "kind": "premise_disproved",
+        "closed_on": "2026-07-20",
+        "closure_ref": "alpha-engine-config-I2972#issuecomment-5017155505",
+        "premise": "universe_returns 21d-horizon columns stopped populating after 2026-06-16",
+        "evidence": [
+          {"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "observed_at": "2026-10-03", "value": 0, "source": "AlphaEngine/Data CloudWatch; alpha-engine-config-I11093#issuecomment-5968543453, re-queried by the I11988 audit"}
+        ],
+        "reopen_when": {"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "op": "gt", "threshold": 0}
+      }
+    },
+    {
+      "item": "alpha-engine-config-I11093",
+      "scope": {"anchor": "nousergon-data:universe_returns 21d-horizon label surface", "acceptance": "21d-grades-not-corrupted-by-label-stall"},
+      "completion": {
+        "kind": "premise_disproved",
+        "closed_on": "2026-10-03",
+        "closure_ref": "alpha-engine-config-I11093#issuecomment-5968543453",
+        "premise": "the I2972 21d-return column stall is corrupting predictor/research 21d grades",
+        "evidence": [
+          {"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "observed_at": "2026-10-03", "value": 0, "source": "AlphaEngine/Data CloudWatch"},
+          {"measure": "predictor_outcomes_grading_lag_trading_days{HorizonDays=21}", "observed_at": "2026-10-03", "value": 0, "source": "AlphaEngine/Data CloudWatch"}
+        ],
+        "reopen_when": {"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "op": "gt", "threshold": 0}
+      }
+    },
+    {
+      "item": "alpha-engine-config-I7644",
+      "scope": {"anchor": "crucible-evaluator:grading/tiles/substrate.py::_sf_success_rate", "acceptance": "not-reached-stages-cycle-not-clean"},
+      "completion": {
+        "kind": "repair_verified",
+        "closed_on": "2026-08-25",
+        "closure_ref": "alpha-engine-config-I7644#issuecomment-5418024826",
+        "change_ref": "crucible-evaluator-PR235",
+        "evidence": [
+          {"measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages", "observed_at": "2026-08-21", "value": 0, "source": "evaluator 2026-08-21 report card sf_success_rate_4w status_reason (weekly 0/16, per-cycle scope named)"},
+          {"measure": "sf_success_rate_4w", "observed_at": "2026-08-21", "value": 0.4667, "n": 60, "status": "RED", "source": "evaluator 2026-08-21 report card"}
+        ],
+        "reopen_when": {"measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages", "op": "gt", "threshold": 0}
+      }
+    },
+    {
+      "item": "alpha-engine-config-I964",
+      "scope": {"anchor": "crucible-executor:value-stance falling-knife guard (L4549)", "acceptance": "falling-knife-guard"},
+      "ruling": {
+        "decision": "sunset", "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I964#issuecomment-5593742298",
+        "reopen_when": {"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "op": "eq", "threshold": 1}
+      }
+    },
+    {
+      "item": "alpha-engine-config-I1084",
+      "scope": {"anchor": "crucible-backtester:portfolio report vs deployed strategy", "acceptance": "portfolio-report-measures-deployed-strategy"},
+      "ruling": {
+        "decision": "sunset", "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I1084#issuecomment-5593740565",
+        "reopen_when": {"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "op": "eq", "threshold": 1}
+      }
+    },
+    {
+      "item": "alpha-engine-config-I2978",
+      "scope": {"anchor": "nousergon-data:universe_returns 21d-horizon label surface", "acceptance": "21d-grades-not-corrupted-by-label-stall"},
+      "ruling": {
+        "decision": "sunset", "decided_on": "2026-09-08",
+        "source_ref": "alpha-engine-config-I2978#issuecomment-5593739433",
+        "reopen_when": {"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "op": "eq", "threshold": 1}
+      }
+    }
+  ],
+  "current": [
+    {"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "observed_at": "2026-10-03", "value": 0, "source": "AlphaEngine/Data CloudWatch, three hourly maxima (I11988 audit)"},
+    {"measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages", "observed_at": "2026-10-02", "value": 0, "source": "2026-10-02 card: clean requires full declared-spine coverage (I11987 / I11988 audit)"},
+    {"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "observed_at": "2026-10-04", "value": 0, "source": "alpha-engine-config-I9760 thread: no ruling cancelling phase 4 or retaining v1"},
+    {"measure": "momentum_l1_ic", "observed_at": "2026-10-02", "value": -0.024421, "n": 16, "status": "RED", "source": "2026-10-02 report card (N is walk_forward.n_folds)"},
+    {"measure": "alpha_vs_spy", "observed_at": "2026-10-02", "value": -0.12126969924606945, "n": 144, "status": "RED", "source": "2026-10-02 report card"},
+    {"measure": "information_ratio", "observed_at": "2026-10-02", "value": -1.7929880167239172, "n": 144, "status": "RED", "source": "2026-10-02 report card"},
+    {"measure": "sf_success_rate_4w", "observed_at": "2026-10-02", "status": "RED", "source": "2026-10-02 report card"}
+  ],
+  "expected_reconciliation": {
+    "alpha-engine-config-I2972": "stays_closed",
+    "alpha-engine-config-I11093": "stays_closed",
+    "alpha-engine-config-I7644": "stays_closed",
+    "alpha-engine-config-I964": "stays_closed",
+    "alpha-engine-config-I1084": "stays_closed",
+    "alpha-engine-config-I2978": "stays_closed"
+  },
+  "proposals": [
+    {
+      "_why": "2026-10-02 plan action 4: 'land residual #2972'. Premise disproved; labels current.",
+      "proposal": {"id": "land-residual-2972", "priority": "P0", "targets": ["alpha-engine-config-I2972"], "evidence": ["momentum_l1_ic", "research_composite_ic"]},
+      "expected": {"decision": "refuse", "priority": "P0", "matched": ["alpha-engine-config-I2972"]}
+    },
+    {
+      "_why": "The same question under a fresh slug: identity is scope, not slug.",
+      "proposal": {"id": "validate-21d-label-surface-v2", "priority": "P0", "scope": {"anchor": "nousergon-data:universe_returns 21d-horizon label surface", "acceptance": "21d-grades-not-corrupted-by-label-stall"}, "evidence": ["momentum_l1_ic"]},
+      "expected": {"decision": "refuse", "priority": "P0", "matched": ["alpha-engine-config-I11093", "alpha-engine-config-I2978"]}
+    },
+    {
+      "_why": "2026-10-02 plan action 6 (substrate-weekly-freshness-clean-cycle): 'land I7644'. Landed in crucible-evaluator-PR235 and verified 2026-08-25.",
+      "proposal": {"id": "substrate-weekly-freshness-clean-cycle", "priority": "P0", "targets": ["alpha-engine-config-I7644"], "evidence": ["sf_success_rate_4w"]},
+      "expected": {"decision": "refuse", "priority": "P0", "matched": ["alpha-engine-config-I7644"]}
+    },
+    {
+      "_why": "The valid class behind action 6 is I11987's skip semantics: same anchor, different acceptance, so it is different work.",
+      "proposal": {"id": "clean-with-declared-skips", "priority": "P1", "scope": {"anchor": "crucible-evaluator:grading/tiles/substrate.py::_sf_success_rate", "acceptance": "clean-with-declared-skips"}, "evidence": ["sf_success_rate_4w"]},
+      "expected": {"decision": "allow", "priority": "P1", "matched": []}
+    },
+    {
+      "_why": "2026-10-02 plan action 1 re-asks the I964 sunset ruling under a fresh slug while portfolio metrics stay RED.",
+      "proposal": {"id": "keep-sizing-derisked-exit-criteria", "priority": "P1", "scope": {"anchor": "crucible-executor:value-stance falling-knife guard (L4549)", "acceptance": "falling-knife-guard"}, "evidence": ["alpha_vs_spy", "information_ratio"]},
+      "expected": {"decision": "refuse", "priority": "P1", "matched": ["alpha-engine-config-I964"]}
+    },
+    {
+      "_why": "2026-10-02 plan action 2 re-asks the I1084 sunset ruling.",
+      "proposal": {"id": "deployed-strategy-n-window-validation", "priority": "P1", "targets": ["alpha-engine-config-I1084"], "evidence": ["alpha_vs_spy", "information_ratio"]},
+      "expected": {"decision": "refuse", "priority": "P1", "matched": ["alpha-engine-config-I1084"]}
+    },
+    {
+      "_why": "alpha-engine-config-I11984: a new run-scope cadence-branch defect. It shares sf_success_rate_4w with closed I7644 but is different work, so it keeps P1.",
+      "proposal": {"id": "run-scope-cadence-branch-attribution", "priority": "P1", "scope": {"anchor": "nousergon-data:infrastructure/lambdas/weekly-run-scope/run_scope.py::work_entry", "acceptance": "run-scope-follows-observed-cadence-branch"}, "evidence": ["sf_success_rate_4w", "EvalJudge"]},
+      "shares_evidence_with": "alpha-engine-config-I7644",
+      "expected": {"decision": "allow", "priority": "P1", "matched": []}
+    }
+  ],
+  "changed_conditions": [
+    {
+      "name": "21d label lag actually recurs",
+      "override": [{"measure": "universe_returns_horizon_grading_lag_trading_days{HorizonDays=21}", "observed_at": "2026-10-09", "value": 3, "source": "synthetic: genuine recurrence"}],
+      "expected_reconciliation": {"alpha-engine-config-I2972": "reopen_condition_met", "alpha-engine-config-I11093": "reopen_condition_met", "alpha-engine-config-I2978": "stays_closed"},
+      "expected_decisions": {"land-residual-2972": "allow", "validate-21d-label-surface-v2": "refuse"}
+    },
+    {
+      "name": "I7644 defect signature recurs",
+      "override": [{"measure": "sf_success_rate_4w.clean_cycles_with_not_reached_stages", "observed_at": "2026-10-09", "value": 2, "source": "synthetic: genuine recurrence"}],
+      "expected_reconciliation": {"alpha-engine-config-I7644": "reopen_condition_met"},
+      "expected_decisions": {"substrate-weekly-freshness-clean-cycle": "allow"}
+    },
+    {
+      "name": "the sunset ruling's own invalid-when is met",
+      "override": [{"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "observed_at": "2026-10-09", "value": 1, "source": "synthetic: ruling on I9760 retains v1"}],
+      "expected_reconciliation": {"alpha-engine-config-I964": "reopen_condition_met", "alpha-engine-config-I1084": "reopen_condition_met", "alpha-engine-config-I2978": "reopen_condition_met"},
+      "expected_decisions": {"keep-sizing-derisked-exit-criteria": "allow", "deployed-strategy-n-window-validation": "allow", "validate-21d-label-surface-v2": "refuse"}
+    }
+  ]
+}
