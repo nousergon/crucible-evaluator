@@ -26,8 +26,12 @@ contract is live and self-activates on the first ``agent_quality.json``.
 
 ``judge_calibration_cohen_kappa`` stays N/A-NOT-IMPL — it needs a human
 blind-Step-1-operator labeling pass (config Batch E #1153), not just a
-producer. ``stance_source_provenance`` is N/A-MISSING-INPUT until the
-``signals.json`` ``stance_source`` field lands (crucible-research#297).
+producer. ``stance_source_provenance`` reads the dated
+``signals/{run_date}/signals.json`` (windowed) and grades the share of
+``universe`` entries carrying a ``stance_source`` (crucible-research#297). It
+is N/A-MISSING-INPUT only when no signals artifact resolves, it is stale, or
+no entry carries the field at all — until alpha-engine-config-I12231 it was
+hard-coded N/A even though the producer had been emitting the field.
 
 The four ``groom_*`` components (config#2151) grade the backlog-groom
 pipeline's LLM-agent runs from ``groom/{date}/*.json`` — computed in
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 
 import boto3
 from botocore.exceptions import ClientError
@@ -85,6 +90,67 @@ def _block(aq: dict | None, key: str) -> dict | None:
     if isinstance(blk, dict) and blk.get("value") is not None:
         return blk
     return None
+
+
+#: Windowed key of the dated signals artifact the provenance component reads.
+#: Dated, not ``signals/latest.json``: the card grades the run it is for.
+SIGNALS_KEY_TEMPLATE = "signals/{date}/signals.json"
+
+
+def _stance_source_provenance(s3, bucket: str, run_date: str):
+    """Grade ``stance_source_provenance`` from the dated ``signals.json``.
+
+    value = entries with a non-empty string ``stance_source`` / all
+    ``universe`` entries. An artifact in which NO entry carries the field is a
+    producer that predates crucible-research#297 — that is MISSING-INPUT, not
+    a measured 0%. The reason names the source-value distribution so a card
+    reader can see when provenance is present but single-valued.
+    """
+    name = "stance_source_provenance"
+    sig, _sig_date, sig_age, sig_key = get_json_windowed(s3, bucket, SIGNALS_KEY_TEMPLATE, run_date)
+    src = f"s3://{bucket}/{sig_key}" if sig_key else f"s3://{bucket}/{SIGNALS_KEY_TEMPLATE.format(date=run_date)}"
+
+    def _na(detail: str):
+        return build_metric(
+            name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
+            n_floor=1, source_path=src, input_present=False, na_detail=detail,
+        )
+
+    if sig is None:
+        return _na(
+            f"{name}: no signals.json resolved for {run_date} in the trailing "
+            f"window — the field is emitted on universe entries by the signals "
+            f"producer (crucible-research#297)."
+        )
+    if artifact_is_stale(sig_age, AGENT_ARTIFACT_MAX_AGE_DAYS):
+        return _na(
+            f"{name}: signals.json is {sig_age}d old "
+            f"(> {AGENT_ARTIFACT_MAX_AGE_DAYS}d max) — stale input, cannot grade confidently."
+        )
+    universe = sig.get("universe") if isinstance(sig, dict) else None
+    entries = [e for e in universe if isinstance(e, dict)] if isinstance(universe, list) else []
+    if not entries:
+        return _na(f"{name}: signals.json carries no universe entries this cycle.")
+    if not any("stance_source" in e for e in entries):
+        return _na(
+            f"{name}: none of the {len(entries)} signals.json universe entries "
+            f"carries a `stance_source` field — the producer predates "
+            f"crucible-research#297."
+        )
+    sources = [e.get("stance_source") for e in entries]
+    tagged = [v for v in sources if isinstance(v, str) and v.strip()]
+    value = len(tagged) / len(entries)
+    dist = Counter(tagged).most_common(4)
+    dist_txt = ", ".join(f"{k}={n}" for k, n in dist) or "none"
+    return build_metric(
+        name=name, module=MODULE, metric_type="pct", criticality="diagnostic",
+        value=value, unit=FRACTION, n_samples=len(entries), n_floor=1,
+        source_path=src,
+        reason=(
+            f"{name} = {value:.1%} ({len(tagged)}/{len(entries)} universe entries "
+            f"carry a stance_source; distribution: {dist_txt}) vs target 95% / red-line 50%."
+        ),
+    )
 
 
 def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
@@ -214,14 +280,13 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
             else agent_quality_na_reason(aq, "judge_rubric_distribution"),
         ))
 
-    # 6. stance_source_provenance (diagnostic) — pick-provenance coverage; lands
-    #    when signals.json carries `stance_source` (crucible-research#297).
-    components.append(build_metric(
-        name="stance_source_provenance", module=MODULE, metric_type="pct", criticality="diagnostic",
-        n_floor=1, source_path=f"s3://{bucket}/signals/latest.json",
-        input_present=False,
-        na_detail="stance_source_provenance: signals.json universe entries' `stance_source` field self-activates on the first run carrying it (crucible-research#297).",
-    ))
+    # 6. stance_source_provenance (diagnostic) — pick-provenance coverage: the
+    #    share of signals.json ``universe`` entries carrying a non-empty
+    #    ``stance_source`` (crucible-research#297). Until
+    #    alpha-engine-config-I12231 this was hard-coded N/A-MISSING-INPUT and
+    #    never read the artifact, so the producer's field (902/902 entries on
+    #    2026-10-09) could not self-activate as the contract promised.
+    components.append(_stance_source_provenance(s3, bucket, run_date))
 
     # 7. judge_calibration_cohen_kappa (critical) — needs a HUMAN blind-Step-1
     #    labeling pass vs the LLM judge; not a producer (config Batch E #1153).

@@ -520,6 +520,14 @@ def _put_agent_quality(s3, body):
     )
 
 
+def _put_signals(s3, date, universe):
+    import json
+    s3.put_object(
+        Bucket=BUCKET, Key=f"signals/{date}/signals.json",
+        Body=json.dumps({"date": date, "universe": universe}).encode(),
+    )
+
+
 class TestAgent:
     def test_all_components_na_when_no_producer(self, s3):
         tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
@@ -550,6 +558,47 @@ class TestAgent:
         ss = _comp(tile, "stance_source_provenance")
         assert ss["status"] == "N/A-MISSING-INPUT"
         assert "stance_source" in ss["status_reason"]
+
+    # alpha-engine-config-I12231: the component used to be hard-coded
+    # N/A-MISSING-INPUT and never read signals.json, so the producer's
+    # field could not self-activate. These pin the wired read.
+    def test_stance_source_grades_from_dated_signals(self, s3):
+        _put_signals(s3, RUN_DATE, [
+            {"ticker": "AAA", "stance_source": "quant_envelope_producer"},
+            {"ticker": "BBB", "stance_source": "quant_envelope_producer"},
+            {"ticker": "CCC", "stance_source": "carryover"},
+            {"ticker": "DDD", "stance_source": "cio_entrant"},
+        ])
+        ss = _comp(build_agent_tile(BUCKET, RUN_DATE, s3_client=s3), "stance_source_provenance")
+        assert ss["value"] == pytest.approx(1.0)
+        assert ss["n_samples"] == 4
+        assert ss["status"] == "GREEN"
+        assert ss["source_path"] == f"s3://{BUCKET}/signals/{RUN_DATE}/signals.json"
+        assert "quant_envelope_producer=2" in ss["status_reason"]
+
+    def test_stance_source_partial_coverage_is_measured_not_na(self, s3):
+        _put_signals(s3, RUN_DATE, [
+            {"ticker": "AAA", "stance_source": "carryover"},
+            {"ticker": "BBB", "stance_source": None},
+            {"ticker": "CCC", "stance_source": ""},
+            {"ticker": "DDD"},
+        ])
+        ss = _comp(build_agent_tile(BUCKET, RUN_DATE, s3_client=s3), "stance_source_provenance")
+        assert ss["value"] == pytest.approx(0.25)
+        assert ss["status"] == "RED"  # below the 50% red-line
+
+    def test_stance_source_field_absent_everywhere_is_missing_input(self, s3):
+        """A pre-#297 producer is MISSING-INPUT, never a measured 0%."""
+        _put_signals(s3, RUN_DATE, [{"ticker": "AAA"}, {"ticker": "BBB"}])
+        ss = _comp(build_agent_tile(BUCKET, RUN_DATE, s3_client=s3), "stance_source_provenance")
+        assert ss["status"] == "N/A-MISSING-INPUT"
+        assert ss["value"] is None
+        assert "predates" in ss["status_reason"]
+
+    def test_stance_source_empty_universe_is_missing_input(self, s3):
+        _put_signals(s3, RUN_DATE, [])
+        ss = _comp(build_agent_tile(BUCKET, RUN_DATE, s3_client=s3), "stance_source_provenance")
+        assert ss["status"] == "N/A-MISSING-INPUT"
 
     def test_judge_kappa_not_impl_names_producer(self, s3):
         tile = build_agent_tile(BUCKET, RUN_DATE, s3_client=s3)
