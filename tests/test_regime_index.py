@@ -29,6 +29,7 @@ import pytest
 from moto import mock_aws
 
 from grading.regime_index import (
+    ASOF_MAX_AGE_DAYS,
     REGIME_INDEX_KEY,
     SCHEMA_VERSION,
     SIGNALS_KEY_TEMPLATE,
@@ -219,11 +220,15 @@ class TestGetCountDoesNotScale:
         """
         _seed(s3, 200, untagged=100)
         counting = _CountingS3(s3)
-        _build_and_persist(counting)
-        assert counting.signals_gets == 200
+        _, index = _build_and_persist(counting)
+        # Cold: every probed date exactly once. Since I12230 the probe set is the
+        # 200 row dates PLUS the non-row calendar days an as-of lookup walks
+        # back over (`_dates` skips the 29th-31st, so the untagged half has some).
+        assert counting.signals_gets == index["n_entries"]
+        assert counting.signals_gets >= 200
         counting.reset()
         _build_and_persist(counting)
-        assert counting.signals_gets <= _MISS_REPROBE_DAYS
+        assert counting.signals_gets <= _MISS_REPROBE_DAYS + ASOF_MAX_AGE_DAYS
 
     def test_only_the_newly_appended_dates_are_fetched(self, s3):
         """One more weekday of book costs one more GET, not N more."""
@@ -310,9 +315,14 @@ class TestIndexContract:
         assert idx["n_entries"] == 12
         assert idx["n_resolved"] == 10
         assert idx["n_unresolved"] == 2
-        # Unresolvable dates are recorded as explicit nulls, not omitted.
+        assert idx["asof_max_age_days"] == ASOF_MAX_AGE_DAYS
+        # Unresolvable dates are recorded as explicit nulls, not omitted...
         assert idx["entries"][dates[-1]] is None
-        assert set(resolution.unresolved) == set(dates[-2:])
+        # ...but the as-of join (I12230) carries the last tagged date's regime
+        # onto them, so the caller sees no unresolved row here.
+        assert resolution.unresolved == []
+        assert resolution.sources[dates[-1]] == resolution.sources[dates[-2]] == dates[-3]
+        assert resolution.n_carried == 2
 
     def test_no_op_cycle_produces_no_index_to_write(self, s3):
         dates = _seed(s3, 30)
@@ -327,7 +337,9 @@ class TestIndexContract:
         late = dates[-1]
         first = resolve_regimes(BUCKET, dates, s3_client=s3)
         write_index(BUCKET, first.index, s3_client=s3)
-        assert late not in first.regimes
+        # Carried from the previous day until its own file lands (I12230).
+        assert first.sources[late] == dates[-2]
+        assert first.index["entries"][late] is None
 
         s3.put_object(
             Bucket=BUCKET,
@@ -336,6 +348,7 @@ class TestIndexContract:
         )
         second = resolve_regimes(BUCKET, dates, s3_client=s3)
         assert second.regimes[late] == "caution"
+        assert second.sources[late] == late
         assert second.index is not None
 
     @pytest.mark.parametrize(
@@ -359,3 +372,106 @@ class TestIndexContract:
 
         with pytest.raises(ClientError):
             read_index(BUCKET, s3_client=_Denied())
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I12230 — the as-of join.
+#
+# signals.json is written once per WEEKLY run (usually a Friday, sometimes a
+# Saturday or Sunday); eod_pnl.csv is DAILY. The exact-date join resolved
+# 43 of 149 live rows on 2026-10-12. These tests model that cadence and fail
+# against the exact-date join.
+# ---------------------------------------------------------------------------
+
+def _weekdays(start: str, n: int) -> list[str]:
+    from datetime import date, timedelta
+    d, out = date.fromisoformat(start), []
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _put_signal(s3, day: str, regime: str) -> None:
+    s3.put_object(
+        Bucket=BUCKET, Key=SIGNALS_KEY_TEMPLATE.format(date=day),
+        Body=json.dumps({"market_regime": regime}).encode(),
+    )
+
+
+class TestAsOfJoin:
+    """Each row takes the regime in force on its date, never a later one."""
+
+    def test_weekly_cadence_resolves_daily_rows_without_look_ahead(self, s3):
+        rows = _weekdays("2026-03-02", 20)            # Mon 03-02 .. Fri 03-27
+        _put_signal(s3, "2026-03-06", "bull")         # Fri
+        _put_signal(s3, "2026-03-14", "bear")         # Sat — never a row date
+        _put_signal(s3, "2026-03-20", "caution")      # Fri
+        _put_signal(s3, "2026-03-27", "neutral")      # Fri
+
+        res = resolve_regimes(BUCKET, rows, s3_client=s3)
+
+        # Before the first signal: unresolved, NOT back-filled from 03-06.
+        assert res.unresolved == ["2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05"]
+        expected = {
+            **{d: "bull" for d in rows[4:10]},        # Fri 03-06 .. Fri 03-13
+            **{d: "bear" for d in rows[10:14]},       # Mon 03-16 .. Thu 03-19
+            **{d: "caution" for d in rows[14:19]},    # Fri 03-20 .. Thu 03-26
+            "2026-03-27": "neutral",
+        }
+        assert res.regimes == expected
+        # The exact-date join resolved only the three Friday rows here.
+        assert len(res.regimes) == 16
+        assert res.sources["2026-03-16"] == "2026-03-14"
+        assert res.sources["2026-03-13"] == "2026-03-06"
+        assert all(src <= d for d, src in res.sources.items()), "look-ahead"
+
+    def test_regime_older_than_the_window_is_not_carried(self, s3):
+        rows = _weekdays("2026-03-06", 11)            # Fri 03-06 .. Fri 03-20
+        _put_signal(s3, "2026-03-06", "bull")         # then the producer skips a week
+        res = resolve_regimes(BUCKET, rows, s3_client=s3)
+        assert res.sources["2026-03-13"] == "2026-03-06"   # exactly 7 days: in force
+        assert "2026-03-16" not in res.regimes              # 10 days: stale
+        assert res.unresolved == _weekdays("2026-03-16", 5)
+
+    def test_a_later_signal_is_never_used(self, s3):
+        rows = _weekdays("2026-03-02", 4)             # Mon .. Thu
+        _put_signal(s3, "2026-03-06", "bull")         # the Friday after
+        res = resolve_regimes(BUCKET, rows, s3_client=s3)
+        assert res.regimes == {}
+        assert res.unresolved == rows
+
+    def test_tile_regime_window_counts_the_carried_rows(self, s3):
+        rows = _weekdays("2026-01-05", 60)            # 12 weeks
+        s3.put_object(Bucket=BUCKET, Key=EOD_PNL_KEY, Body=_eod_csv(rows).encode("utf-8"))
+        fridays = rows[4::5]
+        for i, day in enumerate(fridays):
+            _put_signal(s3, day, "bull" if i % 2 == 0 else "bear")
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
+        tile.pop("_regime_index", None)
+        rwa = next(c for c in tile["components"] if c["name"] == "regime_weighted_alpha")
+        # Mon 01-05 .. Thu 01-08 precede the first Friday; every other row joins.
+        assert rwa["window"]["rows_excluded"] == 4
+        assert rwa["window"]["trading_days"] == 56
+
+    def test_weekly_cadence_steady_state_get_count_does_not_scale(self):
+        """The I9702 growth guard, re-run on the weekly cadence the as-of join
+        introduces non-row probes for: warm cost is constant in history length."""
+        counts = {}
+        for n_weeks in (8, 80):
+            with mock_aws():
+                client = boto3.client("s3", region_name="us-east-1")
+                client.create_bucket(Bucket=BUCKET)
+                rows = _weekdays("2024-01-01", 5 * n_weeks)
+                client.put_object(Bucket=BUCKET, Key=EOD_PNL_KEY,
+                                  Body=_eod_csv(rows).encode("utf-8"))
+                for day in rows[4::5]:                 # every Friday
+                    _put_signal(client, day, "bull")
+                counting = _CountingS3(client)
+                _build_and_persist(counting)
+                counting.reset()
+                _build_and_persist(counting)
+                counts[n_weeks] = counting.signals_gets
+        assert counts[8] == counts[80]
+        assert counts[80] <= _MISS_REPROBE_DAYS + ASOF_MAX_AGE_DAYS

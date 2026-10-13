@@ -44,6 +44,35 @@ is likewise not an error: that is the pre-existing card contract
 (``_regime_na_detail`` in ``grading/tiles/portfolio_outcome.py`` renders it as a
 specific N/A), and this module preserves it while making the count of such
 dates a persisted, countable field rather than an invisible skip.
+
+**The join is AS-OF, not exact-date (alpha-engine-config-I12230).** The only
+producer of ``signals/{date}/signals.json`` is the ``signals_envelope`` Lambda,
+invoked once per WEEKLY Step Functions run — usually dated a Friday, sometimes a
+Saturday or Sunday. ``eod_pnl.csv`` is DAILY. An exact-date join therefore
+resolved about one trading day in five: measured 2026-10-12, 43 of 149 rows
+(71.1% unresolved), and every one of the 106 misses was an absent file, not a
+file missing the field. The regime a weekly run publishes is the regime in
+force until the next run, so each row now takes the ``market_regime`` of the
+LATEST ``signals.json`` dated on or before the row date, no more than
+``ASOF_MAX_AGE_DAYS`` calendar days older. Over the same 2026-10-12 data that
+resolves 149 of 149.
+
+* **No look-ahead.** A row only ever reads signal dates ``<= row date`` — the
+  same-day pairing the exact join already used, extended backwards only.
+* **Weekend-dated runs count.** 11 of the 58 live ``signals.json`` files are
+  dated on a Saturday or Sunday, which are never ``eod_pnl.csv`` rows, so the
+  probe set is no longer just the row dates: a row with no same-day regime
+  also probes the non-row calendar days behind it, back to the nearest day the
+  index already resolves. Each such day is fetched once and tombstoned like
+  any other, so the steady-state GET count stays bounded by a constant.
+* **Bounded staleness.** Past ``ASOF_MAX_AGE_DAYS`` the tag is stale (the
+  producer skipped a week), and the row stays UNRESOLVED and counted rather
+  than inheriting an old regime.
+
+The persisted index is unchanged in shape (still ``signals date -> regime or
+null``, ``schema_version`` 1): it caches exact per-date probes, and the as-of
+step is a pure in-memory pass over it. Which signal date each row inherited is
+returned as ``RegimeResolution.sources``.
 """
 
 from __future__ import annotations
@@ -52,7 +81,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -93,6 +122,13 @@ _MAX_FETCH_WORKERS = 8
 # the steady-state GET count does not grow with history length.
 _MISS_REPROBE_DAYS = 7
 
+# How many calendar days a published regime stays in force for the as-of join
+# (alpha-engine-config-I12230). The producer is weekly, so 7 covers a run that
+# slipped a day (Friday -> Saturday) without letting a SKIPPED week inherit a
+# fortnight-old tag. Measured 2026-10-12 over the live 149-row book and all 58
+# signals.json files: 3 days resolves 86 rows, 5 resolves 131, 7 resolves 149.
+ASOF_MAX_AGE_DAYS = 7
+
 
 class RegimeIndexError(RuntimeError):
     """The persisted regime index exists but cannot be trusted."""
@@ -102,8 +138,10 @@ class RegimeIndexError(RuntimeError):
 class RegimeResolution:
     """What one ``resolve_regimes`` call produced.
 
-    ``regimes`` is the caller-facing join (unresolvable dates simply absent —
-    the pre-existing contract). ``index`` is the merged document to persist, or
+    ``regimes`` is the caller-facing AS-OF join (unresolvable dates simply
+    absent — the pre-existing contract). ``sources`` maps each resolved date to
+    the ``signals.json`` date its regime came from (equal to the date itself
+    for a same-day match). ``index`` is the merged document to persist, or
     ``None`` when nothing changed and a write would be a no-op PUT. ``gets``
     counts signals.json fetches actually performed, which is what the
     regression test in ``tests/test_regime_index.py`` asserts does not grow
@@ -114,6 +152,12 @@ class RegimeResolution:
     index: dict | None
     gets: int = 0
     unresolved: list[str] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def n_carried(self) -> int:
+        """Rows whose regime came from an EARLIER signals.json, not same-day."""
+        return sum(1 for d, src in self.sources.items() if src != d)
 
 
 def _empty_index() -> dict:
@@ -245,43 +289,85 @@ def _dates_to_fetch(dates: list[str], entries: dict[str, str | None]) -> list[st
     return missing
 
 
-def resolve_regimes(bucket: str, dates: list[str], s3_client=None) -> RegimeResolution:
-    """Join ``dates`` to their ``market_regime`` tags through the persisted index.
+def _parse_date(date_s: str) -> date | None:
+    try:
+        return date.fromisoformat(date_s)
+    except (TypeError, ValueError):
+        return None
 
-    Reads the index (1 GET), fetches only the dates it does not already answer
-    — concurrently, bounded by ``_MAX_FETCH_WORKERS`` — merges, and returns the
-    merged document for the caller to persist. Never writes: the tile builders
-    in this repo are pure of S3 writes so the pre-promotion deploy canary
-    (``{"write": false}``) genuinely writes nothing, and every derived artifact
-    is persisted by ``grading/handler.py`` under its ``write`` flag.
+
+def _asof_candidates(dates: list[str], entries: dict[str, str | None]) -> list[str]:
+    """Non-row calendar days that could carry the regime in force on a row.
+
+    Only rows the index does not resolve same-day need one. For each, walk
+    back up to ``ASOF_MAX_AGE_DAYS`` and stop at the first day the index
+    already resolves — nothing older can be the latest. Row dates on the way
+    are skipped (``_dates_to_fetch`` owns them); a non-row day is returned when
+    the index has never probed it, or when it is a null no older than the
+    ``_MISS_REPROBE_DAYS``-th most recent row (the same late-writer re-probe
+    the row dates get). Order-preserving and de-duplicated.
     """
-    s3 = s3_client or boto3.client("s3")
-    index = read_index(bucket, s3_client=s3)
-    entries: dict[str, str | None] = index["entries"]
-    gets = 1  # the index read itself
+    rows = set(dates)
+    recent_floor = min(dates[-_MISS_REPROBE_DAYS:]) if dates else ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in dates:
+        if entries.get(d):
+            continue
+        row_day = _parse_date(d)
+        if row_day is None:
+            continue
+        for back in range(1, ASOF_MAX_AGE_DAYS + 1):
+            c = (row_day - timedelta(days=back)).isoformat()
+            if entries.get(c):
+                break
+            if c in rows or c in seen:
+                continue
+            if c not in entries or c >= recent_floor:
+                out.append(c)
+                seen.add(c)
+    return out
 
-    to_fetch = _dates_to_fetch(dates, entries)
-    fetched: dict[str, str | None] = {}
-    if to_fetch:
-        workers = min(_MAX_FETCH_WORKERS, len(to_fetch))
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="regime-fetch",
-        ) as pool:
-            results = list(pool.map(lambda d: (d, _fetch_one(s3, bucket, d)), to_fetch))
-        # `pool.map` re-raises the first exception in submission order, so a
-        # real S3 fault on any date still fails the build loudly and
-        # deterministically — same posture as the sequential reader it replaces.
-        fetched = dict(results)
-        gets += len(to_fetch)
-        logger.info(
-            "regime index: %d/%d dates already indexed, %d fetched with %d workers "
-            "(%d resolved, %d unresolved).",
-            len(dates) - len(to_fetch), len(dates), len(to_fetch), workers,
-            sum(1 for v in fetched.values() if v), sum(1 for v in fetched.values() if not v),
-        )
-    else:
-        logger.info("regime index: all %d dates served from the index (0 fetches).", len(dates))
 
+def _asof_join(
+    dates: list[str], entries: dict[str, str | None],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Each date's regime = the latest resolved entry on or before it, within
+    ``ASOF_MAX_AGE_DAYS``. Returns ``(regimes, sources)``. Never looks forward."""
+    regimes: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for d in dates:
+        if entries.get(d):
+            regimes[d], sources[d] = entries[d], d
+            continue
+        row_day = _parse_date(d)
+        if row_day is None:
+            continue
+        for back in range(1, ASOF_MAX_AGE_DAYS + 1):
+            c = (row_day - timedelta(days=back)).isoformat()
+            if entries.get(c):
+                regimes[d], sources[d] = entries[c], c
+                break
+    return regimes, sources
+
+
+def _fetch_many(s3, bucket: str, to_fetch: list[str]) -> dict[str, str | None]:
+    """Fetch ``to_fetch`` through the bounded pool. Empty in, empty out."""
+    if not to_fetch:
+        return {}
+    workers = min(_MAX_FETCH_WORKERS, len(to_fetch))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="regime-fetch",
+    ) as pool:
+        results = list(pool.map(lambda d: (d, _fetch_one(s3, bucket, d)), to_fetch))
+    # `pool.map` re-raises the first exception in submission order, so a
+    # real S3 fault on any date still fails the build loudly and
+    # deterministically — same posture as the sequential reader it replaces.
+    return dict(results)
+
+
+def _merge(entries: dict[str, str | None], fetched: dict[str, str | None]) -> bool:
+    """Merge ``fetched`` into ``entries``; True when anything changed."""
     dirty = False
     for d, regime in fetched.items():
         if d not in entries or entries[d] != regime:
@@ -292,9 +378,49 @@ def resolve_regimes(bucket: str, dates: list[str], s3_client=None) -> RegimeReso
                 continue
             entries[d] = regime
             dirty = True
+    return dirty
 
-    regimes = {d: entries[d] for d in dates if entries.get(d)}
-    unresolved = [d for d in dates if not entries.get(d)]
+
+def resolve_regimes(bucket: str, dates: list[str], s3_client=None) -> RegimeResolution:
+    """As-of join of ``dates`` to the ``market_regime`` in force on each date.
+
+    Reads the index (1 GET), fetches only the dates it does not already answer
+    — the row dates first, then any non-row calendar days an as-of lookup still
+    needs (I12230) — concurrently, bounded by ``_MAX_FETCH_WORKERS``. Each date
+    then takes the regime of the latest resolved signals date on or before it,
+    within ``ASOF_MAX_AGE_DAYS``. Merges, and returns the
+    merged document for the caller to persist. Never writes: the tile builders
+    in this repo are pure of S3 writes so the pre-promotion deploy canary
+    (``{"write": false}``) genuinely writes nothing, and every derived artifact
+    is persisted by ``grading/handler.py`` under its ``write`` flag.
+    """
+    s3 = s3_client or boto3.client("s3")
+    index = read_index(bucket, s3_client=s3)
+    entries: dict[str, str | None] = index["entries"]
+    gets = 1  # the index read itself
+
+    # Pass 1: the row dates themselves (new dates + recent-null re-probes).
+    to_fetch = _dates_to_fetch(dates, entries)
+    fetched = _fetch_many(s3, bucket, to_fetch)
+    dirty = _merge(entries, fetched)
+    # Pass 2 (I12230): the non-row calendar days an as-of lookup still needs —
+    # weekend-dated weekly runs live there. Computed AFTER pass 1 so a row that
+    # just resolved same-day, or a nearer row that did, prunes the walk-back.
+    asof_fetch = _asof_candidates(dates, entries)
+    asof_fetched = _fetch_many(s3, bucket, asof_fetch)
+    dirty = _merge(entries, asof_fetched) or dirty
+    gets += len(to_fetch) + len(asof_fetch)
+
+    regimes, sources = _asof_join(dates, entries)
+    unresolved = [d for d in dates if d not in regimes]
+    n_same_day = sum(1 for d, src in sources.items() if src == d)
+    logger.info(
+        "regime index: %d rows, %d row dates + %d non-row days fetched; as-of join "
+        "resolved %d (%d same-day, %d carried from an earlier signals.json within "
+        "%dd), %d unresolved.",
+        len(dates), len(to_fetch), len(asof_fetch), len(regimes), n_same_day,
+        len(regimes) - n_same_day, ASOF_MAX_AGE_DAYS, len(unresolved),
+    )
 
     merged: dict | None = None
     if dirty:
@@ -306,11 +432,15 @@ def resolve_regimes(bucket: str, dates: list[str], s3_client=None) -> RegimeReso
         index["n_entries"] = len(entries)
         index["n_resolved"] = sum(1 for v in entries.values() if v)
         index["n_unresolved"] = sum(1 for v in entries.values() if not v)
+        # Informational: the entries are exact per-date probes; consumers join
+        # them as-of within this many days (I12230). Not a schema change.
+        index["asof_max_age_days"] = ASOF_MAX_AGE_DAYS
         index["entries"] = dict(sorted(entries.items()))
         merged = index
 
     return RegimeResolution(
         regimes=regimes, index=merged, gets=gets, unresolved=unresolved,
+        sources=sources,
     )
 
 
