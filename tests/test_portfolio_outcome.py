@@ -289,11 +289,13 @@ class TestRegimeWeightedAlpha:
         # but only 10 total joined samples — well below the n_floor=30 gate.
         body, dates = _regime_csv(80, lambda i: 1.0 if i % 2 == 0 else 2.0)
         _put_eod(s3, body)
-        for d in dates[:5]:
+        for d in dates[70:75]:
             _put_regime(s3, d, "bull")
-        for d in dates[5:10]:
+        for d in dates[75:80]:
             _put_regime(s3, d, "bear")
-        # Remaining 70 dates deliberately left with no signals.json at all.
+        # The first 70 dates deliberately have no signals.json at all. They sit
+        # BEFORE every tagged date, so the as-of join (I12230) cannot carry a
+        # regime onto them — that would be look-ahead.
 
         tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
         rwa = self._rwa(tile)
@@ -307,8 +309,11 @@ class TestRegimeWeightedAlpha:
 
     def test_missing_or_malformed_signals_json_skipped_without_error(self, s3):
         # Only every-other date has a signals.json; one present-but-malformed
-        # (no market_regime key) date is thrown in too. Nothing should raise,
-        # and the join should simply exclude the untagged dates.
+        # (no market_regime key) date is thrown in too. Nothing should raise.
+        # Since I12230 the join is as-of: an untagged date takes the regime of
+        # the nearest tagged date at or before it (within 7 days), so only the
+        # malformed first date and the date after it, which has nothing earlier
+        # to inherit, are excluded.
         body, dates = _regime_csv(80, lambda i: 1.0 if i % 2 == 0 else 2.0)
         _put_eod(s3, body)
         tagged_dates = dates[::2]  # 40 dates get a signals.json
@@ -324,7 +329,9 @@ class TestRegimeWeightedAlpha:
         tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3)
         rwa = self._rwa(tile)
 
-        # 19 bull + 20 bear = 39 joined samples, two qualifying regimes, >=30 total.
+        # 38 bull (dates[2..39]) + 40 bear (dates[40..79]) = 78 joined samples.
         assert rwa["value"] is not None
-        assert rwa["n_samples"] == 39
+        assert rwa["n_samples"] == 78
+        assert rwa["window"]["start"] == dates[2]
+        assert rwa["window"]["rows_excluded"] == 2
         assert not rwa["status"].startswith("N/A")
