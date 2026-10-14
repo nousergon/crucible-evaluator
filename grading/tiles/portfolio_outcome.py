@@ -433,7 +433,7 @@ def _build_alpha_trend(alpha_pct: list[float], src: str, *, window: dict | None 
 # ---------------------------------------------------------------------------
 
 def _resolve_regimes_for_dates(bucket: str, dates: list[str], s3_client=None):
-    """Join each ``eod_pnl.csv`` date to its ``market_regime`` tag.
+    """Join each ``eod_pnl.csv`` date to the ``market_regime`` in force on it.
 
     Delegates to ``grading/regime_index.py``, which serves the join from one
     small persisted index (``evaluator/indexes/market_regime.json``) and fetches
@@ -445,9 +445,13 @@ def _resolve_regimes_for_dates(bucket: str, dates: list[str], s3_client=None):
     duration regression from ~68s (through 2026-08-20) to a 300s
     ``States.Timeout`` on 2026-08-30.
 
-    The card contract is unchanged: the TOP-LEVEL ``market_regime`` field
-    (``bull``/``neutral``/``caution``/``bear``) is what is read, and a date with
-    no ``signals.json`` or no ``market_regime`` key is SKIPPED, never fabricated
+    The TOP-LEVEL ``market_regime`` field (``bull``/``neutral``/``caution``/
+    ``bear``) is what is read. Since alpha-engine-config-I12230 the join is
+    AS-OF: ``signals.json`` is written once per WEEKLY run while the rows are
+    daily, so the exact-date join resolved 43 of 149 rows (measured
+    2026-10-12). Each date now takes the regime of the latest ``signals.json``
+    dated on or before it, at most ``ASOF_MAX_AGE_DAYS`` older — never a later
+    one. A date with no such file in that window is SKIPPED, never fabricated
     — the caller sees it simply absent from ``resolution.regimes``, and
     ``_regime_na_detail`` renders that as a specific N/A. What IS new is that
     such a date is now recorded as an explicit ``null`` in the index and
@@ -1064,8 +1068,9 @@ def build_portfolio_outcome_tile(
     components.append(_build_pbo_component(bucket, s3_client=s3_client))
 
     # 13. Regime-weighted alpha (critical) — market-regime decomposition of daily
-    #     alpha via a join against signals/{date}/signals.json's market_regime
-    #     tag (config#857 C2-fu). Equal-weight mean log-alpha across regime
+    #     alpha via an AS-OF join against the latest signals/{date}/signals.json
+    #     market_regime tag on or before each row (config#857 C2-fu; as-of since
+    #     alpha-engine-config-I12230 — the producer is weekly, the rows daily). Equal-weight mean log-alpha across regime
     #     buckets meeting the sample floor; N/A (not a guess) if the book hasn't
     #     yet traded through >=2 regimes with enough days in each.
     regime_resolution = _resolve_regimes_for_dates(
