@@ -128,15 +128,43 @@ def test_the_same_run_without_the_witness_is_not_clean_in_either_scope(monkeypat
 
 
 def test_an_arbitrary_skip_flag_never_excuses_a_stage_the_witness_does_not_name(monkeypatch):
-    """Measured 2026-10-05: the live scheduled trigger also carries
-    ``skip_rag_ingestion`` and ``skip_data_phase2``. No registered witness
-    names those stages, so the cycle stays NOT clean even though the parity
-    witness is present and parity is excused."""
-    flags = {"skip_parity": True, "skip_rag_ingestion": True, "skip_data_phase2": True}
-    walk = _walk(without=(*PARITY, "RAGIngestion", "DataPhase2"), witness=True)
+    """A flag alone excuses nothing. ``skip_scanner`` is not a registered
+    witness, and Scanner is still graded (not pending, retiring or cadence-
+    declared), so a run that skipped it under that flag stays NOT clean even
+    though the parity witness is present and parity is excused.
+
+    This used to use ``skip_rag_ingestion`` / ``skip_data_phase2``; since
+    nousergon-lib v0.124.171 (alpha-engine-config-I12271) those two stages
+    are RETIRING on this spine, so they no longer test the rule — see the
+    next test for what excuses them instead."""
+    assert "Scanner" in SPINE
+    assert "Scanner" not in ps.retiring_definition_stages_for(SM)
+    assert "Scanner" not in ps.pending_definition_stages_for(SM)
+    flags = {"skip_parity": True, "skip_scanner": True}
+    walk = _walk(without=(*PARITY, "Scanner"), witness=True)
     sf = _rate(monkeypatch, [_exec(walk, payload=flags)])
     assert sf["n_cycles_clean"] == 0 and sf["n_cycles_clean_full_scope"] == 0
-    assert "missing RAGIngestion, DataPhase2" in sf["scope_detail"][f"{SM}:2026-10-02"]
+    assert "missing Scanner" in sf["scope_detail"][f"{SM}:2026-10-02"]
+    assert sf["declared_skips"] == {}
+
+
+@pytest.mark.parametrize("flags", [
+    {"skip_rag_ingestion": True, "skip_data_phase2": True},
+    {},
+], ids=["with-flags", "without-flags"])
+def test_the_v1_rag_and_phase2_copies_are_excused_by_the_retiring_marker_not_the_flag(
+    monkeypatch, flags,
+):
+    """alpha-engine-config-I12271: v2 is the one writer of D15/D16/D46, so
+    RAGIngestion/DataPhase2 are declared RETIRING in the lib registry. The
+    excuse is the registry's, identical with or without the input flags —
+    the flag is still never read."""
+    retiring = ps.retiring_definition_stages_for(SM)
+    assert {"RAGIngestion", "DataPhase2"} <= retiring
+    sf = _rate(monkeypatch, [_exec(_walk(without=("RAGIngestion", "DataPhase2")), payload=flags)])
+    assert sf["n_cycles_clean"] == 1 and sf["n_cycles_clean_full_scope"] == 1
+    # Retiring is not a cadence-declared skip: nothing is counted NOT_IN_SCOPE.
+    assert sf["declared_skips"] == {}
 
 
 # --- recovery ---------------------------------------------------------------
