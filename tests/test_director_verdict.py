@@ -289,7 +289,7 @@ class TestPassRestoresAuthority:
         monkeypatch.setattr(H, "_issue_filing_enabled", lambda: True)
         monkeypatch.setattr(
             H, "file_director_issues",
-            lambda plan, rd, token=None: calls.append(rd) or {"status": "ok", "n_filed": 2,
+            lambda plan, rd, token=None, **kw: calls.append(rd) or {"status": "ok", "n_filed": 2,
                                                               "issues": []},
         )
         block = V.read_card_verdict(_card(_PASS_BLOCK))
@@ -437,7 +437,7 @@ class TestEndToEnd:
         filed: list[str] = []
         out = self._run(s3, monkeypatch, _card(_PASS_BLOCK), mutators={
             "file_director_issues": (
-                lambda plan, rd, token=None: (filed.append(rd),
+                lambda plan, rd, token=None, **kw: (filed.append(rd),
                                               {"status": "ok", "n_filed": 1, "issues": []})[1]
             ),
             "backfill_issue_numbers": lambda items, repo=None, token=None: 0,

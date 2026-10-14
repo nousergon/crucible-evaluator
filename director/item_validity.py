@@ -63,12 +63,15 @@ green and never read as permission to file fresh work.
 Determinism: every verdict here is a pure function of typed records and
 observations. No LLM produces or edits a completion verdict.
 
-Slice 2 (not in this module yet): wire ``reconcile_record`` / ``gate_proposal``
-into ``loop_verification.verify_and_correct``, ``issue_filer`` (replacing the
-metric-overlap reconfirm match) and ``agent._carryover_context``; add an
-additive, versioned ``work_scope`` / ``targets`` to ``schema.ActionItem``; and
-sweep the stored ledger through this code, recording corrected / retained /
-unevaluable per row. This slice changes no runtime behavior.
+Slice 2 wires this module in through ``director/item_validity_gate.py``:
+``loop_verification.verify_and_correct`` (crucible-evaluator-PR345), then the
+carry-over prompt (``agent._carryover_context``), the plan artifact's per-item
+verdict, ``issue_filer`` (declared identity replaces the metric-overlap
+re-confirm cap) and an additive ``targets`` on ``schema.ActionItem``. Still
+open: sweeping the stored ledger through this code, recording corrected /
+retained / unevaluable per row, and the observation producers the shipped
+records' reopen conditions need. This module itself changes no runtime
+behavior.
 """
 
 from __future__ import annotations

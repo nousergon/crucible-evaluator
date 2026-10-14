@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -169,6 +170,30 @@ def _row_scope(row: Mapping) -> WorkScope | None:
         return None
 
 
+#: A bare or repo-qualified reference to an ``alpha-engine-config`` issue, in
+#: the forms an action item's ``targets`` arrives in: ``#2972``, ``I2972``,
+#: ``2972``, ``alpha-engine-config-I2972``, ``alpha-engine-config#2972``,
+#: ``nousergon/alpha-engine-config#2972``. Anything else (another repo's ref,
+#: prose) is kept verbatim: it can still equal a record's ``item`` exactly, and
+#: it is never parsed into a number it does not state.
+_ISSUE_REF_RE = re.compile(
+    r"^(?:(?:nousergon/)?alpha-engine-config\s*(?:-\s*i|#)|#|i)?\s*#?\s*(\d+)$",
+    re.IGNORECASE,
+)
+
+
+def canonical_ref(ref: object) -> str | None:
+    """``alpha-engine-config-I<N>`` for an issue reference in any of the forms
+    above, the stripped string for any other non-empty string, else ``None``."""
+    if not isinstance(ref, str):
+        return None
+    text = ref.strip()
+    if not text:
+        return None
+    m = _ISSUE_REF_RE.match(text)
+    return f"{ISSUE_REF_PREFIX}{int(m.group(1))}" if m else text
+
+
 def proposal_for_row(row: Mapping) -> Proposal:
     """The row as the contract's ``Proposal``: its own issue plus any explicit
     ``targets`` / ``work_scope``. ``priority`` is carried for the type only —
@@ -179,7 +204,7 @@ def proposal_for_row(row: Mapping) -> Proposal:
         targets.append(own)
     extra = row.get("targets")
     if isinstance(extra, (list, tuple)):
-        targets.extend(str(t) for t in extra if isinstance(t, str) and t.strip())
+        targets.extend(c for c in (canonical_ref(t) for t in extra) if c)
     priority = str(row.get("priority") or "").strip().upper()
     return Proposal(
         id=str(row.get("id") or "(no id)"),
@@ -279,3 +304,111 @@ def not_valid_to_grade(row: Mapping) -> bool:
     never stamped (a direct caller, a pre-I11990 ledger) is graded as before."""
     verdict = row.get(VERDICT_KEY)
     return isinstance(verdict, Mapping) and verdict.get("valid_to_grade") is False
+
+
+# ── the proposal half: this week's plan items (I11990 slice 2, second part) ──
+#
+# The grading pass above decides whether a CLOSED item may be graded on color.
+# This half asks the contract's other question of every item the plan just
+# PROPOSED: may it stand as open work at all, given the declared closures and
+# rulings? It is read by two consumers, neither of which may decide it for
+# itself:
+#
+#   * the plan artifact, which carries the per-item verdict as an extra
+#     (``PLAN_ITEM_VALIDITY_KEY``) — so the dated plan states, next to each
+#     item, whether a declared record holds it and why;
+#   * ``issue_filer.file_director_issues``, which does not file an item the
+#     verdict says is not valid to file.
+#
+# Identity is the same as the grading pass: the item's own ``targets`` (what
+# the proposer declared it lands or redoes), plus — when the item carries a
+# ledger row forward — that row's tracked issue and stored ``targets``. A plan
+# item restating ``validate-21d-return-column-stall`` is the work of I2978 by
+# the ledger, whatever its title now says about #2972.
+
+#: The plan-artifact extra the per-item verdicts are stamped under. An EXTRA on
+#: ``DirectorWeeklyActionPlan`` (``extra="allow"``), never a declared field: a
+#: verdict the LLM is asked to produce about its own items is not a verdict
+#: (``verdict.stamp_plan_artifact`` gives the same reasoning).
+PLAN_ITEM_VALIDITY_KEY = "action_item_validity"
+
+
+def _plan_item_row(item: Mapping, ledger_row: Mapping | None) -> dict:
+    """The fields :func:`proposal_for_row` reads, for one plan item."""
+    targets: list = list(item.get("targets") or [])
+    row: dict = {"id": item.get("id"), "priority": item.get("priority"), "issue_number": None}
+    if ledger_row is not None:
+        row["issue_number"] = ledger_row.get("issue_number")
+        targets.extend(ledger_row.get("targets") or [])
+        if isinstance(ledger_row.get("work_scope"), Mapping):
+            row["work_scope"] = ledger_row["work_scope"]
+    row["targets"] = targets
+    return row
+
+
+def assess_plan_items(items: list[Mapping], ledger_rows: list[Mapping] | None,
+                      card: Mapping | None, *, as_of: date,
+                      record_set: RecordSet | None = None) -> dict:
+    """Every plan item's verdict: may it stand as open work this week, and why.
+
+    ``items`` are the plan's action items as dicts (``ActionItem.model_dump()``);
+    ``ledger_rows`` are the carry-over ledger's active rows as the plan was built
+    from them (their ``issue_number`` is identity for an item carried forward).
+
+    Returns the block stamped onto the plan under :data:`PLAN_ITEM_VALIDITY_KEY`.
+    ``items[*].valid_to_file`` is the one field the issue filer obeys.
+
+    Records **unreadable** fails closed only where it can matter: an item with
+    no identity at all (no targets, no tracked issue) cannot match ANY record,
+    so its verdict does not depend on the records and it stays valid; an item
+    WITH identity is held, because whether its declared record refuses it is
+    exactly what could not be read."""
+    rs = record_set if record_set is not None else load_records()
+    observations = observations_from_card(card or {}, as_of=as_of)
+    by_id = {r.get("id"): r for r in (ledger_rows or []) if isinstance(r, Mapping)}
+    out: list[dict] = []
+    for item in items:
+        row = _plan_item_row(item, by_id.get(item.get("id")))
+        has_identity = bool(proposal_for_row(row).targets) or "work_scope" in row
+        if rs.status == "error" and not has_identity:
+            verdict = _verdict(
+                valid=True, basis=BASIS_NO_RECORD, as_of=as_of,
+                reason="no targets and no tracked issue — no declared record can share this "
+                       "work, so the unreadable records file does not bear on it",
+            )
+        else:
+            verdict = assess_row(row, rs, observations, as_of=as_of)
+        out.append({
+            "id": item.get("id"),
+            "issue_number": row.get("issue_number"),
+            "targets": list(proposal_for_row(row).targets),
+            "valid_to_file": verdict["valid_to_grade"],
+            "basis": verdict["basis"],
+            "decision": verdict["decision"],
+            "matched": verdict["matched"],
+            "reason": verdict["reason"],
+        })
+    block = {
+        "schema_version": ITEM_VALIDITY_SCHEMA_VERSION,
+        "as_of": as_of.isoformat(),
+        "records": rs.status,
+        "n_records": len(rs.records),
+        "n_items": len(out),
+        "n_not_valid": sum(1 for i in out if not i["valid_to_file"]),
+        "items": out,
+    }
+    if rs.error:
+        block["records_error"] = rs.error
+    return block
+
+
+def not_valid_to_file(block: Mapping | None) -> dict[str, dict]:
+    """``{item id: verdict}`` for every item ``block`` says may not be filed.
+    An absent or malformed block withholds nothing — the pre-I11990 path."""
+    if not isinstance(block, Mapping):
+        return {}
+    return {
+        str(i.get("id")): dict(i)
+        for i in (block.get("items") or [])
+        if isinstance(i, Mapping) and i.get("valid_to_file") is False
+    }

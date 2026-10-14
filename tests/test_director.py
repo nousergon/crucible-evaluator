@@ -585,7 +585,7 @@ class TestHandler:
         monkeypatch.setattr(H, "_director_github_token", lambda: "tok")
         monkeypatch.setattr(H, "_fetch_backlog_digest_best_effort", lambda tok, **kw: "DIGEST")
         monkeypatch.setattr(H, "file_director_issues",
-                            lambda plan, run_date, token: {
+                            lambda plan, run_date, token, **kw: {
                                 "status": "ok", "n_filed": 1,
                                 "issues": [{"slug": "s", "number": 7,
                                             "url": "https://x/issues/7"}]})

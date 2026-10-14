@@ -52,7 +52,12 @@ from director.issue_filer import (
     open_issues_digest,
     recently_closed_proposals_digest,
 )
-from director.item_validity_gate import VERDICT_KEY, assess_ledger
+from director.item_validity_gate import (
+    PLAN_ITEM_VALIDITY_KEY,
+    VERDICT_KEY,
+    assess_ledger,
+    assess_plan_items,
+)
 from director.loop_verification import backfill_issue_numbers, verify_and_correct
 from director.roadmap_pr import TOKEN_SECRET_NAME
 from director.substatus import apply_substatus_honesty
@@ -233,7 +238,8 @@ def _fetch_resolved_digest_best_effort(token: str, run_date: str, budget=None) -
 
 
 def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None,
-                             verdict_block: dict | None = None) -> dict:
+                             verdict_block: dict | None = None,
+                             item_validity: dict | None = None) -> dict:
     """Phase H output half: file the weekly proposals as ``area:director-proposals``
     GitHub issues (Brian triages). Best-effort + fail-loud — the plan is already
     persisted, so a missing token or a GitHub error is WARN-logged AND recorded
@@ -273,12 +279,19 @@ def _file_issues_best_effort(plan, run_date: str, token: str | None, budget=None
         logger.warning("Director: issue filing skipped — %s", reason)
         return {"director_issues": "skipped", "director_issues_reason": reason}
     try:
-        res = file_director_issues(plan, run_date, token=token)
-        return {
+        res = file_director_issues(plan, run_date, token=token, item_validity=item_validity)
+        out = {
             "director_issues": res.get("status", "ok"),
             "director_issues_n_filed": res.get("n_filed"),
             "director_issues_urls": [i.get("url") for i in res.get("issues", [])],
         }
+        # alpha-engine-config-I11990: an item a declared record holds is not
+        # filed, and the SF output names it rather than counting it as filed.
+        if res.get("withheld"):
+            out["director_issues_withheld"] = [
+                {"slug": w.get("slug"), "reason": w.get("reason")} for w in res["withheld"]
+            ]
+        return out
     except Exception as e:  # noqa: BLE001 — advisory channel; plan already shipped
         logger.warning("Director issue filing failed (plan already written, non-fatal): %s", e)
         return {"director_issues": "error", "director_issues_error": str(e)}
@@ -421,6 +434,31 @@ def _assess_item_validity_best_effort(items: list[dict], card: dict | None,
                 "basis": "assessment_error", "decision": None, "matched": [], "reason": reason,
             }
         return {"director_item_validity": "error", "director_item_validity_error": str(e)}
+
+
+def _assess_plan_items_best_effort(plan, ledger: dict | None, card: dict | None,
+                                   run_date: str | None) -> dict:
+    """The per-item verdict for this week's PROPOSALS
+    (``item_validity_gate.assess_plan_items``, alpha-engine-config-I11990):
+    may each item stand as open work, given the declared closures and rulings?
+
+    Stamped onto the plan artifact (``PLAN_ITEM_VALIDITY_KEY``) and obeyed by
+    the issue filer. Never raises. If the assessment itself fails the block says
+    so and carries no items, which withholds nothing from filing: the same
+    pre-I11990 path a missing records file takes, named rather than silent. The
+    grading pass fails closed instead because it MUTATES on its answer (reopen,
+    refile); a proposal that slips through here is a triage-visible issue."""
+    try:
+        as_of = date.fromisoformat(str(run_date)[:10]) if run_date else datetime.now(timezone.utc).date()
+    except ValueError:
+        as_of = datetime.now(timezone.utc).date()
+    try:
+        items = [ai.model_dump() for ai in plan.action_items]
+        return assess_plan_items(items, (ledger or {}).get("items") or [], card, as_of=as_of)
+    except Exception as e:  # noqa: BLE001 — annotation; never sinks the plan
+        logger.error("Director plan item-validity assessment failed: %s", e)
+        return {"as_of": as_of.isoformat(), "records": "assessment_error",
+                "error": f"{type(e).__name__}: {e}"[:400], "items": []}
 
 
 def _load_report_card(s3, bucket: str, run_date: str) -> dict | None:
@@ -950,6 +988,11 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
                              roadmap_digest=backlog_digest, resolved_digest=resolved_digest,
                              budget=budget, plan_ceiling_s=host.plan_ceiling_s)
 
+    # alpha-engine-config-I11990: every proposed item's verdict against the
+    # declared closures and rulings, read against the ledger the plan was built
+    # from (an item carried forward is the work of that row's tracked issue).
+    plan_item_validity = _assess_plan_items_best_effort(plan, ledger, card, run_date)
+
     plan_key = f"director/{run_date}/action_plan.json"
     stamped_body = stamp_plan_artifact(plan, verdict_block)
     # alpha-engine-config-I8332: stamp WHICH registry produced this plan
@@ -960,7 +1003,8 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
     # scoped to the §2.3a verdict; the registry fingerprint is a handler-level
     # fact (`_ensure_registry` is the sole place the bytes are obtained).
     stamped_body = json.dumps(
-        {**json.loads(stamped_body), REGISTRY_PROVENANCE_KEY: registry_fingerprint()},
+        {**json.loads(stamped_body), REGISTRY_PROVENANCE_KEY: registry_fingerprint(),
+         PLAN_ITEM_VALIDITY_KEY: plan_item_validity},
         indent=2,
     ).encode("utf-8")
     s3.put_object(
@@ -1027,7 +1071,8 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
     # Phase H output half: file the weekly proposals as area:director-proposals
     # issues (Brian triages). Best-effort — the plan above is the primary deliverable.
     issues_summary = _file_issues_best_effort(plan, run_date, gh_token, budget=budget,
-                                              verdict_block=verdict_block)
+                                              verdict_block=verdict_block,
+                                              item_validity=plan_item_validity)
 
     # Substrate producer: the deploy-health rollup the substrate tile reads
     # (config#1153 Batch E). The Director is the one weekly component holding both
@@ -1044,6 +1089,9 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
         "latest_action_plan_key": LATEST_ACTION_PLAN_KEY,
         "ledger_key": ledger_key,
         "ledger_size": len(merged.get("items", [])),
+        # alpha-engine-config-I11990: how many of this week's proposals a
+        # declared closure or ruling holds (the per-item list is on the plan).
+        "director_plan_items_not_valid": plan_item_validity.get("n_not_valid"),
         "digest_email": "sent" if email_sent else "not_sent",
         # Which home produced this run (alpha-engine-config-I11936), so the SF
         # output and the stage-coverage record say where the plan was made.
