@@ -302,9 +302,15 @@ def test_file_issues_reconfirms_instead_of_fresh_p1_for_prior_closed_evidence():
     config#1061 (closed 2026-06-14) and config#1168 (closed 2026-06-24) already
     validated twice as 'noisy but sound, no action'. The new item's slug is
     DELIBERATELY DIFFERENT from any prior slug (the LLM names slugs freely) so
-    the exact-slug idempotency skip alone would NOT catch it — only the
-    evidence-overlap check does. Assert the Director does NOT file a fresh P1;
-    it must file the lower-confidence re-confirm variant referencing #1168."""
+    the exact-slug idempotency skip alone would NOT catch it. Assert the
+    Director does NOT file a fresh P1; it must file the lower-confidence
+    re-confirm variant referencing #1168.
+
+    Since alpha-engine-config-I11990 the re-confirm is decided by DECLARED
+    identity (the item's ``targets`` names #1168), not by the shared metrics
+    alone — one shared metric capped a genuinely new P1 defect (I11984). The
+    evidence-only case is pinned in
+    ``tests/test_director_plan_item_validity.py``."""
     prior_evidence = ["metrics.json::cio_selection_skill", "metrics.json::research_composite_ic"]
     gh = FakeGitHub(closed=[_closed_proposal(1168, prior_evidence, closed_at="2026-06-24T00:00:00Z",
                                               title="[director] Validate reliability-LOW cio_selection_skill + "
@@ -313,6 +319,7 @@ def test_file_issues_reconfirms_instead_of_fresh_p1_for_prior_closed_evidence():
         "validate-reliability-low-research-metrics",  # NEW slug, distinct from the #1168 slug
         priority="P1", confidence=75, evidence=prior_evidence,
     )
+    new_item.targets = ["alpha-engine-config-I1168"]
     plan = DirectorWeeklyActionPlan(
         run_date="2026-07-03", system_summary="x", top_risks=["r"], action_items=[new_item],
     )

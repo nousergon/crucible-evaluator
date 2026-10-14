@@ -41,6 +41,21 @@ Design invariants (mirror the retired ``roadmap_pr`` channel):
     lower-confidence **re-confirm** variant (``render_reconfirm_issue``) that
     explicitly links the prior closure(s) and is capped at ``P2``, rather than
     presenting as a fresh top-priority investigation.
+
+    **Since alpha-engine-config-I11990 a shared metric is a candidate, not
+    identity.** One shared metric name capped a genuinely new P1 defect
+    (I11984, run-scope cadence attribution) to P2 because an unrelated closed
+    coverage investigation also cited ``sf_success_rate_4w``. The cap and the
+    re-confirm framing now apply only to a prior closed proposal the item
+    DECLARES it re-does (``ActionItem.targets``,
+    :func:`find_declared_reconfirm`). Evidence overlap with no declared
+    identity still links the prior closure on the filed issue, at the item's
+    own priority.
+  - **Gated on the declared item-validity records** (alpha-engine-config-I11990,
+    ``director.item_validity_gate.assess_plan_items``). An item whose work a
+    declared closure or ruling holds — refused, or unevaluable because the
+    observation its reopen condition needs is missing — is not filed, and is
+    named in the summary with the reason.
   - **Best-effort, fail-loud.** The plan is already persisted to S3; the handler
     wraps this so a token / GitHub error is WARN-logged and recorded in the
     summary, never fatal (the advisory channel must not break the run that
@@ -58,6 +73,7 @@ from __future__ import annotations
 import logging
 import re
 
+from director.item_validity_gate import canonical_ref, not_valid_to_file
 from director.roadmap_pr import _SLUG_RE, _gh_request, select_new_items
 from director.schema import ActionItem, DirectorWeeklyActionPlan
 
@@ -298,11 +314,13 @@ def find_reconfirm_match(item: ActionItem, closed_proposals: list[dict]) -> list
     a re-confirm OF — i.e. share ``>= _MIN_EVIDENCE_OVERLAP`` cited evidence
     names with ``item.evidence`` (config#2307).
 
-    This is the code-enforced identity check: the exact-slug skip
-    (``existing_proposal_slugs``) only catches a re-fire under the IDENTICAL
-    slug, and the LLM is free to name a semantically-identical investigation
-    with a brand-new slug (as happened re-filing #1061/#1168 under a fresh id
-    for #1639) — evidence is the stable identity the slug isn't. Returns the
+    Since alpha-engine-config-I11990 this is the EVIDENCE half only: a match
+    here is linked on the filed issue, but it no longer re-frames or caps the
+    item — a shared metric is not work identity (a new defect, I11984, was
+    capped P1 -> P2 by exactly this overlap). The identity half is
+    :func:`find_declared_reconfirm`. Historically (config#2307) this was the
+    only check behind the exact-slug skip, for the LLM re-filing #1061/#1168
+    under a fresh id as #1639. Returns the
     matching prior issues (may be more than one), sorted oldest-first so the
     body cites the ORIGINAL investigation first; ``[]`` if no match (file as a
     normal fresh proposal)."""
@@ -318,6 +336,45 @@ def find_reconfirm_match(item: ActionItem, closed_proposals: list[dict]) -> list
     return matches
 
 
+def find_declared_reconfirm(item: ActionItem, closed_proposals: list[dict]) -> list[dict]:
+    """The prior closed proposals ``item`` DECLARES it re-does: those whose issue
+    ref appears in ``item.targets`` (any form :func:`canonical_ref` reads).
+
+    This is the identity half of the re-confirm decision
+    (alpha-engine-config-I11990). :func:`find_reconfirm_match` stays the
+    evidence half — it finds prior closures that SHARE a cited metric, which is
+    worth linking but is not the same work: a new defect can cite the metric a
+    closed investigation cited. Only a declared match is filed as a re-confirm
+    and capped. Sorted oldest-closed first, like ``find_reconfirm_match``."""
+    declared = {c for c in (canonical_ref(t) for t in (item.targets or [])) if c}
+    if not declared:
+        return []
+    matches = [
+        p for p in closed_proposals
+        if p.get("number") is not None and canonical_ref(f"#{p['number']}") in declared
+    ]
+    matches.sort(key=lambda p: (p.get("closed_at") or ""))
+    return matches
+
+
+def _shared_evidence_note(prior: list[dict]) -> str:
+    """The section a FRESH issue carries when it shares cited evidence with a
+    prior closed proposal it does not declare it re-does."""
+    lines = "\n".join(
+        f"- #{p['number']}"
+        + (f" (closed {p['closed_at'][:10]})" if p.get("closed_at") else "")
+        + (f" — {p['title']}" if p.get("title") else "")
+        for p in prior if p.get("number") is not None
+    )
+    return (
+        "## Shares cited evidence with closed proposal(s)\n"
+        f"{lines}\n\n"
+        "Not declared the same work (no `targets` entry names them), so this is filed at "
+        "its own priority: a shared metric is not work identity "
+        "(alpha-engine-config-I11990). Triage may still merge it into a prior item.\n\n"
+    )
+
+
 def file_director_issues(
     plan: DirectorWeeklyActionPlan,
     run_date: str,
@@ -325,6 +382,7 @@ def file_director_issues(
     token: str,
     repo: str = DEFAULT_REPO,
     gh_request=_gh_request,
+    item_validity: dict | None = None,
 ) -> dict:
     """File each NEW action item as an issue, idempotent by slug, labeled
     ``area:director-proposals`` + the item's suggested ``P#``.
@@ -338,15 +396,22 @@ def file_director_issues(
     (422/5xx) still raises (the handler's best-effort wrapper records it).
     Before filing, each new item is also checked against recently-CLOSED
     proposals for an evidence match (config#2307,
-    ``find_reconfirm_match``/``RECONFIRM_LOOKBACK_WEEKS``); a match files as a
+    ``find_reconfirm_match``/``RECONFIRM_LOOKBACK_WEEKS``); that match is
+    linked on the issue. A prior closure the item DECLARES it re-does files as a
     lower-confidence re-confirm variant (``render_reconfirm_issue``, capped
     ``P2``, explicitly linking the prior closure) instead of a fresh proposal
-    at the item's original suggested priority — this is the code-enforced
-    backstop for the advisory ``recently_closed_proposals_digest`` prompt
-    context, which the LLM is free to (and did) ignore.
+    at the item's original suggested priority.
+
+    Since alpha-engine-config-I11990 the re-confirm cap applies only to a prior
+    closure the item declares in ``targets`` (:func:`find_declared_reconfirm`);
+    an evidence-only overlap files at the item's own priority and links the
+    prior closure. ``item_validity`` is the plan's
+    ``item_validity_gate.assess_plan_items`` block: an item it marks not valid
+    to file is skipped and named under ``withheld``. ``None`` (a direct caller)
+    withholds nothing.
 
     ``gh_request`` is injected for tests. Returns a compact summary
-    (status / n_filed / issues / slugs)."""
+    (status / n_filed / issues / slugs / withheld)."""
     api = f"https://api.github.com/repos/{repo}"
     already = existing_proposal_slugs(repo, token, gh_request=gh_request)
     new_items = select_new_items(plan, already)
@@ -357,17 +422,35 @@ def file_director_issues(
         )
         return {"status": "nochange", "n_filed": 0, "reason": "all items already filed as issues"}
 
+    held = not_valid_to_file(item_validity)
+    withheld = [
+        {"slug": item.id, "decision": held[item.id].get("decision"),
+         "matched": held[item.id].get("matched") or [], "reason": held[item.id].get("reason")}
+        for item in new_items if item.id in held
+    ]
+    for w in withheld:
+        logger.warning(
+            "issue_filer: NOT filing %r — a declared item-validity record holds its work "
+            "(alpha-engine-config-I11990): %s", w["slug"], w["reason"],
+        )
+    new_items = [item for item in new_items if item.id not in held]
+
     closed_proposals = fetch_recently_closed_proposals(
         repo, token, run_date=run_date, gh_request=gh_request,
-    )
+    ) if new_items else []
 
     filed: list[dict] = []
     for item in new_items:
-        reconfirm_of = find_reconfirm_match(item, closed_proposals)
+        reconfirm_of = find_declared_reconfirm(item, closed_proposals)
+        declared = {p.get("number") for p in reconfirm_of}
+        shares_evidence = [
+            p for p in find_reconfirm_match(item, closed_proposals)
+            if p.get("number") not in declared
+        ]
         if reconfirm_of:
             title, body, priority = render_reconfirm_issue(item, run_date, reconfirm_of)
             logger.info(
-                "issue_filer: %r matches prior closed evidence (%s) — filing as "
+                "issue_filer: %r declares it re-does closed %s — filing as "
                 "re-confirm at %s instead of fresh %s.",
                 item.id, ", ".join(f"#{p.get('number')}" for p in reconfirm_of),
                 priority, item.priority,
@@ -375,6 +458,15 @@ def file_director_issues(
         else:
             title, body = render_issue(item, run_date)
             priority = item.priority
+        if shares_evidence:
+            # Before the Closes-when/footer, so the evidence-section parser and
+            # the idempotency marker read exactly as they did.
+            body = body.replace("## Closes when\n", _shared_evidence_note(shares_evidence) + "## Closes when\n", 1)
+            logger.info(
+                "issue_filer: %r shares cited evidence with closed %s but does not declare "
+                "it the same work — filed at %s, prior closure linked (I11990).",
+                item.id, ", ".join(f"#{p.get('number')}" for p in shares_evidence), priority,
+            )
         status, res = gh_request(
             "POST", f"{api}/issues", token,
             {"title": title, "body": body, "labels": [PROPOSAL_LABEL, priority]},
@@ -399,12 +491,15 @@ def file_director_issues(
                 "reason": f"PAT lacks issues:write (HTTP {status})",
                 "issues": filed,
                 "slugs": [f["slug"] for f in filed],
+                "n_withheld": len(withheld),
+                "withheld": withheld,
             }
         if status != 201:
             raise RuntimeError(f"issue_filer: create issue for {item.id!r} -> {status}: {res}")
         filed.append({
             "slug": item.id, "number": res.get("number"), "url": res.get("html_url"),
             "reconfirm_of": [p.get("number") for p in reconfirm_of] if reconfirm_of else [],
+            "shares_evidence_with": [p.get("number") for p in shares_evidence],
         })
 
     summary = {
@@ -412,6 +507,8 @@ def file_director_issues(
         "n_filed": len(filed),
         "issues": filed,
         "slugs": [f["slug"] for f in filed],
+        "n_withheld": len(withheld),
+        "withheld": withheld,
     }
     logger.info("issue_filer: %s", summary)
     return summary

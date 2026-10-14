@@ -51,6 +51,19 @@ class ActionItem(BaseModel):
     suggested_change_type: ChangeTypeLiteral
     confidence: int = Field(ge=0, le=100, description="Self-assessed 0-100.")
     status: ItemStatusLiteral = "proposed"
+    # alpha-engine-config-I11990: work identity, declared by the proposer and
+    # judged by code. Additive with an empty default, so a plan or ledger row
+    # written before this field still parses.
+    targets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Issue refs (alpha-engine-config-I<N>) of any CLOSED or RULED issue this item "
+            "proposes to land, redo, reopen or re-confirm. Empty for genuinely new work. "
+            "This is the item's work identity: an item naming a closed or ruled issue is "
+            "filed only if that issue's declared reopen condition is met, and only an item "
+            "naming a prior closed proposal is filed as its re-confirm."
+        ),
+    )
 
 
 class SelfGrade(BaseModel):
