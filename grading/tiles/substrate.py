@@ -64,13 +64,25 @@ MODULE = "substrate"
 # freshness sentinel (config#2350) that the live writer stamps instead.
 PRICE_CACHE_FRESHNESS_SENTINEL_KEY = "reference/price_cache/_freshness.json"
 
-# The 3 orchestration Step Functions whose rolling success rate IS the substrate
+# The orchestration Step Functions whose rolling success rate IS the substrate
 # headline. ARNs are *discovered* at runtime (list_state_machines) rather than
 # hardcoded, so no AWS account id lives in this public repo.
+#
+# ``ne-postclose-reconcile-pipeline`` is the collector-dependent half of the
+# post-close run, split out by nousergon-data-PR1996 (2026-10-01):
+# ``WaitForCollectionManifests``, ``EODReconcile`` and ``StopTradingInstance``
+# moved there with their names unchanged, and nousergon-lib (>= v0.124.171)
+# cut ``ne-postclose-trading-pipeline``'s spine to ``("CaptureSnapshot",)``.
+# Without it those three stages are graded nowhere (alpha-engine-config-I12279).
+# Its scheduled role is ``eod`` (started by ``alpha-engine-eod-backstop``),
+# already in ``_SCHEDULED_ROLES``. The evaluator role's
+# ``StepFunctionsExecutionHistoryRead`` grant must name its execution ARN
+# before this list does, or the first history read fails AccessDenied.
 _SF_NAMES = (
     "ne-weekly-freshness-pipeline",
     "ne-preopen-trading-pipeline",
     "ne-postclose-trading-pipeline",
+    "ne-postclose-reconcile-pipeline",
 )
 _SF_TERMINAL = {"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"}
 _SF_WINDOW_DAYS = 28
@@ -184,7 +196,7 @@ _SCHEDULED_ROLES = {"weekly", "saturday", "daily", "eod"}
 
 
 def _discover_sf_arns(sfn) -> list[str]:
-    """Resolve the 3 pipeline SF ARNs by name (no hardcoded account id).
+    """Resolve the ``_SF_NAMES`` pipeline SF ARNs by name (no hardcoded account id).
 
     Env override ``EVALUATOR_SF_ARNS`` (comma-separated) wins — lets the Lambda
     skip the ListStateMachines call / IAM grant if the ARNs are configured.
@@ -337,7 +349,7 @@ def _fold(sf_name: str, key: str, execs: list) -> dict:
 def _sf_success_rate(
     sfn, as_of: datetime, window_days: int,
 ) -> dict | None:
-    """Cycle-level success across the 3 SFs over the trailing window.
+    """Cycle-level success across the ``_SF_NAMES`` SFs over the trailing window.
 
     Returns two distinct, complementary metrics (config#1059 / #970 / L4552d) —
     the OLD per-execution rate conflated operator-recovered cycles AND scheduled
