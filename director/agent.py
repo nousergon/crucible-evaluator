@@ -47,10 +47,13 @@ import json
 import logging
 import os
 import time
+from datetime import date, datetime, timezone
 
 from director import emf
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
 from director.carryover import carry_count, is_p0, order_for_prompt
+from director.item_validity import observations_from_card
+from director.item_validity_gate import assess_row, load_records
 # Pure, stdlib-only helpers (no boto3, no GitHub call) — the import graph is
 # acyclic: loop_verification -> issue_filer -> roadmap_pr -> schema, and none
 # of those imports agent.
@@ -1570,12 +1573,42 @@ def select_carryover_rows(rows: list[dict]) -> tuple[list[dict], list[dict], boo
     return shown, rest[room:], False
 
 
-def _row_block(it: dict, status_map: dict) -> tuple[list[str], bool]:
-    """Render one ledger row (header + live-card annotation) -> (lines, contradicted)."""
+def _declared_record_line(verdict: dict | None) -> str | None:
+    """The carry-over annotation for a row a DECLARED closure or ruling covers
+    (alpha-engine-config-I11990), or ``None`` when no record covers it.
+
+    Rendered from ``item_validity_gate.assess_row`` — a deterministic verdict
+    over the shipped records and this week's card — so the model is told what
+    the authority says next to the row's own (possibly weeks-old) claim. It
+    annotates; it never drops or reorders the row, for the same reason the
+    live-card annotation does not."""
+    if not verdict or verdict.get("basis") != "item_validity_record":
+        return None
+    refs = ", ".join(verdict.get("matched") or []) or "a declared record"
+    reason = verdict.get("reason") or ""
+    if verdict.get("valid_to_grade"):
+        return (
+            f"      declared record ({refs}): {reason}. Its declared reopen condition is met "
+            "this week — it may be carried as open work, citing that condition."
+        )
+    return (
+        f"      ⚠ DECLARED CLOSED/RULED ({refs}): {reason}. This row's work is held by that "
+        "record, and the color of the metrics it cites does not reopen it. Do NOT restate it "
+        "as an action item or re-propose it under another id; dispose of it in "
+        "carryover_review as held by its declared record."
+    )
+
+
+def _row_block(it: dict, status_map: dict, validity: dict | None = None) -> tuple[list[str], bool]:
+    """Render one ledger row (header + declared-record and live-card
+    annotations) -> (lines, contradicted)."""
     lines = [
         f"  - [{it.get('id')}] {it.get('title')} "
         f"(status={it.get('status')}, owner={it.get('proposed_owner')}, priority={it.get('priority')})"
     ]
+    declared = _declared_record_line(validity)
+    if declared:
+        lines.append(declared)
     if not status_map:
         return lines, False
     # Wider than evidence_still_adverse's evidence-only scope on purpose:
@@ -1648,6 +1681,40 @@ def _elision_summary(
     )
 
 
+def _carryover_validity(rows: list[dict], report_card: dict | None) -> tuple[dict[int, dict], str | None]:
+    """``({id(row): verdict}, header note)`` for the rows the prompt shows —
+    each row's item-validity verdict computed NOW, from the shipped records and
+    this week's card (alpha-engine-config-I11990).
+
+    Computed here rather than read off the row's stored ``item_validity``
+    stamp: that stamp is written by the loop pass AFTER the plan, so at prompt
+    time it is last week's answer, or absent on a row first stamped this week.
+    Pure and never raises — a failure yields no annotation and one header line
+    saying the records could not be read, never a guessed verdict."""
+    try:
+        rs = load_records()
+        if rs.status == "absent":
+            return {}, None
+        if rs.status != "loaded":
+            return {}, (
+                f"  ⚠ The declared item-validity records could not be read ({rs.error}); "
+                "no row below is annotated with its declared closure or ruling this week."
+            )
+        rd = ((report_card or {}).get("_provenance") or {}).get("run_date")
+        try:
+            as_of = date.fromisoformat(str(rd)[:10]) if rd else datetime.now(timezone.utc).date()
+        except ValueError:
+            as_of = datetime.now(timezone.utc).date()
+        observations = observations_from_card(report_card or {}, as_of=as_of)
+        return {id(r): assess_row(r, rs, observations, as_of=as_of) for r in rows}, None
+    except Exception as e:  # noqa: BLE001 — a prompt annotation must never sink the plan
+        logger.warning("Director: carry-over item-validity annotation failed: %s", e)
+        return {}, (
+            "  ⚠ The declared item-validity check failed this week "
+            f"({type(e).__name__}); no row below is annotated with its declared closure or ruling."
+        )
+
+
 def _carryover_context(carryover: dict | None, report_card: dict | None = None) -> str:
     """Render the carry-over ledger for the prompt, EACH ROW RECONCILED
     AGAINST THIS WEEK'S CARD (alpha-engine-config-I8178), and BOUNDED
@@ -1710,6 +1777,7 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     items = list(carryover.get("items") or [])
     status_map = component_status_map(report_card or {})
     shown, omitted, p0_over_cap = select_carryover_rows(items)
+    validity, records_note = _carryover_validity(shown, report_card)
 
     header: list[str] = []
     if status_map:
@@ -1720,6 +1788,8 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
             "is carried. Where a row is marked CONTRADICTED, do not restate its claim: "
             "either re-ground the item in what the card now says, or mark it resolved."
         )
+    if records_note:
+        header.append(records_note)
     if p0_over_cap:
         header.append(
             f"  ⚠ P0 SET EXCEEDS THE PROMPT CAP: {len(shown)} of {len(items)} active "
@@ -1739,7 +1809,7 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     n_contradicted = 0
     used = _SECTION_OVERHEAD_CHARS + sum(len(line) + 1 for line in header)
     for it in shown:
-        block, contradicted = _row_block(it, status_map)
+        block, contradicted = _row_block(it, status_map, validity.get(id(it)))
         cost = sum(len(line) + 1 for line in block)
         if spilled or (not is_p0(it) and used + cost > CARRYOVER_PROMPT_CHAR_BUDGET):
             # Once one row has spilled, every later (lower-ranked) row spills
@@ -1831,7 +1901,10 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
     human += [
         "",
         "Produce the DirectorWeeklyActionPlan now. Ground every action item's "
-        "rationale + evidence in the metrics above.",
+        "rationale + evidence in the metrics above. If an item proposes to land, redo, "
+        "reopen or re-confirm work tracked by a CLOSED or RULED issue, name that issue in "
+        "its `targets` (alpha-engine-config-I<N>); code checks it against the declared "
+        "closures and rulings before anything is filed.",
     ]
     return [("system", _load_system_prompt()), ("human", "\n".join(human))]
 
