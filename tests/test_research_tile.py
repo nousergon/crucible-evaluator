@@ -345,6 +345,39 @@ class TestMacroAndCalibration:
         assert macro["value"] == pytest.approx(2.0)
         assert macro["status"] == "GREEN"  # +2pp > target 0, N=40 > floor 20
 
+    def test_macro_stale_sources_names_the_dead_table_not_absence(self, s3):
+        # alpha-engine-config-I12295: macro_eval.json was PRESENT with
+        # status=stale_sources and the card said "absent this cycle".
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "macro_eval.json", {
+            "status": "stale_sources",
+            "reason": "macro_eval cannot be measured",
+            "source_freshness": {"stale": True, "stale_tables": ["cio_evaluations"], "sources": [{
+                "table": "cio_evaluations", "newest_date": "2026-07-10", "age_days": 92,
+                "stale": True, "retired_date": "2026-07-12",
+                "reference": "alpha-engine-config-I2515 / config#1580"}]},
+        })
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        macro = _comp(tile, "macro_agent")
+        assert macro["status"] == "N/A-MISSING-INPUT"
+        reason = macro["status_reason"]
+        assert "absent" not in reason
+        assert "status=stale_sources" in reason
+        assert "cio_evaluations 92d stale" in reason
+        assert "writer retired 2026-07-12" in reason
+
+    def test_macro_other_non_ok_status_is_named(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        _put(s3, "macro_eval.json", {"status": "insufficient_data", "reason": "n=3 < 20"})
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        reason = _comp(tile, "macro_agent")["status_reason"]
+        assert "status='insufficient_data' — n=3 < 20" in reason
+
+    def test_macro_absent_still_says_absent(self, s3):
+        _put(s3, "e2e_lift.json", _E2E)
+        tile = build_research_tile(BUCKET, RUN_DATE, s3_client=s3)
+        assert "macro_eval.json absent this cycle" in _comp(tile, "macro_agent")["status_reason"]
+
     def test_calibration_ece_lower_is_better(self, s3):
         _put(s3, "e2e_lift.json", _E2E)
         _put(s3, "portfolio_calibration.json", {"status": "ok", "ece": 0.03, "n": 200})
