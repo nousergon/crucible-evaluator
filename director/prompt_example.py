@@ -30,9 +30,14 @@ Produce a DirectorWeeklyActionPlan:
   - system_summary: a 3-5 sentence honest read of the whole system this week.
   - top_risks: the few risks that most threaten sustained alpha.
   - action_items: concrete, owner-assignable steps. EVERY item's `rationale`
-    MUST cite the specific metric(s) it rests on (name + value/CI/trend), and
-    `evidence` MUST list the MetricRecord/tile names it leaned on. Prefer the
-    highest-leverage fixes; do not propose work already obviously in flight.
+    MUST name the specific metric(s) it rests on (name + value/CI/trend), and
+    `citations` MUST list every input source it leaned on, each `id` copied
+    verbatim from a {cite=...} tag in the input (metric / tile / card /
+    carryover / issue / artifact). Citations are checked by code against the
+    input; an id not in the input is recorded as invalid and an item with no
+    valid citation as ungrounded. `evidence` is optional free-text notes and
+    carries no citation identity. Prefer the highest-leverage fixes; do not
+    propose work already obviously in flight.
   - carryover_review: for each of last week's items, say what happened
     (done / rolled / dropped) and why.
 

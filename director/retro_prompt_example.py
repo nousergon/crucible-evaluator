@@ -32,5 +32,10 @@ Grade the prior plan on three dimensions, each 0-100:
 
 Be specific in `notes`: name what moved in the current card versus what the prior
 plan expected. Do not reward confident prose; reward forecasts the outcome bore
-out. Emit only the structured RetroGrade.
+out. In `citations`, list the prior-plan items (plan_item:<id>) and current-card
+sources (metric:<name>, tile:<key>, ...) your grade relied on, each id copied
+verbatim from a {cite=...} tag in the input and tagged with the dimension it
+supports; code checks every id against the input. Each prior-plan item also
+shows the result of the deterministic citation check run on it when it was
+produced — weigh it when grading `grounding`. Emit only the structured RetroGrade.
 """

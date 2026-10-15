@@ -70,7 +70,14 @@ from director.budget import (
     MIN_VIABLE_CALL_S as _BUDGET_MIN_VIABLE_CALL_S,
 )
 from director.budget import RETRO_JUDGE_RESERVE_S, UNBOUNDED
-from director.loop_verification import component_status_map, resolve_cited_metrics
+from director.citations import (
+    CITATION_CHECK_KEY,
+    CITATION_SOURCES_KEY,
+    RETRO_CITATION_INSTRUCTIONS,
+    SourceRegistry,
+    validate_grade_citations,
+)
+from director.loop_verification import component_status_map, item_cited_metrics
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan, RetroGrade
 
@@ -728,9 +735,31 @@ def _default_llm(budget=None) -> _KrepisStructuredJudge:
     )
 
 
-def _prior_plan_summary(prior_plan: dict) -> str:
+def _item_citation_line(it: dict) -> str | None:
+    """The prior item's typed citations and their deterministic check, as the
+    judge reads them (alpha-engine-config-I12312). ``None`` for a legacy item
+    with no typed citations — its prose ``evidence`` is shown instead."""
+    cits = it.get("citations") or []
+    if not cits and it.get("citation_grounding") is None:
+        return None
+    rendered = []
+    for c in cits:
+        if not isinstance(c, dict):
+            continue
+        check = c.get("check") or "unchecked"
+        rendered.append(f"{c.get('id')} ({check})")
+    grounding = it.get("citation_grounding") or "unchecked"
+    return f"citations [{grounding}]: " + (", ".join(rendered) or "none")
+
+
+def _prior_plan_summary(prior_plan: dict, sources: SourceRegistry | None = None) -> str:
     """Condense the prior plan into the judge's human message — the claims it
-    made, so the judge can score them against the realized card."""
+    made, so the judge can score them against the realized card.
+
+    With ``sources`` (alpha-engine-config-I12312) each item is offered as
+    ``plan_item:<id>`` and tagged, and each item shows its typed citations
+    with the check result stamped when the plan was produced; a legacy item
+    shows its prose ``evidence`` exactly as before."""
     lines = [
         f"PRIOR PLAN (run_date {prior_plan.get('run_date', '?')}):",
         f"  System summary: {prior_plan.get('system_summary', '(none)')}",
@@ -740,11 +769,17 @@ def _prior_plan_summary(prior_plan: dict) -> str:
         lines.append(f"    - {r}")
     lines.append("  Action items proposed:")
     for it in prior_plan.get("action_items", []) or []:
-        lines.append(
+        line = (
             f"    - [{it.get('priority')}] {it.get('title')} "
             f"(owner={it.get('proposed_owner')}, type={it.get('suggested_change_type')}) "
             f"— {it.get('rationale')} [evidence: {', '.join(it.get('evidence', []) or []) or 'none'}]"
         )
+        cit_line = _item_citation_line(it)
+        if cit_line:
+            line += f" [{cit_line}]"
+        if sources is not None and str(it.get("id") or "").strip():
+            line = sources.tagged("plan_item", it.get("id"), line)
+        lines.append(line)
     if not (prior_plan.get("action_items") or []):
         lines.append("    - (no action items)")
     return "\n".join(lines)
@@ -760,26 +795,55 @@ def _prior_plan_pinned_components(prior_plan: dict, status_map: dict) -> set[str
         return set()
     names: set[str] = set()
     for it in prior_plan.get("action_items") or []:
-        names |= set(resolve_cited_metrics(
-            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
-            status_map,
-        ).keys())
+        names |= set(item_cited_metrics(it, status_map, wide=True).keys())
     return names
 
 
 def build_messages(prior_plan: dict, current_card: dict) -> list:
     """Assemble (system, human) messages for the retro judge call."""
+    messages, _ = build_messages_with_sources(prior_plan, current_card)
+    return messages
+
+
+def build_messages_with_sources(prior_plan: dict, current_card: dict) -> tuple[list, SourceRegistry]:
+    """:func:`build_messages` plus the registry of ids the prompt offered —
+    the prior plan's items and the current card's lines
+    (alpha-engine-config-I12312)."""
+    sources = SourceRegistry()
     pinned = _prior_plan_pinned_components(prior_plan, component_status_map(current_card or {}))
     human = [
-        _prior_plan_summary(prior_plan),
+        _prior_plan_summary(prior_plan, sources=sources),
         "",
         "CURRENT REPORT CARD (the realized outcome ~1 week later):",
-        summarize_report_card(current_card, pinned_components=pinned),
+        summarize_report_card(current_card, pinned_components=pinned, sources=sources),
         "",
         "Grade the prior plan now (grounding / calibration / actionability). "
         "Set prior_run_date to the prior plan's run_date.",
+        "",
+        RETRO_CITATION_INSTRUCTIONS,
     ]
-    return [("system", _load_retro_prompt()), ("human", "\n".join(human))]
+    return [("system", _load_retro_prompt()), ("human", "\n".join(human))], sources
+
+
+def stamp_grade_citations(grade, sources: SourceRegistry) -> dict | None:
+    """Check the judge's citations against the ids its prompt offered and
+    stamp ``citation_check`` / ``citation_sources`` onto the grade
+    (``extra="allow"``). Invalid ids are recorded, never dropped."""
+    try:
+        block = validate_grade_citations(grade, sources)
+        setattr(grade, CITATION_CHECK_KEY, block)
+        setattr(grade, CITATION_SOURCES_KEY, sources.manifest())
+    except Exception as e:  # noqa: BLE001 — a test double may not take attributes
+        logger.warning("Director retro: could not stamp citation check onto %r: %s",
+                       type(grade).__name__, e)
+        return None
+    if block["invalid"] or block["grounding"] != "grounded":
+        logger.warning(
+            "Director retro citations: %d citation(s), %d invalid %s, grounding=%s",
+            block["n_citations"], len(block["invalid"]),
+            [f"{r['id']}:{r['status']}" for r in block["invalid"]][:20], block["grounding"],
+        )
+    return block
 
 
 def grade_prior_plan(
@@ -801,8 +865,9 @@ def grade_prior_plan(
     off direct Anthropic.)
     """
     llm = llm or _default_llm(budget)
-    messages = build_messages(prior_plan, current_card)
+    messages, sources = build_messages_with_sources(prior_plan, current_card)
     grade = _invoke_with_retry(llm, messages, budget=budget)
+    stamp_grade_citations(grade, sources)
     # config#1673's other half, against the SERVED models rather than the two
     # group handles. Raises on a collision, before the caller can persist a
     # self-graded verdict (alpha-engine-config-I6052).

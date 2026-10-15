@@ -73,6 +73,7 @@ from __future__ import annotations
 import logging
 import re
 
+from director.citations import UNGROUNDED, VALID, valid_citation_ids
 from director.item_validity_gate import canonical_ref, not_valid_to_file
 from director.roadmap_pr import _SLUG_RE, _gh_request, select_new_items
 from director.schema import ActionItem, DirectorWeeklyActionPlan
@@ -160,6 +161,41 @@ def slug_issue_number_map(
     return out
 
 
+def evidence_pieces(item: ActionItem) -> list[str]:
+    """What an item's ``## Evidence`` section names: the ids of its VALID typed
+    citations first (alpha-engine-config-I12312 — the deterministic identity),
+    then any free-text ``evidence`` notes. A legacy item yields its prose only,
+    exactly as before."""
+    typed = valid_citation_ids(item) or []
+    prose = [e for e in (item.evidence or []) if str(e).strip() and e not in typed]
+    return typed + prose
+
+
+def _evidence_text(item: ActionItem) -> str:
+    return ", ".join(evidence_pieces(item)) or "see report card"
+
+
+def citation_check_section(item: ActionItem) -> str:
+    """``## Citation check`` — the post-call validator's verdict on this item,
+    so an invalid or missing citation is visible on the filed issue rather
+    than only in the plan artifact. Empty for a legacy item that was never
+    checked. Rendered as its own section so ``parse_evidence_from_body``'s
+    ``## Evidence`` read never includes it."""
+    cits = list(item.citations or [])
+    if not cits and item.citation_grounding is None:
+        return ""
+    n_valid = sum(1 for c in cits if c.check == VALID)
+    lines = [f"{n_valid} of {len(cits)} citation(s) valid against the Director's input."]
+    for c in cits:
+        if c.check != VALID:
+            lines.append(f"- ⚠ `{c.id}` ({c.kind}) — {c.check or 'unchecked'}"
+                         + (f": {c.check_reason}" if c.check_reason else ""))
+    if item.citation_grounding == UNGROUNDED or not n_valid:
+        lines.append("⚠ **Ungrounded** — no citation on this item names a source the Director "
+                     "was actually given. Treat its rationale as unverified.")
+    return "## Citation check\n" + "\n".join(lines) + "\n\n"
+
+
 def render_issue(item: ActionItem, run_date: str) -> tuple[str, str]:
     """``(title, body)`` for one action item.
 
@@ -167,7 +203,7 @@ def render_issue(item: ActionItem, run_date: str) -> tuple[str, str]:
     body restates the Director's assigned priority (also applied as the live
     ``P#`` label) alongside the full backlog discipline."""
     title = f"[director] {item.title.rstrip().rstrip('.')} (id={item.id})"
-    evidence = ", ".join(item.evidence) if item.evidence else "see report card"
+    evidence = _evidence_text(item)
     change = item.suggested_change_type.replace("_", " ")
     body = (
         "_Auto-filed by the weekly Director (Layer C, Phase H) — advisory. The "
@@ -179,6 +215,7 @@ def render_issue(item: ActionItem, run_date: str) -> tuple[str, str]:
         f"**Change type:** {change}\n\n"
         f"## Rationale\n{item.rationale.rstrip()}\n\n"
         f"## Evidence\n{evidence}\n\n"
+        f"{citation_check_section(item)}"
         "## Closes when\n"
         f"The cited evidence ({evidence}) clears its target/red-line, or the "
         f"proposed {change} ships and is verified. A merging PR can ADVANCE this; "
@@ -210,7 +247,7 @@ def render_reconfirm_issue(
         f"[director] Re-confirm: {item.title.rstrip().rstrip('.')} "
         f"(id={item.id}) [re-confirm of {refs}]"
     )
-    evidence = ", ".join(item.evidence) if item.evidence else "see report card"
+    evidence = _evidence_text(item)
     change = item.suggested_change_type.replace("_", " ")
     capped_priority = item.priority if item.priority in ("P2", "P3") else "P2"
     confidence = max(10, item.confidence - 30)
@@ -235,6 +272,7 @@ def render_reconfirm_issue(
         f"## Prior investigation(s) of this evidence\n{prior_lines}\n\n"
         f"## Rationale\n{item.rationale.rstrip()}\n\n"
         f"## Evidence\n{evidence}\n\n"
+        f"{citation_check_section(item)}"
         "## Closes when\n"
         f"The cited evidence ({evidence}) clears its target/red-line, or the "
         f"metric has moved materially past the prior closure's read (in which "
@@ -324,7 +362,10 @@ def find_reconfirm_match(item: ActionItem, closed_proposals: list[dict]) -> list
     matching prior issues (may be more than one), sorted oldest-first so the
     body cites the ORIGINAL investigation first; ``[]`` if no match (file as a
     normal fresh proposal)."""
-    item_evidence = {e.strip().lower() for e in (item.evidence or []) if e.strip()}
+    # alpha-engine-config-I12312 / I12101: typed citation ids (exact) plus any
+    # prose notes — the same pieces the filed ``## Evidence`` section carries,
+    # so a typed item overlaps a prior typed issue deterministically.
+    item_evidence = {str(e).strip().lower() for e in evidence_pieces(item) if str(e).strip()}
     if not item_evidence:
         return []
     matches: list[dict] = []

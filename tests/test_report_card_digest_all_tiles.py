@@ -279,8 +279,12 @@ def test_degraded_producer_census_names_the_missing_components():
 
 
 def test_plan_and_retro_share_the_same_complete_digest():
+    from director.citations import SourceRegistry
+
     card = _card()
-    digest = summarize_report_card(card)
+    # Both calls render the digest WITH citation tags (alpha-engine-config-I12312);
+    # the tagged digest is still one and the same text in both prompts.
+    digest = summarize_report_card(card, sources=SourceRegistry())
     plan_human = agent.build_messages(card)[1][1]
     retro_human = retro.build_messages({"run_date": "2026-09-25"}, card)[1][1]
     assert digest in plan_human

@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import re
 
+from director.citations import metric_name, valid_citation_ids
 from director.issue_filer import slug_issue_number_map
 from director.item_validity_gate import not_valid_to_grade
 from director.roadmap_pr import _gh_request
@@ -120,6 +121,68 @@ def resolve_cited_metrics(texts, status_map: dict[str, str]) -> dict[str, str]:
             if status is not None:
                 hits[token] = status
     return hits
+
+
+def citation_mode(item: dict) -> str:
+    """``"typed"`` when the row carries typed ``citations``
+    (alpha-engine-config-I12312), else ``"legacy"`` — a plan or ledger row
+    written before the citation contract, which only has prose ``evidence``."""
+    return "legacy" if valid_citation_ids(item) is None else "typed"
+
+
+def item_cited_metrics(item: dict, status_map: dict[str, str], *, wide: bool = False) -> dict[str, str]:
+    """The card components ``item`` cites → their status on ``status_map``.
+
+    **Typed path (alpha-engine-config-I12312).** A row carrying ``citations``
+    resolves through the ``metric:<name>`` ids that PASSED the post-call check
+    — an exact dictionary lookup, no tokenising. Its prose is not consulted:
+    a typed row whose citations name no metric on this card is
+    ``unverifiable``, deterministically, rather than whatever a regex finds in
+    its sentences. An id that failed the check never counts.
+
+    **Legacy path.** A row with no ``citations`` at all (every plan on disk
+    before the contract) falls back to :func:`resolve_cited_metrics` over its
+    ``evidence`` prose, unchanged — so the ledger written before this change
+    keeps the I8178 behaviour instead of going silently unverifiable.
+
+    ``wide=True`` is the non-mutating annotation scope (``_row_block``, digest
+    pinning): it additionally reads title / rationale / evidence prose, exactly
+    as those callers did before. The reopen path never passes it.
+    """
+    typed = valid_citation_ids(item, kind="metric")
+    hits: dict[str, str] = {}
+    if typed is None:
+        hits.update(resolve_cited_metrics(item.get("evidence") or [], status_map))
+    else:
+        for sid in typed:
+            key = (metric_name(sid) or "").strip().lower()
+            status = status_map.get(key)
+            if status is not None:
+                hits[key] = status
+    if wide:
+        hits.update(resolve_cited_metrics(
+            list(item.get("evidence") or []) + [item.get("title") or "", item.get("rationale") or ""],
+            status_map,
+        ))
+    return hits
+
+
+def item_evidence_still_adverse(item: dict, status_map: dict[str, str]) -> str:
+    """:func:`evidence_still_adverse` for a whole ledger row — typed citations
+    when it has them, its legacy ``evidence`` prose when it does not."""
+    hits = item_cited_metrics(item, status_map)
+    if not hits:
+        return "unverifiable"
+    return "adverse" if any(s in ADVERSE_STATUSES for s in hits.values()) else "recovered"
+
+
+def evidence_label(item: dict) -> str:
+    """What a human-visible comment names as the item's evidence: the ids of
+    its VALID typed citations, else its legacy prose, else a placeholder."""
+    typed = valid_citation_ids(item)
+    if typed:
+        return ", ".join(typed)
+    return ", ".join(item.get("evidence") or []) or "the cited evidence"
 
 
 def evidence_still_adverse(evidence: list[str], status_map: dict[str, str]) -> str:
@@ -219,6 +282,9 @@ def verify_and_correct(
         "open": 0, "closed_verified": 0, "closed_unrecovered": 0,
         "closed_unverifiable": 0, "escalated": 0, "closed_ruled_unrecovered": 0,
         "closed_not_valid_to_grade": 0,
+        # alpha-engine-config-I12312: which identity path each examined
+        # closed row resolved through.
+        "resolved_typed": 0, "resolved_legacy": 0,
     }
     reopened: list[int] = []
     not_graded: list[int] = []
@@ -252,7 +318,8 @@ def verify_and_correct(
                 counts["closed_not_valid_to_grade"] += 1
                 not_graded.append(number)
                 continue
-            outcome = evidence_still_adverse(item.get("evidence") or [], status_map)
+            counts[f"resolved_{citation_mode(item)}"] += 1
+            outcome = item_evidence_still_adverse(item, status_map)
             if outcome == "adverse":
                 comments = _fetch_comments(api, number, gh_request, token)
                 if _is_human_ruled(res, comments):
@@ -307,7 +374,7 @@ def _labels_of(issue: dict) -> set[str]:
 
 
 def _reopen_unrecovered(api: str, number: int, item: dict, gh_request, token: str) -> bool:
-    evidence = ", ".join(item.get("evidence") or []) or "the cited evidence"
+    evidence = evidence_label(item)
     status, _ = gh_request("PATCH", f"{api}/issues/{number}", token, {"state": "open"})
     if status not in (200, 201):
         logger.warning("loop_verification: reopen issue #%s -> HTTP %s", number, status)
@@ -346,7 +413,7 @@ def _comment_ruled_unrecovered(api: str, number: int, item: dict, gh_request, to
     verb is withdrawn. Posts once — ``ruled_unrecovered_notified`` on the
     ledger item guards the caller against re-posting the same notice every
     week the metric stays adverse."""
-    evidence = ", ".join(item.get("evidence") or []) or "the cited evidence"
+    evidence = evidence_label(item)
     comment = (
         "**Director loop-verification (config#3145):** this issue closed under an "
         f"operator ruling, but {evidence} still reads RED/WATCH on the current "
@@ -373,7 +440,7 @@ def _file_new_issue_for_ruled_unrecovered(
     already been notice-commented on a prior run and the metric is STILL
     adverse the following week. Sets ``ruled_unrecovered_filed`` so a further
     week's adverse read does not refile again."""
-    evidence = ", ".join(item.get("evidence") or []) or "the cited evidence"
+    evidence = evidence_label(item)
     title = f"[director] {item.get('title', 'Unresolved metric')} — still adverse after ruled close #{number}"
     body = (
         f"Re-tracks `#{number}` (\"{item.get('title', '(untitled)')}\"), which was closed under an "

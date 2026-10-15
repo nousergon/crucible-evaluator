@@ -405,3 +405,34 @@ class DirectorGroupParameter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_grounding_resolves_typed_citations_by_id_not_prose():
+    """alpha-engine-config-I12312: an item carrying typed citations is grounded
+    by its code-checked ``metric:`` ids alone. A metric its prose names does
+    not count when its typed citation failed the check."""
+    from director.citations import SourceRegistry, validate_citations
+    from director.report_card_digest import summarize_report_card
+    from director.schema import Citation
+
+    card = {"tiles": {"predictor": {"status": "RED", "components": [
+        {"name": "momentum_l1_ic", "status": "RED", "value": -0.01},
+        {"name": "meta_l2_ic", "status": "WATCH", "value": 0.01},
+    ]}}}
+    reg = SourceRegistry()
+    summarize_report_card(card, sources=reg)
+
+    def item(item_id, cits, evidence):
+        return ActionItem(id=item_id, title="t", rationale="r", citations=cits, evidence=evidence,
+                          proposed_owner="predictor", priority="P1", horizon="this_week",
+                          suggested_change_type="investigation", confidence=50)
+
+    plan = DirectorWeeklyActionPlan(run_date="2026-10-10", system_summary="s", top_risks=[],
+                                    action_items=[
+        item("a", [Citation(id="metric:momentum_l1_ic", kind="metric")], ["meta_l2_ic prose"]),
+        item("b", [Citation(id="metric:nope", kind="metric")], ["predictor tile momentum_l1_ic"]),
+    ])
+    validate_citations(plan.action_items, reg)
+    s = score_plan(plan, card)
+    assert s.grounded_items == 1 and s.grounding_rate == 0.5
+    assert s.red_covered == 1
