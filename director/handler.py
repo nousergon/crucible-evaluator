@@ -532,7 +532,11 @@ def _persist_retro(s3, bucket: str, run_date: str, grade) -> str:
             trend = {"grades": []}
         else:
             raise
+    # The offered-source manifest is per-run evidence and lives in retro.json;
+    # the trend ledger accumulates weekly, so it carries the check, not the
+    # whole rendered prompt index (alpha-engine-config-I12312).
     row = {"retro_run_date": run_date, **grade.model_dump()}
+    row.pop("citation_sources", None)
     grades = [g for g in trend.get("grades", []) if g.get("prior_run_date") != grade.prior_run_date]
     grades.append(row)
     grades.sort(key=lambda g: g.get("prior_run_date", ""))

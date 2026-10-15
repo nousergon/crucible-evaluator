@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import date, datetime, timezone
 
@@ -57,10 +58,19 @@ from director.item_validity_gate import assess_row, load_records
 # Pure, stdlib-only helpers (no boto3, no GitHub call) — the import graph is
 # acyclic: loop_verification -> issue_filer -> roadmap_pr -> schema, and none
 # of those imports agent.
+from director.citations import (
+    CITATION_CHECK_KEY,
+    CITATION_SOURCES_KEY,
+    PLAN_CITATION_INSTRUCTIONS,
+    SourceRegistry,
+    cite_tag,
+    source_id,
+    validate_citations,
+)
 from director.loop_verification import (
     ADVERSE_STATUSES,
     component_status_map,
-    resolve_cited_metrics,
+    item_cited_metrics,
 )
 from director.report_card_digest import summarize_report_card
 from director.schema import DirectorWeeklyActionPlan
@@ -1616,10 +1626,9 @@ def _row_block(it: dict, status_map: dict, validity: dict | None = None) -> tupl
     # "#7289" and "collapse" sat), so the title and rationale are read
     # too. Safe to widen precisely because this annotates a prompt and
     # reopens nothing.
-    hits = resolve_cited_metrics(
-        list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
-        status_map,
-    )
+    # alpha-engine-config-I12312: a row's typed metric citations resolve by id;
+    # ``wide=True`` keeps the prose read this annotation always had.
+    hits = item_cited_metrics(it, status_map, wide=True)
     if not hits:
         lines.append(
             "      live card: no metric named by this row appears on this week's card "
@@ -1715,7 +1724,8 @@ def _carryover_validity(rows: list[dict], report_card: dict | None) -> tuple[dic
         )
 
 
-def _carryover_context(carryover: dict | None, report_card: dict | None = None) -> str:
+def _carryover_context(carryover: dict | None, report_card: dict | None = None,
+                       sources: SourceRegistry | None = None) -> str:
     """Render the carry-over ledger for the prompt, EACH ROW RECONCILED
     AGAINST THIS WEEK'S CARD (alpha-engine-config-I8178), and BOUNDED
     (alpha-engine-config-I8163).
@@ -1771,6 +1781,11 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     :data:`CARRYOVER_PROMPT_CHAR_BUDGET`; whatever does not fit is replaced by
     one counted, characterised summary line (:func:`_elision_summary`) rather
     than disappearing.
+
+    ``sources`` (alpha-engine-config-I12312): when given, every row that is
+    actually RENDERED is offered as ``carryover:<id>`` and its header line
+    carries the tag. A row elided by the cap or the char budget is never
+    registered — it is not in the prompt, so it is not citable.
     """
     if not carryover or not carryover.get("items"):
         return "No prior action plan on record (this is the first cycle or the ledger is empty)."
@@ -1810,6 +1825,12 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
     used = _SECTION_OVERHEAD_CHARS + sum(len(line) + 1 for line in header)
     for it in shown:
         block, contradicted = _row_block(it, status_map, validity.get(id(it)))
+        row_sid = None
+        if sources is not None and str(it.get("id") or "").strip():
+            # The tag is part of the row's cost, so it is added BEFORE the
+            # budget check; the row is registered only once it is kept.
+            row_sid = source_id("carryover", it.get("id"))
+            block = [f"{block[0]} {cite_tag(row_sid)}", *block[1:]]
         cost = sum(len(line) + 1 for line in block)
         if spilled or (not is_p0(it) and used + cost > CARRYOVER_PROMPT_CHAR_BUDGET):
             # Once one row has spilled, every later (lower-ranked) row spills
@@ -1818,6 +1839,8 @@ def _carryover_context(carryover: dict | None, report_card: dict | None = None) 
             spilled.append(it)
             continue
         used += cost
+        if row_sid is not None:
+            sources.offer("carryover", it.get("id"), "\n".join(block))
         body.extend(block)
         n_contradicted += 1 if contradicted else 0
     if spilled:
@@ -1871,24 +1894,54 @@ def _open_carryover_pinned_components(carryover: dict | None, status_map: dict) 
         return set()
     names: set[str] = set()
     for it in carryover.get("items") or []:
-        names |= set(resolve_cited_metrics(
-            list(it.get("evidence") or []) + [it.get("title") or "", it.get("rationale") or ""],
-            status_map,
-        ).keys())
+        names |= set(item_cited_metrics(it, status_map, wide=True).keys())
     return names
+
+
+#: ``#<N> ...`` — the line shape of ``issue_filer.open_issues_digest`` /
+#: ``recently_closed_proposals_digest`` (both on ``DEFAULT_REPO``).
+_DIGEST_ISSUE_LINE = re.compile(r"^#(\d+)\b")
+_DIGEST_ISSUE_REPO = "alpha-engine-config"
+
+
+def _tag_issue_digest(digest: str, sources: SourceRegistry) -> str:
+    """Offer every ``#<N>`` line of a backlog digest as
+    ``issue:alpha-engine-config-I<N>`` and append its tag. Lines that do not
+    open with an issue number pass through untagged and uncitable."""
+    out = []
+    for line in str(digest).splitlines():
+        m = _DIGEST_ISSUE_LINE.match(line)
+        out.append(sources.tagged("issue", f"{_DIGEST_ISSUE_REPO}-I{m.group(1)}", line) if m else line)
+    return "\n".join(out)
 
 
 def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_digest: str | None = None,
                    resolved_digest: str | None = None) -> list:
     """Assemble (system, human) messages for the Director call."""
+    messages, _ = build_messages_with_sources(
+        report_card, carryover=carryover, roadmap_digest=roadmap_digest,
+        resolved_digest=resolved_digest,
+    )
+    return messages
+
+
+def build_messages_with_sources(
+    report_card: dict, *, carryover: dict | None = None, roadmap_digest: str | None = None,
+    resolved_digest: str | None = None,
+) -> tuple[list, SourceRegistry]:
+    """:func:`build_messages`, plus the :class:`~director.citations.SourceRegistry`
+    of every id the rendered prompt offered (alpha-engine-config-I12312) —
+    the set :func:`build_action_plan` checks the plan's citations against."""
+    sources = SourceRegistry()
     pinned = _open_carryover_pinned_components(carryover, component_status_map(report_card or {}))
     human = [
-        summarize_report_card(report_card, pinned_components=pinned),
+        summarize_report_card(report_card, pinned_components=pinned, sources=sources),
         "",
-        _carryover_context(carryover, report_card),
+        _carryover_context(carryover, report_card, sources=sources),
     ]
     if roadmap_digest:
-        human += ["", "Currently-tracked / in-flight work (open backlog — do NOT re-propose):", roadmap_digest]
+        human += ["", "Currently-tracked / in-flight work (open backlog — do NOT re-propose):",
+                  _tag_issue_digest(roadmap_digest, sources)]
     if resolved_digest:
         human += [
             "",
@@ -1896,7 +1949,7 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
             "do NOT re-propose these under a new name. If a metric tied to one of these still reads "
             "adverse, it is being MONITORED / accumulating to significance, NOT unexamined — note it "
             "in the existing item's terms rather than opening a fresh investigation):",
-            resolved_digest,
+            _tag_issue_digest(resolved_digest, sources),
         ]
     human += [
         "",
@@ -1905,8 +1958,10 @@ def build_messages(report_card: dict, *, carryover: dict | None = None, roadmap_
         "reopen or re-confirm work tracked by a CLOSED or RULED issue, name that issue in "
         "its `targets` (alpha-engine-config-I<N>); code checks it against the declared "
         "closures and rulings before anything is filed.",
+        "",
+        PLAN_CITATION_INSTRUCTIONS,
     ]
-    return [("system", _load_system_prompt()), ("human", "\n".join(human))]
+    return [("system", _load_system_prompt()), ("human", "\n".join(human))], sources
 
 
 def _invoke_with_retry(llm, messages, *, budget=None):
@@ -2022,6 +2077,41 @@ def _invoke_with_retry(llm, messages, *, budget=None):
     raise RuntimeError(f"Director LLM failed after {_MAX_RETRIES} attempts") from last
 
 
+def stamp_plan_citations(plan, sources: SourceRegistry) -> dict | None:
+    """Check every action item's citations against the ids the prompt offered
+    and stamp the result onto ``plan`` (alpha-engine-config-I12312).
+
+    Stamps, on the plan (``extra="allow"``, so archived in ``action_plan.json``
+    without entering the LLM schema): ``citation_check`` — per-status counts,
+    every invalid citation with its reason, the ungrounded item ids — and
+    ``citation_sources``, the offered set itself with its digest, so the check
+    is re-runnable from the artifact alone. On each item: ``citation_grounding``;
+    on each citation: ``check`` / ``check_reason``. Invalid citations are kept
+    and named, never dropped; an ungrounded item is flagged, not removed —
+    proposing stays the Director's job and disposing stays the operator's."""
+    items = list(getattr(plan, "action_items", None) or [])
+    try:
+        block = validate_citations(items, sources)
+        setattr(plan, CITATION_CHECK_KEY, block)
+        setattr(plan, CITATION_SOURCES_KEY, sources.manifest())
+    except Exception as e:  # noqa: BLE001 — a test double may not take attributes
+        logger.warning("Director: could not stamp citation check onto %r: %s",
+                       type(plan).__name__, e)
+        return None
+    if block["ungrounded_item_ids"] or block["invalid"]:
+        logger.warning(
+            "Director plan citations: %d/%d items grounded; %d invalid citation(s) %s; "
+            "ungrounded items %s",
+            block["grounded_items"], block["n_items"], len(block["invalid"]),
+            [f"{r['id']}:{r['status']}" for r in block["invalid"]][:20],
+            block["ungrounded_item_ids"],
+        )
+    else:
+        logger.info("Director plan citations: %d/%d items grounded, %d citations all valid",
+                    block["grounded_items"], block["n_items"], block["n_citations"])
+    return block
+
+
 def build_action_plan(
     report_card: dict,
     *,
@@ -2070,9 +2160,12 @@ def build_action_plan(
         )
     llm = llm or _default_llm(budget, group=group, callsite_id=callsite_id,
                               plan_ceiling_s=plan_ceiling_s)
-    messages = build_messages(report_card, carryover=carryover, roadmap_digest=roadmap_digest,
-                              resolved_digest=resolved_digest)
+    messages, sources = build_messages_with_sources(
+        report_card, carryover=carryover, roadmap_digest=roadmap_digest,
+        resolved_digest=resolved_digest,
+    )
     plan = _invoke_with_retry(llm, messages, budget=budget)
+    stamp_plan_citations(plan, sources)
     # Stamp the run_date from the card if the model didn't echo one.
     rd = run_date or (report_card.get("_provenance", {}) or {}).get("run_date")
     if rd and not plan.run_date:

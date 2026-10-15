@@ -44,6 +44,14 @@ visible arithmetic mismatch instead of a silence. Critical unmeasured and
 unreported components are NAMED; non-critical ones are counted by reason-kind,
 which keeps the digest bounded by the card's problems, not its size.
 
+**Citation tags (alpha-engine-config-I12312).** When the caller passes a
+``director.citations.SourceRegistry`` as ``sources``, every line the model may
+cite is registered under a stable id and rendered with a trailing
+``{cite=<id>}`` tag — ``metric:<component>``, ``tile:<key>``, ``card:<block>``,
+``artifact:<key>``. The registry is then exactly the set of ids the prompt
+offered, which is what the post-call validator checks the model's citations
+against. Without ``sources`` the output is byte-identical to the untagged form.
+
 Output is plain text (markdown-ish) so it drops straight into the prompt.
 """
 
@@ -113,7 +121,43 @@ def _fmt(v) -> str:
     return str(v)
 
 
-def _component_line(c: dict) -> str:
+def _tag(sources, kind: str, key, text: str) -> str:
+    """``text`` with a ``{cite=kind:key}`` tag when a registry is collecting,
+    else ``text`` unchanged. A blank key is never registered."""
+    if sources is None or key is None or not str(key).strip():
+        return text
+    return sources.tagged(kind, key, text)
+
+
+def _component_line(c: dict, sources=None, suffix: str = "") -> str:
+    """One component, in full. With ``sources``, the line is registered as
+    ``metric:<name>`` (reason included, so a quoted reason checks) and the tag
+    closes the first line; the component's declared window sources, if any,
+    are offered as ``artifact:`` ids on a following line."""
+    line = _component_text(c) + suffix
+    name = c.get("name")
+    if sources is None or name is None or not str(name).strip():
+        return line
+    tag = sources.offer("metric", name, line)
+    head, sep, rest = line.partition("\n")
+    out = f"{head} {tag}{sep}{rest}"
+    arts = [
+        sources.offer("artifact", src, f"{name} window source {src}")
+        for src in _window_sources(c)
+    ]
+    if arts:
+        out += "\n      sources: " + " ".join(arts)
+    return out
+
+
+def _window_sources(c) -> list[str]:
+    w = c.get("window") if isinstance(c, dict) else None
+    if not isinstance(w, dict):
+        return []
+    return [str(s) for s in (w.get("sources") or []) if isinstance(s, str) and s.strip()]
+
+
+def _component_text(c: dict) -> str:
     parts = [f"  - {c.get('name')} [{c.get('criticality', '?')}] = {_chip(c.get('status'))}"]
     val = c.get("value")
     if val is not None:
@@ -158,7 +202,8 @@ def _chip(status) -> str:
     return str(status or "N/A")
 
 
-def summarize_report_card(card: dict, *, pinned_components: set[str] | None = None) -> str:
+def summarize_report_card(card: dict, *, pinned_components: set[str] | None = None,
+                          sources=None) -> str:
     """Return a compact text digest of the report card for the prompt.
 
     ``pinned_components``: lower-cased component names to render in full
@@ -166,6 +211,10 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
     an open carry-over item / prior-plan action item. See the module
     docstring, "Pinned components", for why this is bounded by the carried
     backlog rather than by the card.
+
+    ``sources``: an optional ``director.citations.SourceRegistry``; when given,
+    every citable line is registered and tagged (see the module docstring,
+    "Citation tags").
     """
     pinned_components = pinned_components or set()
     if not card:
@@ -176,7 +225,10 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
     overall = card.get("tiles_overall_status", "N/A")
     tiles = card.get("tiles", {}) or {}
 
-    out = [f"# Report Card v2 — run_date {run_date}", f"OVERALL: {overall}"]
+    header = f"# Report Card v2 — run_date {run_date}"
+    if run_date != "?":
+        header = _tag(sources, "artifact", f"evaluator/{run_date}/report_card.json", header)
+    out = [header, _tag(sources, "card", "overall", f"OVERALL: {overall}")]
 
     # sf-pipeline-policy §2.3a rule 3 — every surface presenting the run's numbers
     # carries the correctness-verdict state. The Director acts on these numbers
@@ -199,6 +251,7 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
         f"{k} as-of {v or 'never'}" for k, v in sorted(as_of.items())
     )
     stamp_suffix = f" [{stamps}]" if stamps else ""
+    att_start = len(out)
     if verdict == "PASS":
         out.append(
             "CORRECTNESS ATTESTATION: PASS — the deployed backtest engine, the "
@@ -243,12 +296,15 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
             "producer, and do not describe the run as contamination-free."
         )
 
+    _tag_block(out, att_start, sources, "attestation")
+
     # alpha-engine-config-I7282 — §2.3a rule 3. The attestation above says
     # whether the arithmetic behind these numbers is right; this says whether the
     # pipeline's own pre-spend correctness gates ran at all before it spent. Both
     # polarities render: a line that appears only on the bad week is
     # indistinguishable from a producer that stopped emitting.
     gates = card.get(PIPELINE_GATES_KEY) or {}
+    gates_start = len(out)
     statement = gates.get("statement")
     if statement:
         out.append(("PIPELINE GATES: " if gates.get("verdict") == MEASURED
@@ -269,7 +325,9 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
     #
     # Both polarities render. A scope line that appears only on a narrow week is
     # indistinguishable from a producer that stopped emitting one.
+    _tag_block(out, gates_start, sources, "pipeline_gates")
     scope = card.get(RUN_SCOPE_KEY) or {}
+    scope_start = len(out)
     scope_statement = scope.get("statement")
     if scope_statement and scope.get("verdict") == SCOPE_MEASURED:
         out.append("RUN SCOPE: " + scope_statement)
@@ -288,9 +346,10 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
             "here from one that ran and failed; do not report either as the other."
         )
 
+    _tag_block(out, scope_start, sources, "run_scope")
     if card.get("degraded_staleness"):
-        out.append("⚠ DEGRADED (staleness): stale tiles — "
-                   + ", ".join(card.get("stale_tiles") or []))
+        out.append(_tag(sources, "card", "staleness", "⚠ DEGRADED (staleness): stale tiles — "
+                        + ", ".join(card.get("stale_tiles") or [])))
     # alpha-engine-config-I8380 — distinguish "absent from the card" from "not
     # carried into this digest". A GREEN/N-A component that is not itemized
     # below is COUNTED, not absent: it appears in its tile's "N GREEN, N
@@ -305,14 +364,25 @@ def summarize_report_card(card: dict, *, pinned_components: set[str] | None = No
         "every tile's components list AND every count — never say it about a "
         "metric this digest merely counted instead of naming."
     )
+    census_start = len(out)
     out.extend(_census_lines(card, tiles))
+    _tag_block(out, census_start, sources, "census")
     out.append("")
 
     for key in ordered_tile_keys(tiles):
-        out.extend(_tile_lines(key, tiles.get(key), pinned_components))
+        out.extend(_tile_lines(key, tiles.get(key), pinned_components, sources))
         out.append("")
 
     return "\n".join(out).strip()
+
+
+def _tag_block(out: list[str], start: int, sources, block: str) -> None:
+    """Tag every line ``out[start:]`` appended for one card-level block as
+    ``card:<block>`` (one id, several lines)."""
+    if sources is None:
+        return
+    for i in range(start, len(out)):
+        out[i] = sources.tagged("card", block, out[i])
 
 
 def _comps(tile) -> list:
@@ -368,13 +438,14 @@ def _census_lines(card: dict, tiles: dict) -> list[str]:
     return out
 
 
-def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
+def _tile_lines(key: str, tile, pinned_components: set[str], sources=None) -> list[str]:
     """One tile's section. Every component on the tile lands in exactly one
     disposition, and every disposition is either expanded by name or counted
     in the head — nothing on the tile is skipped."""
     if not isinstance(tile, dict):
-        return [f"## {key} — ⚠ UNREADABLE tile entry ({type(tile).__name__}); "
-                "no components could be read — treat this tile as unmeasured, not healthy."]
+        return [_tag(sources, "tile", key,
+                     f"## {key} — ⚠ UNREADABLE tile entry ({type(tile).__name__}); "
+                     "no components could be read — treat this tile as unmeasured, not healthy.")]
     comps = _comps(tile)
     by: dict[str, list] = {d: [] for d in DISPOSITIONS}
     for c in comps:
@@ -387,7 +458,7 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
             + f"); {len(green)} GREEN, {len(adverse)} adverse, {len(na) + len(permanent)} N/A"
             + (f" ({len(permanent)} permanent)" if permanent else "")
             + (f", {len(other)} UNCLASSIFIED" if other else ""))
-    out = [head]
+    out = [_tag(sources, "tile", key, head)]
     if (wl := _window_label(tile)):
         out.append(f"  - window: {wl}")
     if not comps:
@@ -408,7 +479,7 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
 
     # Expand the adverse (RED/WATCH) components — these are the issues.
     for c in adverse:
-        out.append(_component_line(c))
+        out.append(_component_line(c, sources))
     # alpha-engine-config-I8380 — a GREEN/N-A component named by an open
     # carry-over item is pinned into full detail regardless of colour, so
     # the Director can cite its RECOVERY and close the item. Rendered once
@@ -417,13 +488,13 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
     pinned_green = [c for c in green if _pinned(c)]
     pinned_na = [c for c in na + permanent if _pinned(c)]
     for c in pinned_green + pinned_na:
-        out.append(_component_line(c) + " (carryover-pinned — cite this to close the item)")
+        out.append(_component_line(c, sources, " (carryover-pinned — cite this to close the item)"))
     # A status outside the known vocabulary is named, never counted into a
     # bucket it does not belong to.
     for c in other:
         if isinstance(c, dict):
-            out.append(_component_line(c) + f" (UNCLASSIFIED status {c.get('status')!r} — "
-                       "not GREEN/RED/WATCH/N/A; treat as unverified)")
+            out.append(_component_line(c, sources, f" (UNCLASSIFIED status {c.get('status')!r} — "
+                                       "not GREEN/RED/WATCH/N/A; treat as unverified)"))
         else:
             out.append(f"  - ⚠ unparseable component entry ({type(c).__name__}) — "
                        "treat as unmeasured")
@@ -439,11 +510,13 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
                    if c.get("criticality") == "critical" or c.get("unreported")]
         if missing:
             out.append("  - critical/unreported unmeasured: " + ", ".join(
-                f"{c.get('name')} ({c.get('status')})" for c in missing))
+                _tag(sources, "metric", c.get("name"), f"{c.get('name')} ({c.get('status')})")
+                for c in missing))
     perm_unpinned = [c for c in permanent if c not in pinned_na]
     if perm_unpinned:
         line = "  - permanent absence (declared, excluded from coverage): " + _kind_counts(perm_unpinned)
-        crit = [str(c.get("name")) for c in perm_unpinned if c.get("criticality") == "critical"]
+        crit = [_tag(sources, "metric", c.get("name"), str(c.get("name")))
+                for c in perm_unpinned if c.get("criticality") == "critical"]
         if crit:
             line += "; critical: " + ", ".join(crit)
         out.append(line)
@@ -453,7 +526,8 @@ def _tile_lines(key: str, tile, pinned_components: set[str]) -> list[str]:
         if c in pinned_green:
             continue
         if c.get("trend_decoration") in ("↓", "↓↓"):
-            out.append(f"  - {c.get('name')} GREEN but trending {c['trend_decoration']} (drift-watch)")
+            out.append(_tag(sources, "metric", c.get("name"),
+                            f"  - {c.get('name')} GREEN but trending {c['trend_decoration']} (drift-watch)"))
     return out
 
 

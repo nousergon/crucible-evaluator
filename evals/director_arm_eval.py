@@ -67,8 +67,10 @@ on which the arms are ranked:
                     the fraction of action items citing at least one evidence
                     token that resolves to a real component on the card the
                     plan was built from, using the Director's OWN resolver
-                    (``loop_verification.resolve_cited_metrics``), not a
-                    second implementation of it.
+                    (``loop_verification.item_cited_metrics``: the item's
+                    code-checked typed ``metric:`` citations, or its legacy
+                    ``evidence`` prose when it has none), not a second
+                    implementation of it.
   G4 RED COVERAGE   ``red_coverage`` >= ``MIN_RED_COVERAGE`` (0.50) — the
                     fraction of the card's RED components addressed by at
                     least one action item. An arm that writes a fluent plan
@@ -289,7 +291,7 @@ def _plan_texts(plan) -> list:
 
 def score_plan(plan, card: dict, *, rung: str = "") -> PlanScore:
     """Grade one plan against the report card it was built from. Pure."""
-    from director.loop_verification import component_status_map, resolve_cited_metrics
+    from director.loop_verification import component_status_map, item_cited_metrics
 
     status_map = component_status_map(card or {})
     adverse = _adverse_statuses()
@@ -302,7 +304,8 @@ def score_plan(plan, card: dict, *, rung: str = "") -> PlanScore:
     grounded = 0
     adverse_hits = 0
     for item in items:
-        hits = resolve_cited_metrics(getattr(item, "evidence", None) or [], status_map)
+        row = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+        hits = item_cited_metrics(row, status_map)
         if hits:
             grounded += 1
             covered |= set(hits)
