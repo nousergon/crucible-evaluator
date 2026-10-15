@@ -213,6 +213,43 @@ def _loop_converged(entry: dict) -> bool:
     return proposed is not None and proposed == entry.get("current")
 
 
+#: Minimum sweep coverage for a ``blocked`` predicate to count as a guard
+#: refusing on a complete sample rather than a fault (alpha-engine-config-I10064).
+GUARD_REFUSING_MIN_COVERAGE = 0.95
+
+
+def _guard_refusing(entry: dict) -> bool:
+    """Is this block a safety guard refusing, correctly, on a complete sample?
+
+    alpha-engine-config-I10064, Brian's ruling #18 (2026-10-14): accept the
+    10-12 health rule with card colour WATCH. The producer's
+    ``unblock_predicate`` (crucible-backtester-PR805) is ``guard_refusing`` when
+    ``state == "blocked"`` (alpha MEASURED and nothing reaches the floor),
+    ``sample.n_unmeasured == 0`` and ``window.coverage_min >= 0.95``. That is
+    the guard working, not the loop malfunctioning, so it caps at WATCH instead
+    of escalating to RED on the week counter.
+
+    Every other shape stays on the week rule and can still go RED: ``unmeasured``
+    or ``insufficient_sample`` states, coverage below 0.95, any unmeasured combo,
+    and a missing, malformed or non-numeric predicate. A field that cannot be
+    read is never treated as a refusal.
+    """
+    pred = entry.get("unblock_predicate")
+    if not isinstance(pred, dict) or pred.get("state") != "blocked":
+        return False
+    sample = pred.get("sample")
+    window = pred.get("window")
+    if not isinstance(sample, dict) or not isinstance(window, dict):
+        return False
+    n_unmeasured = sample.get("n_unmeasured")
+    coverage_min = window.get("coverage_min")
+    if isinstance(n_unmeasured, bool) or not isinstance(n_unmeasured, int):
+        return False
+    if isinstance(coverage_min, bool) or not isinstance(coverage_min, (int, float)):
+        return False
+    return n_unmeasured == 0 and float(coverage_min) >= GUARD_REFUSING_MIN_COVERAGE
+
+
 def build_backtester_tile(
     bucket: str, run_date: str, s3_client=None, *,
     as_of: datetime | None = None, history: CardHistory | None = None,
@@ -507,6 +544,9 @@ def build_backtester_tile(
     #    nothing surfaced it (config#1841) — this component makes that silence
     #    impossible. Per-loop state machine:
     #      error                                   → RED
+    #      blocked, guard_refusing (unblock_predicate state blocked,
+    #        n_unmeasured 0, coverage_min >= 0.95), weeks >= 2 → WATCH
+    #        (alpha-engine-config-I10064, ruling #18)
     #      blocked, consecutive_blocked_weeks >= 4 → RED
     #      blocked, weeks in [2, 3]                → WATCH
     #      promoted / insufficient_data / disabled
@@ -557,6 +597,17 @@ def build_backtester_tile(
                     # champion/challenger loop, not a stuck one
                     # (alpha-engine-config-I7654).
                     healthy.append(f"{loop_name}=converged({weeks}w)")
+                elif weeks >= 2 and _guard_refusing(entry):
+                    # A guard refusing on a complete, fully measured sample is
+                    # the guard working: WATCH, never RED, however long it
+                    # lasts (alpha-engine-config-I10064, ruling #18). Economic
+                    # recovery is graded on alpha_vs_spy, not here.
+                    pred = entry["unblock_predicate"]
+                    watch.append(
+                        f"{desc} guard_refusing (best {pred.get('best_alpha')} "
+                        f"vs floor {pred.get('alpha_floor')}, "
+                        f"{pred['sample'].get('n_measured')} measured)"
+                    )
                 elif weeks >= 4:
                     red.append(desc)
                 elif weeks >= 2:
