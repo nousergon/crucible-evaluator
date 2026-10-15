@@ -246,6 +246,41 @@ def _retired_scanner_history(sl: dict) -> str | None:
     )
 
 
+def _windowed_na_detail(name: str, filename: str, art: dict | None) -> str:
+    """N/A reason for a backtester artifact that yielded no gradeable value.
+
+    The fall-through branch used to say "<file> absent this cycle" whatever
+    the artifact's actual state. ``macro_eval.json`` was PRESENT on the
+    2026-10-09 card with ``status=stale_sources`` — its producer refuses to
+    measure from ``cio_evaluations``, 92d stale since its writer retired
+    2026-07-12 — so the card sent a reader looking for a missing artifact that
+    exists, for a condition that will not recover on its own
+    (alpha-engine-config-I12295). Names the observed state instead: absent,
+    refused on stale sources (which table, how old, which retirement), another
+    non-ok status, or ok with no value.
+    """
+    if not art:
+        return (f"{name}: {filename} absent this cycle "
+                f"(persists from a post-2026-06-04 Saturday run, B1a #279).")
+    status = art.get("status")
+    if status == "stale_sources":
+        fresh = art.get("source_freshness") or {}
+        stale = [r for r in fresh.get("sources") or [] if isinstance(r, dict) and r.get("stale")]
+        detail = "; ".join(
+            f"{r.get('table')} {r.get('age_days')}d stale (newest {r.get('newest_date')}, "
+            f"writer retired {r.get('retired_date')}, {r.get('reference')})"
+            for r in stale
+        ) or ", ".join(fresh.get("stale_tables") or []) or "a source table past its freshness bound"
+        return (f"{name}: {filename} present, status=stale_sources — {detail}. The producer "
+                f"refuses to measure from a frozen source; this does not recover until the "
+                f"source is re-pointed or the grade is retired.")
+    if status != "ok":
+        why = art.get("reason") or art.get("error")
+        return (f"{name}: {filename} present but status={status!r}"
+                f"{f' — {why}' if why else ''} (not gradeable this cycle).")
+    return f"{name}: {filename} present (status=ok) but carries no gradeable value this cycle."
+
+
 def _cf_cycle_source(cf: dict) -> tuple[str, bool]:
     """``(clause, stale)`` naming the table the counterfactual's cycles come from.
 
@@ -651,7 +686,7 @@ def build_research_tile(
             name="composite_scoring", module=MODULE, metric_type="calibration", criticality="supporting",
             estimator="spearman_calibration", measurement_horizon=cal_horizon,
             n_floor=30, band="unbanded", source_path=sc_src, input_present=False,
-            na_detail="composite_scoring: score_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
+            na_detail=_windowed_na_detail("composite_scoring", "score_calibration.json", score_cal),
         ))
 
     # 5. macro_agent (supporting) — macro accuracy lift vs realized regime (pp).
@@ -668,7 +703,7 @@ def build_research_tile(
         components.append(build_metric(
             name="macro_agent", module=MODULE, metric_type="lift", criticality="supporting",
             n_floor=20, source_path=mac_src, input_present=False,
-            na_detail="macro_agent: macro_eval.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
+            na_detail=_windowed_na_detail("macro_agent", "macro_eval.json", macro),
         ))
 
     # 6. calibration_diagnostics (supporting) — judge-vs-realized ECE (lower better).
@@ -685,7 +720,7 @@ def build_research_tile(
             name="calibration_diagnostics", module=MODULE, metric_type="calibration", criticality="supporting",
             n_floor=100, higher_is_better=False, source_path=pc_src,
             input_present=False,
-            na_detail="calibration_diagnostics: portfolio_calibration.json absent this cycle (persists from a post-2026-06-04 Saturday run, B1a #279).",
+            na_detail=_windowed_na_detail("calibration_diagnostics", "portfolio_calibration.json", pcal),
         ))
 
     # Breadth-conditioned momentum IC (config#1140) — RETIRED (alpha-engine-
