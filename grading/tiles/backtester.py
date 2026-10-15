@@ -68,23 +68,43 @@ def _get_json(s3, bucket: str, key: str) -> dict | None:
     A missing or unparseable diagnostic is a legitimate N/A here (secondary
     observability — recorded as N/A on the tile, WARN-logged), never a hard
     failure of the whole report card; a real S3 access error still raises.
+    Delegates to ``_get_json_with_etag`` so the tile keeps ONE get_object
+    site (tests/test_iam_s3_contract.py pins the count).
     """
+    return _get_json_with_etag(s3, bucket, key)[0]
+
+
+# The served model's FROZEN, content-addressed bundle manifest
+# (alpha-engine-config-I12123). crucible-predictor's
+# ``model.registry.promote_to_champion`` copies the champion out of this
+# immutable bundle, and its own ``model_zoo._resolve_incumbent_from_bundle``
+# reads the incumbent's CPCV from exactly this key for the same reason this
+# tile now does: the standing ``MANIFEST_KEY`` holds whatever wrote it last.
+REGISTRY_MANIFEST_KEY_FMT = "predictor/registry/{served_version}/manifest.json"
+
+
+def _get_json_with_etag(s3, bucket: str, key: str) -> tuple[dict | None, str | None]:
+    """``_get_json`` plus the object's ETag, so a card can name the exact
+    object version it graded from (alpha-engine-config-I12123). Same
+    tolerance contract: absent/empty/corrupt is ``None``; a real access error
+    still raises."""
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
-            return None
+            return None, None
         logger.error("S3 read failed for s3://%s/%s: %s", bucket, key, e)
         raise
+    etag = (resp.get("ETag") or "").strip('"') or None
     body = resp["Body"].read()
     if not body or not body.strip():
         logger.warning("Artifact empty: s3://%s/%s", bucket, key)
-        return None
+        return None, etag
     try:
-        return json.loads(body)
+        return json.loads(body), etag
     except json.JSONDecodeError:
         logger.warning("Artifact unparseable (corrupt JSON): s3://%s/%s", bucket, key)
-        return None
+        return None, etag
 
 
 def _coverage(grading: dict) -> tuple[float | None, int, int]:
@@ -710,8 +730,10 @@ def build_backtester_tile(
     # predictor's LIVE rolling skill track what its own leak-free backtest
     # promised? Two ingredients, both read from the exact keys/fields the
     # predictor tile already sources (grading/tiles/predictor.py):
-    #   - synthetic-backtest IC: MANIFEST_KEY (predictor/weights/meta/
-    #     manifest.json) :: meta_model_oos_ic_cpcv.mean_ic — the leak-free
+    #   - synthetic-backtest IC: the SERVED model's frozen registry manifest
+    #     (REGISTRY_MANIFEST_KEY_FMT, located via MANIFEST_KEY's
+    #     served_version pointer — see the pin block below) ::
+    #     meta_model_oos_ic_cpcv.mean_ic — the leak-free
     #     combinatorial-purged-CV walk-forward OOS IC (NOT the in-sample
     #     l2_ic; see predictor.py's module docstring for why that distinction
     #     is load-bearing).
@@ -743,13 +765,37 @@ def build_backtester_tile(
     # — treat it the way fdr_surface_health's original fixed band was treated
     # pre-config#2305: expect to recalibrate once live drift observations
     # accrue, not as an authoritative institutional threshold today.
+    #
+    # THE CPCV LEG IS PINNED TO THE SERVED MODEL (alpha-engine-config-I12123).
+    # Two reads, in this order, and neither may be substituted:
+    #   1. MANIFEST_KEY -> ``served_version``. Only the POINTER is taken from
+    #      the standing manifest, never a score.
+    #   2. REGISTRY_MANIFEST_KEY_FMT.format(served_version) ->
+    #      meta_model_oos_ic_cpcv.mean_ic, from the immutable bundle.
+    # Until 2026-10-15 the CPCV was read straight off the standing key, which
+    # holds whatever wrote it last; with the same model served throughout, the
+    # leg read 0.306, 0.132, 0.082, -0.043 and 0.132 across cards, and the
+    # 2026-09-04 RED used a NON-promoted challenger's 0.082. There is NO
+    # fallback to the standing key: a missing pointer or a missing bundle is
+    # N/A-MISSING-INPUT, because degrading to the standing key is the bug.
     manifest = _get_json(s3, bucket, MANIFEST_KEY)
     latest = _get_json(s3, bucket, LATEST_KEY)
     manifest_src = f"s3://{bucket}/{MANIFEST_KEY}"
     latest_src = f"s3://{bucket}/{LATEST_KEY}"
-    bvlp_src = f"{manifest_src} + {latest_src}"
 
-    cpcv_block = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
+    served_version = (manifest or {}).get("served_version") or None
+    registry_manifest, registry_etag, registry_src = None, None, None
+    if served_version:
+        registry_key = REGISTRY_MANIFEST_KEY_FMT.format(served_version=served_version)
+        registry_src = f"s3://{bucket}/{registry_key}"
+        registry_manifest, registry_etag = _get_json_with_etag(s3, bucket, registry_key)
+    bvlp_src = (
+        f"{manifest_src} (served_version={served_version!r}) + "
+        f"{registry_src or 'no registry bundle (served_version absent)'}"
+        f"{f' [ETag {registry_etag}]' if registry_etag else ''} + {latest_src}"
+    )
+
+    cpcv_block = (registry_manifest or {}).get("meta_model_oos_ic_cpcv") or {}
     cpcv_ic = cpcv_block.get("mean_ic") if cpcv_block.get("status") == "ok" else None
     live_ic = (latest or {}).get("ic_30d")
     rolling_n = (latest or {}).get("rolling_n")
@@ -799,7 +845,9 @@ def build_backtester_tile(
             value=drift, unit=RANK_IC, n_samples=rolling_n, n_floor=10,
             source_path=bvlp_src,
             reason=(f"backtest_vs_live_parity = {drift:+.3g} (live 30d rolling IC {live_ic:.3g} "
-                    f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.3g}) "
+                    f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.6g} "
+                    f"of served_version {served_version} from its frozen registry manifest "
+                    f"{registry_src} [ETag {registry_etag}]) "
                     f"vs target 0.0 / red-line -0.05. Negative = live underperforming what the "
                     f"leak-free backtest promised (config#1153). INSTRUMENT CAVEAT "
                     f"(reliability LOW): the two legs are different estimators over "
@@ -818,8 +866,17 @@ def build_backtester_tile(
         missing = []
         if manifest is None:
             missing.append("manifest.json absent")
+        elif not served_version:
+            missing.append("served_version absent from the standing manifest; the CPCV leg is "
+                           "pinned to the served model's frozen bundle and the standing key's "
+                           "CPCV is not substituted (alpha-engine-config-I12123)")
+        elif registry_manifest is None:
+            missing.append(f"frozen registry manifest for served_version {served_version!r} absent "
+                           f"({registry_src}); the standing key's CPCV is not substituted "
+                           f"(alpha-engine-config-I12123)")
         elif cpcv_ic is None:
-            missing.append(f"meta_model_oos_ic_cpcv not ok/absent (status={cpcv_block.get('status')!r})")
+            missing.append(f"meta_model_oos_ic_cpcv not ok/absent in {registry_src} "
+                           f"(status={cpcv_block.get('status')!r})")
         if latest is None:
             missing.append("latest.json absent")
         elif live_ic is None:
