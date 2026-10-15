@@ -8,11 +8,31 @@ import pytest
 from moto import mock_aws
 
 from grading.history import CardHistory
-from grading.tiles.backtester import _coverage, _fdr_surface_status, build_backtester_tile
+from grading.tiles.backtester import (
+    REGISTRY_MANIFEST_KEY_FMT,
+    _coverage,
+    _fdr_surface_status,
+    build_backtester_tile,
+)
 from grading.tiles.predictor import LATEST_KEY, MANIFEST_KEY
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-06-07"
+SERVED = "v3.0-meta-2026-08-14-119e069b"
+REGISTRY_KEY = REGISTRY_MANIFEST_KEY_FMT.format(served_version=SERVED)
+
+
+def _put_served(s3, mean_ic, status="ok", standing_mean_ic=None):
+    """Write the standing manifest as a served_version POINTER and the served
+    model's frozen registry bundle carrying the CPCV (alpha-engine-config-I12123).
+    ``standing_mean_ic`` puts a DIFFERENT (challenger) CPCV in the standing key,
+    which the tile must ignore."""
+    standing = {"served_version": SERVED}
+    if standing_mean_ic is not None:
+        standing["meta_model_oos_ic_cpcv"] = {"status": "ok", "mean_ic": standing_mean_ic, "n_combos": 12}
+    s3.put_object(Bucket=BUCKET, Key=MANIFEST_KEY, Body=json.dumps(standing).encode())
+    s3.put_object(Bucket=BUCKET, Key=REGISTRY_KEY, Body=json.dumps(
+        {"meta_model_oos_ic_cpcv": {"status": status, "mean_ic": mean_ic, "n_combos": 44}}).encode())
 
 
 @pytest.fixture
@@ -529,7 +549,7 @@ class TestBacktestVsLiveParity:
     underperforming what the backtest promised)."""
 
     def _put_manifest(self, s3, mean_ic=0.18, status="ok"):
-        _put(s3, MANIFEST_KEY, {"meta_model_oos_ic_cpcv": {"status": status, "mean_ic": mean_ic, "n_combos": 12}})
+        _put_served(s3, mean_ic, status=status)
 
     def _put_latest(self, s3, ic_30d=0.15, rolling_n=40):
         _put(s3, LATEST_KEY, {"ic_30d": ic_30d, "rolling_n": rolling_n})
@@ -658,6 +678,45 @@ class TestBacktestVsLiveParity:
         assert MANIFEST_KEY in m["source_path"]
         assert LATEST_KEY in m["source_path"]
 
+    # ── alpha-engine-config-I12123: the CPCV leg is pinned to the served model ──
+
+    def test_challenger_cpcv_in_standing_key_is_ignored(self, s3):
+        """The 2026-09-04 RED graded against a NON-promoted challenger's 0.082
+        sitting in the standing key while the 08-14 champion was served. With a
+        challenger value in the standing key and the champion's frozen bundle
+        present, the tile must use the champion's value."""
+        _put_served(s3, 0.131924, standing_mean_ic=0.082003)
+        self._put_latest(s3, ic_30d=0.10, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["value"] == pytest.approx(0.10 - 0.131924)
+
+    def test_card_names_served_version_registry_key_and_etag(self, s3):
+        _put_served(s3, 0.131924)
+        self._put_latest(s3, ic_30d=0.10, rolling_n=40)
+        etag = s3.head_object(Bucket=BUCKET, Key=REGISTRY_KEY)["ETag"].strip('"')
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        for needle in (SERVED, REGISTRY_KEY, etag, "0.131924"):
+            assert needle in m["status_reason"], needle
+        assert REGISTRY_KEY in m["source_path"] and etag in m["source_path"]
+
+    def test_missing_served_version_is_na_not_standing_key(self, s3):
+        _put(s3, MANIFEST_KEY, {"meta_model_oos_ic_cpcv": {"status": "ok", "mean_ic": 0.18, "n_combos": 12}})
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert m["value"] is None
+        assert "served_version absent" in m["status_reason"]
+
+    def test_missing_registry_bundle_is_na_not_standing_key(self, s3):
+        _put(s3, MANIFEST_KEY, {"served_version": SERVED,
+                                "meta_model_oos_ic_cpcv": {"status": "ok", "mean_ic": 0.18, "n_combos": 12}})
+        self._put_latest(s3, ic_30d=0.15, rolling_n=40)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-MISSING-INPUT"
+        assert m["value"] is None
+        assert "frozen registry manifest" in m["status_reason"]
+        assert REGISTRY_KEY in m["status_reason"]
+
     def test_history_threads_trend(self, s3):
         # Mirrors predictor.py's meta_l2_ic trend-threading (config#1836).
         self._put_manifest(s3, mean_ic=0.18)
@@ -690,5 +749,5 @@ class TestBacktestVsLiveParitySourceVerification:
         assert m["value"] == pytest.approx(expected, abs=1e-9)
 
     def _put_manifest_and_latest(self, s3, cpcv_ic, live_ic):
-        _put(s3, MANIFEST_KEY, {"meta_model_oos_ic_cpcv": {"status": "ok", "mean_ic": cpcv_ic, "n_combos": 12}})
+        _put_served(s3, cpcv_ic)
         _put(s3, LATEST_KEY, {"ic_30d": live_ic, "rolling_n": 40})
