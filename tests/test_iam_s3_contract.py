@@ -172,6 +172,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # `_fetch_one`'s get_object on signals/{date}/signals.json (the "signals"
     # prefix, already declared read). New FILE, no new prefix.
     "grading/regime_index.py": 3,
+    # alpha-engine-config-I12351: `RehearsalContext.prime`'s list_objects_v2 over
+    # rehearsal/<execution>/ — reached only when the event names a weekly-SF
+    # rehearsal. "rehearsal" is a NEW prefix, declared readwrite (the same
+    # module re-keys every write there) and granted as rehearsal/rehearsal-*/*
+    # by nous-ergon-ops-PR1722, which merges FIRST.
+    "grading/rehearsal.py": 1,
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
     "grading/tiles/substrate.py": 1,
