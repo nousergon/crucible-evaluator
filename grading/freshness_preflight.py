@@ -93,6 +93,8 @@ from grading.artifact_registry import (
     load_specs,
 )
 from grading.artifacts import DEFAULT_ARTIFACT_MAX_AGE_DAYS
+from grading.rehearsal import active as active_rehearsal
+from grading.rehearsal import tolerate_stale
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +542,31 @@ def assert_input_freshness(
     cannot-read must never collapse to the same verdict: a rehearsal that
     cannot fail is worse than one that always does, because it is green by
     construction and stops being evidence of anything.
+
+    A weekly-SF rehearsal (alpha-engine-config-I12351)
+    ==================================================
+
+    A rehearsal of ``ne-weekly-freshness-pipeline`` is NOT a dry run: its
+    producers really run and write, under ``rehearsal/<execution name>/``, and
+    :mod:`grading.rehearsal` serves this gate's reads from that namespace
+    first. What a rehearsal cannot promise is that every input is THIS week's.
+    It runs on a weekday against the last completed session, stages past its
+    deadline are skipped, and it never trains or promotes, so an input it did
+    not produce resolves to the live copy, which may sit outside the window.
+    Measured on ``rehearsal-2026-10-16-1``: ``research_signals`` resolved to
+    2026-10-09 against the window [2026-10-12, 2026-10-15], the run raised
+    here, and the rehearsal got no report card at all.
+
+    So under an active rehearsal context a missing or stale input is recorded
+    as ``DEGRADED_REHEARSAL`` with its reason, routed through
+    :func:`grading.rehearsal.tolerate_stale` (which also returns it to the SF
+    under ``rehearsal.degradations``). The 2026-07-20 ruling is untouched: a
+    rehearsal's card is written only under its own namespace, never at a
+    production key, so nobody can grade a real week from it. The same two
+    things still RAISE on a rehearsal: a read that cannot be performed (a
+    ``ClientError``), and an unloadable registry. The context exists only when
+    the event names a ``rehearsal-*`` execution, so a production run takes the
+    unchanged ``raise``.
     """
     s3 = s3_client or boto3.client("s3")
     try:
@@ -560,11 +587,27 @@ def assert_input_freshness(
 
     checked: list[dict] = []
     unmeasured = 0
+    degraded = 0
     for name in GATED_ARTIFACT_IDS:
         fn = _CHECK_FNS[name]
         try:
             outcome = fn(s3, bucket, specs[name], run_d)
         except (MissingInputArtifactError, StaleInputArtifactError) as exc:
+            if not dry_run and tolerate_stale(str(exc), where=f"freshness_preflight:{name}"):
+                # A weekly-SF REHEARSAL only (alpha-engine-config-I12351). See
+                # this function's docstring: recorded as a degradation and
+                # returned to the SF, never raised. A production run has no
+                # active rehearsal context, so `tolerate_stale` is False and
+                # the `raise` below is reached exactly as before.
+                degraded += 1
+                checked.append({
+                    "artifact_id": name,
+                    "content_date": None,
+                    "window": None,
+                    "status": "DEGRADED_REHEARSAL",
+                    "reason": str(exc),
+                })
+                continue
             if not dry_run:
                 raise
             # Dry path only. NOTE what is NOT caught here: a ClientError from
@@ -603,6 +646,12 @@ def assert_input_freshness(
         # against without reading this module (alpha-engine-config-I9731).
         "predicate_source": f"s3://{REGISTRY_BUCKET}/{REGISTRY_KEY}#artifacts",
     }
+    rehearsal = active_rehearsal()
+    if rehearsal is not None:
+        # Both polarities again: a rehearsal that measured every input and one
+        # that degraded on all five must not render identically.
+        provenance["rehearsal"] = rehearsal.name
+        provenance["degraded"] = degraded
     if dry_run:
         # Stated in BOTH polarities (sf-pipeline-policy 2.3a): a dry run that
         # measured everything and one that measured nothing must not render

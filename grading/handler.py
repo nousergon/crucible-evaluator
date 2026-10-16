@@ -253,8 +253,25 @@ def handler(event: dict | None = None, context=None) -> dict:
     `flush_default_sink` returns 0 when no sink is configured and never
     raises — telemetry must not take down the work it measures.
     """
+    # alpha-engine-config-I12351: a weekly-SF REHEARSAL (execution name
+    # ``rehearsal-*``, threaded into the ReportCard Payload as
+    # ``execution_name``) re-keys every S3 write under ``rehearsal/<name>/`` —
+    # no evaluator/latest/report_card.json, no dated card, no self-test or
+    # leaderboard at a live key — and reads what earlier stages of the same
+    # rehearsal wrote (its own signals) before falling back to live inputs.
+    # Its freshness refusals degrade instead of raising, recorded under
+    # ``rehearsal.degradations`` in this stage's output. An event naming no
+    # execution, or a non-rehearsal one, leaves it inert: production is
+    # byte-for-byte the old path. The cost-sink flush stays OUTSIDE the
+    # isolation so cost records keep landing where AggregateCosts reads them.
+    from grading.rehearsal import isolate
+
     try:
-        return _run(event, context)
+        with isolate(event if isinstance(event, dict) else None, stage="ReportCard") as _rehearsal:
+            result = _run(event, context)
+            if _rehearsal is not None and isinstance(result, dict):
+                result["rehearsal"] = _rehearsal.summary()
+            return result
     finally:
         try:
             from krepis.cost_sink import flush_default_sink

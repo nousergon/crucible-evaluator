@@ -37,6 +37,13 @@
     "written by nousergon-data's metron_market_data collector; the evaluator only",
     "reads them.",
     "",
+    "alpha-engine-config-I12351 (2026-10-16): rehearsal is READ and WRITTEN by",
+    "grading/rehearsal.py under a weekly-SF rehearsal only: it lists",
+    "rehearsal/<execution>/ to find what earlier stages wrote, and re-keys every",
+    "write the handler makes into that namespace. Granted as",
+    "rehearsal/rehearsal-*/* (rehearsal-named executions only) by",
+    "nous-ergon-ops-PR1722.",
+    "",
     "access modes:",
     "  read      -> s3:ListBucket (prefix condition) + s3:GetObject on <prefix>/*",
     "  readwrite -> the above + s3:PutObject on <prefix>/* (the code writes here)"
@@ -59,6 +66,7 @@
     "_stage_coverage": "readwrite",
     "decision_artifacts": "readwrite",
     "_freshness_monitor": "read",
-    "market_data": "read"
+    "market_data": "read",
+    "rehearsal": "readwrite"
   }
 }
