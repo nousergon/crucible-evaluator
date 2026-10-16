@@ -65,6 +65,8 @@ from director.citations import (
     SourceRegistry,
     cite_tag,
     source_id,
+    stamp_trace_ids,
+    trace_sources_or_none,
     validate_citations,
 )
 from director.loop_verification import (
@@ -1122,6 +1124,13 @@ class _KrepisStructuredDirector:
             user_content=user_content,
             schema=DirectorWeeklyActionPlan,
             schema_name=_DIRECTOR_SCHEMA_NAME,
+            # alpha-engine-config-I12312 (audit §6.3 item 4a): the prompt's
+            # `{cite=...}` lines, declared to krepis so the call's
+            # `llm_trace.v1` row carries each typed id as a `citations[]`
+            # source_id with its sha256 and offsets. The prompt is unchanged
+            # (see `director.citations.trace_sources`); nothing is written
+            # unless a trace sink is configured on the process.
+            sources=trace_sources_or_none(user_content),
             # Explicit, not krepis' default of 2 — see `_STRUCTURED_ATTEMPTS`.
             # Inheriting the default silently doubled every quoted budget.
             attempts=_STRUCTURED_ATTEMPTS,
@@ -1158,6 +1167,7 @@ class _KrepisStructuredDirector:
         plan: DirectorWeeklyActionPlan = result.parsed
         plan.director_model = self._director_model
         plan.resolved_model = result.model
+        stamp_trace_ids(plan, result)
         # I8165: the group has a second, deliberately weaker arm now, so which
         # model served is a QUALITY fact about this plan and not just a cost
         # attribution. `resolved_model` alone left every consumer to work that

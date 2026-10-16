@@ -335,3 +335,123 @@ RETRO_CITATION_INSTRUCTIONS = (
     "score it supports (grounding / calibration / actionability). Code checks every id against "
     "the tags in this input; an id that does not appear here is recorded as INVALID."
 )
+
+
+# ── llm_trace.v1 sources (alpha-engine-config-I12312, audit §6.3 item 4a) ──
+#
+# The check above runs AFTER the call, on the plan. The trace record krepis
+# writes for the call itself (``krepis.llm_trace``, ``llm_trace.v1``) carries
+# ``citations[]`` — every source injected into the prompt, with a stable source
+# id, the sha256 of the exact injected text and its offsets — but only for
+# sources the caller declares. Until now the Director declared none, so a trace
+# of a Director call could not say which metric or issue lines it was offered.
+#
+# :func:`trace_sources` declares them, from the ``{cite=...}`` tags the prompt
+# already carries. Three things are deliberate:
+#
+# - **The prompt is not changed.** The result is a ``RenderedSources`` whose
+#   text IS the user content, so krepis locates it (exactly once, offset 0)
+#   instead of prepending a second rendering.
+# - **The typed id is the ``source_id``**, the join key evals use. krepis'
+#   ``cid`` grammar (``[A-Za-z0-9_.-]{1,64}``) cannot spell ``metric:<name>``,
+#   so each id gets a positional cid (``s1``, ``s2``; a repeated tag ``s1.1``).
+# - **``cited_in_output`` reads false on these rows by construction.** krepis
+#   resolves it from ``[cid]`` markers; the Director's model cites in the
+#   structured ``citations`` field instead. The authoritative linkage is the
+#   artifact's ``citation_check``, which carries the same ``trace_id``
+#   (:func:`stamp_trace_ids`).
+
+#: Director kind → ``krepis.llm_trace.SOURCE_KINDS``. The Director's own kind is
+#: kept in ``meta.director_kind``; this mapping only places it in krepis' closed
+#: vocabulary.
+TRACE_SOURCE_KINDS = {
+    "metric": "metric",
+    "tile": "metric",
+    "card": "artifact",
+    "carryover": "artifact",
+    "issue": "doc",
+    "artifact": "artifact",
+    "plan_item": "artifact",
+}
+
+#: Key on the plan / retro artifact naming the trace of the call that wrote it.
+TRACE_IDS_KEY = "llm_trace"
+
+_TAG_RE = re.compile(r"\{cite=((" + "|".join(KINDS) + r"):[^{}\n]+)\}")
+
+
+def trace_sources(user_content: str, registry: SourceRegistry | None = None):
+    """The ``krepis.llm_trace.RenderedSources`` for one Director call, or
+    ``None`` when the prompt offered nothing.
+
+    One source per ``{cite=...}`` tag in ``user_content``, in prompt order. Its
+    text is the tagged span — from the start of its line (or the end of an
+    earlier tag on that line) through the tag — exactly as sent, so the
+    recorded sha256 and offsets are of characters the model read. With
+    ``registry``, a tag whose id the registry did not offer is skipped (a tag
+    quoted inside a carried-over row's own text is not an offer).
+    """
+    from krepis.llm_trace import RenderedSource, RenderedSources, SourceBlock, sha256_hex
+
+    if not user_content:
+        return None
+    numbers: dict[str, int] = {}
+    seen: dict[str, int] = {}
+    rendered = []
+    last_end = 0
+    for m in _TAG_RE.finditer(user_content):
+        sid, kind = m.group(1), m.group(2)
+        line_start = user_content.rfind("\n", 0, m.start()) + 1
+        start = max(line_start, last_end)
+        end = last_end = m.end()
+        if registry is not None and sid not in registry:
+            continue
+        text = user_content[start:end]
+        n = numbers.setdefault(sid, len(numbers) + 1)
+        k = seen.get(sid, 0)
+        seen[sid] = k + 1
+        cid = f"s{n}" if k == 0 else f"s{n}.{k}"
+        block = SourceBlock(
+            cid=cid,
+            kind=TRACE_SOURCE_KINDS[kind],
+            source_id=sid,
+            text=text,
+            meta={"director_kind": kind, "contract": CITATION_CONTRACT_VERSION, "occurrence": k},
+        )
+        rendered.append(RenderedSource(
+            block=block, content_sha256=sha256_hex(text), char_start=start, char_end=end,
+        ))
+    if not rendered:
+        return None
+    return RenderedSources(text=user_content, sources=tuple(rendered))
+
+
+def trace_sources_or_none(user_content: str, registry: SourceRegistry | None = None):
+    """:func:`trace_sources`, never raising. Trace sources are telemetry: a
+    fault building them is logged and the call goes ahead without them."""
+    try:
+        return trace_sources(user_content, registry)
+    except Exception as exc:  # noqa: BLE001 — telemetry never blocks the call
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "director: trace sources unavailable, call proceeds without them: %s", exc,
+        )
+        return None
+
+
+def stamp_trace_ids(obj, result) -> None:
+    """Put the call's ``trace_id`` / ``span_id`` on the plan or grade it wrote,
+    so the archived ``citation_check`` joins the ``llm_trace.v1`` row. A result
+    without them (a test double, a krepis predating the trace) stamps
+    nothing."""
+    trace_id = getattr(result, "trace_id", None)
+    if not isinstance(trace_id, str) or not trace_id:
+        return
+    try:
+        setattr(obj, TRACE_IDS_KEY, {
+            "trace_id": trace_id,
+            "span_id": getattr(result, "span_id", None),
+        })
+    except Exception:  # noqa: BLE001 — a model without extra fields
+        pass
