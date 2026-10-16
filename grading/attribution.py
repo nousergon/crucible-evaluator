@@ -290,6 +290,20 @@ def session_portfolio_groups(prior_row: dict, row: dict) -> dict[str, Any]:
         if prior_mv.get(sector, 0.0) <= 0:
             entry_pnl += pnl.pop(sector)
 
+    # The SAME rule for the Index sleeve (alpha-engine-config-I8188). SPY
+    # bought intraday has P&L today and no BOD weight, so `session_brinson`
+    # cannot carry it as a group — and it used to be counted in the closure
+    # sum below while silently dropping out of the BF portfolio leg. Measured
+    # on live data 2026-10-16: 2026-05-14 ($3,930.66) and 2026-06-01
+    # ($2,794.20) alone were 65.1bp of the 67.4bp `return_chain_basis_gap`,
+    # with `input_closure_usd` reading $0.00 on both because it summed a
+    # different set of dollars than the decomposition compounded.
+    index_entry_pnl = 0.0
+    if index_prior_mv <= 0 and index_pnl:
+        index_entry_pnl = index_pnl
+        entry_pnl += index_pnl
+        index_pnl = 0.0
+
     weights: dict[str, float] = {s: mv / prior_nav for s, mv in prior_mv.items()}
     returns: dict[str, float] = {
         s: pnl.get(s, 0.0) / prior_mv[s] for s in prior_mv if prior_mv[s] > 0
@@ -301,8 +315,21 @@ def session_portfolio_groups(prior_row: dict, row: dict) -> dict[str, Any]:
     cash_pnl = named_cash + entry_pnl
     cash_return = (cash_pnl / cash_dollars) if cash_dollars else 0.0
 
-    accounted = sum(pnl.values()) + index_pnl + cash_pnl
-    closure = nav_change - accounted
+    # The closure is measured against the dollars the decomposition ACTUALLY
+    # carries — Σ w·r over exactly the groups `session_brinson` builds — not
+    # against a parallel sum of the raw inputs. A dollar any group fails to
+    # carry (no BOD weight, a zero-dollar cash sleeve, a weight with no return)
+    # therefore surfaces here as measured closure instead of vanishing from the
+    # BF leg while this field reads zero. That is what makes the
+    # `return_chain_basis_gap` = compounded-closure statement in
+    # `build_attribution` true by construction rather than by assumption.
+    index_return = index_pnl / index_prior_mv if index_prior_mv > 0 else 0.0
+    carried = (
+        sum(w * returns.get(s, 0.0) for s, w in weights.items())
+        + index_weight * index_return
+        + cash_weight * cash_return
+    ) * prior_nav
+    closure = nav_change - carried
 
     return {
         "available": True,
@@ -319,6 +346,7 @@ def session_portfolio_groups(prior_row: dict, row: dict) -> dict[str, Any]:
         "cash_pnl_usd": cash_pnl,
         "named_cash_lines": named_cash_lines,
         "entry_pnl_usd": entry_pnl,
+        "index_entry_pnl_usd": index_entry_pnl,
         "unclassified_weight": weights.get(UNCLASSIFIED, 0.0),
         "input_closure_usd": closure,
         "reason": None,
@@ -470,9 +498,13 @@ def build_attribution(
             groups["index_pnl_usd"] / groups["index_prior_mv_usd"]
             if groups["index_prior_mv_usd"] else 0.0
         )
+        # SPY bought intraday has no BOD weight but its P&L is still the
+        # benchmark sleeve's, not the active sleeve's: carve it out too.
+        idx_entry_r = groups["index_entry_pnl_usd"] / groups["prior_nav"]
         denom = 1.0 - idx_w
         port_ex_index_daily.append(
-            ((p / 100.0) - idx_w * idx_r) / denom if denom > 1e-9 else 0.0
+            ((p / 100.0) - idx_w * idx_r - idx_entry_r) / denom
+            if denom > 1e-9 else 0.0
         )
 
         periods.append(bf)
@@ -611,7 +643,10 @@ def build_attribution(
             "active_return_vs_spy": linked.portfolio_return - cum_spy,
             # The SAME window and SAME session set (see above), measured from
             # the STORED daily_return_pct chain instead of the BF-attributed
-            # groups sum.
+            # groups sum. The stored return is the NAV RATIO, so this gap also
+            # carries any session where `nav_change_usd` != ΔNAV (the paired
+            # mark-correction sessions, executor-side I9025) — the closure is
+            # struck against `nav_change_usd`, not against ΔNAV.
             "stored_return_chain": cum_port,
             "return_chain_basis_gap": cum_port - linked.portfolio_return,
             "portfolio_return_ex_index_sleeve": cum_ex,

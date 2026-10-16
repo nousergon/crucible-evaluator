@@ -147,6 +147,61 @@ class TestPortfolioLeg:
             "the cash sleeve is exactly the plug this work removes"
         )
 
+    def test_spy_bought_intraday_is_entry_pnl_and_stays_in_the_bf_leg(self):
+        """alpha-engine-config-I8188, measured 2026-10-16: SPY with P&L today
+        and no BOD weight used to be summed into the closure (reading $0) while
+        `session_brinson` dropped it from the portfolio leg — 65bp of a 67bp
+        `return_chain_basis_gap` came from two such sessions. It now follows
+        the sector entry rule: named entry P&L in the cash sleeve."""
+        prior = _row("2026-05-13", 1_000_000, {"AAA": _pos("Technology", 400_000)})
+        today = _row("2026-05-14", 1_005_000, {
+            "AAA": _pos("Technology", 401_000, 1_000),
+            "SPY": _pos("Broad Market / Index", 300_000, 4_000),
+        }, nav_change_usd=5_000)
+        g = session_portfolio_groups(prior, today)
+        assert g["index_weight"] == pytest.approx(0.0)
+        assert g["index_pnl_usd"] == pytest.approx(0.0)
+        assert g["index_entry_pnl_usd"] == pytest.approx(4_000)
+        assert g["entry_pnl_usd"] == pytest.approx(4_000)
+        assert g["input_closure_usd"] == pytest.approx(0.0, abs=1e-6)
+        bf = session_brinson(g, {"Technology": 1.0}, {"Technology": 0.01})
+        assert bf.portfolio_return == pytest.approx(5_000 / 1_000_000, abs=1e-12), (
+            "the $4,000 of entry-day SPY P&L must reach the BF portfolio leg"
+        )
+
+    def test_a_dollar_no_group_can_carry_surfaces_as_closure(self):
+        """The closure is struck against what the groups CARRY, not a parallel
+        sum of the inputs. Fully invested (zero cash dollars) plus $100 of
+        interest: the cash sleeve has no base to carry it, so it must show as
+        measured closure rather than vanish while closure reads zero."""
+        prior = _row("2026-08-26", 1_000_000, {"AAA": _pos("Technology", 1_000_000)})
+        today = _row("2026-08-27", 1_001_100, {
+            "AAA": _pos("Technology", 1_001_000, 1_000)},
+            nav_change_usd=1_100, interest_usd=100,
+        )
+        g = session_portfolio_groups(prior, today)
+        assert g["cash_weight"] == pytest.approx(0.0)
+        assert g["input_closure_usd"] == pytest.approx(100.0)
+
+    def test_the_bf_leg_differs_from_nav_change_by_exactly_the_closure(self):
+        """The invariant `build_attribution`'s return_chain_basis_gap comment
+        relies on, held per session across entry, index, cash and named lines."""
+        prior = _row("2026-08-26", 1_000_000, {
+            "AAA": _pos("Technology", 300_000),
+            "SPY": _pos("Broad Market / Index", 200_000),
+        })
+        today = _row("2026-08-27", 1_010_000, {
+            "AAA": _pos("Technology", 303_000, 3_000),
+            "BBB": _pos("Healthcare", 50_000, 500),
+            "SPY": _pos("Broad Market / Index", 202_000, 2_000),
+        }, nav_change_usd=10_000, interest_usd=40, pricing_timing_usd=60)
+        g = session_portfolio_groups(prior, today)
+        bf = session_brinson(g, {"Technology": 0.5, "Healthcare": 0.5},
+                             {"Technology": 0.01, "Healthcare": 0.0})
+        expected = (g["nav_change_usd"] - g["input_closure_usd"]) / g["prior_nav"]
+        assert bf.portfolio_return == pytest.approx(expected, abs=1e-12)
+        assert g["input_closure_usd"] == pytest.approx(10_000 - 5_600)
+
     def test_missing_prior_snapshot_is_unavailable_not_empty(self):
         prior = {"date": "2026-08-26", "portfolio_nav": "1000000",
                  "positions_snapshot": ""}
