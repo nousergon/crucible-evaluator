@@ -75,6 +75,8 @@ from director.citations import (
     CITATION_SOURCES_KEY,
     RETRO_CITATION_INSTRUCTIONS,
     SourceRegistry,
+    stamp_trace_ids,
+    trace_sources_or_none,
     validate_grade_citations,
 )
 from director.loop_verification import component_status_map, item_cited_metrics
@@ -556,6 +558,9 @@ class _KrepisStructuredJudge:
             user_content=user_content,
             schema=RetroGrade,
             schema_name=_RETRO_JUDGE_SCHEMA_NAME,
+            # alpha-engine-config-I12312: the offered `{cite=...}` lines as
+            # `llm_trace.v1` sources — same contract as the plan call.
+            sources=trace_sources_or_none(user_content),
             # Explicit, not krepis' default of 2 — see
             # `director.agent._STRUCTURED_ATTEMPTS`. The retro runs LAST, on
             # whatever budget the plan left, so an inherited hidden doubling
@@ -595,6 +600,7 @@ class _KrepisStructuredJudge:
         grade.judge_group = self._judge_group
         grade.judge_model = self._judge_model
         grade.resolved_model = result.model
+        stamp_trace_ids(grade, result)
         return grade
 
 
