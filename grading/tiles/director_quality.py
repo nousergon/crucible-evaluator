@@ -19,6 +19,9 @@ Source artifact: ``director/retro_trend.json`` —
         ...                                             # land with config#1673;
     ]}                                                  # may be absent on older rows.
 
+``resolved_model`` is the model that graded; ``judge_model`` is the registry
+deployment alias the tier resolved to (see ``_judge_part``, I11484).
+
 upserted + sorted ascending by ``prior_run_date`` on every Director run
 (``director/handler.py`` ``_persist_retro``, ~lines 214-244). This tile reads
 ``grades[-1]`` — the most recently upserted (= most recent ``prior_run_date``)
@@ -121,6 +124,46 @@ def _latest_grade(trend: dict | None) -> dict | None:
     return grades[-1]
 
 
+def _judge_part(grade: dict) -> str:
+    """Name the model that GRADED the plan, as the card's reason states it.
+
+    The retro row carries three provenance fields (``director/retro.py``
+    ``_KrepisStructuredJudge.invoke``): ``judge_group`` (the tier asked for),
+    ``judge_model`` (the registry deployment that tier resolved to — an alias
+    such as ``high-cap-streaming``, not a model) and ``resolved_model`` (the
+    model the API actually served). Only the last one graded.
+
+    This used to print ``judge_model=…``, so every card since 2026-09-04 named
+    ``high-cap-streaming`` as the grader while ``deepseek-v4-pro`` graded
+    (alpha-engine-config-I11484: the judge records the wrong grader). A
+    deployment alias also hides a fallback: when the group's second arm serves,
+    the alias is unchanged and the grader is not.
+
+    So the reason names ``resolved_model`` as ``judge_served``, and never falls
+    back to the alias when it is absent — an unrecorded grader reads as
+    ``unrecorded``, with the deployment shown as what it is.
+    ``judge_vs_generator`` (the self-grading verdict) is carried when present,
+    because it is the other half of "who graded this".
+
+    Every field is ``.get()``-read: older rows (pre config#1673) carry none of
+    them and must never crash the tile.
+    """
+    served = grade.get("resolved_model")
+    deployment = grade.get("judge_model")
+    group = grade.get("judge_group")
+    verdict = grade.get("judge_vs_generator")
+    if not (served or deployment or group):
+        return ""
+    parts = [f"judge_served={served}" if served else "judge_served=unrecorded"]
+    if group:
+        parts.append(f"judge_group={group}")
+    if deployment:
+        parts.append(f"judge_deployment={deployment}")
+    if verdict:
+        parts.append(f"judge_vs_generator={verdict}")
+    return ", " + ", ".join(parts)
+
+
 def _component(name: str, grade_key: str, grade: dict | None, src: str):
     """Build one 0-100 supporting component (grounding/calibration/actionability).
 
@@ -134,11 +177,7 @@ def _component(name: str, grade_key: str, grade: dict | None, src: str):
     _band = resolve_band(MODULE, name)
     if grade is not None and grade.get(grade_key) is not None:
         value = grade[grade_key]
-        # judge_model is safe-.get() — config#1673 adds it; older persisted
-        # rows (or a repo where #1673 hasn't landed yet) simply lack it, and
-        # this must never crash reading them.
-        judge_model = grade.get("judge_model")
-        judge_part = f", judge_model={judge_model}" if judge_model else ""
+        judge_part = _judge_part(grade)
         return build_metric(
             name=name, module=MODULE, metric_type="ratio", criticality="supporting",
             value=value, unit=SCORE_0_100, n_samples=1, n_floor=1,
