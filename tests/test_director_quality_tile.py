@@ -115,6 +115,32 @@ class TestDirectorQuality:
         tile = build_director_quality_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert "claude-opus-4-8" in _comp(tile, "director_grounding")["status_reason"]
 
+    def test_reason_names_the_served_grader_not_the_deployment_alias(self, s3):
+        """alpha-engine-config-I11484: the live rows carry
+        judge_model="high-cap-streaming" (a registry deployment alias) and
+        resolved_model="deepseek-v4-pro" (what graded). The card must name the
+        served model as the grader and label the alias as a deployment."""
+        _put_trend(s3, [_grade(
+            "2026-10-02", judge_group="high", judge_model="high-cap-streaming",
+            resolved_model="deepseek-v4-pro", judge_vs_generator="distinct",
+        )])
+        tile = build_director_quality_tile(BUCKET, RUN_DATE, s3_client=s3)
+        reason = _comp(tile, "director_grounding")["status_reason"]
+        assert "judge_served=deepseek-v4-pro" in reason
+        assert "judge_deployment=high-cap-streaming" in reason
+        assert "judge_group=high" in reason
+        assert "judge_vs_generator=distinct" in reason
+        assert "judge_model=" not in reason
+
+    def test_unrecorded_served_model_never_falls_back_to_the_alias(self, s3):
+        """A row with the deployment but no served model must not present the
+        deployment as the grader."""
+        _put_trend(s3, [_grade("2026-06-20", judge_model="high-cap-streaming")])
+        tile = build_director_quality_tile(BUCKET, RUN_DATE, s3_client=s3)
+        reason = _comp(tile, "director_grounding")["status_reason"]
+        assert "judge_served=unrecorded" in reason
+        assert "judge_served=high-cap-streaming" not in reason
+
     def test_judge_model_absent_does_not_crash(self, s3):
         """Older rows (or a repo where config#1673 hasn't landed) lack
         judge_model entirely — must degrade gracefully, never raise."""
