@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -455,3 +456,38 @@ def stamp_trace_ids(obj, result) -> None:
         })
     except Exception:  # noqa: BLE001 — a model without extra fields
         pass
+
+
+#: The ``llm_trace.v1`` capture level the Director's call sites DECLARE
+#: (``director-plan``, ``director-retro-judge`` and the ``director-plan-arm-eval``
+#: harness, which runs the same prompt). Brian's ruling C on
+#: alpha-engine-config-I12312 (2026-10-18): operator-internal call sites whose
+#: inputs are the fleet's own artifacts keep ``full`` traces, so an LLM-judge
+#: eval can re-read the prompt and the output. It must match the
+#: ``trace_capture`` field of each call site's LLM_CALLSITE_REGISTRY row.
+#:
+#: Passed explicitly rather than left to krepis's default, so the level is a
+#: reviewed declaration and not an accident of the environment. A record
+#: whose DLP verdict is not ``ok`` is still downgraded to ``hash_only`` by
+#: krepis at run time; ``KREPIS_TRACE_CAPTURE`` can still lower it.
+DIRECTOR_TRACE_CAPTURE = "full"
+
+#: The env pair krepis's process-default trace sink reads
+#: (``krepis.trace_sink.BUCKET_ENV_VAR`` / ``PREFIX_ENV_VAR``).
+TRACE_SINK_ENV_VARS = ("KREPIS_TRACE_SINK_BUCKET", "KREPIS_TRACE_SINK_PREFIX")
+
+
+def director_trace_capture() -> str:
+    """The ``trace_capture=`` a Director ``LLMClient`` is constructed with.
+
+    :data:`DIRECTOR_TRACE_CAPTURE` when a trace sink is configured on the
+    process, ``off`` when none is. krepis refuses, at construction, a declared
+    ``full`` that writes nowhere — correct for a deploy that dropped its sink
+    env, but every host that never had one (a laptop, CI, a box before its
+    env rollout) would then fail the Director outright, so "no sink" passes
+    ``off`` instead. A HALF-configured sink (one variable without the other)
+    is not masked: krepis's own env check raises on it before any spend.
+    """
+    if any(os.environ.get(name, "").strip() for name in TRACE_SINK_ENV_VARS):
+        return DIRECTOR_TRACE_CAPTURE
+    return "off"

@@ -278,3 +278,61 @@ def test_run_director_flushes_the_trace_sink_in_its_finally():
                 for a in ast.walk(n))
     ]
     assert guarded, "run_director's finally must flush krepis.trace_sink, exception-guarded"
+
+
+# ── declared capture level (ruling C, alpha-engine-config-I12312) ───────────
+#
+# Brian ruled 2026-10-18 that the Director keeps `full` traces. Both call
+# sites pass it explicitly instead of leaving it to krepis's environment
+# default, and fall back to `off` where no sink is configured (krepis refuses
+# a declared `full` that writes nowhere).
+
+from director import citations as _citations  # noqa: E402
+
+_SINK_ENV = {
+    "KREPIS_TRACE_SINK_BUCKET": "alpha-engine-research",
+    "KREPIS_TRACE_SINK_PREFIX": "llm_traces/v1",
+}
+
+
+class TestDeclaredTraceCapture:
+    def test_the_director_declares_full(self):
+        assert _citations.DIRECTOR_TRACE_CAPTURE == "full"
+
+    def test_no_sink_configured_passes_off(self, monkeypatch):
+        for name in _SINK_ENV:
+            monkeypatch.delenv(name, raising=False)
+        assert _citations.director_trace_capture() == "off"
+
+    def test_sink_configured_passes_the_declared_level(self, monkeypatch):
+        for name, value in _SINK_ENV.items():
+            monkeypatch.setenv(name, value)
+        assert _citations.director_trace_capture() == "full"
+
+    def test_env_var_names_match_krepis(self):
+        from krepis import trace_sink as ts
+
+        assert _citations.TRACE_SINK_ENV_VARS == (ts.BUCKET_ENV_VAR, ts.PREFIX_ENV_VAR)
+
+    @pytest.mark.parametrize("module", [agent, retro], ids=["plan", "retro-judge"])
+    def test_every_llmclient_construction_passes_the_declared_level(self, module):
+        tree = ast.parse(Path(module.__file__).read_text())
+        calls = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) == "LLMClient"
+        ]
+        assert calls, f"no LLMClient(...) construction found in {module.__name__}"
+        for call in calls:
+            kw = {k.arg: k.value for k in call.keywords}
+            assert "trace_capture" in kw, (
+                f"{module.__name__}: LLMClient(...) at line {call.lineno} passes "
+                "no trace_capture=, so krepis's environment default decides it"
+            )
+            value = kw["trace_capture"]
+            assert isinstance(value, ast.Call) and getattr(
+                value.func, "id", None
+            ) == "director_trace_capture", (
+                f"{module.__name__}: line {call.lineno} must pass "
+                "trace_capture=director_trace_capture()"
+            )
