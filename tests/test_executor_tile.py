@@ -98,6 +98,34 @@ class TestPopulated:
         assert et["ci_method"] == "wilson"
         assert et["status"] == "GREEN"  # 0.60 > target 0.55, N>floor
 
+    def test_entry_triggers_ci_sized_on_closed_entries(self, s3):
+        # The 2026-10-16 artifact shape (alpha-engine-config-I12387): 278 ENTER
+        # rows, 96 of them closed. The win rate is over the 96, so the CI must be.
+        _put(s3, "trigger_scorecard.json", {
+            "status": "ok",
+            "summary": {"win_rate_vs_spy": 0.3333, "total_entries": 278, "n_closed": 96,
+                        "tp": 32, "fp": 64, "avg_slippage_vs_signal": 0.2434,
+                        "alpha_unit": "pct_points"},
+            "triggers": [],
+        })
+        et = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "entry_triggers")
+        assert et["n_samples"] == 96
+        assert et["ci_low"] == pytest.approx(0.2471, abs=1e-3)
+        assert et["ci_high"] == pytest.approx(0.4324, abs=1e-3)
+        assert et["status"] == "RED"  # CI upper 0.43 still below the 0.45 red-line
+
+    def test_entry_triggers_slippage_rendered_as_percent_points(self, s3):
+        # avg_slippage_vs_signal is percent points: 0.2434 means +0.24%, not +24.34%.
+        _put(s3, "trigger_scorecard.json", {
+            "status": "ok",
+            "summary": {"win_rate_vs_spy": 0.3333, "total_entries": 278, "n_closed": 96,
+                        "avg_slippage_vs_signal": 0.2434},
+            "triggers": [],
+        })
+        et = _comp(build_executor_tile(BUCKET, RUN_DATE, s3_client=s3), "entry_triggers")
+        assert "+0.24%" in et["status_reason"]
+        assert "24.34" not in et["status_reason"]
+
     def test_risk_guard_precision(self, s3):
         _put(s3, "shadow_book.json", {
             "status": "ok", "assessment": "appropriate", "guard_lift": 1.2,
