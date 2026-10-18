@@ -75,6 +75,7 @@ from director.citations import (
     CITATION_SOURCES_KEY,
     RETRO_CITATION_INSTRUCTIONS,
     SourceRegistry,
+    director_trace_capture,
     stamp_trace_ids,
     trace_sources_or_none,
     validate_grade_citations,
@@ -730,6 +731,9 @@ def _default_llm(budget=None) -> _KrepisStructuredJudge:
     client = LLMClient(
         spec,
         callsite_id="director-retro-judge",
+        # Declared `full` (ruling C, alpha-engine-config-I12312), or `off`
+        # when this process has no trace sink. See director_trace_capture.
+        trace_capture=director_trace_capture(),
         timeout=judge_budget.quote(
             "director-retro-judge", RETRO_JUDGE_CEILING_S, attempts=2
         ),

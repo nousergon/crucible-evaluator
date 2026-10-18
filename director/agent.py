@@ -64,6 +64,7 @@ from director.citations import (
     PLAN_CITATION_INSTRUCTIONS,
     SourceRegistry,
     cite_tag,
+    director_trace_capture,
     source_id,
     stamp_trace_ids,
     trace_sources_or_none,
@@ -1418,6 +1419,9 @@ def _default_llm(
         # harness passes `director-plan-arm-eval`, which has its own registry
         # row.
         callsite_id=callsite_id,
+        # Declared `full` (ruling C, alpha-engine-config-I12312), or `off`
+        # when this process has no trace sink. See director_trace_capture.
+        trace_capture=director_trace_capture(),
         timeout=quoted_timeout,
         max_retries=_CLIENT_MAX_RETRIES,
         **api_kwargs,
