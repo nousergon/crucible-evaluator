@@ -93,7 +93,14 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     if trig and trig.get("status") == "ok" and not trig_stale:
         summ = trig.get("summary") or {}
         wr = summ.get("win_rate_vs_spy")
-        n = int(summ.get("total_entries") or 0)
+        # The win rate is computed over the CLOSED entries only (those with a
+        # realized outcome), so that is the N the Wilson CI must be sized on.
+        # ``total_entries`` counts every ENTER row, open ones included, and
+        # sizing on it narrowed the CI ~1.7x (N=278 vs 96 closed, 2026-10-16;
+        # alpha-engine-config-I12387). Artifacts that predate ``n_closed``
+        # (alpha-engine-config-I12231) fall back to ``total_entries``.
+        n_closed = summ.get("n_closed")
+        n = int(n_closed if n_closed is not None else (summ.get("total_entries") or 0))
         if wr is not None and n > 0:
             successes = round(wr * n)
             w = wilson_score_interval(successes, n)
@@ -105,8 +112,11 @@ def build_executor_tile(bucket: str, run_date: str, s3_client=None) -> dict:
                 ci_low=w.get("ci_low"), ci_high=w.get("ci_high"),
                 ci_method="wilson" if w.get("status") == "ok" else None, source_path=ts_src,
                 reason=(f"entry_triggers win-rate vs SPY = {wr:.1%} (Wilson CI "
-                        f"[{w.get('ci_low', 0):.2f}, {w.get('ci_high', 0):.2f}], N={n} entries)"
-                        + (f"; avg slippage {slip:+.2%}" if slip is not None else "")
+                        f"[{w.get('ci_low', 0):.2f}, {w.get('ci_high', 0):.2f}], N={n} closed entries)"
+                        # avg_slippage_vs_signal is already in PERCENT POINTS
+                        # (trigger_scorecard.py units contract); ``:+.2%`` would
+                        # multiply it by 100 again (0.2434 -> "+24.34%").
+                        + (f"; avg slippage vs signal {slip:+.2f}%" if slip is not None else "")
                         + " vs target 55% / red-line 45%."),
             ))
         else:
