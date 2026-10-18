@@ -372,7 +372,9 @@ def build_report_card(
         "predictor": lambda: build_predictor_tile(bucket, run_date, s3_client=s3_client, history=history),
         "research": lambda: build_research_tile(bucket, run_date, s3_client=s3_client, history=history),
         "executor": lambda: build_executor_tile(bucket, run_date, s3_client=s3_client),
-        "backtester": lambda: build_backtester_tile(bucket, run_date, s3_client=s3_client, history=history),
+        "backtester": lambda: build_backtester_tile(
+            bucket, run_date, s3_client=s3_client, history=history, run_scope=report.run_scope,
+        ),
         "substrate": lambda: build_substrate_tile(
             bucket, run_date, s3_client=s3_client,
             threshold_leaderboard=threshold_leaderboard,

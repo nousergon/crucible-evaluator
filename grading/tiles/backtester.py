@@ -53,6 +53,7 @@ from grading.attestation import read_backtester_attestation, read_evaluator_stag
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
+from grading.run_scope import read_run_scope, scope_unknown
 from grading.tiles.predictor import LATEST_KEY, MANIFEST_KEY
 from grading.units import COUNT_EVENTS, COUNT_ITEMS, FRACTION, HOURS, RANK_IC, RATIO
 
@@ -60,6 +61,26 @@ logger = logging.getLogger(__name__)
 
 MODULE = "backtester"
 _CADENCE_H = 168  # weekly Saturday cadence
+
+#: The weekly-SF stages that must BOTH be dispatched for
+#: ``backtest/{date}/parity_report.json`` to exist: the umbrella ``Parity`` gate
+#: (``CheckSkipParity``) and the ``ParityReplay`` task inside its parallel
+#: block, which runs ``spot_parity_replay.sh``, the file's producer. Keys are the
+#: run-scope producer's stage names (``CheckSkip*`` with the prefix stripped,
+#: ``nousergon-data infrastructure/lambdas/weekly-run-scope/run_scope.py``), the
+#: same convention as ``attestation.CONTAMINATION_PRODUCER_STAGES``.
+PARITY_REPORT_PRODUCER_STAGES: tuple[str, ...] = ("Parity", "ParityReplay")
+
+#: The recorded ruling behind a skip flag, quoted beside it on the card so a
+#: reader sees a decision, not a gap. ``skip_parity: true`` has been set on the
+#: live ``alpha-engine-saturday`` target since 2026-08-13 by Brian's standing
+#: ruling, re-enable gated on alpha-engine-config-I7309.
+_SKIP_FLAG_RULINGS = {"skip_parity": "I7309"}
+
+#: Default for ``build_backtester_tile(run_scope=...)``: "not supplied, read the
+#: S3 artifact". Distinct from an explicit ``None``, which is the card builder
+#: saying it already looked on both delivery paths and found nothing.
+_RUN_SCOPE_UNSET = object()
 
 
 def _get_json(s3, bucket: str, key: str) -> dict | None:
@@ -270,15 +291,44 @@ def _guard_refusing(entry: dict) -> bool:
     return n_unmeasured == 0 and float(coverage_min) >= GUARD_REFUSING_MIN_COVERAGE
 
 
+def _parity_disabled_flags(run_scope) -> list[str] | None:
+    """The skip flags that switched off the parity_report.json producer this run.
+
+    ``None`` unless the run scope is MEASURED and records a
+    :data:`PARITY_REPORT_PRODUCER_STAGES` stage as ``DISABLED``. Every other
+    case (scope absent, degraded, unrecognised, or the stage dispatched and then
+    failed or never reached) returns ``None``, so a missing report is still
+    flagged as absent. Only an input that switched the stage off can explain
+    the file away (alpha-engine-config-I12389).
+    """
+    block = read_run_scope(run_scope)
+    if scope_unknown(block):
+        return None
+    disabled = [s for s in PARITY_REPORT_PRODUCER_STAGES
+                if s in set(block.get("disabled_stages") or ())]
+    if not disabled:
+        return None
+    by_stage = block.get("disabled_by_stage") or {}
+    flags = sorted({by_stage[s] for s in disabled if by_stage.get(s)})
+    return flags or ["an operator skip flag"]
+
+
 def build_backtester_tile(
     bucket: str, run_date: str, s3_client=None, *,
     as_of: datetime | None = None, history: CardHistory | None = None,
+    run_scope=_RUN_SCOPE_UNSET,
 ) -> dict:
     """Build the Backtester self-grade tile.
 
     ``history`` (config#1836) supplies prior-card values so ``backtest_vs_live_parity``
     carries cross-cycle ``trend_4w``/``trend_13w``, mirroring the predictor tile's
     ``meta_l2_ic`` trend-threading; omitted → trends stay unpopulated.
+
+    ``run_scope`` is the run's raw scope block, as the card builder resolved it
+    (in-band payload first, then ``backtest/{date}/run_scope.json``; ``None``
+    when both were absent). Omitted, the tile reads the S3 artifact itself, and
+    only when it needs it: to tell a parity producer that was switched off from
+    one that ran and wrote nothing (alpha-engine-config-I12389).
     """
     s3 = s3_client or boto3.client("s3")
     as_of = as_of or datetime.now(UTC)
@@ -500,11 +550,38 @@ def build_backtester_tile(
                 ),
             ))
     else:
-        components.append(build_metric(
-            name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct", criticality="supporting",
-            n_floor=1, band="unbanded", source_path=p_src, input_present=False,
-            na_detail="vectorized_vs_consolidated_parity: parity_report.json absent this cycle.",
-        ))
+        # No report in the window. Absent is the default reading, and it stays
+        # the reading unless the run's OWN scope says the producer was switched
+        # off by input (alpha-engine-config-I12389). `skip_parity` has been on
+        # since 2026-08-13 by a standing ruling (I7309), and "absent this
+        # cycle" made the weekly Director file that decision as a missing
+        # producer. A stage that was dispatched and wrote nothing still lands
+        # on the absent branch, as does an unknown scope.
+        if run_scope is _RUN_SCOPE_UNSET:
+            run_scope = _get_json(s3, bucket, f"{prefix}/run_scope.json")
+        disabled_by = _parity_disabled_flags(run_scope)
+        if disabled_by:
+            flag_text = ", ".join(
+                f"{f}, {_SKIP_FLAG_RULINGS[f]}" if f in _SKIP_FLAG_RULINGS else f
+                for f in disabled_by
+            )
+            components.append(build_metric(
+                name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct",
+                criticality="supporting", n_floor=1, band="unbanded", source_path=p_src,
+                ran=False,
+                na_detail=(
+                    f"vectorized_vs_consolidated_parity: N/A, disabled ({flag_text}). "
+                    f"The run scope records the parity stage as DISABLED, so no "
+                    f"parity_report.json was asked for this cycle. This is not a pass: "
+                    f"backtester-to-executor fill parity is unmeasured on purpose."
+                ),
+            ))
+        else:
+            components.append(build_metric(
+                name="vectorized_vs_consolidated_parity", module=MODULE, metric_type="pct", criticality="supporting",
+                n_floor=1, band="unbanded", source_path=p_src, input_present=False,
+                na_detail="vectorized_vs_consolidated_parity: parity_report.json absent this cycle.",
+            ))
 
     # 4. fdr_surface_health (supporting) — count of BH-FDR-significant correlations.
     attr, _attr_date, attr_age, _attr_key = get_json_windowed(s3, bucket, "backtest/{date}/attribution.json", run_date)

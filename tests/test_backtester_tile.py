@@ -224,6 +224,116 @@ class TestParity:
         assert p["status"] == "N/A-MISSING-INPUT"
 
 
+def _scope_stage(disposition, flag, disabled_by=None):
+    row = {"disposition": disposition, "flag": flag, "gate": f"CheckSkip{flag}"}
+    if disposition == "DISABLED":
+        row["disabled_by"] = disabled_by or flag
+    return row
+
+
+def _run_scope(parity="DISABLED", replay=None, parity_flag="skip_parity", replay_by=None):
+    """The raw ``run_scope.json`` shape the live weekly writes
+    (``backtest/2026-10-16/run_scope.json``: ``Parity`` DISABLED by
+    ``skip_parity`` at its own gate, ``ParityReplay`` DISABLED by the same flag
+    through its parent gate)."""
+    replay = replay or parity
+    return {
+        "schema": "run_scope-1.0.0", "run_date": RUN_DATE,
+        "graded_stages": ["Backtester"],
+        "stages": {
+            "Backtester": _scope_stage("ENABLED_COMPLETED", "skip_backtester"),
+            "Parity": _scope_stage(parity, parity_flag),
+            "ParityReplay": _scope_stage(replay, "skip_parity_replay",
+                                         disabled_by=replay_by or parity_flag),
+        },
+    }
+
+
+class TestParityDisabledByInput:
+    """alpha-engine-config-I12389: a parity stage switched off by input is
+    ``N/A, disabled``, not "absent". ``skip_parity`` has been on since
+    2026-08-13 by a standing ruling (I7309), and "parity_report.json absent
+    this cycle" made the weekly Director file that decision as a missing
+    producer. The absence reading must survive every case where the stage
+    was dispatched, or where the scope cannot say."""
+
+    def _parity(self, s3, **kw):
+        return _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3, **kw),
+                     "vectorized_vs_consolidated_parity")
+
+    def test_skip_parity_reads_disabled_not_absent(self, s3):
+        _put(s3, f"backtest/{RUN_DATE}/run_scope.json", _run_scope())
+        p = self._parity(s3)
+        assert p["status"] == "N/A-NOT-RUN", p
+        assert "N/A, disabled (skip_parity, I7309)" in p["status_reason"]
+        assert "absent" not in p["status_reason"]
+        assert "not a pass" in p["status_reason"]
+
+    def test_in_band_scope_is_used_without_an_s3_artifact(self, s3):
+        """The card builder hands the tile the scope it already resolved
+        (in-band payload first). No S3 artifact is needed."""
+        p = self._parity(s3, run_scope=_run_scope())
+        assert p["status"] == "N/A-NOT-RUN"
+        assert "skip_parity, I7309" in p["status_reason"]
+
+    def test_an_explicit_none_scope_is_absent_and_not_re_read(self, s3):
+        """``None`` from the card builder means both delivery paths were
+        empty. An S3 object that appears afterwards is not consulted, and the
+        reading is absent."""
+        _put(s3, f"backtest/{RUN_DATE}/run_scope.json", _run_scope())
+        p = self._parity(s3, run_scope=None)
+        assert p["status"] == "N/A-MISSING-INPUT"
+        assert "absent this cycle" in p["status_reason"]
+
+    def test_replay_alone_disabled_names_its_own_flag(self, s3):
+        p = self._parity(s3, run_scope=_run_scope(
+            parity="ENABLED_COMPLETED", replay="DISABLED", replay_by="skip_parity_replay"))
+        assert p["status"] == "N/A-NOT-RUN"
+        assert "N/A, disabled (skip_parity_replay)" in p["status_reason"]
+        assert "I7309" not in p["status_reason"]
+
+    @pytest.mark.parametrize("disposition", ["ENABLED_COMPLETED", "ENABLED_FAILED", "NOT_REACHED"])
+    def test_a_stage_that_was_not_disabled_still_flags_absence(self, s3, disposition):
+        """Dispatched (or never reached) and no report: that is the gap
+        #12389 is about, and it must still read as absent."""
+        p = self._parity(s3, run_scope=_run_scope(parity=disposition))
+        assert p["status"] == "N/A-MISSING-INPUT", disposition
+        assert "absent this cycle" in p["status_reason"]
+
+    @pytest.mark.parametrize("scope", [
+        None,
+        {},
+        {"degraded": True, "degraded_reason": "history unreadable"},
+        {"stages": {}},
+        {"stages": {"Parity": {"disposition": "PROBABLY_FINE"},
+                    "ParityReplay": {"disposition": "PROBABLY_FINE"}}},
+    ])
+    def test_an_unknown_scope_never_excuses_the_absence(self, s3, scope):
+        p = self._parity(s3, run_scope=scope)
+        assert p["status"] == "N/A-MISSING-INPUT", scope
+        assert "absent this cycle" in p["status_reason"]
+
+    def test_no_scope_artifact_at_all_is_absent(self, s3):
+        p = self._parity(s3)
+        assert p["status"] == "N/A-MISSING-INPUT"
+
+    def test_a_present_report_is_graded_whatever_the_scope_says(self, s3):
+        """The scope only explains a MISSING report. A report that exists is
+        graded on its own content; a declared failure stays RED."""
+        _put(s3, f"backtest/{RUN_DATE}/parity_report.json",
+             {"data_state": "backtester_replay_error"})
+        p = self._parity(s3, run_scope=_run_scope())
+        assert p["status"] == "RED"
+
+    def test_disabled_parity_does_not_block_a_green_tile(self, s3):
+        """Supporting N/A, as before: the decision to stop measuring parity
+        must not move the tile's status any more than the old absent N/A did."""
+        _put(s3, f"backtest/{RUN_DATE}/run_scope.json", _run_scope())
+        tile_disabled = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3)
+        tile_absent = build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3, run_scope=None)
+        assert tile_disabled["status"] == tile_absent["status"]
+
+
 class TestFdrSurface:
     """config#2305: the band scales with n_fdr_tests (the actual size of the
     shared BH-FDR correction pool), not a fixed absolute count — the fixed
