@@ -262,3 +262,102 @@ class TestTheCardStatesIt:
         assert f"window {dates[0]}→{dates[-1]}, 70 trading days" in sharpe_line
         pbo_line = next(ln for ln in text.splitlines() if ln.startswith("  - pbo "))
         assert f"window {UNDECLARED}" in pbo_line
+
+
+class TestStrategyIdentityJoin:
+    """alpha-engine-config-I11089 — each eod date joined to the executor's
+    order_books/{date}/summary.json; unstamped dates are reported, never inferred."""
+
+    @staticmethod
+    def _summary(s3, date, **fields):
+        _put(s3, f"order_books/{date}/summary.json", json.dumps(fields))
+
+    def test_segments_follow_champion_and_config_and_leave_gaps_unstamped(self, s3):
+        body = _csv(12)
+        _put(s3, EOD_PNL_KEY, body)
+        dates = _parsed_dates(body)
+        sha = "a" * 64
+        sha2 = "b" * 64
+        # dates[0:3]: no summary. [3:5]: pre-#597 (champion only). [5:9]: full stamp.
+        # [9:12]: same champion, NEW config.
+        for d in dates[3:5]:
+            self._summary(s3, d, champion="attractiveness_20", promotion_source="arena_decided")
+        for i, d in enumerate(dates[5:9]):
+            self._summary(s3, d, champion="attractiveness_20", promotion_source="arena_decided",
+                          executor_sha=f"{i:040x}", config_sha256=sha, champion_pointer_version="v1")
+        for d in dates[9:]:
+            self._summary(s3, d, champion="attractiveness_20", promotion_source="arena_held",
+                          executor_sha="f" * 40, config_sha256=sha2, champion_pointer_version="v2")
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12)
+        si = tile["window"]["strategy_identity"]
+        assert si["dates_requested"] == 12 and si["dates_stamped"] == 9
+        assert si["dates_without_summary"] == 3 and si["read_errors"] == []
+        got = [(g["start"], g["end"], g["trading_days"], g["champion"], g["config_sha256"])
+               for g in si["segments"]]
+        assert got == [
+            (dates[0], dates[2], 3, "unstamped", "unstamped"),
+            (dates[3], dates[4], 2, "attractiveness_20", "unstamped"),
+            (dates[5], dates[8], 4, "attractiveness_20", sha),
+            (dates[9], dates[11], 3, "attractiveness_20", sha2),
+        ]
+        assert sum(g["trading_days"] for g in si["segments"]) == 12
+        full = si["segments"][2]
+        assert len(full["executor_shas"]) == 4 and full["champion_pointer_versions"] == ["v1"]
+        # Additive: eod_pnl.csv itself still records none, and no figure moved.
+        assert tile["window"]["strategy_epoch"] == UNDECLARED
+        c = _by_name(tile)
+        assert c["sharpe_ratio"]["window"]["strategy_identity"] == si
+
+    def test_figures_unchanged_by_the_join(self, s3):
+        body = _csv(70)
+        _put(s3, EOD_PNL_KEY, body)
+        before = _by_name(build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12))
+        for d in _parsed_dates(body):
+            self._summary(s3, d, champion="x", config_sha256="c" * 64)
+        after = _by_name(build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12))
+        assert {n: (c.get("value"), c.get("n_samples"), c.get("status")) for n, c in before.items()} == \
+               {n: (c.get("value"), c.get("n_samples"), c.get("status")) for n, c in after.items()}
+
+    def test_unreadable_summary_is_reported_not_raised(self, s3):
+        body = _csv(6)
+        _put(s3, EOD_PNL_KEY, body)
+        d0 = _parsed_dates(body)[0]
+        _put(s3, f"order_books/{d0}/summary.json", "{not json")
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12)
+        si = tile["window"]["strategy_identity"]
+        assert si["dates_stamped"] == 0 and si["read_error_count"] == 1 and len(si["read_errors"]) == 1
+        assert si["read_errors"][0].startswith(d0)
+
+    def test_digest_prints_the_strategy_line(self, s3):
+        body = _csv(6)
+        _put(s3, EOD_PNL_KEY, body)
+        for d in _parsed_dates(body):
+            self._summary(s3, d, champion="scanner_predictor_direct", config_sha256="29bcc4ce" + "0" * 56)
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12)
+        from director.report_card_digest import _strategy_identity_line
+        line = _strategy_identity_line(tile)
+        assert "6/6 dates stamped" in line and "scanner_predictor_direct cfg 29bcc4ce" in line
+
+    def test_repeated_faults_are_counted_but_only_a_few_listed(self, s3):
+        from botocore.exceptions import ClientError
+
+        body = _csv(20)
+        _put(s3, EOD_PNL_KEY, body)
+
+        class Denied:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def get_object(self, **kw):
+                if kw["Key"].startswith("order_books/"):
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+                return self._inner.get_object(**kw)
+
+            def __getattr__(self, n):
+                return getattr(self._inner, n)
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=Denied(s3), n_trials=12)
+        si = tile["window"]["strategy_identity"]
+        assert si["read_error_count"] == 20 and len(si["read_errors"]) == 5
+        assert si["read_errors"][0].endswith("AccessDenied")
+        assert si["dates_stamped"] == 0

@@ -44,6 +44,12 @@
     "rehearsal/rehearsal-*/* (rehearsal-named executions only) by",
     "nous-ergon-ops-PR1722.",
     "",
+    "alpha-engine-config-I11089 (2026-10-19): order_books is READ by",
+    "grading/strategy_identity.py -- order_books/{date}/summary.json is the",
+    "executor's per-session strategy identity (champion, executor_sha,",
+    "config_sha256, champion_pointer_version), joined to the eod_pnl.csv rows so",
+    "the card can say which deployed strategy a window was traded under.",
+    "",
     "access modes:",
     "  read      -> s3:ListBucket (prefix condition) + s3:GetObject on <prefix>/*",
     "  readwrite -> the above + s3:PutObject on <prefix>/* (the code writes here)"
@@ -67,6 +73,7 @@
     "decision_artifacts": "readwrite",
     "_freshness_monitor": "read",
     "market_data": "read",
+    "order_books": "read",
     "rehearsal": "readwrite"
   }
 }

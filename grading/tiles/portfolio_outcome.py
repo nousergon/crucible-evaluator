@@ -43,6 +43,7 @@ from grading.module_agg import build_tile
 from grading.attribution import ATTRIBUTION_LATEST_KEY, build_attribution
 from grading.power import annotate_power_all
 from grading.regime_index import REGIME_INDEX_KEY, SIGNALS_KEY_TEMPLATE, resolve_regimes
+from grading.strategy_identity import build_strategy_identity
 from grading.units import (
     ANNUALIZED_RATIO,
     DAYS,
@@ -914,6 +915,12 @@ def build_portfolio_outcome_tile(
         dates=series.dates, rows_excluded=series.rows_dropped,
         source_object=series.source_object,
     )
+    # alpha-engine-config-I11089 — which deployed strategy each of those rows was
+    # traded under, joined from the executor's order-book summaries (additive:
+    # `strategy_epoch` above still says eod_pnl.csv itself records none).
+    identity = build_strategy_identity(bucket, series.dates, s3_client=s3_client)
+    eod_w["strategy_identity"] = identity
+    dsr_w["strategy_identity"] = identity
 
     # 1. Sharpe (critical)
     sharpe = sharpe_ratio(port)
