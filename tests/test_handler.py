@@ -390,8 +390,11 @@ def _install_fake_stage_coverage(monkeypatch, calls=None):
     calls = calls if calls is not None else []
     fake_mod = types.ModuleType("krepis.stage_coverage")
 
-    def _fake_assert_stage_coverage(stage, *, run_date, window_start):
-        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+    def _fake_assert_stage_coverage(stage, *, run_date, window_start, execution_name=None):
+        calls.append({
+            "stage": stage, "run_date": run_date, "window_start": window_start,
+            "execution_name": execution_name,
+        })
         return {"stage": stage, "status": "COVERED", "run_date": run_date}
 
     fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
@@ -428,6 +431,25 @@ class TestStageCoverageEvaluatorDeployDriftCheck:
         assert [c["stage"] for c in calls] == ["EvaluatorDeployDriftCheck"]
         # never confused with the real work stage this Lambda also backs.
         assert out["stage_coverage"]["stage"] != "ReportCard"
+        # A production / SF-less invocation names no rehearsal.
+        assert calls[0]["execution_name"] is None
+
+    def test_a_rehearsal_names_itself_to_krepis(self, monkeypatch):
+        """alpha-engine-config-I12351: rehearsal-2026-10-16-2 wrote this
+        stage's verdict at a live key. With the SF's execution_name, krepis
+        records it in the rehearsal namespace and publishes no metric."""
+        import grading.deploy_drift as dd
+        monkeypatch.setattr(dd, "check_deploy_drift", lambda *, function_name: {"has_drift": False})
+        calls = _install_fake_stage_coverage(monkeypatch)
+
+        H.handler(
+            {"action": "check_deploy_drift", "execution_name": "rehearsal-2026-10-16-2"},
+            context=None,
+        )
+        assert calls[0]["execution_name"] == "rehearsal-2026-10-16-2"
+
+        H.handler({"action": "check_deploy_drift", "execution_name": "weekly-2026-10-17"}, context=None)
+        assert calls[1]["execution_name"] is None
 
 
 def _block_stage_coverage_import(monkeypatch):
@@ -526,7 +548,9 @@ class TestStageCoverageNeverEnablesEnforcement:
 
         assert seen_kwargs
         for kwargs in seen_kwargs:
-            assert kwargs == {"run_date", "window_start"}
+            # execution_name (alpha-engine-config-I12351) only picks the
+            # rehearsal namespace; it never enables enforcement.
+            assert kwargs == {"run_date", "window_start", "execution_name"}
 
 
 # ── config-I8155: a refused verdict must not kill the stage it observes ──────
@@ -585,3 +609,31 @@ def test_a_normal_run_date_still_reaches_the_library(monkeypatch):
     )
     assert seen[0][1]["run_date"] == "2026-08-22"
     assert out["stage_coverage"]["run_date"] == "2026-08-22"
+
+
+def test_a_rehearsal_publishes_no_unmeasured_metric(monkeypatch):
+    """alpha-engine-config-I12351: the direct UNMEASURED StageCoverage datapoint
+    carries no execution dimension either, so a rehearsal withholds it."""
+    import types
+
+    from grading import handler as h
+
+    fake = types.ModuleType("krepis.stage_coverage")
+
+    def _refuse(stage, **kwargs):
+        raise ValueError("run_date is REQUIRED and must be non-empty")
+
+    fake.assert_stage_coverage = _refuse
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake)
+    clients: list = []
+    monkeypatch.setattr(h.boto3, "client", lambda *a, **k: clients.append(a) or None)
+
+    out = h._record_stage_coverage(
+        "EvaluatorDeployDriftCheck",
+        run_date="",
+        started=datetime.now(timezone.utc),
+        result={},
+        execution_name="rehearsal-2026-10-16-2",
+    )
+    assert out["stage_coverage"]["status"] == h._STAGE_COVERAGE_STATUS_UNMEASURED
+    assert clients == []
