@@ -495,3 +495,104 @@ class TestCarryoverCount:
 
     def test_hand_built_messages_count_zero_rather_than_raising(self):
         assert _carryover_item_count([("system", "hi"), ("human", "there")]) == 0
+
+
+class TestRetroJudgeHasItsOwnLatencyChannel:
+    """alpha-engine-config-I12289 — the retro judge shares `_invoke_with_retry`
+    with the plan call, and its emitter hard-coded `DirectorPlan*` under
+    `Group=ultra`. Measured 2026-10-17: the plan ran 533.761s (amber 0 against
+    536.4s) and the judge ran 207.789s (amber 1 against its 120s ceiling's
+    108s line), and `DirectorPlanLatencyAmber Group=ultra` held both — so the
+    plan-latency alarm read the JUDGE's amber and stayed red from 2026-09-19.
+    """
+
+    def _judge_channel(self, monkeypatch):
+        from director import retro
+
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+        return retro._judge_latency_channel()
+
+    def test_judge_record_is_named_for_the_judge_not_the_plan(self, monkeypatch):
+        rec = _emit_plan_latency(
+            elapsed_s=207.789, outcome="ok", prompt_chars=75296,
+            carryover_items=0, ceiling_s=120.0,
+            channel=self._judge_channel(monkeypatch),
+        )
+        assert rec["Group"] == "high"
+        assert not [k for k in rec if k.startswith("DirectorPlan")], rec
+        # The numbers the judge already published are unchanged — only the
+        # name moved: amber at 0.9 x its 120s ceiling, flagged as ceiling-derived.
+        assert rec["RetroJudgeLatencySeconds"] == 207.789
+        assert rec["RetroJudgeAmberSeconds"] == 108.0
+        assert rec["RetroJudgeLatencyAmber"] == 1
+        assert rec["RetroJudgeAmberClampedToCeiling"] == 1
+
+    def test_judge_emf_declares_only_judge_metrics(self, monkeypatch, capsys):
+        _emit_plan_latency(
+            elapsed_s=10.0, outcome="ok", prompt_chars=1, carryover_items=0,
+            ceiling_s=120.0, channel=self._judge_channel(monkeypatch),
+        )
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        directive = payload["_aws"]["CloudWatchMetrics"][0]
+        names = {m["Name"] for m in directive["Metrics"]}
+        assert "RetroJudgeLatencyAmber" in names
+        assert not [n for n in names if n.startswith("DirectorPlan")]
+        assert directive["Dimensions"] == [["Group"]]
+        assert payload["Group"] == "high"
+
+    def test_judge_group_override_follows_the_env(self, monkeypatch):
+        from director import retro
+
+        monkeypatch.setenv("RETRO_JUDGE_GROUP", "mid")
+        assert retro._judge_latency_channel().group == "mid"
+
+    def test_grade_prior_plan_publishes_nothing_on_the_plan_metric(
+        self, monkeypatch, capsys
+    ):
+        """The call site, not just the emitter: a slow judge call must leave
+        `DirectorPlanLatencyAmber` untouched, whatever the judge's own line."""
+        import director.agent as agent
+        from director.retro import grade_prior_plan
+        from director.schema import RetroGrade
+
+        # The first two monotonic reads are the attempt's start and end.
+        ticks = iter([1000.0, 1207.789])
+        real_monotonic = agent.time.monotonic
+
+        def _clock():
+            tick = next(ticks, None)
+            return real_monotonic() if tick is None else tick
+
+        monkeypatch.setattr(agent.time, "monotonic", _clock)
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+
+        class _SlowJudge:
+            attempt_cost_s = 120.0
+            last_usage = None
+
+            def invoke(self, messages):
+                return RetroGrade(prior_run_date="", grounding=80,
+                                  calibration=55, actionability=70)
+
+        grade_prior_plan({"run_date": "2026-10-09"}, {}, llm=_SlowJudge())
+        records = [
+            json.loads(line)
+            for line in capsys.readouterr().out.strip().splitlines()
+            if "LatencySeconds" in line
+        ]
+        assert records, "the judge's duration must still be published"
+        assert not [r for r in records if "DirectorPlanLatencyAmber" in r], records
+        judge = records[-1]
+        assert judge["RetroJudgeLatencySeconds"] == 207.789
+        assert judge["RetroJudgeLatencyAmber"] == 1
+        assert judge["Group"] == "high"
+
+    def test_plan_default_is_unchanged(self):
+        rec = _emit_plan_latency(
+            elapsed_s=533.761, outcome="ok", prompt_chars=1, carryover_items=0,
+            ceiling_s=1800.0,
+        )
+        assert rec["Group"] == "ultra"
+        assert rec["DirectorPlanLatencyAmber"] == 0
+        assert rec["DirectorPlanAmberSeconds"] == 536.4
+        assert rec["DirectorPlanAmberClampedToCeiling"] == 0
