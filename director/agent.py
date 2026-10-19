@@ -48,6 +48,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from director import emf
@@ -831,6 +832,57 @@ def _plan_amber_threshold_s(measured_max_s: float = None) -> float:
     )
 
 
+@dataclass(frozen=True)
+class LatencyChannel:
+    """WHICH model call a latency record describes: its metric names, its
+    ``Group`` dimension, and the line its amber is scored against.
+
+    alpha-engine-config-I12289: ``_invoke_with_retry`` is the retry loop for
+    BOTH Director model calls, and until this existed its emitter hard-coded
+    ``DirectorPlan*`` and ``Group=ultra``. So the Phase-G retro judge (group
+    ``high``, a 120s ceiling) published every one of its calls AS A PLAN CALL,
+    scored against a 108s amber line (the plan's 536.4s measured-need line
+    clamped to the judge's 120s ceiling). Measured 2026-10-17:
+    ``director/2026-10-16/action_plan.json`` stamps the plan at 533.761s,
+    amber 0; ``director/2026-10-16/retro.json`` stamps the judge at 207.789s,
+    amber 1, clamped 1; and ``AlphaEngine/Director DirectorPlanLatencyAmber
+    Group=ultra`` holds both, 13:05Z = 0 and 13:09Z = 1. The
+    ``alpha-engine-director-plan-latency`` alarm reads that metric's daily
+    Maximum over 7 days, so the judge's weekly point kept it in ALARM from
+    2026-09-19 regardless of how fast the plan call was.
+
+    The caller names the channel; nothing infers it from the adapter, because
+    a default that silently files a second call under the first one's name is
+    the defect this replaces.
+    """
+
+    #: Metric-name prefix: ``DirectorPlan`` → ``DirectorPlanLatencySeconds`` …
+    metric_prefix: str
+    #: ``Group`` dimension value: the capability tier the call was routed to.
+    group: str
+    #: Human name used in log lines.
+    call_name: str
+    #: Ceiling assumed when the adapter declares no ``attempt_cost_s``.
+    default_ceiling_s: float
+    #: True: amber is scored against the PLAN's measured requirement
+    #: (``_plan_amber_threshold_s``), clamped to the ceiling. False: no
+    #: measured requirement exists for this call, so amber is the ceiling
+    #: fraction and ``…AmberClampedToCeiling`` is 1 — the numbers the judge
+    #: already published, under its own name rather than the plan's.
+    plan_anchored: bool
+
+
+#: The weekly plan call. ``_invoke_with_retry``'s default, so every existing
+#: plan caller is unchanged.
+PLAN_LATENCY_CHANNEL = LatencyChannel(
+    metric_prefix="DirectorPlan",
+    group=DIRECTOR_GROUP,
+    call_name="Director plan",
+    default_ceiling_s=DIRECTOR_PLAN_CEILING_S,
+    plan_anchored=True,
+)
+
+
 def _emit_plan_latency(
     *,
     elapsed_s: float,
@@ -840,8 +892,15 @@ def _emit_plan_latency(
     carryover_omitted: int = 0,
     usage=None,
     ceiling_s: float | None = None,
+    channel: LatencyChannel | None = None,
 ) -> dict:
     """Emit one EMF record for one plan ATTEMPT, and return what was emitted.
+
+    **Under the CALLER's name** (``channel``, default the plan's). The retro
+    judge shares this emitter through ``_invoke_with_retry`` and passes its own
+    channel, so its calls land on ``RetroJudge*`` under its own ``Group`` and
+    never on the plan metric the plan-latency alarm reads
+    (alpha-engine-config-I12289; see :class:`LatencyChannel`).
 
     **Per attempt, not per invocation, and in a ``finally``.** The per-attempt
     ceiling is what the call is bounded by, and the attempt that matters most
@@ -866,8 +925,10 @@ def _emit_plan_latency(
     #
     # Computed BEFORE the amber threshold, which is now clamped against it —
     # see ``amber_clamped`` below.
+    channel = channel or PLAN_LATENCY_CHANNEL
+    p = channel.metric_prefix
     effective_ceiling_s = (
-        DIRECTOR_PLAN_CEILING_S if ceiling_s is None else float(ceiling_s)
+        channel.default_ceiling_s if ceiling_s is None else float(ceiling_s)
     )
     # Measured 2026-08-21 (`director/2026-08-21/action_plan.json`,
     # `plan_call_telemetry`): DirectorPlanAmberSeconds=205.2 published ABOVE
@@ -884,7 +945,13 @@ def _emit_plan_latency(
     # ceiling that ends the call, and the clamp is published
     # (``DirectorPlanAmberClampedToCeiling``) rather than silently changing
     # what the number means.
-    raw_amber_s = _plan_amber_threshold_s()
+    # A channel with no measured requirement of its own (the retro judge) is
+    # scored at the ceiling fraction — exactly the clamped line it was given
+    # when it borrowed the plan's anchor, so its numbers do not move; only the
+    # name they are published under does.
+    raw_amber_s = (
+        _plan_amber_threshold_s() if channel.plan_anchored else float("inf")
+    )
     amber_clamped = raw_amber_s >= effective_ceiling_s
     amber_s = (
         DIRECTOR_PLAN_AMBER_FRACTION * effective_ceiling_s
@@ -904,48 +971,50 @@ def _emit_plan_latency(
     # reader or alarm MUST consult before treating that 0 as "a free call".
     tokens_unmeasured = usage is None or bool(getattr(usage, "usage_unknown", False))
     record = {
-        "DirectorPlanLatencySeconds": round(elapsed_s, 3),
-        "DirectorPlanLatencyAmber": 1 if over_amber else 0,
-        "DirectorPlanCeilingSeconds": effective_ceiling_s,
-        "DirectorPlanAmberSeconds": round(amber_s, 1),
-        "DirectorPlanAmberClampedToCeiling": 1 if amber_clamped else 0,
-        "DirectorPlanPromptChars": int(prompt_chars),
-        "DirectorPlanCarryoverItems": int(carryover_items),
+        f"{p}LatencySeconds": round(elapsed_s, 3),
+        f"{p}LatencyAmber": 1 if over_amber else 0,
+        f"{p}CeilingSeconds": effective_ceiling_s,
+        f"{p}AmberSeconds": round(amber_s, 1),
+        f"{p}AmberClampedToCeiling": 1 if amber_clamped else 0,
+        f"{p}PromptChars": int(prompt_chars),
+        f"{p}CarryoverItems": int(carryover_items),
         # The count ELIDED by the prompt cap (alpha-engine-config-I8163).
         # Published on every run, including the 0 of an uncapped run: an
         # omission metric that only appears when something was omitted is
         # indistinguishable from a dead emitter, which is the same
         # `principles.md` §2.7 rule that puts the 0 on DirectorRouteFallback.
-        "DirectorPlanCarryoverOmitted": int(carryover_omitted),
-        "DirectorPlanPromptTokens": int(getattr(usage, "input_tokens", 0) or 0),
-        "DirectorPlanCompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
-        "DirectorPlanReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
-        "DirectorPlanTokensUnmeasured": 1 if tokens_unmeasured else 0,
+        f"{p}CarryoverOmitted": int(carryover_omitted),
+        f"{p}PromptTokens": int(getattr(usage, "input_tokens", 0) or 0),
+        f"{p}CompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
+        f"{p}ReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
+        f"{p}TokensUnmeasured": 1 if tokens_unmeasured else 0,
         "outcome": outcome,
-        "Group": DIRECTOR_GROUP,
+        "Group": channel.group,
     }
-    if amber_clamped:
+    if amber_clamped and channel.plan_anchored:
         logger.info(
-            "Director plan amber threshold clamped: measured-need amber of "
+            "%s amber threshold clamped: measured-need amber of "
             "%.1fs exceeds this attempt's %.1fs ceiling quote — reporting "
             "amber at %.1fs (%.0f%% of the ceiling) instead so the warning "
             "can still fire before the call is killed.",
-            raw_amber_s, effective_ceiling_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
+            channel.call_name, raw_amber_s, effective_ceiling_s, amber_s,
+            DIRECTOR_PLAN_AMBER_FRACTION * 100,
         )
     if outcome == "ok" and tokens_unmeasured:
         logger.error(
-            "Director plan call outcome=ok but token usage is UNMEASURED "
+            "%s call outcome=ok but token usage is UNMEASURED "
             "(krepis reported no usage block for at least one attempt, or "
             "the calling adapter never captured `last_usage`). Cost "
             "attribution for this call is UNKNOWN, not zero — "
-            "DirectorPlanTokensUnmeasured=1 on this record; "
-            "DirectorPlan{Prompt,Completion,Reasoning}Tokens read 0 only "
-            "because there is nothing to sum, not because the call was free."
+            "%sTokensUnmeasured=1 on this record; "
+            "%s{Prompt,Completion,Reasoning}Tokens read 0 only "
+            "because there is nothing to sum, not because the call was free.",
+            channel.call_name, p, p,
         )
     if over_amber:
         logger.warning(
-            "Director plan call AMBER: %.1fs >= %.1fs (%.0f%% of the %.0fs "
-            "slowest measured healthy call) — outcome=%s prompt_chars=%d carryover_items=%d "
+            "%s call AMBER: %.1fs >= %.1fs (%.0f%% of %s) — outcome=%s "
+            "prompt_chars=%d carryover_items=%d "
             "prompt_tokens=%d completion_tokens=%d (reasoning=%d). The call "
             "has not failed; it is measurably closer to the ceiling than it "
             "was. alpha-engine-config-I7311: the inputs and the output this "
@@ -954,25 +1023,31 @@ def _emit_plan_latency(
             "(alpha-engine-config-I8163) — a non-zero omission means the cap "
             "is already binding, so the ledger, not the prompt, is where the "
             "next reduction has to come from.",
-            elapsed_s, amber_s, DIRECTOR_PLAN_AMBER_FRACTION * 100,
-            DIRECTOR_PLAN_MEASURED_MAX_S, outcome, record["DirectorPlanPromptChars"],
-            record["DirectorPlanCarryoverItems"],
-            record["DirectorPlanPromptTokens"],
-            record["DirectorPlanCompletionTokens"],
-            record["DirectorPlanReasoningTokens"],
-            record["DirectorPlanCarryoverOmitted"],
+            channel.call_name, elapsed_s, amber_s,
+            DIRECTOR_PLAN_AMBER_FRACTION * 100,
+            (
+                f"the {DIRECTOR_PLAN_MEASURED_MAX_S:.0f}s slowest measured healthy call"
+                if not amber_clamped
+                else f"this attempt's {effective_ceiling_s:.0f}s ceiling"
+            ),
+            outcome, record[f"{p}PromptChars"],
+            record[f"{p}CarryoverItems"],
+            record[f"{p}PromptTokens"],
+            record[f"{p}CompletionTokens"],
+            record[f"{p}ReasoningTokens"],
+            record[f"{p}CarryoverOmitted"],
         )
     else:
         logger.info(
-            "Director plan call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
+            "%s call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
             "prompt_chars=%d carryover_items=%d carryover_omitted=%d "
             "prompt_tokens=%d completion_tokens=%d",
-            outcome, elapsed_s, amber_s, effective_ceiling_s,
-            record["DirectorPlanPromptChars"],
-            record["DirectorPlanCarryoverItems"],
-            record["DirectorPlanCarryoverOmitted"],
-            record["DirectorPlanPromptTokens"],
-            record["DirectorPlanCompletionTokens"],
+            channel.call_name, outcome, elapsed_s, amber_s, effective_ceiling_s,
+            record[f"{p}PromptChars"],
+            record[f"{p}CarryoverItems"],
+            record[f"{p}CarryoverOmitted"],
+            record[f"{p}PromptTokens"],
+            record[f"{p}CompletionTokens"],
         )
     try:
         emf.emit({
@@ -982,14 +1057,14 @@ def _emit_plan_latency(
                     "Namespace": "AlphaEngine/Director",
                     "Dimensions": [["Group"]],
                     "Metrics": [
-                        {"Name": "DirectorPlanLatencySeconds", "Unit": "Seconds"},
-                        {"Name": "DirectorPlanLatencyAmber", "Unit": "Count"},
-                        {"Name": "DirectorPlanAmberClampedToCeiling", "Unit": "Count"},
-                        {"Name": "DirectorPlanPromptTokens", "Unit": "Count"},
-                        {"Name": "DirectorPlanCompletionTokens", "Unit": "Count"},
-                        {"Name": "DirectorPlanTokensUnmeasured", "Unit": "Count"},
-                        {"Name": "DirectorPlanCarryoverItems", "Unit": "Count"},
-                        {"Name": "DirectorPlanCarryoverOmitted", "Unit": "Count"},
+                        {"Name": f"{p}LatencySeconds", "Unit": "Seconds"},
+                        {"Name": f"{p}LatencyAmber", "Unit": "Count"},
+                        {"Name": f"{p}AmberClampedToCeiling", "Unit": "Count"},
+                        {"Name": f"{p}PromptTokens", "Unit": "Count"},
+                        {"Name": f"{p}CompletionTokens", "Unit": "Count"},
+                        {"Name": f"{p}TokensUnmeasured", "Unit": "Count"},
+                        {"Name": f"{p}CarryoverItems", "Unit": "Count"},
+                        {"Name": f"{p}CarryoverOmitted", "Unit": "Count"},
                     ],
                 }],
             },
@@ -997,9 +1072,9 @@ def _emit_plan_latency(
         })
     except Exception:
         logger.exception(
-            "Director: failed to emit DirectorPlanLatencySeconds — the latency "
+            "Director: failed to emit %sLatencySeconds — the latency "
             "trend is blind for this run, which is the condition "
-            "alpha-engine-config-I7311 exists to end"
+            "alpha-engine-config-I7311 exists to end", p,
         )
     return record
 
@@ -1978,7 +2053,7 @@ def build_messages_with_sources(
     return [("system", _load_system_prompt()), ("human", "\n".join(human))], sources
 
 
-def _invoke_with_retry(llm, messages, *, budget=None):
+def _invoke_with_retry(llm, messages, *, budget=None, latency_channel=None):
     """Retry transient LLM failures — but only while the invocation can pay.
 
     This is the fleet's single retry loop for both Director LLM calls (the plan
@@ -2000,6 +2075,11 @@ def _invoke_with_retry(llm, messages, *, budget=None):
     The attempt's cost is read off the llm adapter's ``attempt_cost_s``.
     Adapters that do not declare one (every injected test double) are treated
     as unbounded, so the retry behaviour outside Lambda is unchanged.
+
+    ``latency_channel`` names the call each attempt's latency record is
+    published as (:class:`LatencyChannel`); omitted, it is the plan's. A
+    caller that is NOT the plan call must pass its own, or its attempts land on
+    the plan metric the plan-latency alarm reads (alpha-engine-config-I12289).
     """
     budget = budget or UNBOUNDED
     cost = getattr(llm, "attempt_cost_s", None)
@@ -2027,6 +2107,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 carryover_omitted=carryover_omitted,
                 usage=None,
                 ceiling_s=cost,
+                channel=latency_channel,
             )
             last = e
             msg = str(e).lower()
@@ -2070,6 +2151,7 @@ def _invoke_with_retry(llm, messages, *, budget=None):
                 carryover_omitted=carryover_omitted,
                 usage=getattr(llm, "last_usage", None),
                 ceiling_s=cost,
+                channel=latency_channel,
             )
             # Also stamp it onto the plan, which is ARCHIVED to
             # ``director/{run_date}/action_plan.json``. CloudWatch metrics age

@@ -62,6 +62,7 @@ from director.agent import (
     DIRECTOR_GROUP,
     _CLIENT_MAX_RETRIES,
     _STRUCTURED_ATTEMPTS,
+    LatencyChannel,
     _assert_routed_through_the_proxy,
     _invoke_with_retry,
     _warn_on_degraded_route,
@@ -209,6 +210,35 @@ def _judge_group() -> str:
 
     A GROUP, not a model. See the constant's note above."""
     return os.environ.get("RETRO_JUDGE_GROUP", RETRO_JUDGE_GROUP_DEFAULT)
+
+
+def _judge_latency_channel() -> LatencyChannel:
+    """The name the judge's latency records are published under.
+
+    ``RetroJudgeLatencySeconds`` / ``RetroJudgeLatencyAmber`` / … under the
+    judge's OWN ``Group`` (read at call time, like :func:`_judge_group`).
+    Until alpha-engine-config-I12289 the judge shared ``_invoke_with_retry``'s
+    plan-only emitter and published every call as ``DirectorPlan*`` under
+    ``Group=ultra``: its 120s ceiling clamps amber to 108s, the judge takes
+    ~200s, so each weekly run put an amber point on the plan metric and held
+    ``alpha-engine-director-plan-latency`` in ALARM from 2026-09-19 while the
+    plan call itself was under its line (2026-10-17: plan 533.8s vs 536.4s,
+    judge 207.8s vs 108s).
+
+    ``plan_anchored=False``: the judge has no measured requirement of its own
+    (``RETRO_JUDGE_IDLE_TIMEOUT_S``'s re-anchor note: no run has measured it),
+    so amber stays the ceiling fraction it already published, flagged
+    ``RetroJudgeAmberClampedToCeiling=1``. No alarm reads it; it is published
+    so the judge's duration stays observed rather than disappearing with the
+    misattribution.
+    """
+    return LatencyChannel(
+        metric_prefix="RetroJudge",
+        group=_judge_group(),
+        call_name="Director retro judge",
+        default_ceiling_s=RETRO_JUDGE_CEILING_S,
+        plan_anchored=False,
+    )
 
 
 def _assert_judge_is_not_the_generator(group: str) -> None:
@@ -876,7 +906,9 @@ def grade_prior_plan(
     """
     llm = llm or _default_llm(budget)
     messages, sources = build_messages_with_sources(prior_plan, current_card)
-    grade = _invoke_with_retry(llm, messages, budget=budget)
+    grade = _invoke_with_retry(
+        llm, messages, budget=budget, latency_channel=_judge_latency_channel(),
+    )
     stamp_grade_citations(grade, sources)
     # config#1673's other half, against the SERVED models rather than the two
     # group handles. Raises on a collision, before the caller can persist a
