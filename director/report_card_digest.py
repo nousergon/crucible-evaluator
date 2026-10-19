@@ -198,6 +198,24 @@ def _window_label(obj) -> str | None:
     return str(w.get("label") or "") or None
 
 
+def _strategy_identity_line(obj) -> str | None:
+    """One line naming which deployed (champion, config) each stretch of the window
+    was traded under (alpha-engine-config-I11089); None when the card carries none."""
+    w = obj.get("window") if isinstance(obj, dict) else None
+    si = w.get("strategy_identity") if isinstance(w, dict) else None
+    if not isinstance(si, dict) or not isinstance(si.get("segments"), list):
+        return None
+    segs = si["segments"]
+    shown = "; ".join(
+        f"{g.get('start')}→{g.get('end')} {g.get('trading_days')}d "
+        f"{g.get('champion')} cfg {str(g.get('config_sha256'))[:8]}"
+        for g in segs[:8] if isinstance(g, dict)
+    )
+    more = f"; +{len(segs) - 8} more" if len(segs) > 8 else ""
+    return (f"{si.get('dates_stamped')}/{si.get('dates_requested')} dates stamped "
+            f"(order_books summaries): {shown}{more}")
+
+
 def _chip(status) -> str:
     return str(status or "N/A")
 
@@ -461,6 +479,8 @@ def _tile_lines(key: str, tile, pinned_components: set[str], sources=None) -> li
     out = [_tag(sources, "tile", key, head)]
     if (wl := _window_label(tile)):
         out.append(f"  - window: {wl}")
+    if (si := _strategy_identity_line(tile)):
+        out.append(f"  - strategy: {si}")
     if not comps:
         out.append("  - ⚠ this tile carries NO components — nothing on it is measured.")
     declared_n = tile.get("n_components")
