@@ -817,8 +817,11 @@ def _install_fake_stage_coverage(monkeypatch, calls=None):
     calls = calls if calls is not None else []
     fake_mod = types.ModuleType("krepis.stage_coverage")
 
-    def _fake_assert_stage_coverage(stage, *, run_date, window_start):
-        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+    def _fake_assert_stage_coverage(stage, *, run_date, window_start, execution_name=None):
+        calls.append({
+            "stage": stage, "run_date": run_date, "window_start": window_start,
+            "execution_name": execution_name,
+        })
         return {"stage": stage, "status": "COVERED", "run_date": run_date}
 
     fake_mod.assert_stage_coverage = _fake_assert_stage_coverage
@@ -988,7 +991,9 @@ class TestStageCoverageNeverEnablesEnforcement:
 
         assert seen_kwargs
         for kwargs in seen_kwargs:
-            assert kwargs == {"run_date", "window_start"}
+            # execution_name (alpha-engine-config-I12351) only picks the
+            # rehearsal namespace; it never enables enforcement.
+            assert kwargs == {"run_date", "window_start", "execution_name"}
 
 
 def _retro() -> "object":

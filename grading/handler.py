@@ -132,7 +132,13 @@ _STAGE_COVERAGE_METRIC_NAME = "StageCoverage"
 _STAGE_COVERAGE_STATUS_UNMEASURED = "UNMEASURED"
 
 
-def _record_stage_coverage(stage: str, run_date: str, started: datetime, result: dict) -> dict:
+def _record_stage_coverage(
+    stage: str,
+    run_date: str,
+    started: datetime,
+    result: dict,
+    execution_name: str | None = None,
+) -> dict:
     """Merge the end-of-stage output-coverage verdict into a handler's return
     payload, under ``stage_coverage`` (config-I7214, the ruled rescope).
 
@@ -155,6 +161,16 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
     CloudWatch metric is published directly (the library's own recording
     path is unreachable when its import fails) so the gap is alarmable, not
     only a log line nothing reads.
+
+    ``execution_name`` is the weekly-SF REHEARSAL's execution name
+    (``grading.rehearsal.rehearsal_name(event)``), or ``None`` for any other
+    run (alpha-engine-config-I12351). krepis (>= 0.59.78) then records a
+    rehearsal's verdict under ``_stage_coverage/.rehearsal/<exec>/`` and
+    publishes no ``StageCoverage`` metric, because the metric has no execution
+    dimension and a rehearsal's datapoint reads as production's. The direct
+    UNMEASURED metric below is withheld for a rehearsal for the same reason.
+    rehearsal-2026-10-16-2 wrote EvaluatorDeployDriftCheck's and
+    EvaluatorDirectorDeployDriftCheck's verdicts at live keys.
     """
     # alpha-engine-config-I8155: `run_date` is the SF execution's own, and it
     # is the ONLY key grouping a run's verdicts — krepis now REQUIRES it and
@@ -169,7 +185,9 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
     # threading, not an environment condition — hence CRITICAL, not ERROR.
     try:
         from krepis.stage_coverage import assert_stage_coverage
-        result["stage_coverage"] = assert_stage_coverage(stage, run_date=run_date, window_start=started)
+        result["stage_coverage"] = assert_stage_coverage(
+            stage, run_date=run_date, window_start=started, execution_name=execution_name
+        )
     except (ImportError, ValueError) as exc:
         if isinstance(exc, ValueError):
             logger.critical(
@@ -195,6 +213,13 @@ def _record_stage_coverage(stage: str, run_date: str, started: datetime, result:
             "enforce": False,
             "is_finding": False,
         }
+        if execution_name:
+            logger.info(
+                "stage_coverage: UNMEASURED metric for %s not published for rehearsal %s",
+                stage,
+                execution_name,
+            )
+            return result
         try:
             # Explicit region, mirroring grading/tiles/substrate.py's existing
             # cloudwatch-client construction in this same repo (config-I7334
@@ -308,8 +333,11 @@ def _run(event: dict | None = None, context=None) -> dict:
         # Infrastructure/gate stage: declares no durable artifact — the lib
         # returns COVERED_NO_OUTPUT for it, but it must still record that it
         # declared nothing (config-I7214 §"declares nothing" != "never considered").
+        from grading.rehearsal import rehearsal_name
+
         return _record_stage_coverage(
             "EvaluatorDeployDriftCheck", run_date=_resolve_run_date({}), started=_started, result=result,
+            execution_name=rehearsal_name(event),
         )
 
     bucket = event.get("bucket") or os.environ.get("EVALUATOR_BUCKET") or DEFAULT_BUCKET
@@ -538,7 +566,12 @@ def _run(event: dict | None = None, context=None) -> dict:
         "pipeline_gates_unmeasured": gate_block["unmeasured"],
         "pipeline_gates_statement": gate_block["statement"],
     }
-    _record_stage_coverage("ReportCard", run_date=run_date, started=_started, result=summary)
+    from grading.rehearsal import rehearsal_name
+
+    _record_stage_coverage(
+        "ReportCard", run_date=run_date, started=_started, result=summary,
+        execution_name=rehearsal_name(event),
+    )
     logger.info(
         "Report Card v2 %s: overall=%s tiles=%s",
         run_date, summary["tiles_overall_status"], tile_status,

@@ -73,6 +73,7 @@ from director.verdict import (
 )
 from grading.pipeline_gates import log_gate_state
 from grading.handler import _record_stage_coverage, _resolve_run_date
+from grading.rehearsal import rehearsal_name
 from krepis.logging import setup_logging
 
 # Structured logging + flow-doctor (see grading/handler.py for the full
@@ -905,7 +906,7 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
         # nothing (config-I7214 §"declares nothing" != "never considered").
         return _record_stage_coverage(
             "EvaluatorDirectorDeployDriftCheck", run_date=_resolve_run_date(event),
-            started=_started, result=result,
+            started=_started, result=result, execution_name=rehearsal_name(event),
         )
 
     if not _enabled():
@@ -913,6 +914,7 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
         return _record_stage_coverage(
             "Director", run_date=_resolve_run_date(event), started=_started,
             result={"status": "disabled", "reason": "DIRECTOR_ENABLED is off"},
+            execution_name=rehearsal_name(event),
         )
 
     # config#6904: every LLM call in this invocation is quoted against the time
@@ -960,6 +962,7 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
         return _record_stage_coverage(
             "Director", run_date=run_date, started=_started,
             result=_dry_run_probe(bucket, run_date, card, s3),
+            execution_name=rehearsal_name(event),
         )
 
     if card is None:
@@ -1128,7 +1131,10 @@ def _run(event: dict | None = None, context=None, *, host: HostProfile = LAMBDA)
     # stage-coverage artifact, the SF output and the execution record alike,
     # rather than being recomputed (or not) by each reader.
     apply_substatus_honesty(summary)
-    _record_stage_coverage("Director", run_date=run_date, started=_started, result=summary)
+    _record_stage_coverage(
+        "Director", run_date=run_date, started=_started, result=summary,
+        execution_name=rehearsal_name(event),
+    )
     logger.info("Director plan written: %s", summary)
     return summary
 
