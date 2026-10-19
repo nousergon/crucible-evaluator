@@ -325,7 +325,7 @@ class TestStrategyIdentityJoin:
         _put(s3, f"order_books/{d0}/summary.json", "{not json")
         tile = build_portfolio_outcome_tile(BUCKET, s3_client=s3, n_trials=12)
         si = tile["window"]["strategy_identity"]
-        assert si["dates_stamped"] == 0 and len(si["read_errors"]) == 1
+        assert si["dates_stamped"] == 0 and si["read_error_count"] == 1 and len(si["read_errors"]) == 1
         assert si["read_errors"][0].startswith(d0)
 
     def test_digest_prints_the_strategy_line(self, s3):
@@ -337,3 +337,27 @@ class TestStrategyIdentityJoin:
         from director.report_card_digest import _strategy_identity_line
         line = _strategy_identity_line(tile)
         assert "6/6 dates stamped" in line and "scanner_predictor_direct cfg 29bcc4ce" in line
+
+    def test_repeated_faults_are_counted_but_only_a_few_listed(self, s3):
+        from botocore.exceptions import ClientError
+
+        body = _csv(20)
+        _put(s3, EOD_PNL_KEY, body)
+
+        class Denied:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def get_object(self, **kw):
+                if kw["Key"].startswith("order_books/"):
+                    raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+                return self._inner.get_object(**kw)
+
+            def __getattr__(self, n):
+                return getattr(self._inner, n)
+
+        tile = build_portfolio_outcome_tile(BUCKET, s3_client=Denied(s3), n_trials=12)
+        si = tile["window"]["strategy_identity"]
+        assert si["read_error_count"] == 20 and len(si["read_errors"]) == 5
+        assert si["read_errors"][0].endswith("AccessDenied")
+        assert si["dates_stamped"] == 0

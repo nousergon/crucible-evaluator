@@ -178,6 +178,11 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # module re-keys every write there) and granted as rehearsal/rehearsal-*/*
     # by nous-ergon-ops-PR1722, which merges FIRST.
     "grading/rehearsal.py": 1,
+    # alpha-engine-config-I11089: `_fetch_one`'s get_object on
+    # order_books/{date}/summary.json — the executor's per-session strategy
+    # identity, joined to the eod rows. "order_books" is a NEW prefix, declared
+    # read, granted by the nous-ergon-ops evaluator-policy PR that merges FIRST.
+    "grading/strategy_identity.py": 1,
     "grading/tiles/predictor.py": 2,
     "grading/tiles/research.py": 1,
     "grading/tiles/substrate.py": 1,

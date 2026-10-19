@@ -42,6 +42,9 @@ IDENTITY_FIELDS = (
 # Under botocore's default max_pool_connections (10), same bound and reasoning
 # as grading/regime_index.py. summary.json is small, so memory is not the limit.
 _MAX_FETCH_WORKERS = 8
+# A permission fault repeats once per date (150+); the count says how many, a few
+# examples say what.
+_MAX_ERRORS_SHOWN = 5
 
 UNSTAMPED = "unstamped"
 
@@ -94,6 +97,7 @@ def build_strategy_identity(bucket: str, dates: list[str], s3_client=None) -> di
         "dates_requested": len(uniq),
         "dates_stamped": 0,
         "dates_without_summary": 0,
+        "read_error_count": 0,
         "read_errors": [],
         "segments": [],
     }
@@ -106,6 +110,7 @@ def build_strategy_identity(bucket: str, dates: list[str], s3_client=None) -> di
             fetched = list(pool.map(lambda d: (d, *_fetch_one(s3, bucket, d)), uniq))
     except Exception as e:  # noqa: BLE001 — e.g. no credentials; the card must still build
         logger.warning("strategy_identity: could not read %s: %s", source, e)
+        out["read_error_count"] = 1
         out["read_errors"].append(f"all: {type(e).__name__}")
         out["dates_without_summary"] = len(uniq)
         out["segments"] = [_segment(uniq, [_identity(None)] * len(uniq))]
@@ -114,7 +119,9 @@ def build_strategy_identity(bucket: str, dates: list[str], s3_client=None) -> di
     idents: list[dict] = []
     for d, summary, err in fetched:
         if err:
-            out["read_errors"].append(err)
+            out["read_error_count"] += 1
+            if len(out["read_errors"]) < _MAX_ERRORS_SHOWN:
+                out["read_errors"].append(err)
         if summary is None:
             out["dates_without_summary"] += 1
         idents.append(_identity(summary))
