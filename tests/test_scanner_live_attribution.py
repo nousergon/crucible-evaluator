@@ -174,9 +174,15 @@ class TestCounterfactualLabels:
         assert "scanner_evaluations (newest 2026-07-17, 78d old, STALE" in reason
 
     def test_basket_states_its_cycles_come_from_the_frozen_table(self, s3):
+        # alpha-engine-config-I12354 (Brian ruling 2026-10-16): a basket whose
+        # cycles come from the frozen table no longer grades a live level; it
+        # grades N/A-stale (frozen) and still names the dead source.
         comp = self._comp(s3, "scanner_basket_return")
-        assert "scanner_evaluations (newest 2026-07-17" in comp["status_reason"]
-        assert comp["value"] == pytest.approx(-0.0069)  # grading unchanged
+        assert comp["status_reason"].startswith("N/A-stale (frozen)")
+        assert "scanner_evaluations" in comp["status_reason"]
+        assert "2026-07-17" in comp["status_reason"]
+        assert comp["value"] is None
+        assert comp["n_samples"] == 7
 
 
 class TestScorecardScanner:

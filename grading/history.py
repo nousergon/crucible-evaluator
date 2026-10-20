@@ -65,9 +65,15 @@ class CardHistory:
         series: dict[tuple[str, str], list[float]],
         n_cards_found: int,
         arm_series: dict[tuple[str, str, str], list[float]] | None = None,
+        n_series: dict[tuple[str, str], list[tuple[str, int]]] | None = None,
     ):
         self._series = series
         self.n_cards_found = n_cards_found
+        # (tile, name) -> [(card_date, n_samples)] oldest → newest, for EVERY
+        # card that carried the component with an integer N — N/A and frozen
+        # weeks included, because "has N stopped growing" is a question about
+        # N, not about whether a value rendered (alpha-engine-config-I12354).
+        self._n_series = n_series or {}
         # (tile, name, arm) -> values, for a component whose measured arm can
         # change under the same name (alpha-engine-config-I11985: ``scanner``
         # moved from the retired tech_score gate to the live published cut).
@@ -80,6 +86,10 @@ class CardHistory:
     def prior_values(self, tile: str, name: str) -> list[float]:
         """Prior value series (oldest → newest) for one component; [] if none."""
         return list(self._series.get((tile, name), ()))
+
+    def prior_n(self, tile: str, name: str) -> list[tuple[str, int]]:
+        """Prior ``(card_date, n_samples)`` readings (oldest → newest); [] if none."""
+        return list(self._n_series.get((tile, name), ()))
 
     def trends_for(
         self, tile: str, name: str, current_value: float | None, *, arm: str | None = None,
@@ -191,6 +201,34 @@ def read_cards(s3, bucket: str, dated_keys: list[tuple[str, str]]) -> list[tuple
     return out
 
 
+def _extract_n_series(
+    dated_cards: list[tuple[str, dict]],
+) -> dict[tuple[str, str], list[tuple[str, int]]]:
+    """``(tile, name) -> [(card_date, n_samples)]`` oldest first (I12354).
+
+    Unlike ``_extract_series`` this keeps a component whose value was N/A: a
+    metric graded N/A-stale still reports the N it froze at, and that is what
+    lets the next card see that N has not moved.
+    """
+    out: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for card_date, card in dated_cards:
+        tiles = card.get("tiles")
+        if not isinstance(tiles, dict):
+            continue
+        for tile_name, tile in tiles.items():
+            comps = (tile or {}).get("components")
+            if not isinstance(comps, list):
+                continue
+            for comp in comps:
+                if not isinstance(comp, dict):
+                    continue
+                n = comp.get("n_samples")
+                if not comp.get("name") or isinstance(n, bool) or not isinstance(n, int):
+                    continue
+                out.setdefault((tile_name, comp["name"]), []).append((card_date, n))
+    return out
+
+
 def load_card_history(
     bucket: str,
     run_date: str,
@@ -211,7 +249,8 @@ def load_card_history(
     n_cards = max(1, min(n_cards, MAX_HISTORY_CARDS))
 
     dated_keys = list_card_keys(s3, bucket, run_date, n_cards)
-    cards = [card for _date, card in read_cards(s3, bucket, dated_keys)]
+    dated_cards = read_cards(s3, bucket, dated_keys)
+    cards = [card for _date, card in dated_cards]
 
     n_found = len(cards)
     if n_found < n_cards:
@@ -226,4 +265,5 @@ def load_card_history(
             "Loaded %d prior report cards before %s for cross-cycle trends.",
             n_found, run_date,
         )
-    return CardHistory(_extract_series(cards), n_found, _extract_series(cards, by_arm=True))
+    return CardHistory(_extract_series(cards), n_found, _extract_series(cards, by_arm=True),
+                       _extract_n_series(dated_cards))

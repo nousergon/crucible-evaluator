@@ -300,6 +300,59 @@ def _cf_cycle_source(cf: dict) -> tuple[str, bool]:
     )
 
 
+# alpha-engine-config-I12354 (Brian ruling 2026-10-16 00:09Z, #11498): a
+# reliability-LOW IC whose source cannot grow any more must not keep
+# presenting as a live level ("WATCH, accumulating"). It grades N/A-stale
+# (frozen). Two signals, either sufficient:
+#   * the producer's own ``source_freshness.stale`` stamp (scanner_basket_return);
+#   * N unchanged across this card and the previous ``_FROZEN_N_CHECKS`` cards
+#     (judge_outcome_ic, attractiveness_trajectory_ic — no freshness stamp).
+# A metric whose N grows, or whose history is shorter than the checks, is
+# graded exactly as before.
+_FROZEN_N_CHECKS = 2
+
+
+def _frozen_n_clause(history: CardHistory | None, name: str, n: int | None) -> str | None:
+    """Clause naming how long ``n`` has been unchanged, or None when it is growing.
+
+    Frozen = the last ``_FROZEN_N_CHECKS`` prior cards that carried the
+    component all reported this same N. Names the earliest card of the
+    trailing equal-N run (the last-growth date, to within card cadence).
+    """
+    if history is None or n is None:
+        return None
+    prior = history.prior_n(MODULE, name)
+    if len(prior) < _FROZEN_N_CHECKS or any(p != n for _d, p in prior[-_FROZEN_N_CHECKS:]):
+        return None
+    since = len(prior) - 1
+    while since > 0 and prior[since - 1][1] == n:
+        since -= 1
+    return (f"N={n} has not grown across the last {_FROZEN_N_CHECKS + 1} report cards "
+            f"(unchanged since the {prior[since][0]} card)")
+
+
+def _frozen_component(name: str, metric_type: str, *, why: str, n: int | None, source_path: str,
+                      arm: str | None = None):
+    """The N/A-stale (frozen) record for a research IC that can no longer accumulate.
+
+    Diagnostic + ``permanent_na_reason`` is the file's existing convention for
+    a metric whose source stopped producing (``momentum_regime_ic``,
+    ``neutralization_live_efficacy``): letter N/A, never WATCH, and the
+    component leaves the coverage denominator because it carries a declared
+    reason. ``n`` is kept on the record so the NEXT card can see N unchanged.
+    Self-clearing: the branch is re-evaluated every cycle, so a source that
+    resumes (N grows / freshness stamp clears) grades normally again.
+    """
+    return build_metric(
+        name=name, module=MODULE, metric_type=metric_type, criticality="diagnostic",
+        n_samples=n, n_floor=1, band="unbanded", source_path=source_path, arm=arm,
+        permanent_na_reason=why,
+        reason=(f"N/A-stale (frozen) — {name}: {why} Not a live level and not "
+                f"accumulating; re-graded automatically if the source resumes "
+                f"(alpha-engine-config-I12354, Brian ruling 2026-10-16)."),
+    )
+
+
 def build_research_tile(
     bucket: str, run_date: str, s3_client=None, *, history: CardHistory | None = None,
 ) -> dict:
@@ -1029,7 +1082,17 @@ def build_research_tile(
     #     gate; the flag flip itself stays a human/registry decision.
     traj = ((att or {}).get("trajectory_ic") or {}).get("pre_repricing_score") or {}
     t_ic = traj.get("date_ic_mean") if att_ok else None
-    if t_ic is not None:
+    t_frozen = (_frozen_n_clause(history, "attractiveness_trajectory_ic", traj.get("n_eval_dates"))
+                if t_ic is not None else None)
+    if t_frozen:
+        components.append(_frozen_component(
+            "attractiveness_trajectory_ic", "ic", n=traj.get("n_eval_dates"), source_path=att_src,
+            why=(f"{t_frozen}; the persisted trajectory artifacts joined to universe_returns "
+                 f"(attractiveness_eval.json::trajectory_ic, status={traj.get('status')!r}) "
+                 f"stopped adding eval dates, so the config#1392 cutover gate cannot be "
+                 f"evidenced from it."),
+        ))
+    elif t_ic is not None:
         t_p = traj.get("date_ic_p")
         t_n = traj.get("n_eval_dates")
         t_insig = t_p is None or t_p >= 0.10
@@ -1158,7 +1221,16 @@ def build_research_tile(
     joi_overall = joi.get("overall") or {}
     j_ic = joi_overall.get("date_ic_mean") if joi.get("status") == "ok" else None
     j_hz = f"{joi.get('horizon_days', 21)}d"
-    if j_ic is not None:
+    j_frozen = (_frozen_n_clause(history, "judge_outcome_ic", joi_overall.get("n_eval_dates"))
+                if j_ic is not None else None)
+    if j_frozen:
+        components.append(_frozen_component(
+            "judge_outcome_ic", "ic", n=joi_overall.get("n_eval_dates"), source_path=aq_src,
+            why=(f"{j_frozen}; agent_quality.json::judge_outcome_ic joins "
+                 f"{joi.get('n_unattributable')} evals with no realised-alpha attribution "
+                 f"(n={joi_overall.get('n')} joined), so the judge↔outcome join cannot grow."),
+        ))
+    elif j_ic is not None:
         j_p = joi_overall.get("date_ic_p")
         j_n = joi_overall.get("n_eval_dates")
         j_insig = j_p is None or j_p >= 0.10
@@ -1260,7 +1332,24 @@ def build_research_tile(
         elif holding_rule is None:
             _missing_field = "holding_rule"
 
-    if att_ok and _missing_field is None:
+    sb_src_stale = _cf_cycle_source(cf)[1] if (att_ok and _missing_field is None) else False
+    sb_n_frozen = (_frozen_n_clause(history, "scanner_basket_return", sb20.get("n_cycles"))
+                   if att_ok and _missing_field is None else None)
+    if att_ok and _missing_field is None and (sb_src_stale or sb_n_frozen):
+        _fresh_src = next(iter((cf.get("source_freshness") or {}).get("sources") or []), {}) or {}
+        components.append(_frozen_component(
+            "scanner_basket_return", "log_return", n=sb20.get("n_cycles"), source_path=att_src,
+            arm=_LIVE_ARM_SCANNER,
+            why=((f"its cycles come from {_fresh_src.get('table')}, frozen since "
+                  f"{_fresh_src.get('newest_date')} ({_fresh_src.get('age_days')}d old; writer "
+                  f"retired {_fresh_src.get('retired_date')}); the producer side was repointed to "
+                  f"candidates/{{run_date}}/candidates.json::scanner_eval_log "
+                  f"(alpha-engine-config-I3053) but this consumer was not."
+                  if sb_src_stale else "")
+                 + (("; " if sb_src_stale and sb_n_frozen else "") + sb_n_frozen
+                    if sb_n_frozen else "")),
+        ))
+    elif att_ok and _missing_field is None:
         raw_s = (
             f"raw (unbalanced) top-20: excess_vs_population={raw20.get('excess_vs_population'):+.4f} "
             f"(t={_fmt_p(raw20.get('excess_t'))}, p={_fmt_p(raw20.get('excess_p'))})"
