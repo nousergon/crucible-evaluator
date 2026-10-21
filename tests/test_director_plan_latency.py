@@ -596,3 +596,88 @@ class TestRetroJudgeHasItsOwnLatencyChannel:
         assert rec["DirectorPlanLatencyAmber"] == 0
         assert rec["DirectorPlanAmberSeconds"] == 536.4
         assert rec["DirectorPlanAmberClampedToCeiling"] == 0
+
+
+class TestBudgetEscalationIsOnTheRecord:
+    """alpha-engine-config-I12470 — the judge's 207.789s on 2026-10-17 was ONE
+    attempt made of TWO model requests: krepis spent the route's whole
+    `max_tokens=8192` on reasoning (8,191 reasoning tokens, no content, 100.9s)
+    and re-issued once at 16,384 (10,670 tokens, 106.4s). Each request ran
+    under its own 120s `total_timeout`, so the attempt passed the "per-attempt"
+    ceiling without any timeout firing — and the record said nothing about it,
+    so the number read as an unexplained 1.7x overrun of the ceiling."""
+
+    class _EscalatedUsage:
+        # The 2026-10-17 judge call's summed usage, as `retro.json` archived it.
+        input_tokens = 47882
+        output_tokens = 18861
+        reasoning_tokens = 16557
+        budget_escalations = 1
+
+    def test_escalation_count_is_published_with_the_judge_latency(self, monkeypatch):
+        from director import retro
+
+        monkeypatch.delenv("RETRO_JUDGE_GROUP", raising=False)
+        rec = _emit_plan_latency(
+            elapsed_s=207.789, outcome="ok", prompt_chars=75296,
+            carryover_items=0, ceiling_s=120.0, usage=self._EscalatedUsage(),
+            channel=retro._judge_latency_channel(),
+        )
+        assert rec["RetroJudgeBudgetEscalations"] == 1
+        assert rec["RetroJudgeLatencySeconds"] > rec["RetroJudgeCeilingSeconds"]
+
+    def test_plan_record_carries_it_too(self):
+        rec = _emit_plan_latency(
+            elapsed_s=1.0, outcome="ok", prompt_chars=1, carryover_items=0,
+            usage=self._EscalatedUsage(),
+        )
+        assert rec["DirectorPlanBudgetEscalations"] == 1
+
+    def test_a_clean_call_publishes_zero(self):
+        class _Usage:
+            input_tokens = 1
+            output_tokens = 1
+            reasoning_tokens = 0
+            budget_escalations = 0
+
+        rec = _emit_plan_latency(
+            elapsed_s=1.0, outcome="ok", prompt_chars=1, carryover_items=0,
+            usage=_Usage(),
+        )
+        assert rec["DirectorPlanBudgetEscalations"] == 0
+
+    def test_usage_without_the_field_or_no_usage_reads_zero(self):
+        class _OldUsage:
+            input_tokens = 1
+            output_tokens = 1
+            reasoning_tokens = 0
+
+        for usage in (_OldUsage(), None):
+            rec = _emit_plan_latency(
+                elapsed_s=1.0, outcome="ok", prompt_chars=1, carryover_items=0,
+                usage=usage,
+            )
+            assert rec["DirectorPlanBudgetEscalations"] == 0
+
+    def test_it_is_a_record_property_not_a_new_cloudwatch_metric(self, capsys):
+        _emit_plan_latency(
+            elapsed_s=1.0, outcome="ok", prompt_chars=1, carryover_items=0,
+            usage=self._EscalatedUsage(),
+        )
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        declared = {
+            m["Name"] for m in payload["_aws"]["CloudWatchMetrics"][0]["Metrics"]
+        }
+        assert payload["DirectorPlanBudgetEscalations"] == 1
+        assert "DirectorPlanBudgetEscalations" not in declared
+
+    def test_it_reaches_the_archived_artifact(self):
+        class _Escalated:
+            last_usage = TestBudgetEscalationIsOnTheRecord._EscalatedUsage()
+
+            def invoke(self, messages):
+                return _plan_with(["x"])
+
+        plan = _invoke_with_retry(_Escalated(), [("system", "s"), ("human", "h")])
+        archived = json.loads(plan.model_dump_json())
+        assert archived["plan_call_telemetry"]["DirectorPlanBudgetEscalations"] == 1
