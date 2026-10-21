@@ -970,6 +970,18 @@ def _emit_plan_latency(
     # below (there is no number to fabricate), but this sibling flag is what a
     # reader or alarm MUST consult before treating that 0 as "a free call".
     tokens_unmeasured = usage is None or bool(getattr(usage, "usage_unknown", False))
+    # How many times krepis RE-ISSUED this attempt at a doubled `max_tokens`
+    # because the first request spent the whole completion budget on reasoning
+    # (`LLMUsage.budget_escalations`, alpha-engine-config-I6917). The escalated
+    # request runs inside the same `llm.invoke()` under its OWN
+    # `total_timeout`, so `{p}CeilingSeconds` bounds each model REQUEST, not
+    # the attempt: an escalated attempt can legitimately run past it. Measured
+    # 2026-10-17 (alpha-engine-config-I12470): the retro judge ran 207.789s
+    # against its 120s ceiling as two requests — 8,191 reasoning tokens and no
+    # content in 100.9s, then 10,670 tokens at max_tokens=16384 in 106.4s —
+    # and nothing on the record said so. A log/artifact property, not a
+    # declared CloudWatch metric.
+    budget_escalations = int(getattr(usage, "budget_escalations", 0) or 0)
     record = {
         f"{p}LatencySeconds": round(elapsed_s, 3),
         f"{p}LatencyAmber": 1 if over_amber else 0,
@@ -988,6 +1000,7 @@ def _emit_plan_latency(
         f"{p}CompletionTokens": int(getattr(usage, "output_tokens", 0) or 0),
         f"{p}ReasoningTokens": int(getattr(usage, "reasoning_tokens", 0) or 0),
         f"{p}TokensUnmeasured": 1 if tokens_unmeasured else 0,
+        f"{p}BudgetEscalations": budget_escalations,
         "outcome": outcome,
         "Group": channel.group,
     }
@@ -1015,7 +1028,9 @@ def _emit_plan_latency(
         logger.warning(
             "%s call AMBER: %.1fs >= %.1fs (%.0f%% of %s) — outcome=%s "
             "prompt_chars=%d carryover_items=%d "
-            "prompt_tokens=%d completion_tokens=%d (reasoning=%d). The call "
+            "prompt_tokens=%d completion_tokens=%d (reasoning=%d) "
+            "budget_escalations=%d (each one is a second model request inside "
+            "this attempt, under its own per-request ceiling). The call "
             "has not failed; it is measurably closer to the ceiling than it "
             "was. alpha-engine-config-I7311: the inputs and the output this "
             "call must produce both grow, so this number trends up on its own "
@@ -1035,19 +1050,21 @@ def _emit_plan_latency(
             record[f"{p}PromptTokens"],
             record[f"{p}CompletionTokens"],
             record[f"{p}ReasoningTokens"],
+            budget_escalations,
             record[f"{p}CarryoverOmitted"],
         )
     else:
         logger.info(
             "%s call %s in %.1fs (amber at %.1fs, ceiling %.0fs) — "
             "prompt_chars=%d carryover_items=%d carryover_omitted=%d "
-            "prompt_tokens=%d completion_tokens=%d",
+            "prompt_tokens=%d completion_tokens=%d budget_escalations=%d",
             channel.call_name, outcome, elapsed_s, amber_s, effective_ceiling_s,
             record[f"{p}PromptChars"],
             record[f"{p}CarryoverItems"],
             record[f"{p}CarryoverOmitted"],
             record[f"{p}PromptTokens"],
             record[f"{p}CompletionTokens"],
+            budget_escalations,
         )
     try:
         emf.emit({
