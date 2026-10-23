@@ -280,6 +280,72 @@ def test_closed_operator_decision_comment_is_not_reopened():
     assert 100 not in gh.patched_state
 
 
+def test_is_human_ruled_looks_past_its_own_notice():
+    """alpha-engine-config-I12113: the ruled-unrecovered notice is posted onto
+    the ruled issue, so it becomes the newest comment. The ruling it cites
+    must still read as a ruling."""
+    issue = {"state": "closed", "labels": [], "state_reason": "completed"}
+    comments = [
+        {"body": "**Operator decision 2026-07-08: Close as resolved.**"},
+        {"body": "**Director loop-verification (config#3145):** this issue closed under an "
+                 "operator ruling, but ... still reads RED/WATCH"},
+    ]
+    assert LV._is_human_ruled(issue, comments) is True
+
+
+def test_is_human_ruled_newer_human_comment_still_supersedes_ruling():
+    """Only the module's OWN notices are skipped: a later ordinary comment
+    still means the ruling is not the newest word, as before."""
+    issue = {"state": "closed", "labels": [], "state_reason": "completed"}
+    comments = [
+        {"body": "**Operator decision 2026-07-08: Close as resolved.**"},
+        {"body": "reopened and fixed properly in #400"},
+    ]
+    assert LV._is_human_ruled(issue, comments) is False
+
+
+def test_ruling_then_notice_then_adverse_pass_does_not_reopen():
+    """The #1301 sequence (alpha-engine-config-I12113): ruling comment ->
+    pass 1 posts the notice -> pass 2, still adverse, must not reopen. Pass 2
+    reads the notice as the newest comment, which is what reopened #1301."""
+    ruling = {"body": "**Operator decision 2026-07-08: Close as resolved.**"}
+    gh = FakeGitHub(
+        issues={100: {"state": "closed", "labels": [], "state_reason": "completed"}},
+        issue_comments={100: [ruling]},
+    )
+    item = _item(evidence=["price_cache_freshness"])
+    first = LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert first["closed_ruled_unrecovered"] == 1
+    notice = gh.comments[100][0]
+    assert notice.startswith(LV._LOOP_VERIFICATION_MARKER)
+
+    # The notice is now the newest comment on the issue. Pass 2 runs on a
+    # ledger row that did NOT carry the notified flag forward — the comment
+    # trail alone must still hold the line.
+    gh._issue_comments[100] = [ruling, {"body": notice}]
+    fresh_item = _item(evidence=["price_cache_freshness"])
+    second = LV.verify_and_correct([fresh_item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert second["closed_ruled_unrecovered"] == 1
+    assert second["closed_unrecovered"] == 0
+    assert second["reopened_issues"] == []
+    assert 100 not in gh.patched_state
+
+
+def test_ledger_recorded_ruling_is_honoured_without_comment_evidence():
+    """alpha-engine-config-I12113: once a pass has notified a ruled close, a
+    later pass that can no longer see the ruling (comments unreadable, or
+    past the first page) does not restore the reopen verb."""
+    gh = FakeGitHub(issues={
+        100: {"state": "closed", "labels": [], "state_reason": "completed"},
+    })
+    item = _item(evidence=["price_cache_freshness"])
+    item["ruled_unrecovered_notified"] = True
+    result = LV.verify_and_correct([item], _CARD, repo="r/x", token="tok", gh_request=gh)
+    assert result["closed_ruled_unrecovered"] == 1
+    assert result["reopened_issues"] == []
+    assert 100 not in gh.patched_state
+
+
 def test_closed_human_label_is_not_reopened():
     """(c) closed with the human label -> NOT reopened."""
     gh = FakeGitHub(issues={
