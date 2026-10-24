@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 10,
+    "account_files": 9,
+    "bucket_hits": 106,
+    "bucket_files": 75,
+    "files": 81
+  },
+  "files": {
+    ".github/workflows/alert-class-pr-guard.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/deploy.yml": {
+      "account": 1
+    },
+    "console.descriptor.yaml": {
+      "account": 1,
+      "bucket": 7
+    },
+    "director/agent.py": {
+      "bucket": 1
+    },
+    "director/carryover.py": {
+      "bucket": 1
+    },
+    "director/handler.py": {
+      "bucket": 1
+    },
+    "evals/director_arm_eval.py": {
+      "bucket": 1
+    },
+    "flow-doctor.yaml": {
+      "bucket": 1
+    },
+    "grading/aggregate.py": {
+      "bucket": 1
+    },
+    "grading/artifact_registry.py": {
+      "bucket": 1
+    },
+    "grading/attribution.py": {
+      "bucket": 2
+    },
+    "grading/handler.py": {
+      "bucket": 1
+    },
+    "grading/iam_s3_contract.json": {
+      "bucket": 2
+    },
+    "grading/producers/deploy_success.py": {
+      "bucket": 2
+    },
+    "grading/rehearsal.py": {
+      "bucket": 1
+    },
+    "grading/scorecard.py": {
+      "bucket": 3
+    },
+    "grading/sectors.py": {
+      "bucket": 1
+    },
+    "grading/thresholds/promote.py": {
+      "bucket": 1
+    },
+    "grading/thresholds/registry.yaml": {
+      "bucket": 1
+    },
+    "grading/tiles/agent.py": {
+      "bucket": 1
+    },
+    "grading/tiles/backtester.py": {
+      "bucket": 1
+    },
+    "grading/tiles/director_quality.py": {
+      "bucket": 1
+    },
+    "grading/tiles/executor.py": {
+      "bucket": 1
+    },
+    "grading/tiles/portfolio_outcome.py": {
+      "bucket": 1
+    },
+    "grading/tiles/predictor.py": {
+      "bucket": 1
+    },
+    "grading/tiles/research.py": {
+      "bucket": 1
+    },
+    "grading/tiles/substrate.py": {
+      "bucket": 1
+    },
+    "infrastructure/deploy.sh": {
+      "bucket": 6
+    },
+    "infrastructure/director_on_box.sh": {
+      "bucket": 1
+    },
+    "tests/artifact_registry_fixture.py": {
+      "bucket": 7
+    },
+    "tests/fixtures/pipeline_status/weekly_failed_2026_08_15.json": {
+      "account": 1
+    },
+    "tests/fixtures/pipeline_status/weekly_gateout_2026_08_20.json": {
+      "account": 1
+    },
+    "tests/fixtures/pipeline_status/weekly_gateout_2026_08_21.json": {
+      "account": 1
+    },
+    "tests/fixtures/pipeline_status/weekly_vacuous_success_watch_rerun_2026_08_16_4.json": {
+      "account": 1
+    },
+    "tests/fixtures/report_card_2026-08-07.json": {
+      "bucket": 1
+    },
+    "tests/test_aggregate.py": {
+      "bucket": 1
+    },
+    "tests/test_apply_audit_consumer_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_apply_loop_converged.py": {
+      "bucket": 1
+    },
+    "tests/test_apply_loop_guard_refusing.py": {
+      "bucket": 1
+    },
+    "tests/test_artifacts.py": {
+      "bucket": 1
+    },
+    "tests/test_attestation_scope_conflict.py": {
+      "account": 1
+    },
+    "tests/test_attractiveness_consumer_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_backtester_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_behavioral_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_console_descriptor_schema.py": {
+      "bucket": 2
+    },
+    "tests/test_contribution_lift_declared_terminal.py": {
+      "bucket": 1
+    },
+    "tests/test_contribution_lift_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_cost_pricing_producer.py": {
+      "bucket": 1
+    },
+    "tests/test_deploy_success_producer.py": {
+      "bucket": 1
+    },
+    "tests/test_director.py": {
+      "bucket": 1
+    },
+    "tests/test_director_citations.py": {
+      "bucket": 2
+    },
+    "tests/test_director_cost_sink_deploy.py": {
+      "bucket": 1
+    },
+    "tests/test_director_quality_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_director_route_degradation.py": {
+      "bucket": 1
+    },
+    "tests/test_director_trace_sources.py": {
+      "bucket": 3
+    },
+    "tests/test_executor_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_experiment_record_producer_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_freshness_preflight.py": {
+      "bucket": 1
+    },
+    "tests/test_groom_metrics.py": {
+      "bucket": 1
+    },
+    "tests/test_handler.py": {
+      "bucket": 1
+    },
+    "tests/test_history.py": {
+      "bucket": 1
+    },
+    "tests/test_iam_s3_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_inference_coverage_denominator.py": {
+      "bucket": 1
+    },
+    "tests/test_pbo_component.py": {
+      "bucket": 1
+    },
+    "tests/test_pipeline_gates.py": {
+      "bucket": 1
+    },
+    "tests/test_portfolio_outcome.py": {
+      "bucket": 1
+    },
+    "tests/test_portfolio_window_provenance.py": {
+      "bucket": 1
+    },
+    "tests/test_predictor_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_regime_index.py": {
+      "bucket": 1
+    },
+    "tests/test_rehearsal_attestation_scope.py": {
+      "bucket": 2
+    },
+    "tests/test_rehearsal_isolation.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "tests/test_research_frozen_ics.py": {
+      "bucket": 1
+    },
+    "tests/test_research_tile.py": {
+      "bucket": 1
+    },
+    "tests/test_run_scope_shape_collision.py": {
+      "account": 2,
+      "bucket": 2
+    },
+    "tests/test_scanner_basket_return.py": {
+      "bucket": 1
+    },
+    "tests/test_scanner_component.py": {
+      "bucket": 1
+    },
+    "tests/test_scanner_live_attribution.py": {
+      "bucket": 2
+    },
+    "tests/test_scorecard.py": {
+      "bucket": 1
+    },
+    "tests/test_scorecard_coverage.py": {
+      "bucket": 3
+    },
+    "tests/test_source_verification.py": {
+      "bucket": 1
+    },
+    "tests/test_substrate_agent_tiles.py": {
+      "bucket": 1
+    }
+  }
+}
