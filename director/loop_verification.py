@@ -73,6 +73,13 @@ _HUMAN_RULED_STATE_REASONS = {"not_planned"}
 #: (per ``decision-queue-policy``) — e.g. "**Operator decision 2026-09-08:
 #: ...**". Anchored at the start of the comment body.
 _OPERATOR_DECISION_RE = re.compile(r"^\*\*Operator decision \d{4}-\d{2}-\d{2}")
+#: Every comment this module posts opens with this marker. ``_is_human_ruled``
+#: looks PAST these when it reads "the newest comment", because the
+#: ruled-unrecovered notice is itself posted onto the ruled issue: read
+#: naively, the guard's own notice becomes the newest comment and erases the
+#: ruling it was posted to honour, and the next adverse pass reopens a
+#: human-ruled close (alpha-engine-config-I12113, measured on #1301).
+_LOOP_VERIFICATION_MARKER = "**Director loop-verification"
 
 
 def component_status_map(card: dict) -> dict[str, str]:
@@ -217,8 +224,11 @@ def _is_human_ruled(issue: dict, comments: list[dict]) -> bool:
       - ``state_reason == "not_planned"`` — GitHub's own "closed, not by
         completing the work" signal, which is what ``backlog-triage``/the
         Decision Queue set on a ruled close;
-      - the NEWEST comment on the issue opens with the ``**Operator decision
-        YYYY-MM-DD`` form those flows write.
+      - the NEWEST comment on the issue that this module did not post itself
+        opens with the ``**Operator decision YYYY-MM-DD`` form those flows
+        write. Comments carrying ``_LOOP_VERIFICATION_MARKER`` are skipped —
+        otherwise the ruled-unrecovered notice hides the ruling it cites
+        (alpha-engine-config-I12113).
 
     ``principles.md`` §5 (human authority) reserves a ruled decision to
     Brian regardless of how confident the system is — this is the reopen
@@ -228,12 +238,22 @@ def _is_human_ruled(issue: dict, comments: list[dict]) -> bool:
         return True
     if issue.get("state_reason") in _HUMAN_RULED_STATE_REASONS:
         return True
-    if comments:
-        newest = comments[-1]
-        body = str(newest.get("body") or "")
-        if _OPERATOR_DECISION_RE.match(body):
-            return True
+    for comment in reversed(comments or []):
+        body = str(comment.get("body") or "")
+        if body.startswith(_LOOP_VERIFICATION_MARKER):
+            continue
+        return bool(_OPERATOR_DECISION_RE.match(body))
     return False
+
+
+def _ledger_recorded_ruling(item: dict) -> bool:
+    """True when an earlier pass already judged this item's close human-ruled
+    and acted on it (posted the notice, or filed the re-track). That judgement
+    is not re-derived from the issue's current comments: the reopen verb was
+    withdrawn for this close once, and a later pass reading less evidence must
+    not restore it (alpha-engine-config-I12113). Fails toward NOT reopening —
+    the direction ``principles.md`` §5 reserves to the operator."""
+    return bool(item.get("ruled_unrecovered_notified") or item.get("ruled_unrecovered_filed"))
 
 
 def backfill_issue_numbers(
@@ -322,7 +342,7 @@ def verify_and_correct(
             outcome = item_evidence_still_adverse(item, status_map)
             if outcome == "adverse":
                 comments = _fetch_comments(api, number, gh_request, token)
-                if _is_human_ruled(res, comments):
+                if _ledger_recorded_ruling(item) or _is_human_ruled(res, comments):
                     counts["closed_ruled_unrecovered"] += 1
                     if item.get("ruled_unrecovered_filed"):
                         # Already re-tracked as a new issue on a prior run;
