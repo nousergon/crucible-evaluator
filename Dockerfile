@@ -16,15 +16,20 @@ RUN microdnf install -y git tar gzip && microdnf clean all
 # sha256) as krepis's own CI step (.github/workflows/test.yml) — do not
 # re-derive independently; bump both in lockstep.
 #
-# krepis's session_dlp.py resolves its config directory in this order (env
-# override, then /opt/llm-routing, /opt/groom-llm-routing,
-# /opt/drain-llm-routing, then a bundled ``_gitleaks_config`` dir next to
-# the installed krepis package, else defaulting to /opt/llm-routing) at
-# MODULE IMPORT TIME — the directory must therefore exist in the image
-# before the Lambda process starts, not just the binary. This image has no
-# shared-dashboard-box provisioning of /opt/llm-routing, so we create it
-# here with a minimal ``[extend] useDefault = true`` config, matching the
-# standard/default resolution path rather than the Lambda-bundled fallback.
+# The RULESET is not written here, deliberately (alpha-engine-config-I8058).
+# krepis's session_dlp.py resolves its config directory at import time:
+# $KREPIS_GITLEAKS_DIR, then /opt/{llm,groom,drain}-llm-routing, then the
+# ruleset krepis ships as package data (krepis/dlp_config/, since
+# krepis-PR211; this repo pins a later krepis). That packaged copy is the
+# fleet's real egress config: stock rules plus the nousergon-specific custom
+# rules (Telegram/OpenRouter/Anthropic/DeepSeek keys, AWS session tokens and
+# key IDs, IBKR credential lines, SSM SecureString responses). This image used
+# to write a two-line `[extend] useDefault = true` stub to
+# /opt/llm-routing. An operator directory outranks the packaged copy, so that
+# stub SHADOWED the real ruleset with gitleaks' stock rules alone, and the
+# scan returned clean on exactly the shapes the custom rules exist for.
+# Leaving /opt/llm-routing absent is what lets the packaged ruleset win.
+# tests/test_dockerfile_dlp_ruleset.py fails if a stub comes back.
 RUN set -euo pipefail; \
     GITLEAKS_VERSION="8.30.1"; \
     GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"; \
@@ -33,9 +38,7 @@ RUN set -euo pipefail; \
     tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks; \
     chmod +x /usr/local/bin/gitleaks; \
     rm -f /tmp/gitleaks.tar.gz; \
-    gitleaks version; \
-    mkdir -p /opt/llm-routing; \
-    printf '[extend]\nuseDefault = true\n' > /opt/llm-routing/gitleaks-egress.toml
+    gitleaks version
 
 # config#2348: stamp the image with the commit it was built from, so the
 # weekly SF's new Lambda-SHA drift probe (grading/deploy_drift.py,
@@ -76,7 +79,15 @@ RUN NOUSERGON_LIB_LINE="$(grep '^nousergon-lib' requirements.txt)" && \
 # needs, and krepis declares those needs in its own .github/consumers.yaml
 # (`runtime_prerequisites`). Same gate infrastructure/director_on_box.sh runs
 # before the box Director starts. No scan, no network call.
+#
 RUN python -m krepis.session_dlp preflight
+
+# alpha-engine-config-I8058: the step above proves the scan CAN run; this one
+# proves it runs the RIGHT ruleset, the packaged fleet ruleset. A narrower
+# config, such as the stub this image used to write, still reports ready and
+# scans clean, so only this grep can tell it apart from the real one. The step
+# above has already enforced preflight's exit status.
+RUN python -m krepis.session_dlp preflight | grep -qx 'ruleset_matches_packaged: True'
 
 # Application code (Layer B grading + Layer C director skeleton).
 COPY grading/ ${LAMBDA_TASK_ROOT}/grading/
