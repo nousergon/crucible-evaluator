@@ -72,6 +72,15 @@
         "source_ref": "alpha-engine-config-I2978#issuecomment-5593739433",
         "reopen_when": {"measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained", "op": "eq", "threshold": 1}
       }
+    },
+    {
+      "item": "alpha-engine-config-I11095",
+      "scope": {"anchor": "crucible-backtester:attractiveness_eval.pillar_ic value-overweight pillar re-weighting", "acceptance": "attractiveness-pillar-reweight-validation"},
+      "ruling": {
+        "decision": "close", "decided_on": "2026-10-14",
+        "source_ref": "alpha-engine-config-I11095#issuecomment-6170869099",
+        "reopen_when": {"measure": "attractiveness_eval.pillar_ic.value:new_nonoverlapping_21d_windows_after_2026-09-04_all_positive_min2", "op": "eq", "threshold": 1}
+      }
     }
   ],
   "current": [
@@ -89,7 +98,8 @@
     "alpha-engine-config-I7644": "stays_closed",
     "alpha-engine-config-I964": "stays_closed",
     "alpha-engine-config-I1084": "stays_closed",
-    "alpha-engine-config-I2978": "stays_closed"
+    "alpha-engine-config-I2978": "stays_closed",
+    "alpha-engine-config-I11095": "unevaluable"
   },
   "proposals": [
     {
