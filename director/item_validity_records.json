@@ -1,5 +1,5 @@
 {
-  "_doc": "Declared item completion / ruling records the weekly Director reads (director/item_validity_gate.py, alpha-engine-config-I11990). Each record restates an AUTHORITATIVE closure or human ruling, copied unchanged from tests/fixtures/director_item_validity_known_answers.json (crucible-evaluator-PR338). The reopen_when threshold on each record is a declared value awaiting Brian's ruling on alpha-engine-config-I11990 / crucible-evaluator-PR338: do not change one without that ruling. A record whose condition is over a measure the report card does not carry is held unevaluable (never graded on color) until a producer supplies that observation.",
+  "_doc": "Declared item completion / ruling records the weekly Director reads (director/item_validity_gate.py, alpha-engine-config-I11990). Each record restates an AUTHORITATIVE closure or human ruling, copied unchanged from tests/fixtures/director_item_validity_known_answers.json (crucible-evaluator-PR338). The reopen_when threshold on each record is a declared value awaiting Brian's ruling on alpha-engine-config-I11990 / crucible-evaluator-PR338: do not change one without that ruling. A record whose condition is over a measure the report card does not carry is held unevaluable (never graded on color) until a producer supplies that observation. alpha-engine-config-I11095 is Brian's ruling #17 (2026-10-14, Option B: defer the value-tilt study to v2, close as validated, not actionable); its reopen_when restates that ruling's own bar (value-pillar IC positive across new non-overlapping 21d windows after 2026-09-04). No producer emits that measure yet, so the row is held unevaluable, which stops the I10252 re-track that filed alpha-engine-config-I12623.",
   "schema_version": 1,
   "records": [
     {
@@ -140,6 +140,23 @@
         "source_ref": "alpha-engine-config-I2978#issuecomment-5593739433",
         "reopen_when": {
           "measure": "alpha-engine-config-I9760:phase4_cancelled_or_v1_retained",
+          "op": "eq",
+          "threshold": 1
+        }
+      }
+    },
+    {
+      "item": "alpha-engine-config-I11095",
+      "scope": {
+        "anchor": "crucible-backtester:attractiveness_eval.pillar_ic value-overweight pillar re-weighting",
+        "acceptance": "attractiveness-pillar-reweight-validation"
+      },
+      "ruling": {
+        "decision": "close",
+        "decided_on": "2026-10-14",
+        "source_ref": "alpha-engine-config-I11095#issuecomment-6170869099",
+        "reopen_when": {
+          "measure": "attractiveness_eval.pillar_ic.value:new_nonoverlapping_21d_windows_after_2026-09-04_all_positive_min2",
           "op": "eq",
           "threshold": 1
         }

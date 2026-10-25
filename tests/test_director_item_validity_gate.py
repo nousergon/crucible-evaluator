@@ -327,3 +327,51 @@ def test_digest_unchanged_when_no_assessment_ran():
                                         loop_summary={"director_loop": "skipped",
                                                       "director_loop_reason": "no GH token"})
     assert "Item validity" not in plain
+
+
+# ── ruling #17 on I11095: a deferred-to-v2 close is not re-tracked (I12623) ──
+#
+# Brian's 2026-10-14 ruling closed I11095 (Option B: defer the value-tilt study
+# to v2). With no record, the 10-23 run graded the row on color and filed
+# alpha-engine-config-I12623 through the I10252 re-track. The row below is the
+# LIVE ledger row's identity on 2026-10-25: issue 11095, targets [I11095].
+
+_I11095_MEASURE = (
+    "attractiveness_eval.pillar_ic.value:new_nonoverlapping_21d_windows_after_2026-09-04_all_positive_min2"
+)
+# The 2026-10-23 card's research components the row cites: no per-pillar
+# observation exists on the card, so the ruling's condition cannot be read.
+_CARD_1023 = {"tiles": {"research": {"components": [
+    {"name": "attractiveness_ic", "value": 0.0085, "status": "WATCH"},
+    {"name": "scanner_feed_counterfactual", "value": -0.02022, "status": "WATCH"},
+]}}}
+
+
+def _i11095_row():
+    return _row("attractiveness-pillar-reweight-validation", 11095, priority="P1",
+                targets=["alpha-engine-config-I11095"])
+
+
+def test_ruling_17_holds_the_attractiveness_row_while_its_condition_is_unread():
+    obs = IV.observations_from_card(_CARD_1023, as_of=date(2026, 10, 23))
+    v = G.assess_row(_i11095_row(), _shipped(), obs, as_of=date(2026, 10, 23))
+    assert v["valid_to_grade"] is False
+    assert v["basis"] == G.BASIS_RECORD
+    assert v["decision"] == "hold_unevaluable"
+    assert v["matched"] == ["alpha-engine-config-I11095"]
+    assert _I11095_MEASURE in v["reason"]
+
+
+def test_ruling_17_row_is_not_refiled_as_a_plan_item():
+    item = {"id": "attractiveness-pillar-reweight-validation", "priority": "P1", "targets": []}
+    block = G.assess_plan_items([item], [_i11095_row()], _CARD_1023, as_of=date(2026, 10, 23),
+                                record_set=_shipped())
+    assert set(G.not_valid_to_file(block)) == {"attractiveness-pillar-reweight-validation"}
+
+
+@pytest.mark.parametrize("value,expected", [(1, (True, "allow")), (0, (False, "refuse"))])
+def test_ruling_17_reopens_only_on_its_own_value_pillar_bar(value, expected):
+    obs = {_I11095_MEASURE: IV.Observation(measure=_I11095_MEASURE, observed_at=date(2026, 11, 27),
+                                           value=value, source="synthetic")}
+    v = G.assess_row(_i11095_row(), _shipped(), obs, as_of=date(2026, 11, 27))
+    assert (v["valid_to_grade"], v["decision"]) == expected
