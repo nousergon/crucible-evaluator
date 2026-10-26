@@ -130,17 +130,15 @@ def existing_proposal_slugs(
     return slugs
 
 
-def slug_issue_number_map(
+def list_proposal_issues(
     repo: str, token: str, *, gh_request=_gh_request, max_pages: int = 20
-) -> dict[str, int]:
-    """``{id=<slug> marker: issue number}`` for every ``area:director-proposals``
-    issue (open OR closed) — the backfill source ``loop_verification.py`` uses to
-    populate ``issue_number`` on ledger rows that predate that field (config#3145),
-    and to self-heal any row that lost track of its issue. Mirrors
-    ``existing_proposal_slugs``'s fetch/pagination exactly; kept as a separate
-    function (rather than changing that one's return type) since callers of
-    ``existing_proposal_slugs`` only need the slug SET."""
-    out: dict[str, int] = {}
+) -> list[dict]:
+    """Every ``area:director-proposals`` issue, open OR closed, PRs skipped —
+    one paginated listing shared by :func:`slug_issue_number_map` and the
+    ledger's current-issue stamp (``loop_verification``, alpha-engine-config-I12644),
+    so the backfill pass reads GitHub once. Pagination mirrors
+    ``existing_proposal_slugs`` exactly."""
+    out: list[dict] = []
     api = f"https://api.github.com/repos/{repo}"
     for page in range(1, max_pages + 1):
         url = (
@@ -150,15 +148,36 @@ def slug_issue_number_map(
         status, items = gh_request("GET", url, token)
         if status != 200 or not isinstance(items, list) or not items:
             break
-        for it in items:
-            if "pull_request" in it:
-                continue
-            text = f"{it.get('title', '')}\n{it.get('body', '') or ''}"
-            for slug in _SLUG_RE.findall(text):
-                out[slug] = it.get("number")
+        out.extend(it for it in items if isinstance(it, dict) and "pull_request" not in it)
         if len(items) < 100:
             break
     return out
+
+
+def slug_map_from_issues(issues: list[dict]) -> dict[str, int]:
+    """``{id=<slug> marker: issue number}`` over a :func:`list_proposal_issues`
+    result. Later entries win, as they always have (the listing is newest
+    first, so a slug filed twice maps to its OLDEST issue)."""
+    out: dict[str, int] = {}
+    for it in issues:
+        text = f"{it.get('title', '')}\n{it.get('body', '') or ''}"
+        for slug in _SLUG_RE.findall(text):
+            out[slug] = it.get("number")
+    return out
+
+
+def slug_issue_number_map(
+    repo: str, token: str, *, gh_request=_gh_request, max_pages: int = 20
+) -> dict[str, int]:
+    """``{id=<slug> marker: issue number}`` for every ``area:director-proposals``
+    issue (open OR closed) — the backfill source ``loop_verification.py`` uses to
+    populate ``issue_number`` on ledger rows that predate that field (config#3145),
+    and to self-heal any row that lost track of its issue. Kept as a separate
+    function (rather than changing ``existing_proposal_slugs``'s return type)
+    since callers of ``existing_proposal_slugs`` only need the slug SET."""
+    return slug_map_from_issues(
+        list_proposal_issues(repo, token, gh_request=gh_request, max_pages=max_pages)
+    )
 
 
 def evidence_pieces(item: ActionItem) -> list[str]:

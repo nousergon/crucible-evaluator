@@ -468,6 +468,23 @@ class TestCarryover:
         assert row["ruled_unrecovered_filed"] is True
         assert row["ruled_unrecovered_issue"] == 777
 
+    def test_merge_keeps_current_issue_number_only_when_stamped(self):
+        """A run whose backfill is skipped keeps last week's open issue rather
+        than falling back to the closed first one (alpha-engine-config-I12644);
+        a row never stamped stays unstamped, since a present ``None`` means
+        "every issue on the chain is closed"."""
+        ledger = {"items": [
+            {"id": "revive-momentum-l1", "status": "carried_over", "first_seen": "2026-05-23",
+             "issue_number": 501, "current_issue_number": 888},
+        ]}
+        row = next(r for r in merge_plan_into_ledger(ledger, _plan(), RUN_DATE)["items"]
+                   if r["id"] == "revive-momentum-l1")
+        assert (row["issue_number"], row["current_issue_number"]) == (501, 888)
+        ledger["items"][0].pop("current_issue_number")
+        row = next(r for r in merge_plan_into_ledger(ledger, _plan(), RUN_DATE)["items"]
+                   if r["id"] == "revive-momentum-l1")
+        assert "current_issue_number" not in row
+
 
 class TestHandler:
     def test_disabled_is_noop(self, s3, monkeypatch):
