@@ -126,11 +126,17 @@ def test_producer_reason_survives_verbatim(s3_with, declared) -> None:
 
 
 def test_gap_still_counts_against_coverage(s3_with) -> None:
-    """A width mismatch is a real producer defect, NOT a declared retirement."""
-    s3 = s3_with([_comp("risk_guard", "gap", module="executor",
-                        reason="width mismatch on 14/39 shared cycles")])
+    """A width mismatch is a real producer defect, NOT a declared retirement.
+
+    ``position_sizing``, not ``risk_guard``: since alpha-engine-config-I12584
+    risk_guard's gap is declared by construction (see
+    ``test_contribution_lift_evaluator_declared.py``). position_sizing is a few
+    dates from matchable and was left out of that ruling on purpose.
+    """
+    s3 = s3_with([_comp("position_sizing", "gap", module="executor",
+                        reason="width mismatch on 3/48 shared cycles")])
     tile = build_contribution_lift_tile(_BUCKET, _DATE, s3_client=s3)
-    record = _component(tile, "risk_guard_contribution_lift")
+    record = _component(tile, "position_sizing_contribution_lift")
     assert record["status"] == "N/A-MISSING-INPUT"
     assert record["permanent_na"] is False, (
         "a producer defect must stay in the denominator until it is fixed"

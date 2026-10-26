@@ -10,7 +10,11 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from grading.tiles.contribution_lift import KNOWN_COMPONENTS, build_contribution_lift_tile
+from grading.tiles.contribution_lift import (
+    _EVALUATOR_DECLARED_PERMANENT_NA,
+    KNOWN_COMPONENTS,
+    build_contribution_lift_tile,
+)
 
 BUCKET = "alpha-engine-research"
 RUN_DATE = "2026-08-15"  # a Saturday
@@ -93,7 +97,13 @@ class TestMissingArtifact:
         assert tile["n_components"] == len(KNOWN_COMPONENTS)
         for name, module in KNOWN_COMPONENTS.items():
             c = _comp(tile, f"{name}_contribution_lift")
-            assert c["status"] == "N/A-MISSING-INPUT"
+            # alpha-engine-config-I12584: an absent artifact does not make a
+            # by-construction retirement measurable, so it stays declared out.
+            if name in _EVALUATOR_DECLARED_PERMANENT_NA:
+                assert c["status"] == "N/A-NOT-IMPL"
+                assert c["permanent_na"] is True
+            else:
+                assert c["status"] == "N/A-MISSING-INPUT"
             assert c["module"] == module
             assert c["metric_type"] == "contribution_lift"
             assert "contribution_lift.json" in c["status_reason"] or "contribution_lift.json" in (c.get("source_path") or "")
@@ -102,7 +112,7 @@ class TestMissingArtifact:
         _put(s3, {"schema_version": 1, "status": "error", "reason": "replay harness crashed mid-cycle", "run_date": RUN_DATE})
         tile = build_contribution_lift_tile(BUCKET, RUN_DATE, s3_client=s3)
         assert tile["n_components"] == len(KNOWN_COMPONENTS)
-        c = _comp(tile, "risk_guard_contribution_lift")
+        c = _comp(tile, "exit_rules_contribution_lift")
         assert c["status"] == "N/A-MISSING-INPUT"
         assert "replay harness crashed mid-cycle" in c["status_reason"]
 
