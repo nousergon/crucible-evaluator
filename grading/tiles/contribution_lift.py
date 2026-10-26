@@ -146,6 +146,91 @@ _STATUS_DECLARED_TERMINAL = frozenset({"N/A-RETIRED", "N/A-NOT-LIFT-SHAPED"})
 # Passed straight through — already valid StatusLiteral values.
 _STATUS_PASSTHROUGH = {"N/A-MISSING-INPUT", "N/A-LOW-N"}
 
+# EVALUATOR-declared permanent N/A (alpha-engine-config-I12584, option 1
+# "Retire", taken at the 2026-10-25 decision-queue triage).
+#
+# Everything above maps a state the PRODUCER declared. These two are declared
+# here instead, on the consumer side, and that is deliberate: the established
+# pattern (I8177) is that ``contribution_lift.json`` declares a terminal state
+# itself, but Sat 2026-10-24 was the last v1 weekly, so no v1 backtester run
+# will ever write one. A producer-side declaration would never take effect.
+#
+# This is a DECLARATION, not an inference. Both lifts read
+# ``N/A-MISSING-INPUT`` on the 10-09, 10-16 and 10-23 cards with the same shape,
+# because #12243's support assurance (crucible-backtester#810) refuses to
+# compare arms whose support differs, and these arms differ BY CONSTRUCTION:
+#
+# * ``entry_triggers`` decides WHEN to enter, so the ablated arm enters on
+#   different dates (10-23: 25 baseline-only and 11 ablated-only dates of 60).
+# * ``risk_guard``'s main effect is the orders it blocks (204 baseline vs 902
+#   ablated), so the ablated arm is wider on purpose.
+#
+# Matching the cohorts would grade a residual that excludes what each
+# component does, which is a new estimand (reserved by #12243 to estimator
+# authority), not a repair. So the reason says "by construction", never
+# "missing input".
+#
+# What the card loses: it no longer states a net-P&L contribution for either
+# component. What remains: the entry_triggers trigger scorecard (#12387) and
+# the risk_guard shadow-book precision/recall in the executor tile.
+#
+# Revisit triggers, either one:
+# * EVENT: the producer emits a VALUE for one of these components (the arms
+#   shared support, so the by-construction reason no longer holds). The
+#   declaration then does not apply and the record grades normally; see
+#   ``_evaluator_declared_reason``.
+# * EVENT: v2 ships an ablation harness, or a matched-cohort estimand is ruled
+#   under estimator authority. Delete the entry here when it does.
+# * DATED BACKSTOP: ``_EVALUATOR_DECLARED_REVISIT_BY``. From that run_date on,
+#   the declaration LAPSES on its own: both records return to the producer's
+#   state, re-enter the coverage denominator, and the digest flags them again.
+#   Renewing it is an edit here with a fresh date and a reason, so a
+#   retirement nobody re-examined cannot outlive its backstop silently.
+#
+# ``position_sizing`` is NOT here: it is a few dates from matchable, and it was
+# not part of the ruling.
+_EVALUATOR_DECLARED_REVISIT_BY = "2026-11-30"
+_KNOWN_PRODUCER_STATUSES = frozenset(
+    {None, "ok"} | _STATUS_PASSTHROUGH | _STATUS_DECLARED_TERMINAL | set(_STATUS_REMAP)
+)
+_EVALUATOR_DECLARED_PERMANENT_NA: dict[str, str] = {
+    "entry_triggers": (
+        "N/A-NOT-MEASURABLE-BY-CONSTRUCTION: the ablated arm (no entry triggers) "
+        "enters on different dates, so the arms never share support and the "
+        "#12243 support assurance refuses the paired comparison. Matching the "
+        "cohorts by date would remove the timing effect the component exists "
+        "to have. The card no longer states a net-P&L contribution for "
+        "entry_triggers; its signal is the trigger scorecard (#12387). Declared "
+        "evaluator-side (alpha-engine-config-I12584, Retire). Revisit when v2 "
+        "ships an ablation harness, or by "
+    ),
+    "risk_guard": (
+        "N/A-NOT-MEASURABLE-BY-CONSTRUCTION: removing the guard admits about "
+        "4.4x the orders (204 vs 902), so the ablated arm is wider on purpose "
+        "and the #12243 support assurance refuses the paired comparison. "
+        "Capping both arms to a common width would drop the orders the guard "
+        "blocks, which is what it does. The card no longer states a net-P&L "
+        "contribution for risk_guard; its signal is the shadow-book "
+        "precision/recall. Declared evaluator-side (alpha-engine-config-I12584, "
+        "Retire). Revisit when v2 ships an ablation harness, or by "
+    ),
+}
+
+
+def _evaluator_declared_reason(name: str, run_date: str, value=None) -> str | None:
+    """The written retirement reason for ``name`` on ``run_date``, or None.
+
+    None when ``name`` is not declared, when the producer measured a value
+    (the arms shared support: the revisit event fired), or when ``run_date``
+    has reached the dated backstop (the declaration lapsed).
+    """
+    reason = _EVALUATOR_DECLARED_PERMANENT_NA.get(name)
+    if reason is None or value is not None:
+        return None
+    if run_date >= _EVALUATOR_DECLARED_REVISIT_BY:
+        return None
+    return f"{reason}{_EVALUATOR_DECLARED_REVISIT_BY}."
+
 
 def _missing_input_detail(name: str, key: str, reason: str | None = None) -> str:
     detail = f"{name}_contribution_lift: contribution_lift.json absent or unusable this cycle (key: {key})."
@@ -178,6 +263,16 @@ def build_contribution_lift_tile(bucket: str, run_date: str, s3_client=None) -> 
     if doc is None or doc.get("status") != "ok":
         top_reason = (doc or {}).get("reason")
         for name, module in KNOWN_COMPONENTS.items():
+            declared = _evaluator_declared_reason(name, run_date)
+            if declared is not None:
+                # Retired by construction (I12584): an absent artifact does
+                # not make it measurable, so it stays declared out.
+                components.append(build_metric(
+                    name=f"{name}_contribution_lift", module=module, metric_type="contribution_lift",
+                    unit=_UNIT, n_floor=_N_FLOOR, source_path=src,
+                    criticality="diagnostic", permanent_na_reason=declared,
+                ))
+                continue
             components.append(build_metric(
                 name=f"{name}_contribution_lift", module=module, metric_type="contribution_lift",
                 unit=_UNIT, n_floor=_N_FLOOR, source_path=src,
@@ -211,7 +306,18 @@ def build_contribution_lift_tile(bucket: str, run_date: str, s3_client=None) -> 
             kwargs["estimator"] = _ESTIMATOR
             kwargs["measurement_horizon"] = _MEASUREMENT_HORIZON
 
-        if producer_status is None or producer_status == "ok":
+        declared = (
+            _evaluator_declared_reason(name, run_date, comp.get("value"))
+            if producer_status in _KNOWN_PRODUCER_STATUSES else None
+        )  # an unrecognized status still fails loud below, declared or not.
+        if declared is not None:
+            # Evaluator-declared retirement (I12584) wins over the producer's
+            # non-value state. The producer's own state rides along verbatim
+            # so the override is never silently lossy.
+            if producer_status not in (None, "ok"):
+                declared += f" Producer reported {producer_status}: {status_reason}"
+            kwargs["permanent_na_reason"] = declared
+        elif producer_status is None or producer_status == "ok":
             pass  # let build_metric/derive_status compute GREEN/WATCH/RED/N/A-LOW-N.
         elif producer_status in _STATUS_PASSTHROUGH:
             kwargs["status"] = producer_status
