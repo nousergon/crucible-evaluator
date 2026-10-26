@@ -705,6 +705,90 @@ class TestAgent:
         assert "declared absent" not in reason
 
 
+# The 10-23 card's block as the pre-#871 producer wrote it (values measured).
+_LATENCY_PRE_871 = {
+    "value": 75701.0, "n": 6, "worst_agent": "analyst_thesis",
+    "p95_ms_by_agent": {"analyst_pillar": 42569.0, "analyst_sweep": 22102.0,
+                        "analyst_thesis": 75701.0, "analyst_triage": 3705.0,
+                        "themes_macro": 20468.0, "themes_sector": 27511.0},
+    "source": "thinktank_run_manifest",
+}
+
+
+def _latency_post_871(short_p95=27511.0, long_p95=75701.0):
+    blk = dict(_LATENCY_PRE_871)
+    blk.update({
+        "n_samples": 107, "worst_agent_n_samples": 23,
+        "by_class": {
+            "short_form": {"p95_ms": short_p95, "worst_agent": "themes_sector",
+                           "n_agents": 4, "n_samples": 62, "worst_agent_n_samples": 15},
+            "long_form": {"p95_ms": long_p95, "worst_agent": "analyst_thesis",
+                          "n_agents": 2, "n_samples": 45, "worst_agent_n_samples": 23},
+        },
+    })
+    return blk
+
+
+class TestAgentLatencyByClass:
+    """alpha-engine-config-I12625 — evaluator half of the latency split.
+
+    ``n`` is the agent count; crucible-research#871 adds ``n_samples`` and a
+    ``by_class`` split. The card grades short_form on 15s/60s and reports
+    long_form ungraded until the card owner rules on its bar."""
+
+    def _lat(self, s3, blk):
+        _put_agent_quality(s3, {"status": "ok", "agent_latency_p95": blk})
+        return _comp(build_agent_tile(BUCKET, RUN_DATE, s3_client=s3), "agent_latency_p95")
+
+    def test_pre_871_artifact_grades_exactly_as_before(self, s3):
+        c = self._lat(s3, dict(_LATENCY_PRE_871))
+        assert c["value"] == 75701.0
+        assert c["n_samples"] == 6
+        assert c["status"] == "RED"
+        assert c["status_reason"] == "agent_latency_p95 = 75701 ms (N=6) vs target 15s / red-line 60s."
+
+    def test_n_is_printed_from_n_samples_when_present(self, s3):
+        blk = dict(_LATENCY_PRE_871, n_samples=107)
+        c = self._lat(s3, blk)
+        assert c["n_samples"] == 107
+        assert "N=107 samples over 6 agents" in c["status_reason"]
+        assert c["status"] == "RED"  # no split ⇒ headline still graded as before
+
+    def test_short_form_is_graded_and_long_form_reported_ungraded(self, s3):
+        c = self._lat(s3, _latency_post_871())
+        assert c["value"] == 27511.0          # short_form p95, not the 75.7s headline
+        assert c["n_samples"] == 62           # short_form's pooled samples
+        assert c["status"] == "WATCH"         # 15s < 27.5s < 60s
+        r = c["status_reason"]
+        assert "(short_form) = 27511 ms" in r and "N=62 samples over 4 agents" in r
+        assert "all classes N=107 samples over 6 agents" in r
+        assert "long_form p95 = 75701 ms" in r and "not graded" in r
+        assert "alpha-engine-config-I12625" in r
+
+    def test_long_form_never_moves_the_grade(self, s3):
+        """A long_form p95 far past 60s must not turn the component RED, and a
+        tiny one must not make it GREEN: it carries no bar yet."""
+        hi = self._lat(s3, _latency_post_871(short_p95=9000.0, long_p95=500000.0))
+        assert hi["status"] == "GREEN" and hi["value"] == 9000.0
+
+    def test_short_form_over_red_line_is_red(self, s3):
+        c = self._lat(s3, _latency_post_871(short_p95=61000.0, long_p95=1000.0))
+        assert c["status"] == "RED"
+
+    def test_long_form_only_is_missing_input_not_green(self, s3):
+        blk = _latency_post_871()
+        del blk["by_class"]["short_form"]
+        c = self._lat(s3, blk)
+        assert c["status"] == "N/A-MISSING-INPUT"
+        assert "no short_form agent" in c["status_reason"]
+        assert "long_form p95 = 75701 ms" in c["status_reason"]
+
+    def test_malformed_split_falls_back_to_the_headline(self, s3):
+        blk = dict(_LATENCY_PRE_871, by_class={"short_form": {"p95_ms": "fast"}})
+        c = self._lat(s3, blk)
+        assert c["value"] == 75701.0 and c["status"] == "RED"
+
+
 class _FakeCW:
     """Stub CloudWatch client: maps metric name → trailing-window Sum (or None
     for no datapoints), or raises a preset exception."""
