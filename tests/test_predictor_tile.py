@@ -357,6 +357,8 @@ class TestDirectionAccuracyVsBaseline:
             "DOWN": {"precision": 0.552, "recall": 0.65, "f1": 0.6, "n_predicted": 773, "n_actual": 763},
         },
         "up_threshold": 0.005, "horizons_days": [21],
+        # Effective N (alpha-engine-config-I11094): non-overlapping windows.
+        "n_effective": 40,
     }
 
     def test_accuracy_lift_matches_incident_and_is_red(self, s3):
@@ -368,7 +370,8 @@ class TestDirectionAccuracyVsBaseline:
         assert c["value"] == pytest.approx(0.3996 - baseline, abs=1e-4)
         assert c["status"] == "RED"  # deeply sub-baseline, mirrors the 2026-06 incident
         assert "DOWN" in c["status_reason"]
-        assert c["n_samples"] == 1379
+        assert c["n_samples"] == 40  # effective N, not the 1379 overlapping rows
+        assert "rows=1379" in c["status_reason"]
 
     def test_up_precision_lift_matches_incident(self, s3):
         _seed(s3)
@@ -377,7 +380,8 @@ class TestDirectionAccuracyVsBaseline:
         c = _comp(tile, "up_precision_vs_base_rate")
         base_rate = 356 / 1379
         assert c["value"] == pytest.approx(0.313 - base_rate, abs=1e-3)
-        assert c["n_samples"] == 456
+        assert c["n_samples"] == 40  # effective N, not the 456 overlapping rows
+        assert "rows=456" in c["status_reason"]
 
     def test_down_precision_lift_matches_incident(self, s3):
         _seed(s3)
@@ -386,12 +390,13 @@ class TestDirectionAccuracyVsBaseline:
         c = _comp(tile, "down_precision_vs_base_rate")
         base_rate = 763 / 1379
         assert c["value"] == pytest.approx(0.552 - base_rate, abs=1e-3)
-        assert c["n_samples"] == 773
+        assert c["n_samples"] == 40  # effective N, not the 773 overlapping rows
+        assert "rows=773" in c["status_reason"]
 
     def test_beats_baseline_is_green(self, s3):
         _seed(s3)
         cm = {
-            "status": "ok", "n": 500, "accuracy": 0.70,
+            "status": "ok", "n": 500, "accuracy": 0.70, "n_effective": 40,
             "per_class": {
                 "UP": {"precision": 0.65, "recall": 0.6, "f1": 0.62, "n_predicted": 200, "n_actual": 190},
                 "FLAT": {"precision": 0.10, "recall": 0.1, "f1": 0.10, "n_predicted": 20, "n_actual": 20},
@@ -609,6 +614,80 @@ class TestCrossCycleTrends:
         tile = build_predictor_tile(BUCKET, s3_client=s3, history=history)
         meta = _comp(tile, "meta_l2_ic")
         assert meta["trend_4w"] == [0.10, 0.12]
+
+
+class TestDirectionFamilyEffectiveN:
+    """alpha-engine-config-I11094 (triage 2026-10-25): the direction family is
+    graded on effective N — non-overlapping label windows — and below the power
+    floor reads insufficient-N rather than RED or GREEN.
+
+    The 2026-10-23 card graded ``direction_accuracy_vs_majority_baseline`` RED
+    at N=3,533 overlapping (ticker, date) rows of 21d labels. These tests fail
+    on that code, which handed the row count to the floor check."""
+
+    _FAMILY = (
+        "direction_accuracy_vs_majority_baseline",
+        "up_precision_vs_base_rate",
+        "down_precision_vs_base_rate",
+    )
+
+    def _tile(self, s3, **over):
+        _seed(s3)
+        cm = {k: v for k, v in TestDirectionAccuracyVsBaseline._CM.items() if k != "n_effective"}
+        cm.update(over)
+        _put_confusion(s3, cm)
+        return build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+
+    def test_sub_floor_effective_n_is_insufficient_not_red(self, s3):
+        tile = self._tile(s3, n_effective=5)
+        c = _comp(tile, "direction_accuracy_vs_majority_baseline")
+        assert c["status"] == "N/A-LOW-N"
+        assert c["n_samples"] == 5
+        # The adverse level stays on the card; only the grade is withheld.
+        assert c["value"] == pytest.approx(0.3996 - 763 / 1379, abs=1e-4)
+        assert "N_eff=5" in c["status_reason"] and "rows=1379" in c["status_reason"]
+        for name in self._FAMILY:
+            assert _comp(tile, name)["status"] == "N/A-LOW-N", name
+
+    def test_effective_n_from_dates_uses_the_declared_horizon(self, s3):
+        # 105 prediction dates of 21d labels = 5 non-overlapping windows.
+        c = _comp(self._tile(s3, n_prediction_dates=105), "direction_accuracy_vs_majority_baseline")
+        assert c["n_samples"] == 5
+        assert c["status"] == "N/A-LOW-N"
+
+    def test_undeclared_effective_n_never_falls_back_to_rows(self, s3):
+        tile = self._tile(s3)
+        for name in self._FAMILY:
+            c = _comp(tile, name)
+            assert c["status"] == "N/A-LOW-N", name
+            assert c["n_samples"] is None, name
+            assert "EFFECTIVE N UNDECLARED" in c["status_reason"], name
+
+    def test_between_half_floor_and_floor_can_be_red_but_not_green(self, s3):
+        tile = self._tile(s3, n_effective=20)
+        assert _comp(tile, "direction_accuracy_vs_majority_baseline")["status"] == "RED"
+        _seed(s3)
+        _put_confusion(s3, {
+            "status": "ok", "n": 500, "accuracy": 0.70, "n_effective": 20, "horizons_days": [21],
+            "per_class": {
+                "UP": {"precision": 0.65, "n_predicted": 200, "n_actual": 190},
+                "FLAT": {"precision": 0.10, "n_predicted": 20, "n_actual": 20},
+                "DOWN": {"precision": 0.75, "n_predicted": 280, "n_actual": 290},
+            },
+        })
+        c = _comp(build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3),
+                  "direction_accuracy_vs_majority_baseline")
+        assert c["status"] == "WATCH"  # +12pp lift, but 20 windows cannot claim GREEN
+
+    def test_per_class_declaration_wins_over_the_matrix_figure(self, s3):
+        cm = {k: v for k, v in TestDirectionAccuracyVsBaseline._CM.items()}
+        cm["per_class"] = {**cm["per_class"],
+                           "UP": {**cm["per_class"]["UP"], "n_effective": 6}}
+        _seed(s3)
+        _put_confusion(s3, cm)  # matrix n_effective=40
+        tile = build_predictor_tile(BUCKET, _RUN_DATE, s3_client=s3)
+        assert _comp(tile, "up_precision_vs_base_rate")["n_samples"] == 6
+        assert _comp(tile, "down_precision_vs_base_rate")["n_samples"] == 40
 
 
 class TestHorizonAndDenominatorConsistency:

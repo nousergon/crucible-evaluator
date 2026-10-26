@@ -50,6 +50,7 @@ from nousergon_lib import contracts
 from grading import attestation as attestation_module
 from grading.artifacts import BACKTESTER_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
 from grading.attestation import read_backtester_attestation, read_evaluator_stage_attestation
+from grading.effective_n import PARITY_MIN_EFFECTIVE_N, declared_effective_n
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -927,9 +928,36 @@ def build_backtester_tile(
     cpcv_ic = cpcv_block.get("mean_ic") if cpcv_block.get("status") == "ok" else None
     live_ic = (latest or {}).get("ic_30d")
     rolling_n = (latest or {}).get("rolling_n")
+    # EFFECTIVE N (alpha-engine-config-I10065 item (a), triage 2026-10-25).
+    # `rolling_n` counts overlapping (ticker, date) rows of 21d forward labels;
+    # the producer's own `realized_ic` block declares how many NON-OVERLAPPING
+    # windows they span, and says that is "the count a significance claim may
+    # use". The tile used to hand `rolling_n` (689 on the 2026-10-23 card) to the
+    # floor check while the same artifact read `n_effective: 1`. Grade on the
+    # declared effective N; one that is undeclared is never replaced by the row
+    # count (grading/effective_n.py). n_floor is 2x the ruling's minimum so
+    # derive_status's half-floor rule makes `n_effective < 2` N/A-LOW-N, and
+    # 2 <= n_effective < 4 can read RED or WATCH but never GREEN.
+    realized_block = (latest or {}).get("realized_ic")
+    n_effective = declared_effective_n(
+        realized_block, horizon_days=(latest or {}).get("forward_days"),
+    )
+    parity_n_floor = 2 * PARITY_MIN_EFFECTIVE_N
 
     if cpcv_ic is not None and live_ic is not None:
         drift = float(live_ic) - float(cpcv_ic)
+        if n_effective is None:
+            n_note = (f"EFFECTIVE N UNDECLARED: {LATEST_KEY} carries no realized_ic.n_effective "
+                      f"(nor n_prediction_dates + horizon_days), so the N behind the live leg is "
+                      f"unknown; the overlapping row count ({rolling_n}) is not substituted "
+                      f"(alpha-engine-config-I10065). Graded insufficient-N.")
+        else:
+            n_note = (f"Graded on effective N={n_effective} non-overlapping "
+                      f"{(realized_block or {}).get('horizon_days') or (latest or {}).get('forward_days')}d "
+                      f"windows (realized_ic.n_effective; {rolling_n} overlapping rows over "
+                      f"{(realized_block or {}).get('n_prediction_dates')} prediction dates), "
+                      f"not the row count; below {PARITY_MIN_EFFECTIVE_N} it reads insufficient-N "
+                      f"(alpha-engine-config-I10065).")
         # AMBIGUOUS(config#7485): drift subtracts a single-window Pearson r
         # (ic_30d, per the comment above at :688) from a leak-free CPCV mean
         # rank IC (mean_ic) — the two operands are not the same estimator, so
@@ -970,10 +998,10 @@ def build_backtester_tile(
             name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
             estimator="ic_delta", measurement_horizon="30d_live_vs_cpcv_oos",
             reliability="low",
-            value=drift, unit=RANK_IC, n_samples=rolling_n, n_floor=10,
+            value=drift, unit=RANK_IC, n_samples=n_effective, n_floor=parity_n_floor,
             source_path=bvlp_src,
             reason=(f"backtest_vs_live_parity = {drift:+.3g} (live 30d rolling IC {live_ic:.3g} "
-                    f"[N={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.6g} "
+                    f"[N_eff={n_effective}, rows={rolling_n}] minus leak-free CPCV backtest-expected IC {cpcv_ic:.6g} "
                     f"of served_version {served_version} from its frozen registry manifest "
                     f"{registry_src} [ETag {registry_etag}]) "
                     f"vs target 0.0 / red-line -0.05. Negative = live underperforming what the "
@@ -987,7 +1015,7 @@ def build_backtester_tile(
                     f"(crucible-backtester analysis/production_health.py), not from fills "
                     f"or orders, so this is prediction-skill drift and not a "
                     f"backtest-vs-live fill-parity claim. Validate the instrument before "
-                    f"acting on the level or the trend."),
+                    f"acting on the level or the trend. {n_note}"),
             **_tr("backtest_vs_live_parity", drift),
         ))
     else:
@@ -1011,7 +1039,7 @@ def build_backtester_tile(
             missing.append("ic_30d null (producer needs >=10 resolved outcomes in the trailing 30d)")
         components.append(build_metric(
             name="backtest_vs_live_parity", module=MODULE, metric_type="ic", criticality="critical",
-            n_floor=10, source_path=bvlp_src, input_present=False,
+            n_floor=parity_n_floor, source_path=bvlp_src, input_present=False,
             na_detail=f"backtest_vs_live_parity: {'; '.join(missing)}.",
             **_tr("backtest_vs_live_parity", None),
         ))

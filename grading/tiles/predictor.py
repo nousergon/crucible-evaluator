@@ -28,6 +28,7 @@ from nousergon_lib.quant.horizons import DEFAULT_POLICY
 from nousergon_lib.quant.stats.intervals import bootstrap_ci
 
 from grading.artifacts import PREDICTOR_ARTIFACT_MAX_AGE_DAYS, artifact_is_stale, get_json_windowed
+from grading.effective_n import declared_effective_n
 from grading.history import CardHistory
 from grading.metric_record import build_metric
 from grading.module_agg import build_tile
@@ -478,6 +479,36 @@ def build_predictor_tile(
         per_class = {}
         base_rates = {}
 
+    # EFFECTIVE N (alpha-engine-config-I11094, triage 2026-10-25: "grade this
+    # family on effective N ... Below the power floor it reads insufficient-N
+    # rather than RED or GREEN"). `n` and `n_predicted` count (ticker, date)
+    # rows whose 21d forward labels overlap across ~30 names per date and 20 of
+    # 21 days between consecutive dates; the 2026-10-23 card graded N=3,533 rows
+    # as if independent. The family is now graded on the number of
+    # non-overlapping label windows (grading/effective_n.py — the producer's
+    # I8701 formula, read as declared), against the SAME n_floor of 30, so
+    # derive_status's half-floor rule reads N/A-LOW-N below 15 windows and
+    # withholds GREEN below 30.
+    #   * matrix level: `n_effective`, else `n_prediction_dates` over the single
+    #     declared horizon;
+    #   * per class: the class's own declaration if the producer gives one, else
+    #     the matrix-level figure — an UPPER bound (a class is predicted on at
+    #     most every date), so it can only be generous, never stricter, than the
+    #     class's true clustered N.
+    # An artifact that declares neither is UNDECLARED and grades insufficient-N;
+    # the row count is never substituted (that substitution is the defect).
+    cm_hz_days = int(cm_hz[:-1]) if cm_hz.endswith("d") and cm_hz[:-1].isdigit() else None
+    cm_n_eff = declared_effective_n(cm, horizon_days=cm_hz_days) if (cm_ok and cm_invalid is None) else None
+
+    def _eff_note(n_eff, n_rows, what: str) -> str:
+        if n_eff is None:
+            return (f" EFFECTIVE N UNDECLARED: confusion_matrix.json carries no n_effective "
+                    f"(nor n_prediction_dates), so the {n_rows} overlapping {what} rows cannot "
+                    f"be converted to independent windows and are not used as N — graded "
+                    f"insufficient-N (alpha-engine-config-I11094).")
+        return (f" Graded on effective N={n_eff} non-overlapping {cm_hz} windows, not the "
+                f"{n_rows} overlapping {what} rows (alpha-engine-config-I11094).")
+
     # direction_accuracy_vs_majority_baseline (supporting) — overall directional
     # accuracy vs the trivial always-predict-the-majority-class baseline.
     if cm_ok and cm_invalid is None and base_rates and cm.get("accuracy") is not None:
@@ -488,11 +519,11 @@ def build_predictor_tile(
         components.append(build_metric(
             name="direction_accuracy_vs_majority_baseline", module=MODULE, metric_type="lift",
             criticality="supporting", estimator="accuracy_delta", measurement_horizon=cm_hz,
-            value=acc_lift, unit=FRACTION, n_samples=n_total, n_floor=30,
+            value=acc_lift, unit=FRACTION, n_samples=cm_n_eff, n_floor=30,
             source_path=cm_src,
             reason=(f"direction_accuracy [{cm_hz}] = {accuracy:.2%} vs always-{majority_class} majority-class "
-                    f"baseline {baseline:.2%} (N={n_total}) — lift {acc_lift:+.2%} vs target "
-                    f"+3pp / red-line 0pp."),
+                    f"baseline {baseline:.2%} (rows={n_total}, N_eff={cm_n_eff}) — lift {acc_lift:+.2%} vs target "
+                    f"+3pp / red-line 0pp." + _eff_note(cm_n_eff, n_total, "resolved")),
         ))
     else:
         components.append(build_metric(
@@ -513,14 +544,18 @@ def build_predictor_tile(
         base_rate = base_rates.get(cls)
         if precision is not None and base_rate is not None:
             n_pred = cls_stats.get("n_predicted")
+            cls_n_eff = declared_effective_n(cls_stats, horizon_days=cm_hz_days)
+            if cls_n_eff is None:
+                cls_n_eff = cm_n_eff
             prec_lift = precision - base_rate
             components.append(build_metric(
                 name=name, module=MODULE, metric_type="lift",
                 criticality="supporting", estimator="precision_delta", measurement_horizon=cm_hz,
-                value=prec_lift, unit=FRACTION, n_samples=n_pred, n_floor=30,
+                value=prec_lift, unit=FRACTION, n_samples=cls_n_eff, n_floor=30,
                 source_path=cm_src,
                 reason=(f"{name} [{cm_hz}]: {cls} precision = {precision:.2%} vs {cls} base rate {base_rate:.2%} "
-                        f"(N={n_pred} predicted-{cls}) — lift {prec_lift:+.2%} vs target +3pp / red-line 0pp."),
+                        f"(rows={n_pred} predicted-{cls}, N_eff={cls_n_eff}) — lift {prec_lift:+.2%} vs target "
+                        f"+3pp / red-line 0pp." + _eff_note(cls_n_eff, n_pred, f"predicted-{cls}")),
             ))
         else:
             na = (
