@@ -122,11 +122,83 @@ def test_backfill_fills_missing_by_slug():
     assert items[1]["issue_number"] == 42  # untouched — already set
 
 
-def test_backfill_noop_when_nothing_missing():
+def test_backfill_fills_nothing_when_nothing_missing():
     gh = FakeGitHub()
     items = [{"id": "a", "issue_number": 1}]
     assert LV.backfill_issue_numbers(items, repo="r/x", token="tok", gh_request=gh) == 0
-    assert gh.calls == []  # never even fetches
+    assert items[0]["issue_number"] == 1
+    # The listing IS read now, every run: the current-issue stamp needs it even
+    # when no number is missing (alpha-engine-config-I12644). An empty listing
+    # stamps nothing rather than declaring every row closed.
+    assert [c[0] for c in gh.calls] == ["GET"]
+    assert "current_issue_number" not in items[0]
+
+
+# ── current_issue_number (alpha-engine-config-I12644) ───────────────────────
+#
+# Shapes copied from the live chain on 2026-10-25: the ledger kept each row's
+# FIRST issue, so the weekly report linked closed #1059 and #11095.
+
+
+def _proposal(number, state, body=""):
+    return {"number": number, "state": state, "title": f"[director] t{number}", "body": body}
+
+
+_LIVE_CHAIN = [
+    # Ruled-unrecovered re-tracks of #1059; #11494 later closed as a duplicate.
+    _proposal(11494, "closed", "Re-tracks `#1059`.\n\n## Evidence\nx\n\n## Prior issue\n#1059\n"),
+    _proposal(11087, "open", "Re-tracks `#1059`.\n\n## Evidence\nx\n\n## Prior issue\n#1059\n"),
+    _proposal(12623, "open", "## Evidence\nx\n\n## Prior issue\n#11095\n"),
+    _proposal(11095, "closed", "<sub>run_date=2026-09-18 · id=attractiveness-pillar-reweight-validation "
+                                "· idempotency marker — do not edit the id · reconfirm_of=#1059</sub>"),
+    _proposal(1059, "closed", "<sub>id=substrate-pipeline-reliability</sub>"),
+    _proposal(12624, "open", "<sub>run_date=2026-10-23 · id=exit-rules-negative-lift-root-cause</sub>"),
+    _proposal(12000, "closed", "<sub>id=dead-end</sub>"),
+]
+
+
+def test_backfill_stamps_the_open_successor_not_the_closed_first_issue():
+    gh = FakeGitHub(proposal_issues=_LIVE_CHAIN)
+    items = [
+        {"id": "substrate-pipeline-reliability", "issue_number": 1059,
+         "ruled_unrecovered_filed": True, "ruled_unrecovered_issue": 11494},
+        {"id": "attractiveness-pillar-reweight-validation", "issue_number": 11095,
+         "ruled_unrecovered_filed": True, "ruled_unrecovered_issue": 12623},
+        {"id": "exit-rules-negative-lift-root-cause", "issue_number": None},
+        {"id": "dead-end", "issue_number": 12000},
+    ]
+    assert LV.backfill_issue_numbers(items, repo="r/x", token="tok", gh_request=gh) == 1
+    # issue_number stays the row's first issue: it anchors loop verification.
+    assert [it["issue_number"] for it in items] == [1059, 11095, 12624, 12000]
+    # The reader gets the issue still being worked: through the closed
+    # duplicate #11494 to #11087, and to the re-track #12623.
+    assert [it["current_issue_number"] for it in items] == [11087, 12623, 12624, None]
+
+
+def test_reconfirm_marker_is_not_followed_across_items():
+    """A re-confirm is its own item with its own row, and its ``reconfirm_of=``
+    names closed issues from several items. Following it sent #1060's row to
+    another item's issue on the live chain (2026-10-26)."""
+    issues = [
+        _proposal(1060, "closed"),
+        _proposal(11985, "open", "<sub>id=scanner-arm-rebaseline · reconfirm_of=#1060, #11499</sub>"),
+        _proposal(11086, "open", "## Evidence\nx\n\n## Prior issue\n#1060\n"),
+    ]
+    states, successors = LV.successor_index(issues)
+    assert successors == {1060: [11086]}
+    assert LV.current_open_issue({"issue_number": 1060}, states, successors) == 11086
+
+
+def test_current_issue_of_an_unlisted_number_is_read_and_unknown_kept():
+    # #964 never carried the proposal label: its state is read directly.
+    gh = FakeGitHub(issues={964: {"state": "closed"}}, proposal_issues=[_proposal(11491, "closed")])
+    items = [
+        {"id": "a", "issue_number": 964, "ruled_unrecovered_issue": 11491},
+        {"id": "b", "issue_number": 77},  # unreadable (404): not proven closed
+    ]
+    LV.backfill_issue_numbers(items, repo="r/x", token="tok", gh_request=gh)
+    assert items[0]["current_issue_number"] is None
+    assert items[1]["current_issue_number"] == 77
 
 
 # ── verify_and_correct ───────────────────────────────────────────────────────
@@ -149,6 +221,7 @@ def test_reopens_closed_issue_still_adverse():
     assert result["reopened_issues"] == [100]
     assert gh.patched_state[100] == "open"
     assert "still reads RED/WATCH" in gh.comments[100][0]
+    assert item["current_issue_number"] == 100  # reopened: the first issue is open again (I12644)
 
 
 def test_closed_and_recovered_is_left_alone():
@@ -386,6 +459,8 @@ def test_ruled_unrecovered_still_adverse_next_run_files_new_issue_not_reopen():
     assert len(gh.filed_issues) == 1
     assert "#100" in gh.filed_issues[0]["body"]
     assert item["ruled_unrecovered_filed"] is True
+    # The re-track is this row's open issue from the moment it is filed (I12644).
+    assert item["current_issue_number"] == gh.filed_issues[0]["number"]
 
 
 def test_ruled_unrecovered_already_filed_is_not_refiled():

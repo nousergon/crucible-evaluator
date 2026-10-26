@@ -232,7 +232,9 @@ def merge_plan_into_ledger(ledger: dict, plan: DirectorWeeklyActionPlan, run_dat
         fresh).
       - ``issue_number``: preserved from the existing row (not derivable from
         the plan itself — populated by ``loop_verification.backfill_issue_numbers``
-        against the live GitHub state).
+        against the live GitHub state). ``current_issue_number`` (the open
+        issue that now tracks the row, alpha-engine-config-I12644) is kept the
+        same way when the existing row has one.
     """
     items = {it["id"]: it for it in (ledger.get("items") or [])}
     for ai in plan.action_items:
@@ -241,6 +243,11 @@ def merge_plan_into_ledger(ledger: dict, plan: DirectorWeeklyActionPlan, run_dat
         if existing:
             row["first_seen"] = existing.get("first_seen", run_date)
             row["issue_number"] = existing.get("issue_number")
+            # The open issue that now tracks this row, restamped by the
+            # backfill every run; kept so a run whose backfill is skipped does
+            # not fall back to a closed first number (alpha-engine-config-I12644).
+            if "current_issue_number" in existing:
+                row["current_issue_number"] = existing["current_issue_number"]
             # Loop-verification state belongs to issue_number, which is kept
             # above; dropping it made a re-proposed item re-notify and refile
             # every run (alpha-engine-config-I11456).

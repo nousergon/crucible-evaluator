@@ -47,7 +47,7 @@ import logging
 import re
 
 from director.citations import metric_name, valid_citation_ids
-from director.issue_filer import slug_issue_number_map
+from director.issue_filer import list_proposal_issues, slug_map_from_issues
 from director.item_validity_gate import not_valid_to_grade
 from director.roadmap_pr import _gh_request
 
@@ -256,25 +256,124 @@ def _ledger_recorded_ruling(item: dict) -> bool:
     return bool(item.get("ruled_unrecovered_notified") or item.get("ruled_unrecovered_filed"))
 
 
+#: How a later director-proposal names the CLOSED issue it re-tracks for the
+#: SAME ledger row (alpha-engine-config-I12644): the ruled-unrecovered
+#: re-track's ``## Prior issue`` section
+#: (:func:`_file_new_issue_for_ruled_unrecovered`). The re-confirm footer's
+#: ``reconfirm_of=`` list is deliberately NOT followed: a re-confirm is a NEW
+#: item with its own id and ledger row, and it routinely names several closed
+#: issues from different items. Following it on the live chain sent
+#: ``research-edge-root-cause`` (#1060) to the scanner re-anchor #11985 and the
+#: pillar-IC issue #12623 instead of its own re-track #11086 (measured
+#: 2026-10-26).
+_PRIOR_ISSUE_RE = re.compile(r"##\s*Prior issue\s*\n\s*#(\d+)")
+
+
+def successor_index(issues: list[dict]) -> tuple[dict[int, str], dict[int, list[int]]]:
+    """``(state by number, re-tracking issues by the number they re-track)``
+    over a ``list_proposal_issues`` result."""
+    states: dict[int, str] = {}
+    successors: dict[int, list[int]] = {}
+    for it in issues:
+        number = it.get("number")
+        if not isinstance(number, int):
+            continue
+        states[number] = str(it.get("state") or "")
+        prior = {int(n) for n in _PRIOR_ISSUE_RE.findall(it.get("body") or "")}
+        for p in prior - {number}:
+            successors.setdefault(p, []).append(number)
+    return states, successors
+
+
+def current_open_issue(
+    item: dict, states: dict[int, str], successors: dict[int, list[int]]
+) -> int | None:
+    """The OPEN issue that now tracks a ledger row (alpha-engine-config-I12644).
+
+    ``issue_number`` is the row's FIRST issue and stays that way — it is the
+    loop-verification anchor, and the ruled-unrecovered flags belong to it. A
+    reader needs the issue still being worked, so this walks from
+    ``issue_number`` and ``ruled_unrecovered_issue`` through every closed issue
+    to the issues that re-track it, and returns the newest open one. ``None``
+    means every issue on the chain is known closed. A start number whose state
+    is unknown (not in the listing) is returned as-is: an unread state is not a
+    closed one."""
+    starts = [n for n in (item.get("issue_number"), item.get("ruled_unrecovered_issue"))
+              if isinstance(n, int)]
+    seen: set[int] = set()
+    queue = list(starts)
+    found: list[int] = []
+    while queue:
+        n = queue.pop(0)
+        if n in seen:
+            continue
+        seen.add(n)
+        state = states.get(n)
+        if state == "open":
+            found.append(n)
+        elif state == "closed":
+            queue.extend(successors.get(n, ()))
+    if found:
+        return max(found)
+    unknown = [n for n in starts if n not in states]
+    return unknown[0] if unknown else None
+
+
 def backfill_issue_numbers(
     ledger_items: list[dict], *, repo: str, token: str, gh_request=_gh_request
 ) -> int:
     """Fill ``issue_number`` on any ledger row missing it, by matching
-    ``id=<slug>`` against the live ``area:director-proposals`` issues.
+    ``id=<slug>`` against the live ``area:director-proposals`` issues, then
+    stamp every row's ``current_issue_number`` (:func:`current_open_issue`).
     Mutates ``ledger_items`` in place and returns the count filled. A fetch
     failure propagates to the handler, which records it explicitly rather than
-    rendering a failed repair as zero backfills."""
-    missing = [it for it in ledger_items if not it.get("issue_number")]
-    if not missing:
+    rendering a failed repair as zero backfills.
+
+    The listing is read every run, not only when a row is missing its number
+    (alpha-engine-config-I12644): issues close between runs, and a ledger that
+    only ever kept the first number sent the weekly report's readers to closed
+    #1059 and #11095 while #11087 and #12623 were the open owners."""
+    if not ledger_items:
         return 0
-    slug_map = slug_issue_number_map(repo, token, gh_request=gh_request)
+    issues = list_proposal_issues(repo, token, gh_request=gh_request)
+    if not issues:
+        return 0
+    slug_map = slug_map_from_issues(issues)
     filled = 0
-    for it in missing:
+    for it in ledger_items:
+        if it.get("issue_number"):
+            continue
         number = slug_map.get(it.get("id"))
         if number is not None:
             it["issue_number"] = number
             filled += 1
+    unknown = {
+        n for it in ledger_items
+        for n in (it.get("issue_number"), it.get("ruled_unrecovered_issue"))
+        if isinstance(n, int)
+    } - {i.get("number") for i in issues}
+    issues = issues + _fetch_issue_states(sorted(unknown), repo, token, gh_request)
+    states, successors = successor_index(issues)
+    for it in ledger_items:
+        it["current_issue_number"] = current_open_issue(it, states, successors)
     return filled
+
+
+def _fetch_issue_states(numbers: list[int], repo: str, token: str, gh_request) -> list[dict]:
+    """``{number, state}`` for ledger numbers outside the proposal listing (a row
+    can point at an issue that never carried the label). A failed read is left
+    out, so :func:`current_open_issue` treats that number as unknown."""
+    api = f"https://api.github.com/repos/{repo}"
+    out: list[dict] = []
+    for n in numbers:
+        try:
+            status, res = gh_request("GET", f"{api}/issues/{n}", token)
+        except Exception as e:  # noqa: BLE001 — one unread state must not sink the stamp
+            logger.warning("loop_verification: GET issue #%s for current-issue stamp failed: %s", n, e)
+            continue
+        if status == 200 and isinstance(res, dict) and res.get("state"):
+            out.append({"number": n, "state": res["state"], "body": ""})
+    return out
 
 
 def verify_and_correct(
@@ -355,6 +454,7 @@ def verify_and_correct(
                         )
                         if new_number:
                             filed_for_ruling.append(new_number)
+                            item["current_issue_number"] = new_number
                             counts["corrections"] += 1
                     elif _comment_ruled_unrecovered(api, number, item, gh_request, token):
                         item["ruled_unrecovered_notified"] = True
@@ -363,6 +463,7 @@ def verify_and_correct(
                     counts["closed_unrecovered"] += 1
                     if _reopen_unrecovered(api, number, item, gh_request, token):
                         reopened.append(number)
+                        item["current_issue_number"] = number
                         counts["corrections"] += 1
             elif outcome == "recovered":
                 counts["closed_verified"] += 1
