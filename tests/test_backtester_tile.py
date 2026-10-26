@@ -661,15 +661,23 @@ class TestBacktestVsLiveParity:
     def _put_manifest(self, s3, mean_ic=0.18, status="ok"):
         _put_served(s3, mean_ic, status=status)
 
-    def _put_latest(self, s3, ic_30d=0.15, rolling_n=40):
-        _put(s3, LATEST_KEY, {"ic_30d": ic_30d, "rolling_n": rolling_n})
+    def _put_latest(self, s3, ic_30d=0.15, rolling_n=40, n_effective=8):
+        # The producer's current shape (crucible-backtester pipeline_common,
+        # alpha-engine-config-I8701; preserved by the daily write since
+        # crucible-predictor#657): `realized_ic.n_effective` is the N the
+        # tile grades on (alpha-engine-config-I10065).
+        _put(s3, LATEST_KEY, {
+            "ic_30d": ic_30d, "rolling_n": rolling_n, "forward_days": 21,
+            "realized_ic": {"value": ic_30d, "horizon_days": 21, "n_rows": rolling_n,
+                            "n_prediction_dates": n_effective * 21, "n_effective": n_effective},
+        })
 
     def test_both_present_computes_drift(self, s3):
         self._put_manifest(s3, mean_ic=0.18)
         self._put_latest(s3, ic_30d=0.15, rolling_n=40)
         m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
         assert m["value"] == pytest.approx(0.15 - 0.18)
-        assert m["n_samples"] == 40
+        assert m["n_samples"] == 8  # realized_ic.n_effective, not rolling_n=40
         assert m["criticality"] == "critical"
         assert m["estimator"] == "ic_delta"
 
@@ -844,6 +852,67 @@ class TestBacktestVsLiveParity:
         assert m["trend_decoration"] == "→"
 
 
+class TestBacktestVsLiveParityEffectiveN:
+    """alpha-engine-config-I10065 item (a): grade on ``realized_ic.n_effective``;
+    below 2 the component reads insufficient-N, never GREEN or RED.
+
+    The 2026-10-23 card graded this critical RED at N=689 (``rolling_n``) while
+    the artifact it read declared ``n_effective: 1, se_effective: 1.0``. These
+    tests fail on that code: it handed ``rolling_n`` to the floor check."""
+
+    def _latest(self, s3, ic_30d, **block):
+        _put(s3, LATEST_KEY, {"ic_30d": ic_30d, "rolling_n": 689, "forward_days": 21,
+                              **({"realized_ic": block} if block else {})})
+
+    def test_live_2026_10_24_shape_is_insufficient_n_not_red(self, s3):
+        # Values from predictor/metrics/latest.json @ e6lETbzQR3Uj819Xwqh3pBqsaGijRF5g
+        # and the served model's frozen CPCV (the 10-23 card's RED inputs).
+        _put_served(s3, 0.131924)
+        self._latest(s3, 0.0657, value=0.0657, horizon_days=21, n_rows=689,
+                     n_prediction_dates=22, n_effective=1, se_effective=1.0)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-LOW-N"
+        assert m["n_samples"] == 1
+        # The level is still published, with the rows beside it — only the grade is withheld.
+        assert m["value"] == pytest.approx(0.0657 - 0.131924)
+        assert "N_eff=1" in m["status_reason"] and "rows=689" in m["status_reason"]
+
+    def test_effective_n_of_one_cannot_read_green_either(self, s3):
+        _put_served(s3, 0.10)
+        self._latest(s3, 0.20, horizon_days=21, n_effective=1)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-LOW-N"
+
+    def test_effective_n_of_two_grades_red_on_the_estimate(self, s3):
+        _put_served(s3, 0.18)
+        self._latest(s3, 0.08, horizon_days=21, n_effective=2)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "RED"
+
+    def test_thin_effective_n_withholds_green(self, s3):
+        # 2 <= N_eff < 4: below the floor, so derive_status will not claim GREEN.
+        _put_served(s3, 0.10)
+        self._latest(s3, 0.20, horizon_days=21, n_effective=3)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "WATCH"
+
+    def test_effective_n_derived_from_dates_with_the_producers_formula(self, s3):
+        # n_effective absent, n_prediction_dates declared: 22 // 21 = 1.
+        _put_served(s3, 0.10)
+        self._latest(s3, 0.20, horizon_days=21, n_prediction_dates=22)
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["n_samples"] == 1
+        assert m["status"] == "N/A-LOW-N"
+
+    def test_undeclared_effective_n_never_falls_back_to_rows(self, s3):
+        _put_served(s3, 0.18)
+        self._latest(s3, 0.08)  # no realized_ic block at all
+        m = _comp(build_backtester_tile(BUCKET, RUN_DATE, s3_client=s3), "backtest_vs_live_parity")
+        assert m["status"] == "N/A-LOW-N"
+        assert m["n_samples"] is None
+        assert "EFFECTIVE N UNDECLARED" in m["status_reason"]
+
+
 class TestBacktestVsLiveParitySourceVerification:
     """Source-verification style (crucible-evaluator#100/#106 trust-battery
     harness, tests/test_source_verification.py): re-derive the graded value
@@ -860,4 +929,5 @@ class TestBacktestVsLiveParitySourceVerification:
 
     def _put_manifest_and_latest(self, s3, cpcv_ic, live_ic):
         _put_served(s3, cpcv_ic)
-        _put(s3, LATEST_KEY, {"ic_30d": live_ic, "rolling_n": 40})
+        _put(s3, LATEST_KEY, {"ic_30d": live_ic, "rolling_n": 40,
+                              "realized_ic": {"horizon_days": 21, "n_effective": 8}})
