@@ -13,7 +13,9 @@ the producer must satisfy (consumer-contract-first, config Batch A #1149):
       "agent_validation_failure_rate": {"value": <0-1>, "n": <invokes>},
       "cost_per_signal":               {"value": <usd>, "n": <signals>},
       "retry_storm_count":             {"value": <count>, "n": <agents>},
-      "agent_latency_p95":             {"value": <ms>,  "n": <agents>},
+      "agent_latency_p95":             {"value": <ms>,  "n": <agents>,
+                                        "n_samples": <samples>,       # crucible-research#871
+                                        "by_class": {"short_form": {...}, "long_form": {...}}},
       "judge_rubric_distribution":     {"value": <0-1 modal-concentration>, "n": <evals>},
       ...                              # judge_rubric_pass_rate / pillar_emit_coverage
       ...                              # / signal_volume_adequacy live on the Research tile
@@ -153,6 +155,105 @@ def _stance_source_provenance(s3, bucket: str, run_date: str):
     )
 
 
+def _count(x) -> int | None:
+    """A non-negative int sample count, or None (bool is not a count)."""
+    if isinstance(x, bool) or not isinstance(x, int) or x < 0:
+        return None
+    return x
+
+
+def _latency_class(by_class, cls: str) -> dict | None:
+    """One ``by_class`` entry when it is well-formed (a numeric ``p95_ms``)."""
+    if not isinstance(by_class, dict):
+        return None
+    entry = by_class.get(cls)
+    if not isinstance(entry, dict):
+        return None
+    p95 = entry.get("p95_ms")
+    if isinstance(p95, bool) or not isinstance(p95, (int, float)):
+        return None
+    return entry
+
+
+def _latency_component(blk: dict, aq_src: str):
+    """Grade ``agent_latency_p95`` from a present ``agent_quality.json`` block.
+
+    alpha-engine-config-I12625. ``n`` in the block is the number of AGENTS with
+    a duration sample, not a sample size: the 10-23 card printed ``N=6`` over
+    107 pooled invocations and the Director read it as six samples. And one
+    wall-clock bar does not fit every agent: the long-form writers
+    (``analyst_thesis``, ``analyst_pillar``) emit ~6-11K output tokens at a flat
+    ~190 tok/s, so their p95 measures output length, not a slow call.
+
+    crucible-research#871 adds ``n_samples`` and a ``by_class`` split. When the
+    split is present:
+
+    * ``by_class.short_form`` is graded against the registry's 15s / 60s bars,
+      with ``N`` = that class's pooled duration samples;
+    * ``by_class.long_form`` is REPORTED in the reason and NOT graded. Its bar
+      is the card owner's decision, still open on the issue; grading it on
+      15s/60s would be the mis-specification the issue found, and grading it on
+      any other number would be a bar nobody has ruled on;
+    * no short-form agent sampled ⇒ N/A-MISSING-INPUT naming the long-form p95,
+      never a GREEN by omission.
+
+    An artifact written before #871 carries neither field: the headline (worst
+    agent overall) is graded exactly as before, with ``N`` from ``n_samples``
+    when present and from ``n`` otherwise.
+    """
+    name = "agent_latency_p95"
+    common = {
+        "name": name, "module": MODULE, "metric_type": "duration", "criticality": "diagnostic",
+        "n_floor": 1, "higher_is_better": False, "source_path": aq_src,
+    }
+    by_class = blk.get("by_class")
+    short = _latency_class(by_class, "short_form")
+    long_ = _latency_class(by_class, "long_form")
+
+    if short is None and long_ is None:
+        # Pre-#871 artifact (or a malformed split): today's behaviour.
+        n_samples = _count(blk.get("n_samples"))
+        if n_samples is not None:
+            n_txt = f"N={n_samples} samples over {blk.get('n')} agents"
+            n_graded = n_samples
+        else:
+            n_txt = f"N={blk.get('n')}"
+            n_graded = blk.get("n")
+        return build_metric(
+            **common, value=blk["value"], unit=MILLISECONDS, n_samples=n_graded,
+            reason=f"{name} = {blk['value']:.0f} ms ({n_txt}) vs target 15s / red-line 60s.",
+        )
+
+    long_txt = ""
+    if long_ is not None:
+        long_txt = (
+            f" long_form p95 = {long_['p95_ms']:.0f} ms (worst {long_.get('worst_agent')}, "
+            f"N={long_.get('n_samples')} samples over {long_.get('n_agents')} agents) is "
+            f"reported, not graded: its bar awaits the card owner (alpha-engine-config-I12625)."
+        )
+
+    if short is None:
+        return build_metric(
+            **common, input_present=False,
+            na_detail=(
+                f"{name}: no short_form agent was sampled this cycle, so nothing is "
+                f"graded on 15s / red-line 60s.{long_txt}"
+            ),
+        )
+
+    short_n = _count(short.get("n_samples"))
+    total_n = _count(blk.get("n_samples"))
+    total_txt = f"; all classes N={total_n} samples over {blk.get('n')} agents" if total_n is not None else ""
+    return build_metric(
+        **common, value=float(short["p95_ms"]), unit=MILLISECONDS, n_samples=short_n,
+        reason=(
+            f"{name} (short_form) = {short['p95_ms']:.0f} ms (worst {short.get('worst_agent')}, "
+            f"N={short_n} samples over {short.get('n_agents')} agents{total_txt}) "
+            f"vs target 15s / red-line 60s.{long_txt}"
+        ),
+    )
+
+
 def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     """Build the Behavioural / Agent-Quality tile.
 
@@ -242,14 +343,11 @@ def build_agent_tile(bucket: str, run_date: str, s3_client=None) -> dict:
     # 4. agent_latency_p95 (diagnostic) — per-agent-type p95 wall-clock (ms,
     #    lower better). A latency creep flags a slowing agent before it trips the
     #    Lambda ceiling.
+    #    Since alpha-engine-config-I12625 the graded value is the SHORT-FORM
+    #    class's p95 when the producer splits by class; see _latency_component.
     blk = _block(aq, "agent_latency_p95")
     if blk is not None and not aq_stale:
-        components.append(build_metric(
-            name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
-            value=blk["value"], unit=MILLISECONDS, n_samples=blk.get("n"), n_floor=1,
-            higher_is_better=False, source_path=aq_src,
-            reason=f"agent_latency_p95 = {blk['value']:.0f} ms (N={blk.get('n')}) vs target 15s / red-line 60s.",
-        ))
+        components.append(_latency_component(blk, aq_src))
     else:
         components.append(build_metric(
             name="agent_latency_p95", module=MODULE, metric_type="duration", criticality="diagnostic",
