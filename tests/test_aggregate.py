@@ -490,6 +490,53 @@ class TestWriteReportCard:
         written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=False)
         assert written["latest_key"] == "evaluator/latest/report_card.json"
 
+    def test_a_late_rebuild_does_not_overwrite_the_dated_card(self, s3):
+        """alpha-engine-config-I12124: a dated card is an as-of record. A rebuild
+        more than the rewrite window after its run date writes BESIDE it."""
+        import datetime as dt
+
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        on_time = dt.datetime(2026, 6, 7, 14, 0, tzinfo=dt.timezone.utc)
+        first = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=True, now=on_time)
+        assert first["dated_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        original = s3.get_object(Bucket=BUCKET, Key=first["dated_key"])["Body"].read()
+
+        regraded = dict(card, status="regraded-from-current-data")
+        late = dt.datetime(2026, 6, 22, 14, 51, tzinfo=dt.timezone.utc)
+        second = write_report_card(BUCKET, RUN_DATE, regraded, s3_client=s3, snapshot=True, now=late)
+        assert second["dated_key"] is None
+        assert second["regrade_key"] == f"evaluator/{RUN_DATE}/report_card.regrade-20260622T145100Z.json"
+        assert s3.get_object(Bucket=BUCKET, Key=f"evaluator/{RUN_DATE}/report_card.json")["Body"].read() == original
+        beside = json.loads(s3.get_object(Bucket=BUCKET, Key=second["regrade_key"])["Body"].read())
+        assert beside["status"] == "regraded-from-current-data"
+
+    def test_a_rerun_inside_the_window_still_replaces_the_dated_card(self, s3):
+        """A weekend watch-rerun of the same weekly supersedes a partial first card."""
+        import datetime as dt
+
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        sat = dt.datetime(2026, 6, 6, 18, 0, tzinfo=dt.timezone.utc)
+        mon = dt.datetime(2026, 6, 8, 9, 0, tzinfo=dt.timezone.utc)
+        write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=True, now=sat)
+        second = write_report_card(BUCKET, RUN_DATE, dict(card, status="rerun"), s3_client=s3, snapshot=True, now=mon)
+        assert second["dated_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert second["regrade_key"] is None
+        stored = json.loads(s3.get_object(Bucket=BUCKET, Key=second["dated_key"])["Body"].read())
+        assert stored["status"] == "rerun"
+
+    def test_a_late_first_snapshot_is_written_normally(self, s3):
+        """No card exists yet: a late first write is not a regrade."""
+        import datetime as dt
+
+        _seed_full(s3)
+        card = build_report_card(BUCKET, RUN_DATE, s3_client=s3)
+        late = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
+        written = write_report_card(BUCKET, RUN_DATE, card, s3_client=s3, snapshot=True, now=late)
+        assert written["dated_key"] == f"evaluator/{RUN_DATE}/report_card.json"
+        assert written["regrade_key"] is None
+
     def test_report_card_key_helper(self):
         assert report_card_key("2026-01-02") == "evaluator/2026-01-02/report_card.json"
 
