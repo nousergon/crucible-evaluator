@@ -103,7 +103,12 @@ EXPECTED_PER_FILE_ACCESS_COUNTS: dict[str, int] = {
     # backtester-parity soak-compare mechanism (--compare CLI flag too) —
     # 3 -> 2. No contract/IAM change: the remaining 2 sites are the same
     # already-granted "evaluator" prefix writes.
-    "grading/aggregate.py": 2,
+    # alpha-engine-config-I12124: 2 -> 4. A head_object on the dated card (does it
+    # already exist?) and the put_object of a late rebuild BESIDE it
+    # (`report_card.regrade-<utc>.json`). Both are under the "evaluator" prefix,
+    # already `readwrite`; HeadObject needs s3:GetObject (granted on evaluator/*)
+    # and the role's unconditional ListBucket makes a missing key a 404, not 403.
+    "grading/aggregate.py": 4,
     # §2.3a runtime attestation: one get_object call site, shared by
     # `_read_verdict_artifact` across TWO keys — backtest/{run_date}/attestation.json
     # (the simulation engine's verdict) and backtest/{run_date}/evaluator_attestation.json
