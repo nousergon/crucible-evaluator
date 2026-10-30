@@ -8,6 +8,12 @@ on:
   schedule:
     - cron: "0 7 * * 1"  # Mondays 07:00 UTC
 
+# Least privilege for every job that does not declare its own (CodeQL
+# actions/missing-workflow-permissions, alpha-engine-config-I10559). The
+# notify-ci-failure reusable workflow declares `permissions: {}` itself.
+permissions:
+  contents: read
+
 jobs:
   analyze:
     # Both languages GitHub default setup would have scanned here. `actions`
