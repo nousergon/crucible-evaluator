@@ -442,10 +442,13 @@ def _run(event: dict | None = None, context=None) -> dict:
 
     latest_key = None
     dated_key = None
+    regrade_key = None
     if write:
         written = write_report_card(bucket, run_date, card, snapshot=snapshot)
         latest_key = written["latest_key"]
         dated_key = written["dated_key"]
+        # alpha-engine-config-I12124: a late rebuild lands BESIDE the as-of card.
+        regrade_key = written.get("regrade_key")
 
     # experiment_record.v1 (alpha-engine-config#3077 Phase C): a per-run index
     # binding what ran to what it emitted, for the results renderer. Isolated,
@@ -519,7 +522,7 @@ def _run(event: dict | None = None, context=None) -> dict:
     if write:
         try:
             record = build_experiment_record(
-                bucket, run_date, card, report_card_key=dated_key or latest_key,
+                bucket, run_date, card, report_card_key=dated_key or regrade_key or latest_key,
             )
             written_record = write_experiment_record(bucket, run_date, record)
             experiment_record_key = written_record["dated_key"]
@@ -539,6 +542,7 @@ def _run(event: dict | None = None, context=None) -> dict:
         "tile_status": tile_status,
         "real_graded": real_graded,
         "report_card_key": dated_key,
+        "report_card_regrade_key": regrade_key,
         "latest_key": latest_key,
         "snapshot": snapshot,
         "artifacts": card.get("_provenance", {}).get("artifacts", {}),

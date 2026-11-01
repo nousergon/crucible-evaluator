@@ -24,6 +24,7 @@ for manual observe runs.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -686,6 +687,40 @@ def latest_report_card_key() -> str:
     return LATEST_REPORT_CARD_KEY
 
 
+#: How long after its run date a dated card may still be REPLACED in place
+#: (alpha-engine-config-I12124). A weekend watch-rerun of the same weekly
+#: (Sat-Mon) legitimately supersedes a partial first card, so it keeps
+#: overwriting. Past this window a rebuild is a regrade: the tiles read
+#: standing, undated keys (``predictor/weights/meta/manifest.json``,
+#: ``predictor/metrics/latest.json``), so it would stamp TODAY's readings under
+#: the old date. The 2026-09-11 card was rewritten that way on 09-27.
+DATED_CARD_REWRITE_WINDOW_DAYS = 3
+
+
+def regrade_report_card_key(run_date: str, now: dt.datetime) -> str:
+    stamp = now.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{REPORT_CARD_PREFIX}/{run_date}/report_card.regrade-{stamp}.json"
+
+
+def _dated_card_exists(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+    except s3.exceptions.ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return True
+
+
+def _is_stale_rewrite(run_date: str, now: dt.datetime) -> bool:
+    try:
+        day = dt.date.fromisoformat(run_date)
+    except ValueError:
+        return False
+    return (now.astimezone(dt.timezone.utc).date() - day).days > DATED_CARD_REWRITE_WINDOW_DAYS
+
+
 def write_report_card(
     bucket: str,
     run_date: str,
@@ -693,6 +728,7 @@ def write_report_card(
     s3_client=None,
     *,
     snapshot: bool = False,
+    now: dt.datetime | None = None,
 ) -> dict:
     """Persist the report card (config-I2556: persistent surface + weekly snapshot).
 
@@ -715,8 +751,15 @@ def write_report_card(
     default for the persistent-surface model where a frozen weekly snapshot
     is the deliberate exception.
 
-    Returns ``{"latest_key": str, "dated_key": str | None}`` (``dated_key`` is
-    ``None`` when ``snapshot=False``).
+    Returns ``{"latest_key": str, "dated_key": str | None, "regrade_key": str | None}``
+    (``dated_key`` is ``None`` when ``snapshot=False``).
+
+    Dated cards are as-of records (alpha-engine-config-I12124). When the dated
+    card already exists and ``now`` is more than
+    :data:`DATED_CARD_REWRITE_WINDOW_DAYS` past ``run_date``, the snapshot is
+    written BESIDE it as ``report_card.regrade-<utc>.json`` and the original is
+    never overwritten (``dated_key`` is then ``None``, ``regrade_key`` names the
+    new object). The dated attribution artifact is left alone in that case too.
 
     Freshness preflight mirror (alpha-engine-config#3058): ``snapshot=True``
     freezes the dated weekly record — the worst-case outcome the issue names
@@ -729,9 +772,16 @@ def write_report_card(
     ``build_report_card``'s own preflight.
     """
     s3 = s3_client or boto3.client("s3")
+    now = now or dt.datetime.now(dt.timezone.utc)
 
     if snapshot:
         assert_input_freshness(bucket, run_date, s3_client=s3)
+
+    regrade = bool(
+        snapshot
+        and _is_stale_rewrite(run_date, now)
+        and _dated_card_exists(s3, bucket, report_card_key(run_date))
+    )
 
     body = json.dumps(scorecard, indent=2, default=str).encode("utf-8")
 
@@ -758,20 +808,33 @@ def write_report_card(
 
             write_attribution(
                 attribution, bucket=bucket,
-                run_date=run_date if snapshot else None, s3_client=s3,
+                run_date=run_date if (snapshot and not regrade) else None, s3_client=s3,
             )
     except Exception as e:  # noqa: BLE001 — secondary artifact, see above
         logger.error("attribution artifact write failed for %s: %s", run_date, e)
 
     dated_key = None
-    if snapshot:
+    regrade_key = None
+    if regrade:
+        regrade_key = regrade_report_card_key(run_date, now)
+        s3.put_object(
+            Bucket=bucket, Key=regrade_key, Body=body, ContentType="application/json",
+        )
+        logger.warning(
+            "Dated report card s3://%s/%s already exists and %s is more than %d days "
+            "past its run date: wrote the regrade beside it at %s and left the as-of "
+            "record unchanged (alpha-engine-config-I12124)",
+            bucket, report_card_key(run_date), now.date().isoformat(),
+            DATED_CARD_REWRITE_WINDOW_DAYS, regrade_key,
+        )
+    elif snapshot:
         dated_key = report_card_key(run_date)
         s3.put_object(
             Bucket=bucket, Key=dated_key, Body=body, ContentType="application/json",
         )
         logger.info("Wrote report card to s3://%s/%s (weekly snapshot)", bucket, dated_key)
 
-    return {"latest_key": latest_key, "dated_key": dated_key}
+    return {"latest_key": latest_key, "dated_key": dated_key, "regrade_key": regrade_key}
 
 
 # _letters / compare_to_backtester / --compare deleted RC v3 T1
