@@ -52,7 +52,23 @@ owning_repo: crucible-evaluator
 substrate: lambda
 origin: aws:lambda:alpha-engine-evaluator
 owner: brian
-lifecycle: in-service
+lifecycle: retired
+lifecycle_reason: >-
+  Retired 2026-11-06. Producer switched off by ruling, not failed: the only
+  producer is the v1 weekly ne-weekly-freshness-pipeline
+  (events:alpha-engine-saturday DISABLED 2026-10-28,
+  alpha-engine-config-I12758; last run 2026-10-24, so
+  evaluator/latest/report_card.json last wrote 2026-10-24T13:54Z). No
+  EventBridge rule or schedule targets this Lambda, and
+  ne-weekly-freshness-pipeline is the only state machine that names it
+  (read-only 2026-11-06). This row is a repo descriptor, so nous-ergon-ops
+  governance/decommission.d/v1-weekly-evaluator-backtest-aec12838.yaml names
+  it under `registries` rather than `components`. The resource is deleted with
+  the v1 path under Crucible v2 phase 4 (alpha-engine-config-I9760). If the
+  producer is re-enabled, move this row back to in-service in the same change
+  (alpha-engine-config-I12838).
+lifecycle_owner: brian
+lifecycle_reexam: 2027-02-04
 
 authority_tier: unknown
 authority_tier_reason: >-
