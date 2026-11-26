@@ -152,7 +152,7 @@ jobs:
   notify-main-failure:
     needs: [test, docker-image-tests]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@633b0fe47e521ad1769e4a2df264a1900fff2552
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@52bb0d5435cb10d494b9a3dc6e570f2c760a778f
     secrets: inherit
 
   # Rejects any dependency extra written with an underscore. pip <23.3 does not
